@@ -7,8 +7,15 @@ name = "scraper-engine"
 version = "0.1.0"
 description = "Search & Scraper Engine — multi-level web scraping with anti-detection"
 requires-python = ">=3.11"
-readme = "README.md"
 license = {text = "Proprietary"}
+
+[tool.setuptools.packages.find]
+include = ["core*", "proxy*", "browser*", "fetcher*", "services*", "storage*", "orchestrator*", "api*", "cli*", "config*", "observability*", "scrapy_project*", "monitoring*"]
+
+[tool.setuptools.package-data]
+config = ["*.yaml"]
+infra = ["pgbouncer/*.ini"]
+monitoring = ["alerts/*.yml", "dashboards/*.json"]
 
 dependencies = [
     "fastapi>=0.109.0",
