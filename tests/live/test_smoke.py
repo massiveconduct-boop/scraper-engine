@@ -26,7 +26,7 @@ class TestPublicEndpoints:
                     if response.status_code == 200:
                         return
             except (httpx.ReadTimeout, httpx.ConnectError):
-                pass
+                continue
             if attempt < 2:
                 await asyncio.sleep(2)
         pytest.skip("httpbin.org unreachable after 3 attempts")

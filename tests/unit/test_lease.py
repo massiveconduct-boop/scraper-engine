@@ -30,7 +30,7 @@ class TestProxyLease:
         tenant = TenantId("test")
         lease = ProxyLease(proxy=proxy, tenant_id=tenant, lease_ttl_seconds=120)
         async with lease:
-            pass
+            assert lease._acquired_at is not None
         assert lease._released is True
 
     @pytest.mark.asyncio
