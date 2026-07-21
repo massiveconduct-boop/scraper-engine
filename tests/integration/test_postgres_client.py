@@ -2,6 +2,7 @@
 """PostgresClient integration tests — real Postgres + tenant scoping."""
 
 import pytest
+
 from core.tenant import TenantId
 from storage.postgres_client import PostgresClient
 

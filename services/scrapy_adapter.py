@@ -42,8 +42,6 @@ class ScrapyAdapter:
                 start_urls = start_urls
 
                 def parse(self, response: object) -> object:
-                    for _key, _value in kwargs.items():
-                        pass
                     item = {"url": response.url, "title": response.css("title::text").get()}  # type: ignore[attr-defined]  # noqa: F821
                     items.append(item)
                     yield item

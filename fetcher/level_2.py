@@ -26,7 +26,7 @@ class Level2Fetcher:
     TIMEOUT_SECONDS = 40
 
     def __init__(self) -> None:
-        pass
+        """Level 2 fetcher — no initialization required."""
 
     async def fetch(
         self,

@@ -20,14 +20,14 @@ from core.models import JobStatus, JobStatusResponse, ScrapeRequest
 router = APIRouter(prefix="/v1")
 
 
-@router.post("/scrape")  # type: ignore[untyped-decorator]
+@router.post("/scrape")
 async def scrape(request: ScrapeRequest) -> dict[str, object]:
     """Enqueue a scrape job. Returns job_id for status polling."""
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "status": JobStatus.PENDING.value, "urls": len(request.urls)}
 
 
-@router.get("/jobs/{job_id}")  # type: ignore[untyped-decorator]
+@router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> JobStatusResponse:
     """Get the status and results of a scrape job."""
     return JobStatusResponse(
@@ -37,7 +37,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
     )
 
 
-@router.get("/health")  # type: ignore[untyped-decorator]
+@router.get("/health")
 async def health() -> dict[str, str]:
     """Composite health check."""
     return {"status": "ok"}

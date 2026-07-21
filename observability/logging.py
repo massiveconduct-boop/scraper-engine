@@ -55,4 +55,5 @@ def configure_logging(level: str = "INFO", json_format: bool = True) -> None:
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """Get a structlog logger instance."""
-    return structlog.get_logger(name or "scraper_engine")
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name or "scraper_engine")
+    return logger
