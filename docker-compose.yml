@@ -1,0 +1,99 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - pgbouncer
+      - minio
+
+  worker-l1:
+    build: .
+    command: rq worker scraper-level1
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - pgbouncer
+
+  worker-l2:
+    build: .
+    command: rq worker scraper-level2
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - pgbouncer
+
+  worker-l3:
+    build: .
+    command: rq worker scraper-level3
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - pgbouncer
+
+  proxy-harvester:
+    build: .
+    command: python -m proxy.harvester
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scraper_engine
+      POSTGRES_USER: scraper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scraper}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: scraper
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-scraper}
+      DB_NAME: scraper_engine
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "500"
+      DEFAULT_POOL_SIZE: "20"
+    volumes:
+      - ./infra/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+    ports:
+      - "6432:6432"
+    depends_on:
+      - postgres
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+volumes:
+  pgdata:
+  miniodata:

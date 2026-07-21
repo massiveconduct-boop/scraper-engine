@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scraper-engine"
+version = "0.1.0"
+description = "Search & Scraper Engine — multi-level web scraping with anti-detection"
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "Proprietary"}
+
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-core>=2.14.0",
+    "httpx>=0.26.0",
+    "scrapling>=0.1.0",
+    "asyncpg>=0.29.0",
+    "redis>=5.0.0",
+    "rq>=1.16.0",
+    "camoufox>=3.0.0",
+    "structlog>=24.1.0",
+    "prometheus-client>=0.19.0",
+    "pyyaml>=6.0",
+    "boto3>=1.34.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.5.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+    "types-pyyaml>=6.0.0",
+    "types-redis>=5.0.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["UP042"]  # str+Enum pattern matches spec; StrEnum changes Pydantic serialization
+
+[tool.ruff.lint.isort]
+known-first-party = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api", "cli", "config", "observability"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["no-untyped-def", "no-untyped-call", "misc"]
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = "migrations.*"
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --strict-markers --tb=short"
+markers = [
+    "unit: unit tests (no I/O)",
+    "integration: integration tests (real DB/Redis)",
+    "chaos: resource exhaustion and race condition tests",
+    "live: live tests against owned/consented targets (BD-05)",
+    "slow: tests that take >5 seconds",
+]
+
+[tool.coverage.run]
+source = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api"]
+
+[tool.coverage.report]
+fail_under = 90
+include = ["core/*", "proxy/*", "orchestrator/*"]

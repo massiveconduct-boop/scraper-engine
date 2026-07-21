@@ -1,0 +1,8 @@
+# Staging overrides — mirrors production but more verbose + relaxed rate limits
+observability:
+  logging_level: DEBUG
+  tracing_enabled: true
+
+politeness:
+  default_concurrency: 3
+  default_delay_seconds: 2.0

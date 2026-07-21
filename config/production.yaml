@@ -1,0 +1,11 @@
+# Production overrides
+observability:
+  logging_level: WARNING
+  tracing_enabled: true
+
+camoufox:
+  headless_mode: virtual   # keep virtual in production (no real display)
+
+politeness:
+  default_concurrency: 1   # conservative — respect target sites under real load
+  default_delay_seconds: 10.0

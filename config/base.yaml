@@ -1,0 +1,64 @@
+# Base configuration — defaults inherited by all environments
+# Values with ${ENV_VAR} are resolved from environment variables at startup
+
+levels:
+  level_1:
+    engine: scrapling
+    proxy_tier_min_score: 40.0
+    timeout_seconds: 20
+  level_2:
+    engine: botasaurus+camoufox
+    proxy_tier_min_score: 70.0
+    timeout_seconds: 40
+    capsolver_enabled: true
+  level_3:
+    engine: camoufox
+    proxy_tier_min_score: 90.0
+    timeout_seconds: 60
+    capsolver_enabled: true
+
+camoufox:
+  geoip: true
+  humanize: 1.5
+  headless_mode: virtual
+  max_total_instances: 8
+
+proxy_harvester:
+  sources:
+    - proxifly
+    - proxyscrape
+    - iplocate
+    - proxripper
+  interval_seconds: 600
+
+politeness:
+  default_concurrency: 2
+  default_delay_seconds: 5.0
+  slot_ttl_seconds: 120
+
+circuit_breaker:
+  failure_threshold: 0.95
+  attempt_threshold: 20
+  cooldown_seconds: 600
+  max_cooldown_seconds: 3600
+
+capsolver:
+  daily_credit_ceiling_default: 1.0   # [CONFIRMED — BD-03: $1.00/day]
+  max_concurrent_solves: 10
+
+ssrf_guard:
+  additional_denied_cidrs: []
+
+observability:
+  metrics_enabled: true
+  tracing_enabled: true
+  logging_level: INFO
+
+pgbouncer:
+  pool_mode: transaction
+  max_client_conn: 500            # [CONFIRMED — BD-06]
+  default_pool_size: 20
+
+session_retention:
+  browser_sessions_ttl_days: 30
+  domain_ban_history_retention_days: 7
