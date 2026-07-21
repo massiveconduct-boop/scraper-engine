@@ -1,0 +1,84 @@
+{
+  "title": "Scraper Engine — Overview",
+  "uid": "scraper-engine-overview",
+  "panels": [
+    {
+      "title": "Proxy Pool Size by Tier",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "proxy_pool_size", "legendFormat": "{{tier}}"}
+      ]
+    },
+    {
+      "title": "Browser Pool Status",
+      "type": "stat",
+      "targets": [
+        {"expr": "browser_pool_size", "legendFormat": "{{status}}"}
+      ]
+    },
+    {
+      "title": "Job Duration (p50/p95/p99)",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(job_duration_seconds_bucket[5m]))", "legendFormat": "p50 {{level}}"},
+        {"expr": "histogram_quantile(0.95, rate(job_duration_seconds_bucket[5m]))", "legendFormat": "p95 {{level}}"},
+        {"expr": "histogram_quantile(0.99, rate(job_duration_seconds_bucket[5m]))", "legendFormat": "p99 {{level}}"}
+      ]
+    },
+    {
+      "title": "Circuit Breaker State",
+      "type": "state-timeline",
+      "targets": [
+        {"expr": "circuit_state", "legendFormat": "{{domain}}"}
+      ]
+    },
+    {
+      "title": "Proxy Exhaustion Rate",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(proxy_exhausted_total[5m])", "legendFormat": "{{level}}/{{domain}}"}
+      ]
+    },
+    {
+      "title": "Dead Letter Queue Size",
+      "type": "stat",
+      "targets": [
+        {"expr": "dlq_size"}
+      ],
+      "thresholds": [
+        {"value": 0, "color": "green"},
+        {"value": 50, "color": "yellow"},
+        {"value": 100, "color": "red"}
+      ]
+    },
+    {
+      "title": "CapSolver Daily Spend",
+      "type": "gauge",
+      "targets": [
+        {"expr": "capsolver_daily_spend", "legendFormat": "{{tenant_id}}"}
+      ],
+      "max": 1.0,
+      "thresholds": [
+        {"value": 0, "color": "green"},
+        {"value": 0.75, "color": "yellow"},
+        {"value": 0.9, "color": "red"}
+      ]
+    },
+    {
+      "title": "Proxy Harvest Duration",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(proxy_harvest_duration_seconds_bucket[5m])", "legendFormat": "le{{le}}"}
+      ]
+    },
+    {
+      "title": "Browser Launch Duration (p95)",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, rate(browser_launch_duration_seconds_bucket[5m]))"}
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"}
+}

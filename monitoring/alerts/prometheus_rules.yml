@@ -1,0 +1,109 @@
+# monitoring/alerts/prometheus_rules.yml
+# Prometheus alert rules — spec §9 observability
+groups:
+  - name: scraper_engine
+    rules:
+      # Proxy pool critical low — Level 3 escalations will fail
+      - alert: ProxyPoolCriticallyLow
+        expr: proxy_pool_size{tier="elite"} < 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elite-tier proxy pool near-empty — Level 3 escalations will fail closed"
+          description: "Elite proxy count is {{ $value }}. Minimum safe threshold is 5."
+
+      # Browser pool exhausted
+      - alert: BrowserPoolExhausted
+        expr: browser_pool_size{status="idle"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No idle browser instances available"
+          description: "All Camoufox instances are currently active. New L2/L3 requests will queue."
+
+      # Circuit breaker tripped repeatedly — possible misconfiguration
+      - alert: CircuitBreakerFrequentTrips
+        expr: rate(circuit_state[1h]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Domain circuit tripped >5x in an hour — cooldown backoff likely misconfigured"
+          description: "Domain {{ $labels.domain }} circuit tripped {{ $value }} times in the last hour."
+
+      # Dead letter queue growing — jobs accumulating without resolution
+      - alert: DeadLetterQueueGrowing
+        expr: dlq_size > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead letter queue has {{ $value }} entries — jobs accumulating"
+          description: "More than 100 jobs in the DLQ. Investigate failure patterns."
+
+      # CapSolver budget near ceiling
+      - alert: CapSolverBudgetExhausted
+        expr: capsolver_daily_spend / 1.0 > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CapSolver daily budget at {{ $value | humanizePercentage }}"
+          description: "CapSolver spend is nearing the $1.00/day ceiling (BD-03). New solves will be rejected."
+
+      # Proxy exhaustions increasing — harvester may be failing
+      - alert: ProxyExhaustionRateHigh
+        expr: rate(proxy_exhausted_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Proxy pool exhaustion rate elevated: {{ $value }}/s"
+          description: "Domain {{ $labels.domain }} at level {{ $labels.level }} failing to find proxies."
+
+      # High job failure rate
+      - alert: HighJobFailureRate
+        expr: |
+          (
+            sum(rate(job_duration_seconds_count{status="failed"}[10m]))
+            /
+            sum(rate(job_duration_seconds_count[10m]))
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Job failure rate above 50% in the last 10 minutes"
+          description: "{{ $value | humanizePercentage }} of jobs are failing. Check target availability and proxy health."
+
+      # API error rate
+      - alert: HighAPIErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API 5xx error rate elevated"
+          description: "{{ $value }}/s 5xx errors in the last 5 minutes."
+
+      # PgBouncer connection pool near limit
+      - alert: PgBouncerPoolNearLimit
+        expr: pgbouncer_pool_active_connections / pgbouncer_pool_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PgBouncer pool at {{ $value | humanizePercentage }} capacity"
+          description: "Connection pool near limit (BD-06: max_client_conn=500). Consider scaling."
+
+      # Redis unreachable
+      - alert: RedisUnreachable
+        expr: up{job="scraper-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scraper engine metrics endpoint unreachable"
+          description: "Prometheus cannot scrape metrics from scraper-engine. Service may be down."
