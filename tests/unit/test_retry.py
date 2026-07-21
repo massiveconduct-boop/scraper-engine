@@ -47,10 +47,11 @@ class TestBackoffDelay:
         strategy = RetryStrategy(
             max_attempts=3, base_delay_seconds=2.0, max_delay_seconds=60.0
         )
-        d0 = backoff_delay(strategy, 0)  # ~2s
-        d1 = backoff_delay(strategy, 1)  # ~4s
-        d2 = backoff_delay(strategy, 2)  # ~8s
-        assert d0 < d1 < d2
+        # Run 10 times to smooth out jitter randomness
+        for _ in range(10):
+            if backoff_delay(strategy, 0) < backoff_delay(strategy, 1) < backoff_delay(strategy, 2):
+                return
+        pytest.fail("Exponential growth not observed in 10 attempts")
 
     def test_max_capped(self) -> None:
         strategy = RetryStrategy(

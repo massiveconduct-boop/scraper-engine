@@ -192,7 +192,7 @@ def upgrade() -> None:
                 CREATE INDEX IF NOT EXISTS idx_results_job ON %s.scrape_results (job_id);
                 CREATE INDEX IF NOT EXISTS
                     idx_results_url_hash ON %s.scrape_results (url, content_hash);
-            $f$, safe_slug, safe_slug, safe_slug);
+            $f$, safe_slug, safe_slug, safe_slug, safe_slug);
 
             -- dead_letter_queue
             EXECUTE format($f$
