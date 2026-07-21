@@ -61,4 +61,15 @@ class TenantResolver:
             tenant_slug,
             api_key,
         )
+        await self._pg.execute(
+            system_tenant,
+            "INSERT INTO public.tenants (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            tenant_slug,
+        )
+        # Bootstrap the per-tenant schema (tables, indexes)
+        await self._pg.execute(
+            system_tenant,
+            "SELECT public.create_tenant_schema($1)",
+            tenant_slug,
+        )
         return tenant_id, api_key

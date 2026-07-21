@@ -28,6 +28,17 @@ class RedisClient:
             self._redis_url, encoding="utf-8", decode_responses=True
         )
 
+    @property
+    def raw(self) -> aioredis.Redis:
+        """Return the underlying Redis client for system-level (non-tenant) operations.
+
+        Circuit breaker, politeness controller, and other system-level components
+        use this raw access. Never expose this to tenant-scoped handlers.
+        """
+        if self._client is None:
+            raise RuntimeError("RedisClient.start() must be called before accessing raw")
+        return self._client
+
     async def stop(self) -> None:
         """Close the Redis connection."""
         if self._client:

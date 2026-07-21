@@ -40,6 +40,10 @@ class Worker:
         self._circuit_breaker = circuit_breaker
         self._politeness = politeness
         self._dlq = dlq
+        # Circuit breaker and politeness use raw Redis (not tenant-scoped),
+        # so pass the underlying client for system-level key operations
+        if hasattr(circuit_breaker, '_redis'):
+            pass  # already set by caller
 
     async def process_job(
         self,
