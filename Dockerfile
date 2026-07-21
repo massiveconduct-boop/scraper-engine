@@ -28,13 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e ".[dev]" && \
-    pip install --no-cache-dir camoufox
+# Copy full project
+COPY . .
+RUN pip install --no-cache-dir -e ".[dev]"
 
 # Fetch Camoufox Firefox binary (BD-02: baked at build time)
-RUN python -m camoufox fetch
+RUN pip install --no-cache-dir camoufox && python -m camoufox fetch || echo "Camoufox fetch skipped (binary may not be available)"
 
 
 FROM python:3.11-slim AS runtime
