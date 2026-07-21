@@ -53,11 +53,10 @@ class TestAtomicLua:
     @pytest.mark.asyncio
     async def test_slot_expiry_prevents_leak(self):
         """Simulate a worker crash — TTL must release the slot."""
-        from unittest.mock import AsyncMock
         from fakeredis import FakeAsyncRedis
 
         redis = FakeAsyncRedis(decode_responses=True)
-        from orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
+        from orchestrator.politeness import ACQUIRE_SLOT_LUA
 
         tenant = TenantId("test")
         slot_key = f"politeness:slots:{tenant}:chaos.com"
@@ -78,7 +77,7 @@ class TestAtomicLua:
                 return 0
             return 0
 
-        redis.eval = mock_eval
+        redis.eval = mock_eval  # type: ignore[method-assign]
 
         # Acquire a slot
         result = await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "worker-1", "2", "120")

@@ -39,8 +39,9 @@ class TestPublicEndpoints:
     @pytest.mark.asyncio
     async def test_challenge_detector_no_false_positive(self):
         """Challenge detector must not flag httpbin as a challenge page."""
-        from fetcher.challenge_detector import ChallengeDetector
         import httpx
+
+        from fetcher.challenge_detector import ChallengeDetector
 
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get("https://httpbin.org/html")
@@ -52,8 +53,8 @@ class TestPublicEndpoints:
     @pytest.mark.asyncio
     async def test_ssrf_guard_blocks_loopback(self):
         """Live SSRF guard test — must block localhost."""
-        from core.ssrf_guard import SSRFGuard
         from core.exceptions import SSRFBlockedError
+        from core.ssrf_guard import SSRFGuard
 
         guard = SSRFGuard()
         with pytest.raises(SSRFBlockedError):
