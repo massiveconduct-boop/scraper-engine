@@ -37,7 +37,7 @@ class ScrapyAdapter:
             from scrapy.spiders import Spider
             from scrapy.utils.project import get_project_settings
 
-            class _DynamicSpider(Spider):  # type: ignore[misc]
+            class _DynamicSpider(Spider):
                 name = spider_name
                 start_urls = start_urls
 
