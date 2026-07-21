@@ -100,11 +100,16 @@ class TestRetryWithBackoff:
 
     @pytest.mark.asyncio
     async def test_exhausts_retries(self) -> None:
+        call_count = 0
+
         async def fn():
+            nonlocal call_count
+            call_count += 1
             raise ConnectionError("always fail")
 
         with pytest.raises(ConnectionError):
             await retry_with_backoff(fn, FailureCategory.NETWORK_TIMEOUT)
+        assert call_count == 3  # max_attempts=3 for NETWORK_TIMEOUT
 
     @pytest.mark.asyncio
     async def test_no_retry_for_non_retryable(self) -> None:

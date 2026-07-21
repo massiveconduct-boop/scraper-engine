@@ -65,5 +65,34 @@ class TestSSRFGuard:
             SSRFGuard, "_resolve_host", new_callable=AsyncMock
         ) as mock_resolve:
             mock_resolve.return_value = "93.184.216.34"
-            # Should not raise
             await guard.validate("https://example.com/")
+
+    @pytest.mark.asyncio
+    async def test_validate_redirect_chain(self) -> None:
+        guard = SSRFGuard()
+
+        class MockResponse:
+            url = "https://final.example.com/page"
+
+        with patch.object(
+            SSRFGuard, "_resolve_host", new_callable=AsyncMock
+        ) as mock_resolve:
+            mock_resolve.return_value = "93.184.216.34"
+            await guard.validate_redirect_chain(MockResponse())
+
+    @pytest.mark.asyncio
+    async def test_resolve_host_with_mock(self):
+        """Test _resolve_host with mocked socket.getaddrinfo."""
+        guard = SSRFGuard()
+        with patch("socket.getaddrinfo") as mock_getaddrinfo:
+            mock_getaddrinfo.return_value = [(2, 1, 6, "", ("93.184.216.34", 0))]
+            host = await guard._resolve_host("https://example.com/path")
+            assert host == "93.184.216.34"
+
+    @pytest.mark.asyncio
+    async def test_resolve_host_no_hostname(self):
+        """Test _resolve_host raises ValueError for malformed URL."""
+        guard = SSRFGuard()
+        with pytest.raises(ValueError):
+            await guard._resolve_host("not-a-valid-url://")
+

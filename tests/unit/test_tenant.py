@@ -61,3 +61,15 @@ class TestTenantId:
     def test_repr(self) -> None:
         t = TenantId("testtenant")
         assert "testtenant" in repr(t)
+
+    def test_pydantic_validation(self) -> None:
+        """Test TenantId works as a Pydantic field type."""
+        from pydantic import BaseModel, ValidationError
+
+        class Model(BaseModel):
+            tenant: TenantId
+
+        m = Model(tenant="validname")  # type: ignore[arg-type]
+        assert isinstance(m.tenant, TenantId)
+        with pytest.raises(ValidationError):
+            Model(tenant="bad name")  # type: ignore[arg-type]
