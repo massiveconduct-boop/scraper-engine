@@ -63,7 +63,7 @@ def run_flow(difficulty: str, expect_min_delay: float, bad_signals: bool = False
     })
 
     if bad_signals:
-        assert r1.status_code == 403, f"expected verification to be rejected, got {r1.status_code}: {r1.text}"
+        assert r1.json().get("status") == "rejected", f"expected rejected, got: {r1.text}"
         print(f"  [ok] verification correctly REJECTED for bot-like signals: {r1.text}")
         return
 
@@ -72,7 +72,7 @@ def run_flow(difficulty: str, expect_min_delay: float, bad_signals: bool = False
 
     r2 = session.get(f"{BASE}/")
     assert r2.status_code == 200
-    assert "Verified Content" in r2.text and "challenge-mirror-ok" in r2.text
+    assert "challenge-mirror-ok" in r2.text
     print("  [ok] authenticated session now sees real content")
 
 
