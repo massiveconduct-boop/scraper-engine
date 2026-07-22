@@ -10,12 +10,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
 
 from .result import FetchResult
 
 if TYPE_CHECKING:
-    from browser.camoufox_wrapper import CamoufoxWrapper
     from core.models import ConfigOverrides, Proxy
     from core.tenant import TenantId
 

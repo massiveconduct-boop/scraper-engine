@@ -47,11 +47,15 @@ class CamoufoxWrapper:
         try:
             from camoufox.async_api import AsyncCamoufox
 
+            proxy_config = None
+            if self.proxy is not None:
+                proxy_config = {"server": self.proxy.url()}
+
             self._browser = AsyncCamoufox(
                 geoip=True,
                 humanize=1.5,
                 headless="virtual",
-                proxy=self.proxy.url() if self.proxy else None,
+                proxy=proxy_config,
             )
             self._context = await self._browser.__aenter__()
             return self._context
