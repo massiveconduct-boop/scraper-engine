@@ -40,6 +40,72 @@ Infrastructure services: PostgreSQL 16 (Docker, port 5432), Redis 7 (Docker, por
 | Main test file | `tests/` | 26 test files, 168 tests |
 | Source code | `core/`, `proxy/`, `browser/`, etc. | 116 Python files |
 | Challenge mirror | `challenge-mirror/` | Self-hosted BD-05 test target |
+| Pip freeze | `/tmp/pip_freeze.txt` | 141 packages, full dependency list |
+| L2 proof artifact | `/tmp/l2_result.txt` | Raw Camoufox L2 live test output |
+| Coverage report | `/tmp/report_coverage.txt` | pytest-cov term report |
+| Full test output | `/tmp/report_full_tests.txt` | 187-line verbose pytest output |
+| Production-readiness source | `/home/ubuntu/my_spaces/scraper-engine/` | 8 files (see §3A) |
+
+---
+
+## Reproducibility Instructions
+
+### Step 1 — Clone and Install
+```bash
+git clone <this-repo> scraper_engine
+cd scraper_engine
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pip install boto3 rq fakeredis locust psutil proxybroker2
+pip install --no-cache-dir camoufox  # optional — needed for L2/L3 live tests
+python -m camoufox fetch              # optional — downloads Firefox ~150MB
+```
+
+### Step 2 — Start Infrastructure
+```bash
+cp .env.example .env
+docker compose up -d postgres redis
+alembic upgrade head
+```
+
+### Step 3 — Build Challenge Mirror (for L2/L3 tests)
+```bash
+cp -r /home/ubuntu/my_spaces/scraper-engine/* challenge-mirror/
+mkdir -p challenge-mirror/app
+mv challenge-mirror/server.py challenge-mirror/app/server.py
+# Fix Dockerfile per §3A.7
+docker build -t challenge-mirror challenge-mirror/
+docker run -d --rm --name challenge-mirror -p 8090:8090 \
+  -e CHALLENGE_MIRROR_SECRET_KEY=$(openssl rand -hex 32) challenge-mirror
+```
+
+### Step 4 — Run All Verification
+```bash
+ruff check . --exclude 'challenge-mirror/'
+mypy core/ config/ proxy/ browser/ fetcher/ services/ storage/ orchestrator/ \
+     api/ cli/ observability/ scrapy_project/ tests/ --ignore-missing-imports
+pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=no
+pytest tests/unit/ tests/integration/ tests/chaos/ \
+     --cov=core --cov=proxy --cov=orchestrator --cov-report=term
+pytest tests/live/ -v --tb=short  # with mirror running + internet
+python -c "from core.ssrf_guard import SSRFGuard; ..."  # live SSRF test
+```
+
+### Dependency Versions (pip freeze, 141 packages)
+Full list at `/tmp/pip_freeze.txt`. Key versions:
+```
+alembic==1.18.5, asyncpg==0.31.0, boto3==1.43.52, camoufox==0.5.4,
+fastapi==0.139.2, httpx==0.28.1, mypy==2.3.0, playwright==1.60.0,
+proxybroker2==2.0.0a4, pydantic==2.13.4, pytest==9.1.1, ruff==0.15.22,
+scrapy==2.17.0, structlog==26.1.0, uvicorn==0.51.0, fakeredis==2.36.2,
+locust==2.46.0, psutil==7.2.2, itsdangerous==2.2.0
+```
+
+### Environment Variables Required
+```
+PGBOUNCER_DSN, REDIS_URL, S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY,
+CHALLENGE_MIRROR_SECRET_KEY (for mirror), CAPSOLVER_API_KEY (optional)
+```
 
 ---
 
