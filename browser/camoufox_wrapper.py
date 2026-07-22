@@ -25,8 +25,8 @@ class CamoufoxWrapper:
     Acquires core.budget.BROWSER_SEMAPHORE BEFORE spawning any process (closes F-14).
     Delegates 100% of fingerprint surface to camoufox.async_api.AsyncCamoufox.
 
-    ~80MB RSS per instance (measured 2026-07-22, Camoufox v152) (Camoufox's published figure) — this is the binding
-    constraint for max_total_instances, not CPU.
+    ~80MB RSS per instance (measured 2026-07-22, Camoufox v152).
+    This figure is the binding constraint for max_total_instances, not CPU.
     """
 
     def __init__(

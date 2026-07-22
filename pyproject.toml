@@ -53,7 +53,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
-exclude = ["challenge-mirror/", ".venv/", ".git/", ".wolf/", ".claude/"]
+exclude = ["challenge-mirror", "report-review-fix", ".venv", ".git", ".wolf", ".claude"]
 ignore = ["UP042"]  # str+Enum pattern matches spec; StrEnum changes Pydantic serialization
 
 [tool.ruff.lint.isort]

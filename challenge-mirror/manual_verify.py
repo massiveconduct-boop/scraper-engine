@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """
 Manual end-to-end verification of the challenge mirror, run directly (not via pytest)
 to prove the server logic works before wiring the pytest suite. Mimics exactly what

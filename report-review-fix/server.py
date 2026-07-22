@@ -99,12 +99,10 @@ def _record_lookup(challenge_hash: str) -> dict | None:
 
 def _verify_challenge(challenge_id: str, nonce: int, signals: dict) -> tuple[bool, str]:
     now = time.time()
-    challenge_hash = None
     record = None
     with _challenge_lock:
-        for ch, rec in _active_challenges.items():
+        for _ch, rec in _active_challenges.items():
             if rec["id"] == challenge_id:
-                challenge_hash = ch
                 record = rec
                 break
     if record is None:
@@ -181,10 +179,10 @@ async function solve() {{
     resp.json().then(function(data) {{
       if (data.status === 'verified') {{
         document.cookie = data.cookie_name + '=' + data.cookie_token + ';path=' + data.cookie_path + ';max-age=300';
-        document.getElementById('status').innerText = 'Verified — redirecting…';
+        document.getElementById("status").innerText="Verified — redirecting…";
         window.location.href = '/';
       }} else {{
-        document.getElementById('status').innerText = 'Verification failed: ' + (data.reason || 'unknown');
+        document.getElementById('status').innerText = 'Verification failed: ' +(data.reason||'unknown');
       }}
     }});
   }});
@@ -290,3 +288,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ruff: noqa: E501
