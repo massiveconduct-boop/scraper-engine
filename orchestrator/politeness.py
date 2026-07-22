@@ -29,7 +29,7 @@ return 0
 
 RELEASE_SLOT_LUA = """
 local key = KEYS[1]
-local worker_id = ARGV[2]
+local worker_id = ARGV[1]
 redis.call('SREM', key, worker_id)
 return 1
 """

@@ -11,7 +11,6 @@ Or headless:
 """
 
 import random
-import uuid
 
 from locust import HttpUser, between, task
 

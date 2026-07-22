@@ -53,6 +53,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+exclude = ["challenge-mirror/", ".venv/", ".git/", ".wolf/", ".claude/"]
 ignore = ["UP042"]  # str+Enum pattern matches spec; StrEnum changes Pydantic serialization
 
 [tool.ruff.lint.isort]
@@ -90,7 +91,7 @@ markers = [
 source = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api"]
 
 [tool.coverage.report]
-fail_under = 85
-include = ["core/*", "proxy/*", "orchestrator/*"]
-# Note: 89% achieved (1% gap is SSRF DNS resolution via run_in_executor,
-# untestable in unit CI without real DNS)
+fail_under = 90
+include = ["core/*", "proxy/*", "orchestrator/*", "browser/*"]
+# G-02 closure: browser/ now measured (F-14 OOM risk, F-16 process leak fixes verified)
+# G-10 closure: gate restored to 90% — line-level justification for any shortfall below
