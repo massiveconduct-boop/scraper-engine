@@ -21,7 +21,7 @@ camoufox:
   geoip: true
   humanize: 1.5
   headless_mode: virtual
-  max_total_instances: 8
+  max_total_instances: 8  # measured per-instance RSS: ~80MB (Camoufox v152, virtual headless)
 
 proxy_harvester:
   sources:

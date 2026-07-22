@@ -69,7 +69,11 @@ class ProxyHarvester:
             return 0
 
         broker = Broker(sources=self._sources)
-        async for proxy_data in broker.find(limit=limit, types=["HTTP", "HTTPS"]):
+        proxy_stream = await broker.find(limit=limit, types=["HTTP", "HTTPS"])
+        if proxy_stream is None:
+            logger.warning("proxy sources returned no results — sources may be unreachable")
+            return 0
+        async for proxy_data in proxy_stream:
             try:
                 asn = await self._classifier.classify(proxy_data.get("ip", "0.0.0.0"))
                 asn_class = AsnClass.RESIDENTIAL if "residential" in asn.lower() else (

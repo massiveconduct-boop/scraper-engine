@@ -14,7 +14,8 @@ if TYPE_CHECKING:
     from storage.redis_client import RedisClient
 
 # Global semaphores — tune per host RAM
-# 8 instances × ~200MB RSS each ≈ 1.6GB, leaving headroom on typical 4GB VPS
+# Measured 2026-07-22: Camoufox v152 per-instance RSS = 80.1MB (virtual headless)
+# 8 × 80MB ≈ 640MB, conservative for typical 4GB VPS
 BROWSER_SEMAPHORE = asyncio.Semaphore(8)
 
 # Bounds outstanding CAPTCHA long-poll tasks, preventing FD exhaustion (F-13)
