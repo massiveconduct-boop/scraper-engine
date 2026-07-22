@@ -69,7 +69,11 @@ class ProxyHarvester:
             return 0
 
         broker = Broker(sources=self._sources)
-        proxy_stream = await broker.find(limit=limit, types=["HTTP", "HTTPS"])
+        try:
+            proxy_stream = await broker.find(limit=limit, types=["HTTP", "HTTPS"])
+        except Exception as exc:
+            logger.warning("proxy source fetch failed: %s", str(exc))
+            return 0
         if proxy_stream is None:
             logger.warning("proxy sources returned no results — sources may be unreachable")
             return 0

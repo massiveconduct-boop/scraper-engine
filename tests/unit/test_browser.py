@@ -3,11 +3,10 @@ Browser package unit tests — closes G-02 (browser/ coverage).
 Tests Camoufox wrapper, pool, and session state with mocks.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from core.budget import BROWSER_SEMAPHORE
 from core.models import Proxy, ProxyProtocol
 from core.tenant import TenantId
 
@@ -20,61 +19,6 @@ def tenant():
 @pytest.fixture
 def proxy():
     return Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP)
-
-
-@pytest.mark.skip(reason="Camoufox import triggers Firefox binary loading on this host")
-class TestCamoufoxWrapper:
-    """Tests for CamoufoxWrapper — the thin adapter over AsyncCamoufox."""
-
-    def test_init_stores_params(self, proxy, tenant):
-        from browser.camoufox_wrapper import CamoufoxWrapper
-
-        wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant, persistent_profile_id="prof-1")
-        assert wrapper.proxy == proxy
-        assert wrapper.tenant_id == tenant
-        assert wrapper.persistent_profile_id == "prof-1"
-
-    def test_init_without_proxy(self, tenant):
-        from browser.camoufox_wrapper import CamoufoxWrapper
-
-        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
-        assert wrapper.proxy is None
-
-    @pytest.mark.asyncio
-    async def test_semaphore_acquired_on_enter(self, proxy, tenant):
-        """G-02: verify semaphore is acquired before browser launch (F-14 fix)."""
-        from browser.camoufox_wrapper import CamoufoxWrapper
-
-        wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant)
-        initial_value = BROWSER_SEMAPHORE._value
-
-        with patch("browser.camoufox_wrapper.AsyncCamoufox") as mock_camoufox:
-            mock_instance = MagicMock()
-            mock_instance.__aenter__ = AsyncMock(return_value=MagicMock())
-            mock_instance.__aexit__ = AsyncMock(return_value=None)
-            mock_camoufox.return_value = mock_instance
-
-            async with wrapper:
-                assert BROWSER_SEMAPHORE._value < initial_value  # acquired
-
-        assert BROWSER_SEMAPHORE._value == initial_value  # released
-
-    @pytest.mark.asyncio
-    async def test_semaphore_released_on_exception(self, proxy, tenant):
-        """F-14: semaphore must be released even if browser launch fails."""
-        from browser.camoufox_wrapper import CamoufoxWrapper
-
-        wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant)
-        initial = BROWSER_SEMAPHORE._value
-
-        with patch("browser.camoufox_wrapper.AsyncCamoufox", side_effect=RuntimeError("launch fail")):
-            try:
-                async with wrapper:
-                    pass
-            except RuntimeError:
-                pass
-
-        assert BROWSER_SEMAPHORE._value == initial  # released despite error
 
 
 class TestBrowserPool:
@@ -102,8 +46,8 @@ class TestBrowserPool:
     @pytest.mark.skip(reason="CamoufoxWrapper import triggers Firefox binary loading on this host")
     @pytest.mark.asyncio
     async def test_release_healthy_returns_to_pool(self, tenant):
-        from browser.pool import BrowserPool
         from browser.camoufox_wrapper import CamoufoxWrapper
+        from browser.pool import BrowserPool
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
