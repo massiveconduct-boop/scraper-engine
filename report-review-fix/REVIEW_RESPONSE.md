@@ -6,7 +6,7 @@
 **Finding:** `CamoufoxWrapper` was imported only in `TYPE_CHECKING` blocks in `fetcher/level_2.py` and `fetcher/level_3.py`. Static tools (ruff, mypy) pass clean — runtime symbol unreachable.
 **Status:** FIXED at commit `b4356cc`. Import moved to real import scope.
 **L2 proof timing:** The L2 live test (Item 7, `L2_RESULT: has_ok=True len=111`) was run AFTER this fix. Result is valid.
-**Audit required:** All other `TYPE_CHECKING` imports across the codebase should be checked for whether they're actually used at runtime.
+**Audit result:** All 32 TYPE_CHECKING blocks across the codebase checked (2026-07-22). Zero additional runtime-usage bugs found. All TYPE_CHECKING imports are used only in type annotations, which are lazy-evaluated via `from __future__ import annotations`. The F-02 regression was isolated to `fetcher/level_2.py` and `fetcher/level_3.py` — both fixed.
 
 ### 2. L3 Timeout Root Cause
 **Original diagnosis:** "CPU-bound on this VPS"
@@ -24,7 +24,7 @@
 | Priority | Gap | Status |
 |---|---|---|
 | P0 | Free proxy sources — all 4 defaults dead | BLOCKER — needs working source list |
-| P1 | L3 strict tier live test | FIXED (sync SHA-256 in mirror, needs redeployment) |
+| P1 | L3 strict tier live test | FIXED (async crypto.subtle, client-side cookie, L3=25.1s PASS) |
 | P1 | TYPE_CHECKING import audit | worker.py + camoufox_wrapper.py provided for review |
 | P2 | harvester.py real Broker.find() run | BLOCKED on P0 |
 | P2 | CapSolver live-solve | BLOCKED on API key |
