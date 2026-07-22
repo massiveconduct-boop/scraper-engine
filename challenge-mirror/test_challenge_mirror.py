@@ -28,7 +28,7 @@ def ensure_server_running():
         yield
         return
     except requests.exceptions.ConnectionError:
-        pass
+        time.sleep(1)  # wait for server to start, then retry
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "app.server"],
