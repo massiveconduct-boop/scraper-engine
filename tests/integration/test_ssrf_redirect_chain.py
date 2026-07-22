@@ -34,7 +34,7 @@ def redirect_server():
     """Start a server on a random port that redirects to cloud metadata IP."""
     server = HTTPServer(("127.0.0.1", 0), _RedirectToMetadataHandler)
     port = server.server_address[1]
-    thread = asyncio.get_event_loop().run_in_executor(None, server.handle_request)
+    _ = asyncio.get_event_loop().run_in_executor(None, server.handle_request)
     yield f"http://127.0.0.1:{port}/redirect"
     server.server_close()
 

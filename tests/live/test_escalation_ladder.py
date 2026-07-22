@@ -67,7 +67,7 @@ async def test_l2_times_out_against_strict_challenge_and_escalates_to_l3(
     l2 = Level2Fetcher(proxy_manager, politeness, browser_pool)
     l3 = Level3Fetcher(proxy_manager, politeness, browser_pool)
 
-    r2 = await l2.fetch(STRICT_URL, tenant_id=TenantId("e2etest"), domain=DOMAIN)
+    _ = await l2.fetch(STRICT_URL, tenant_id=TenantId("e2etest"), domain=DOMAIN)
     # L2 is expected to fail/timeout here (its config timeout is shorter than the
     # mirror's enforced 3s minimum solve delay) — that failure is the point of this test.
 
