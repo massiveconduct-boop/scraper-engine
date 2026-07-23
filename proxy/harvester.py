@@ -1,3 +1,4 @@
+# ruff: noqa: E501  -- subprocess script strings contain embedded Python code
 # proxy/harvester.py
 """Proxy harvester — discovers, validates, and persists free proxies.
 
@@ -119,7 +120,7 @@ asyncio.run(main())'''
         finally:
             try:
                 os.unlink(path)
-            except OSError:
+            except OSError:  # noqa: SIM105
                 pass
 
         if proc.returncode != 0:

@@ -1,7 +1,7 @@
 # tests/unit/test_harvester.py
 """ProxyHarvester tests — direct scrape + proxybroker2 subprocess fallback."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
