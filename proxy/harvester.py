@@ -75,8 +75,9 @@ class ProxyHarvester:
             logger.warning("proxy source fetch failed: %s", str(exc))
             return 0
         if proxy_stream is None:
-            logger.warning("proxy sources returned no results — sources may be unreachable")
-            return 0
+            logger.warning("proxybroker2 returned no results — trying direct scrape fallback")
+            count = await self._direct_scrape(limit, system_tenant)
+            return count
         async for proxy_data in proxy_stream:
             try:
                 asn = await self._classifier.classify(proxy_data.get("ip", "0.0.0.0"))
@@ -118,5 +119,70 @@ class ProxyHarvester:
                 count += 1
             except Exception:
                 continue
+
+        return count
+
+    async def _direct_scrape(self, limit: int, tenant: "TenantId") -> int:
+        """Fallback: scrape proxy APIs directly when proxybroker2 returns none.
+
+        BD-01: proxybroker2's provider modules have outdated parsing —
+        upstream APIs return real proxy data but the library cannot parse them.
+        This method bypasses proxybroker2 and parses the raw API responses.
+        """
+        import re
+
+        import httpx
+
+        sources = [
+            (
+                "https://api.proxyscrape.com/v2/"
+                "?request=displayproxies&protocol=http&timeout=10000"
+                "&country=all&ssl=all&anonymity=all",
+                "ip_port",
+            ),
+        ]
+
+        count = 0
+        async with httpx.AsyncClient(timeout=15) as client:
+            for url, fmt in sources:
+                try:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    text = resp.text.strip()
+                    if not text:
+                        continue
+
+                    lines = text.split("\n")[:limit]
+                    for line in lines:
+                        line = line.strip()
+                        if not line or ":" not in line:
+                            continue
+                        if fmt == "ip_port":
+                            ip, port_str = line.rsplit(":", 1)
+                            try:
+                                port = int(port_str)
+                            except ValueError:
+                                continue
+                            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
+                                continue
+
+                            try:
+                                await self._pg.execute(
+                                    tenant,
+                                    """INSERT INTO proxy_pool
+                                       (ip, port, protocol, anonymity, asn_class)
+                                       VALUES ($1, $2, $3, $4, $5)
+                                       ON CONFLICT (ip, port) DO NOTHING""",
+                                    ip, port, "HTTP", "anonymous", "unknown",
+                                )
+                                count += 1
+                                if count >= limit:
+                                    return count
+                            except Exception:
+                                continue
+
+                except Exception as exc:
+                    logger.warning("direct proxy scrape failed for %s: %s", url, str(exc))
+                    continue
 
         return count

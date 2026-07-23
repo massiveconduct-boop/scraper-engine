@@ -35,16 +35,22 @@ class TestProxyHarvester:
 
     @pytest.mark.asyncio
     async def test_harvest_once_no_broker(self, pg, classifier):
+        """proxybroker2 ImportError → returns 0 without calling _direct_scrape."""
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
-        with patch("proxy.harvester.logger"):
+        h._direct_scrape = AsyncMock(return_value=0)
+        with patch("proxy.harvester.logger"), \
+             patch("proxy.harvester.Broker", side_effect=ImportError, create=True):
             count = await h.harvest_once(limit=10)
             assert count == 0
 
     @pytest.mark.asyncio
     async def test_harvest_once_no_proxybroker2(self, pg, classifier):
+        """proxybroker2 not installed — returns 0."""
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
-        count = await h.harvest_once(limit=10)
-        assert count == 0
+        h._direct_scrape = AsyncMock(return_value=0)
+        with patch("proxy.harvester.Broker", side_effect=ImportError, create=True):
+            count = await h.harvest_once(limit=10)
+            assert count == 0
 
     @pytest.mark.asyncio
     async def test_harvester_initial_state(self, pg, classifier):
@@ -67,19 +73,21 @@ class TestProxyHarvester:
 
     @pytest.mark.asyncio
     async def test_harvest_once_broker_returns_none(self, pg, classifier):
-        """G-04: broker.find() returns None (sources unreachable)."""
+        """G-04: broker.find() returns None — falls back to direct scrape."""
         h = ProxyHarvester(pg=pg, sources=["dead"], asn_classifier=classifier)
+        h._direct_scrape = AsyncMock(return_value=5)
         broker = _mock_broker_factory(return_value=None)
         with (
             patch("proxy.harvester.logger"),
             patch("proxybroker2.Broker", return_value=broker, create=True),
         ):
-            assert await h.harvest_once(limit=10) == 0
+            assert await h.harvest_once(limit=10) == 5
 
     @pytest.mark.asyncio
     async def test_harvest_once_exception_handled(self, pg, classifier):
         """G-04: broker.find() raises — returns 0, no crash."""
         h = ProxyHarvester(pg=pg, sources=["err"], asn_classifier=classifier)
+        h._direct_scrape = AsyncMock(return_value=0)
         broker = _mock_broker_factory(side_effect=ConnectionError("refused"))
         with (
             patch("proxy.harvester.logger"),
@@ -89,9 +97,10 @@ class TestProxyHarvester:
 
     @pytest.mark.asyncio
     async def test_harvest_once_empty_stream(self, pg, classifier):
-        """G-04: broker returns empty async generator."""
+        """G-04: broker returns None — _direct_scrape fallback handles it."""
         h = ProxyHarvester(pg=pg, sources=["empty"], asn_classifier=classifier)
-        broker = _mock_broker_factory(return_value=None)  # None iterable tests None handling
+        h._direct_scrape = AsyncMock(return_value=0)
+        broker = _mock_broker_factory(return_value=None)
         with (
             patch("proxy.harvester.logger"),
             patch("proxybroker2.Broker", return_value=broker, create=True),
