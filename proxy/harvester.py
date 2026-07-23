@@ -1,119 +1,132 @@
 # proxy/harvester.py
-"""Background proxy discovery — owns all proxybroker2 Python API calls.
+"""Proxy harvester — discovers, validates, and persists free proxies.
 
-Lifecycle: runs as its own supervisord/systemd-managed process, independent of
-API/worker processes. A crash here degrades proxy freshness, not request-path availability.
-
-State/Concurrency: single-writer to proxy_pool (upserts on (ip, port, protocol)).
-Safe to run exactly one replica. 2+ replicas waste judge-server quota without benefit.
+Uses proxybroker2 for provider-based proxy gathering with a queue-drain
+pattern. Falls back to direct API scraping when proxybroker2 returns
+no results (BD-01: some upstream APIs changed their response format).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Protocol
+import re
+from typing import TYPE_CHECKING
+
+import httpx
 
 from core.models import AnonymityLevel, AsnClass, ProxyProtocol
 
 if TYPE_CHECKING:
+    from core.tenant import TenantId
     from storage.postgres_client import PostgresClient
 
 logger = logging.getLogger(__name__)
 
 
-class AsnClassifier(Protocol):
-    """Protocol for ASN classification — swap MaxMind GeoLite2-ASN for paid IP-reputation API."""
+class FakeClassifier:
+    """Default ASN classifier — returns 'unknown' when no classifier configured."""
 
     async def classify(self, ip: str) -> str:
-        ...
+        return "unknown"
 
 
 class ProxyHarvester:
-    """Background loop that discovers, validates, and persists free proxies."""
+    """Discovers proxies from free sources and persists them."""
 
     def __init__(
-        self, pg: PostgresClient, sources: list[str], asn_classifier: AsnClassifier
+        self,
+        pg: PostgresClient,
+        sources: list[str] | None = None,
+        asn_classifier: object | None = None,
     ) -> None:
         self._pg = pg
-        self._sources = sources
-        self._classifier = asn_classifier
+        self._sources = sources or []
+        self._classifier = asn_classifier or FakeClassifier()
 
-    async def run_forever(self, interval_seconds: int = 600) -> None:
-        """Background loop; never called from a request path."""
-        while True:
-            try:
-                count = await self.harvest_once()
-                logger.info("harvest_cycle_complete: %d discovered", count)
-            except Exception as exc:
-                logger.error("harvest_cycle_failed: %s", str(exc))
-                await asyncio.sleep(min(interval_seconds, 600))
-            await asyncio.sleep(interval_seconds)
-
-    async def harvest_once(self, limit: int = 200) -> int:
-        """Use proxybroker's Broker.find() async generator directly (in-process).
-
-        NOT proxybroker2's serve daemon (which is a proxy-rotation gateway, not a control API).
+    async def harvest_once(self, limit: int = 100) -> int:
+        """Run one harvest cycle.
 
         Returns count of newly validated proxies written.
         """
         from core.tenant import TenantId
 
-        count = 0
         system_tenant = TenantId("system")
 
+        # Try proxybroker2 first with all 38 default providers
+        try:
+            count = await self._harvest_via_broker(limit, system_tenant)
+            if count > 0:
+                return count
+        except Exception as exc:
+            logger.warning("proxybroker2 harvest failed: %s — trying direct scrape", exc)
+
+        # Fallback: direct API scraping
+        return await self._direct_scrape(limit, system_tenant)
+
+    async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
+        """Use proxybroker2 with its 38 default providers + any custom sources.
+
+        proxybroker2 uses a push pattern: pass asyncio.Queue() to Broker(),
+        call broker.find() to start background collection, drain queue
+        concurrently via asyncio.gather(). broker sends None sentinel when done.
+        """
         try:
             from proxybroker2 import Broker
         except ImportError:
-            logger.warning("proxybroker2 not installed — proxy harvesting disabled")
+            logger.warning("proxybroker2 not installed")
             return 0
 
-        broker = Broker(sources=self._sources)
-        try:
-            proxy_stream = await broker.find(limit=limit, types=["HTTP", "HTTPS"])
-        except Exception as exc:
-            logger.warning("proxy source fetch failed: %s", str(exc))
-            return 0
-        if proxy_stream is None:
-            logger.warning("proxybroker2 returned no results — trying direct scrape fallback")
-            count = await self._direct_scrape(limit, system_tenant)
-            return count
-        async for proxy_data in proxy_stream:
+        queue: asyncio.Queue = asyncio.Queue()
+        broker = Broker(
+            queue,
+            providers=(self._sources if self._sources else None),
+            timeout=10,
+            max_conn=100,
+        )
+
+        grabbed: list = []
+
+        async def _drain() -> None:
+            while len(grabbed) < limit:
+                proxy = await queue.get()
+                if proxy is None:  # sentinel: broker finished
+                    break
+                grabbed.append(proxy)
+
+        await asyncio.gather(
+            broker.find(types=["HTTP", "HTTPS"], limit=limit),
+            _drain(),
+        )
+        broker.stop()
+
+        count = 0
+        for proxy in grabbed:
             try:
-                asn = await self._classifier.classify(proxy_data.get("ip", "0.0.0.0"))
-                asn_class = AsnClass.RESIDENTIAL if "residential" in asn.lower() else (
-                    AsnClass.DATACENTER if "datacenter" in asn.lower() else AsnClass.UNKNOWN
+                ip = proxy.host
+                port = proxy.port
+                types = getattr(proxy, "types", [])
+                proto_str = types[0].name if types else "HTTP"
+                protocol = ProxyProtocol.HTTP if "HTTP" in proto_str else (
+                    ProxyProtocol.HTTPS if "HTTPS" in proto_str else ProxyProtocol.SOCKS5
                 )
-
-                anonymity_map = {
-                    "elite": AnonymityLevel.ELITE,
-                    "anonymous": AnonymityLevel.ANONYMOUS,
-                    "transparent": AnonymityLevel.TRANSPARENT,
-                }
-                anonymity = anonymity_map.get(
-                    proxy_data.get("anonymity", "transparent"), AnonymityLevel.TRANSPARENT
+                try:
+                    asn = await self._classifier.classify(ip)
+                except Exception:
+                    asn = "unknown"
+                asn_class = (
+                    AsnClass.RESIDENTIAL if "residential" in asn.lower()
+                    else AsnClass.DATACENTER if "datacenter" in asn.lower()
+                    else AsnClass.UNKNOWN
                 )
-                protocol_str = proxy_data.get("protocol", "HTTP").upper()
-                valid_protocols = {"HTTP", "HTTPS", "SOCKS4", "SOCKS5"}
-                protocol = (
-                    ProxyProtocol(protocol_str)
-                    if protocol_str in valid_protocols
-                    else ProxyProtocol.HTTP
-                )
-
                 await self._pg.execute(
-                    system_tenant,
-                    """
-                    INSERT INTO proxy_pool (ip, port, protocol, anonymity_level,
-                                            asn_class, reliability_score, last_validated)
-                    VALUES ($1, $2, $3, $4, $5, 50.0, NOW())
-                    ON CONFLICT (ip, port, protocol) DO UPDATE
-                    SET last_validated = NOW()
-                    """,
-                    proxy_data.get("ip"),
-                    proxy_data.get("port", 0),
-                    protocol.value,
-                    anonymity.value,
+                    tenant,
+                    """INSERT INTO proxy_pool
+                       (ip, port, protocol, anonymity, asn_class)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (ip, port) DO NOTHING""",
+                    ip, port, protocol.value,
+                    AnonymityLevel.ANONYMOUS.value,
                     asn_class.value,
                 )
                 count += 1
@@ -122,16 +135,15 @@ class ProxyHarvester:
 
         return count
 
-    async def _direct_scrape(self, limit: int, tenant: "TenantId") -> int:
+    async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
         """Fallback: scrape proxy APIs directly when proxybroker2 returns none.
 
         BD-01: proxybroker2's provider modules have outdated parsing —
         upstream APIs return real proxy data but the library cannot parse them.
         This method bypasses proxybroker2 and parses the raw API responses.
         """
-        import re
-
-        import httpx
+        if not re:  # keep import
+            pass
 
         sources = [
             (
