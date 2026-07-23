@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from .camoufox_wrapper import CamoufoxWrapper
+
 if TYPE_CHECKING:
     from core.models import Proxy
     from core.tenant import TenantId
-
-    from .camoufox_wrapper import CamoufoxWrapper
 
 
 class BrowserPool:
