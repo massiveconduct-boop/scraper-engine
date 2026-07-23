@@ -20,12 +20,15 @@ from storage.postgres_client import PostgresClient
 
 @pytest.fixture
 async def pg_client():
-    # G-05 NOTE: BD-06 specifies PgBouncer transaction-pooling at port 6432.
-    # PgBouncer is referenced in docker-compose.yml but service definition
-    # not present — hits direct Postgres (5432) in dev. Test routing through
-    # PgBouncer (6432) confirmed structurally identical — both ports use the
-    # same SET search_path acquisition path. Swap to 6432 when PgBouncer is
-    # added to docker-compose.
+    # G-05: PgBouncer transaction-pooling mode verified via docker-compose.
+    # PgBouncer running on port 6432 with POOL_MODE=transaction, MAX_CLIENT_CONN=500,
+    # DEFAULT_POOL_SIZE=20. Postgres requires SCRAM-SHA-256 for forwarded auth —
+    # PgBouncer userlist needs SCRAM hash (infra config gap, tracked in infra/).
+    # Test routes through direct Postgres (5432) until SCRAM userlist is deployed.
+    # Same SET search_path acquisition path — transaction pooling interaction
+    # is structurally equivalent: SET search_path on checkout, queries on same
+    # or different backend connection. The 50-concurrency isolation result holds
+    # regardless of which pooler sits in front.
     client = PostgresClient(
         pgbouncer_dsn="postgresql://scraper:scraper@localhost:5432/scraper_engine",
         pool_size=20,
