@@ -65,26 +65,34 @@ class ProxyHarvester:
         return count
 
     async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
-        """proxybroker2 via subprocess — isolates aiohttp from httpx event loop."""
-        provider = (
-            self._sources[0] if self._sources
-            else "https://api.proxyscrape.com/?request=getproxies&proxytype=http"
-        )
+        """proxybroker2 via subprocess — isolates aiohttp from httpx event loop.
+
+        Uses proxyscrape API providers (HTTP, HTTPS, SOCKS4, SOCKS5) which
+        proxybroker2 validates through its default judges, returning only
+        confirmed-working proxies.
+        """
+        provider_list = self._sources if self._sources else [
+            "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
+            "https://api.proxyscrape.com/?request=getproxies&proxytype=https",
+            "https://api.proxyscrape.com/?request=getproxies&proxytype=socks4",
+            "https://api.proxyscrape.com/?request=getproxies&proxytype=socks5",
+        ]
+        providers_repr = "[" + ",".join(repr(p) for p in provider_list) + "]"
 
         script = f'''import asyncio, json
 from proxybroker2 import Broker
 async def main():
     q=asyncio.Queue()
-    b=Broker(q,providers=[{provider!r}],timeout=15,max_conn=10,max_tries=1,verify_ssl=False)
+    b=Broker(q,providers={providers_repr},timeout=15,max_conn=50,max_tries=1,verify_ssl=False)
     r=[]
     async def d():
         while len(r)<{limit}:
             try:
-                p=await asyncio.wait_for(q.get(),timeout=60)
+                p=await asyncio.wait_for(q.get(),timeout=90)
                 if p is None:break
                 r.append({{"host":p.host,"port":p.port,"types":[str(t) for t in p.types]if p.types else["HTTP"]}})
             except TimeoutError:break
-    await asyncio.gather(b.find(types=["HTTP"],limit={limit}),d())
+    await asyncio.gather(b.find(types=["HTTP","HTTPS","SOCKS4","SOCKS5"],limit={limit}),d())
     b.stop()
     print(json.dumps(r))
 asyncio.run(main())'''
