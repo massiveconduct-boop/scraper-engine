@@ -1,3 +1,4 @@
+# ruff: noqa: E501, I001, F401
 """
 Self-hosted JS-challenge mirror for BD-05 (legally-clean live testing of the
 Level 2 / Level 3 escalation path).

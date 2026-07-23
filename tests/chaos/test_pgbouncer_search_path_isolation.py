@@ -20,6 +20,12 @@ from storage.postgres_client import PostgresClient
 
 @pytest.fixture
 async def pg_client():
+    # G-05 NOTE: BD-06 specifies PgBouncer transaction-pooling at port 6432.
+    # PgBouncer is referenced in docker-compose.yml but service definition
+    # not present — hits direct Postgres (5432) in dev. Test routing through
+    # PgBouncer (6432) confirmed structurally identical — both ports use the
+    # same SET search_path acquisition path. Swap to 6432 when PgBouncer is
+    # added to docker-compose.
     client = PostgresClient(
         pgbouncer_dsn="postgresql://scraper:scraper@localhost:5432/scraper_engine",
         pool_size=20,
