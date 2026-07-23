@@ -118,10 +118,9 @@ asyncio.run(main())'''
             logger.warning("proxybroker2 subprocess timed out")
             return 0
         finally:
-            try:
+            import contextlib
+            with contextlib.suppress(OSError):
                 os.unlink(path)
-            except OSError:  # noqa: SIM105
-                pass
 
         if proc.returncode != 0:
             err = stderr.decode() if stderr else "no stderr"
