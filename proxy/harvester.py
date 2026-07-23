@@ -80,25 +80,32 @@ class ProxyHarvester:
             logger.warning("proxybroker2 not installed")
             return 0
 
-        queue: asyncio.Queue = asyncio.Queue()
+        queue = asyncio.Queue()
         broker = Broker(
             queue,
-            providers=(self._sources if self._sources else None),
-            timeout=10,
-            max_conn=100,
+            providers=(self._sources if self._sources else [
+                "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
+            ]),
+            timeout=15,
+            max_conn=10,
+            max_tries=1,
+            verify_ssl=False,
         )
 
         grabbed: list = []
 
         async def _drain() -> None:
             while len(grabbed) < limit:
-                proxy = await queue.get()
-                if proxy is None:  # sentinel: broker finished
+                try:
+                    proxy = await asyncio.wait_for(queue.get(), timeout=60)
+                    if proxy is None:
+                        break
+                    grabbed.append(proxy)
+                except TimeoutError:
                     break
-                grabbed.append(proxy)
 
         await asyncio.gather(
-            broker.find(types=["HTTP", "HTTPS"], limit=limit),
+            broker.find(types=["HTTP"], limit=limit),
             _drain(),
         )
         broker.stop()
