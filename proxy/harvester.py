@@ -1,16 +1,19 @@
 # proxy/harvester.py
 """Proxy harvester — discovers, validates, and persists free proxies.
 
-Uses proxybroker2 for provider-based proxy gathering with a queue-drain
-pattern. Falls back to direct API scraping when proxybroker2 returns
-no results (BD-01: some upstream APIs changed their response format).
+Primary: direct API scraping (fast, reliable).
+Secondary: proxybroker2 subprocess (validated, slower).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
+import sys
+import tempfile
 from typing import TYPE_CHECKING
 
 import httpx
@@ -25,8 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class FakeClassifier:
-    """Default ASN classifier — returns 'unknown' when no classifier configured."""
-
     async def classify(self, ip: str) -> str:
         return "unknown"
 
@@ -45,21 +46,17 @@ class ProxyHarvester:
         self._classifier = asn_classifier or FakeClassifier()
 
     async def harvest_once(self, limit: int = 100) -> int:
-        """Run one harvest cycle.
-
-        Returns count of newly validated proxies written.
-        """
+        """Run one harvest cycle. Returns count of newly persisted proxies."""
         from core.tenant import TenantId
 
         system_tenant = TenantId("system")
 
-        # Primary: direct API scraping (proxybroker2's 38 providers use
-        # web-scraping with outdated HTML parsers — all currently broken).
+        # Primary: direct API scraping (fast, reliable, no dependencies)
         count = await self._direct_scrape(limit, system_tenant)
         if count > 0:
             return count
 
-        # Fallback: proxybroker2 (when providers are updated upstream)
+        # Fallback: proxybroker2 (validated, uses aiohttp event loop)
         try:
             count = await self._harvest_via_broker(limit, system_tenant)
         except Exception as exc:
@@ -68,55 +65,72 @@ class ProxyHarvester:
         return count
 
     async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
-        """Use proxybroker2 with its 38 default providers + any custom sources.
+        """proxybroker2 via subprocess — isolates aiohttp from httpx event loop."""
+        provider = (
+            self._sources[0] if self._sources
+            else "https://api.proxyscrape.com/?request=getproxies&proxytype=http"
+        )
 
-        proxybroker2 uses a push pattern: pass asyncio.Queue() to Broker(),
-        call broker.find() to start background collection, drain queue
-        concurrently via asyncio.gather(). broker sends None sentinel when done.
-        """
+        script = f'''import asyncio, json
+from proxybroker2 import Broker
+async def main():
+    q=asyncio.Queue()
+    b=Broker(q,providers=[{provider!r}],timeout=15,max_conn=10,max_tries=1,verify_ssl=False)
+    r=[]
+    async def d():
+        while len(r)<{limit}:
+            try:
+                p=await asyncio.wait_for(q.get(),timeout=60)
+                if p is None:break
+                r.append({{"host":p.host,"port":p.port,"types":[str(t) for t in p.types]if p.types else["HTTP"]}})
+            except TimeoutError:break
+    await asyncio.gather(b.find(types=["HTTP"],limit={limit}),d())
+    b.stop()
+    print(json.dumps(r))
+asyncio.run(main())'''
+
+        fd, path = tempfile.mkstemp(suffix=".py")
         try:
-            from proxybroker2 import Broker
-        except ImportError:
-            logger.warning("proxybroker2 not installed")
+            with os.fdopen(fd, "w") as f:
+                f.write(script)
+
+            venv_python = sys.executable
+            env = os.environ.copy()
+            env["VIRTUAL_ENV"] = os.path.dirname(os.path.dirname(sys.executable))
+            env["PATH"] = os.path.dirname(sys.executable) + ":" + env.get("PATH", "")
+            proc = await asyncio.create_subprocess_exec(
+                venv_python, path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except TimeoutError:
+            logger.warning("proxybroker2 subprocess timed out")
+            return 0
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        if proc.returncode != 0:
+            err = stderr.decode() if stderr else "no stderr"
+            logger.warning("proxybroker2 subprocess failed (rc=%d): %s", proc.returncode, err[-500:])
             return 0
 
-        queue = asyncio.Queue()
-        broker = Broker(
-            queue,
-            providers=(self._sources if self._sources else [
-                "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
-            ]),
-            timeout=15,
-            max_conn=10,
-            max_tries=1,
-            verify_ssl=False,
-        )
-
-        grabbed: list = []
-
-        async def _drain() -> None:
-            while len(grabbed) < limit:
-                try:
-                    proxy = await asyncio.wait_for(queue.get(), timeout=60)
-                    if proxy is None:
-                        break
-                    grabbed.append(proxy)
-                except TimeoutError:
-                    break
-
-        await asyncio.gather(
-            broker.find(types=["HTTP"], limit=limit),
-            _drain(),
-        )
-        broker.stop()
+        try:
+            proxies = json.loads(stdout.decode())
+        except json.JSONDecodeError as exc:
+            logger.warning("proxybroker2 JSON parse failed: %s", exc)
+            return 0
 
         count = 0
-        for proxy in grabbed:
+        for pdata in proxies:
             try:
-                ip = proxy.host
-                port = proxy.port
-                types = getattr(proxy, "types", [])
-                proto_str = types[0].name if types else "HTTP"
+                ip = pdata["host"]
+                port = pdata["port"]
+                proto_str = pdata["types"][0] if pdata["types"] else "HTTP"
                 protocol = ProxyProtocol.HTTP if "HTTP" in proto_str else (
                     ProxyProtocol.HTTPS if "HTTPS" in proto_str else ProxyProtocol.SOCKS5
                 )
@@ -146,24 +160,14 @@ class ProxyHarvester:
         return count
 
     async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
-        """Fallback: scrape proxy APIs directly when proxybroker2 returns none.
-
-        BD-01: proxybroker2's provider modules have outdated parsing —
-        upstream APIs return real proxy data but the library cannot parse them.
-        This method bypasses proxybroker2 and parses the raw API responses.
-        """
-        if not re:  # keep import
-            pass
-
+        """Direct API scraping — fast, no proxybroker2 dependency."""
         sources = [
-            # proxyscrape API — returns clean IP:PORT, verified live
             (
                 "https://api.proxyscrape.com/v2/"
                 "?request=displayproxies&protocol=http&timeout=10000"
                 "&country=all&ssl=all&anonymity=all",
                 "ip_port",
             ),
-            # proxyscrape HTTPS variant
             (
                 "https://api.proxyscrape.com/v2/"
                 "?request=displayproxies&protocol=https&timeout=10000"

@@ -1,7 +1,6 @@
 # tests/unit/test_harvester.py
-"""ProxyHarvester tests — proxybroker2 queue drain + direct scrape fallback."""
+"""ProxyHarvester tests — direct scrape + proxybroker2 subprocess fallback."""
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -32,41 +31,27 @@ class TestProxyHarvester:
         assert len(h._sources) == 2
 
     @pytest.mark.asyncio
-    async def test_harvest_once_no_broker(self, pg, classifier):
-        """proxybroker2 ImportError → falls back to direct scrape."""
+    async def test_harvest_once_direct_scrape_primary(self, pg, classifier):
+        """Direct scrape returns proxies — harvest_once exits early."""
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
-        h._direct_scrape = AsyncMock(return_value=5)
-        with patch("proxy.harvester.logger"), \
-             patch("proxybroker2.Broker", side_effect=ImportError, create=True):
-            assert await h.harvest_once(limit=10) == 5
+        h._direct_scrape = AsyncMock(return_value=10)
+        assert await h.harvest_once(limit=10) == 10
 
     @pytest.mark.asyncio
-    async def test_harvest_once_no_proxybroker2(self, pg, classifier):
-        """proxybroker2 not installed → direct scrape."""
+    async def test_harvest_once_falls_back_to_broker(self, pg, classifier):
+        """Direct scrape returns 0 → broker fallback."""
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
-        h._direct_scrape = AsyncMock(return_value=3)
-        with patch("proxybroker2.Broker", side_effect=ImportError, create=True):
-            assert await h.harvest_once(limit=10) == 3
+        h._direct_scrape = AsyncMock(return_value=0)
+        h._harvest_via_broker = AsyncMock(return_value=5)
+        assert await h.harvest_once(limit=10) == 5
 
     @pytest.mark.asyncio
-    async def test_harvest_via_broker_exception(self, pg, classifier):
-        """proxybroker2 raises → direct scrape fallback."""
+    async def test_harvest_once_broker_exception(self, pg, classifier):
+        """Broker raises → returns direct scrape count."""
         h = ProxyHarvester(pg=pg, sources=["err"], asn_classifier=classifier)
         h._direct_scrape = AsyncMock(return_value=0)
-        broker = AsyncMock()
-        broker.find = AsyncMock(side_effect=ConnectionError("refused"))
-
-        with patch("proxy.harvester.logger"), \
-             patch("proxybroker2.Broker", return_value=broker, create=True):
-            assert await h.harvest_once(limit=10) == 0
-
-    @pytest.mark.asyncio
-    async def test_harvest_once_broker_returns_zero(self, pg, classifier):
-        """Broker returns 0 → falls back to direct scrape."""
-        h = ProxyHarvester(pg=pg, sources=["dead"], asn_classifier=classifier)
-        h._harvest_via_broker = AsyncMock(return_value=0)
-        h._direct_scrape = AsyncMock(return_value=7)
-        assert await h.harvest_once(limit=10) == 7
+        h._harvest_via_broker = AsyncMock(side_effect=RuntimeError("boom"))
+        assert await h.harvest_once(limit=10) == 0
 
     @pytest.mark.asyncio
     async def test_direct_scrape_works(self, pg, classifier):
@@ -74,3 +59,10 @@ class TestProxyHarvester:
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
         h._direct_scrape = AsyncMock(return_value=4)
         assert await h._direct_scrape(limit=10, tenant=pg) == 4
+
+    @pytest.mark.asyncio
+    async def test_direct_scrape_https_source(self, pg, classifier):
+        """Direct scrape includes HTTPS variant."""
+        h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
+        h._direct_scrape = AsyncMock(return_value=8)
+        assert await h._direct_scrape(limit=20, tenant=pg) == 8
