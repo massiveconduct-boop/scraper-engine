@@ -64,8 +64,9 @@ def run_flow(difficulty: str, expect_min_delay: float, bad_signals: bool = False
     })
 
     if bad_signals:
-        assert r1.json().get("status") == "rejected", f"expected rejected, got: {r1.text}"
-        print(f"  [ok] verification correctly REJECTED for bot-like signals: {r1.text}")
+        # Server returns 403 FORBIDDEN with plain-text reason on verification failure
+        assert r1.status_code == 403, f"expected 403, got {r1.status_code}: {r1.text}"
+        print(f"  [ok] verification correctly REJECTED for bot-like signals: {r1.text.strip()}")
         return
 
     assert r1.status_code == 200, f"verify failed: {r1.status_code} {r1.text}"
