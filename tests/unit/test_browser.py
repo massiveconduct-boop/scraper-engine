@@ -3,10 +3,13 @@ Browser package unit tests — closes G-02 (browser/ coverage).
 Tests Camoufox wrapper, pool, and session state with mocks.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
+from browser.pool import BrowserPool
+from browser.session_state import SessionStateManager
 from core.models import Proxy, ProxyProtocol
 from core.tenant import TenantId
 
@@ -26,8 +29,6 @@ class TestBrowserPool:
     NOTE: acquire/release tests require Camoufox (skipped in CI)."""
 
     def test_init(self, tenant):
-        from browser.pool import BrowserPool
-
         pool = BrowserPool(tenant_id=tenant, prewarm_count=5, max_idle_seconds=600)
         assert pool._prewarm_count == 5
         assert pool._max_idle_seconds == 600
@@ -62,7 +63,6 @@ class TestBrowserPool:
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         # shutdown on empty pool should not error
-        import asyncio
         asyncio.run(pool.shutdown())
 
 
@@ -70,8 +70,6 @@ class TestSessionState:
     """Tests for SessionStateManager — browser session persistence."""
 
     def test_save_and_load(self, tenant):
-        from browser.session_state import SessionStateManager
-
         redis = AsyncMock()
         redis.set.return_value = None
         redis.get.return_value = '{"cookies": [{"name": "test"}]}'
@@ -88,8 +86,6 @@ class TestSessionState:
         asyncio.run(run())
 
     def test_load_missing_returns_none(self, tenant):
-        from browser.session_state import SessionStateManager
-
         redis = AsyncMock()
         redis.get.return_value = None
         mgr = SessionStateManager(redis=redis)
@@ -102,8 +98,6 @@ class TestSessionState:
         asyncio.run(run())
 
     def test_delete_clears_entry(self, tenant):
-        from browser.session_state import SessionStateManager
-
         redis = AsyncMock()
         mgr = SessionStateManager(redis=redis)
 
