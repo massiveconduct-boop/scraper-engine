@@ -53,16 +53,19 @@ class ProxyHarvester:
 
         system_tenant = TenantId("system")
 
-        # Try proxybroker2 first with all 38 default providers
+        # Primary: direct API scraping (proxybroker2's 38 providers use
+        # web-scraping with outdated HTML parsers — all currently broken).
+        count = await self._direct_scrape(limit, system_tenant)
+        if count > 0:
+            return count
+
+        # Fallback: proxybroker2 (when providers are updated upstream)
         try:
             count = await self._harvest_via_broker(limit, system_tenant)
-            if count > 0:
-                return count
         except Exception as exc:
-            logger.warning("proxybroker2 harvest failed: %s — trying direct scrape", exc)
+            logger.warning("proxybroker2 harvest failed: %s", exc)
 
-        # Fallback: direct API scraping
-        return await self._direct_scrape(limit, system_tenant)
+        return count
 
     async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
         """Use proxybroker2 with its 38 default providers + any custom sources.
@@ -146,9 +149,17 @@ class ProxyHarvester:
             pass
 
         sources = [
+            # proxyscrape API — returns clean IP:PORT, verified live
             (
                 "https://api.proxyscrape.com/v2/"
                 "?request=displayproxies&protocol=http&timeout=10000"
+                "&country=all&ssl=all&anonymity=all",
+                "ip_port",
+            ),
+            # proxyscrape HTTPS variant
+            (
+                "https://api.proxyscrape.com/v2/"
+                "?request=displayproxies&protocol=https&timeout=10000"
                 "&country=all&ssl=all&anonymity=all",
                 "ip_port",
             ),
