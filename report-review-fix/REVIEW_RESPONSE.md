@@ -34,3 +34,21 @@
 ## Files Provided
 - `orchestrator/worker.py` — escalation state machine (to be reviewed for TYPE_CHECKING issues)
 - `browser/camoufox_wrapper.py` — post-fix version (verified working in L2 live test)
+
+## Round 4 — Goal Condition Responses
+
+### 1. worker.py Coverage — Per-Line Analysis
+```
+$ pytest tests/unit/test_worker.py tests/integration/test_worker_escalation.py \
+  --cov=orchestrator.worker --cov-report=term-missing
+
+Name                     Stmts   Miss  Cover   Missing
+orchestrator/worker.py      82     32    61%   75-76, 85, 130-174
+```
+13 tests pass (5 unit + 8 escalation). Missed lines are `_fetch_url` method body — the L1/L2/L3 dispatch that requires Camoufox/real fetchers. Tests mock `_fetch_url` and verify the state-machine decision logic (escalate/retry/DLQ paths). The 8 state-table tests exercise the branching logic correctly but the dispatch body remains uncovered because it spawns real fetcher instances.
+
+### 2. L3 Sync SHA-256 — Honest Status
+Delivered sync SHA-256 file not found in any project directory. Two scratch re-implementations attempted in this session had vector mismatches (FAIL on "empty" and "abc" test vectors against Python hashlib). Container runs async `crypto.subtle.digest()` at 25.1s. The file from the prior session was never committed to disk.
+
+### 3. Politeness Race — Implementation Method
+Test explicitly documents: "10 concurrent tasks (simulating 10 worker processes)" — asyncio tasks, not OS subprocesses. Real Redis Lua `eval()` for ACQUIRE/RELEASE. SCARD sampled across 50 iterations, max observed = 2 (max allowed = 2). Lua atomicity verified at the Redis level — functionally equivalent for race detection.
