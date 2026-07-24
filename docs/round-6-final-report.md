@@ -1,6 +1,6 @@
 # Scraper Engine — Round 6 Final Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `87f3e3c` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
+**Date:** 2026-07-24 | **Git HEAD:** `7c63825` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
 **Specification:** `specs/scraper-engine-blueprint-v2.md` v2.0 | **Directive:** `docs/round-6-directive.md`
 **Execution method:** pytest 9.1.1 via venv Python 3.12.3, Docker 29.5.3
 
@@ -343,6 +343,6 @@ Annotated HTML shows: L75-76 `<p class="mis show_mis">` (missed), L85 mis, L130-
 
 ## Final Summary
 
-170 passed, 0 errors, 0 failures. 5 of 6 items MET, 1 PARTIALLY MET (BD-01: 6/50+ operators — product owner decision pending). Self-hosted judge operational (:8089). PgBouncer auto-entrypoint working. BrowserPool lifecycle leak-free. Two INSERT bugs found and fixed. Fake OOM diagnosis corrected (Bash timeout, not kernel kill). 84 commits, ruff clean, clean tree.
+170 passed, 0 errors, 0 failures. 5 of 6 items MET, 1 PARTIALLY MET (BD-01: 6/50+ operators — product owner decision pending). Self-hosted judge operational (:8089). PgBouncer auto-entrypoint working. BrowserPool lifecycle leak-free. Two INSERT bugs found and fixed. Fake OOM diagnosis corrected (Bash timeout, not kernel kill). 85 commits, ruff clean, clean tree.
 
 **Artifact index:** `docs/round-6-final-report.md` (this document). Deep dives: `htmlcov/z_870c8b05ae87daee_worker_py.html` for coverage, `proxy/harvester.py` for multi-source harvest + validation, `judge_server.py` for self-hosted judge, `tests/live/test_browser_pool_lifecycle.py` for lifecycle test.
