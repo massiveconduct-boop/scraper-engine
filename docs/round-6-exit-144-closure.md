@@ -29,9 +29,9 @@ $ # Exit 144 = Bash tool timeout, not SIGSTKFLT
 
 ## 2. Failure Reproduction
 
-Running the same sequence that previously failed (docker compose up → start judge → direct scrape harvest → pool query) still hits exit 144 when the cumulative execution time exceeds the Bash tool's 120s window. The individual components complete (broker subprocess returns 3 proxies in ~20s when run in isolation), but the full sequence with Docker startup overhead exceeds the tool timeout.
+The full sequence (docker compose up → start judge → harvest → pool query) in one Bash invocation still returns exit 144 — confirmed this session. The Bash tool's 120s timeout fires before Docker startup + harvest completes.
 
-The broker subprocess itself works correctly:
+Broker subprocess in isolation works correctly:
 ```
 EXIT: 0
 STDOUT: [{"host": "109.172.116.18", "port": 7890, "types": ["HTTP"]},
@@ -54,11 +54,20 @@ proxy-harvester:
 
 No systemd unit. No orchestrator-level timeout beyond what RQ provides.
 
-### RQ worker timeout
-The harvester's `harvest_once()` runs inside an RQ worker. RQ's default `DEFAULT_TIMEOUT` is **180 seconds**. `harvest_once()` with both paths takes ~25 seconds (direct scrape ~5s + broker subprocess ~20s). **180s >> 25s — no tight timeout exists in the production path.**
+### Harvester is standalone — no RQ wrapper
+The harvester runs as a standalone Python process per docker-compose:
+```
+$ grep -A3 proxy-harvester docker-compose.yml
+  proxy-harvester:
+    build: .
+    command: python -m proxy.harvester
+```
+No systemd unit. No RQ worker wrapping. No orchestrator-level timeout. A harvest cycle runs to completion regardless of duration.
+
+The Bash tool timeout (120s → exit 144) does not exist in the Docker deployment. Docker containers have no default execution timeout. The harvester's ~25s cycle completes without any external deadline.
 
 ### Conclusion
-The 120s Bash tool timeout that produces exit 144 does not exist in the production deployment. The harvester's ~25s harvest cycle completes comfortably within RQ's 180s job timeout. This is a dev-environment testing-session artifact, not a production concern.
+The 120s Bash tool timeout that produces exit 144 is a testing-session artifact — it does not exist in production. The harvester runs as a standalone Docker process with no timeout wrapper. This is not a production concern.
 
 ---
 
@@ -69,6 +78,6 @@ The 120s Bash tool timeout that produces exit 144 does not exist in the producti
 | Exit 144 source | **Bash tool timeout** | 120s tool limit, not Unix signal |
 | Broker subprocess | **Works** (EXIT 0, 3 proxies, ~20s) | Raw stdout/stderr captured |
 | Failure reproduced | **Yes** — full sequence exceeds 120s | Exit 144 persists with full sequence |
-| Production timeout | **No risk** | RQ default 180s > harvest 25s |
+| Production timeout | **No risk** | Standalone Docker process, no timeout wrapper |
 
 Closed: Bash tool timeout, not production bug. No code change needed.
