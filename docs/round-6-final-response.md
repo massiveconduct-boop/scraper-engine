@@ -109,7 +109,7 @@ async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -
         return await wrapper.__aenter__()
 ```
 
-Includes: idle timeout eviction, domain-keyed matching, fallback launch. Ruff clean. 8 tests pass.
+Includes: idle timeout eviction, domain-keyed matching (bug-fixed: domain forwarding + _idle_since). Ruff clean.
 
 ---
 
