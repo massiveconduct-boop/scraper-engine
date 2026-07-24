@@ -39,9 +39,11 @@ class TestAcquireDoubleIssue:
         # Second acquire — pool should be empty, must NOT return same ctx
         with patch.object(pool, '_active_wrappers', []), \
              patch('browser.pool.CamoufoxWrapper') as mock_cw:
-            mock_instance = MagicMock()
-            mock_instance.__aenter__ = AsyncMock(return_value=object())
-            mock_cw.return_value = mock_instance
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+            mock_cw.side_effect = make_mock
             ctx2 = await pool.acquire()
             assert ctx2 is not fake_ctx, (
                 "DOUBLE-ISSUE BUG: second acquire returned same context. "
@@ -64,9 +66,16 @@ class TestAcquireDoubleIssue:
 
         with patch.object(pool, '_active_wrappers', []), \
              patch('browser.pool.CamoufoxWrapper') as mock_cw:
-            mock_instance = MagicMock()
-            mock_instance.__aenter__ = AsyncMock(return_value=object())
-            mock_cw.return_value = mock_instance
+            # Each acquire() creates a new CamoufoxWrapper which returns
+            # a distinct context object on __aenter__
+            ctx_counter = [0]
+
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+
+            mock_cw.side_effect = make_mock
 
             ctx2 = await pool.acquire()
             ctx3 = await pool.acquire()
