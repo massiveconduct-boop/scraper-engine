@@ -1,6 +1,6 @@
 # Scraper Engine — Closing Items Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `092e390` | **Suite:** 170 passed, 0 errors
+**Date:** 2026-07-24 | **Git HEAD:** `5a66b5b` | **Suite:** 170 passed, 0 errors
 
 Covers ONLY the three items from the final review. Items 4, 5, 6 already accepted and not repeated here.
 
@@ -177,4 +177,4 @@ $ .venv/bin/pytest tests/unit/ tests/integration/ tests/chaos/ -q
 170 passed, 2 skipped, 1 warning
 ```
 
-88 commits, ruff clean, clean tree.
+89 commits, ruff clean, clean tree.
