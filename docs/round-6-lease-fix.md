@@ -1,6 +1,6 @@
 # Scraper Engine — Invariant §1.1.6 Restoration Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `82ac8d4` | **Suite:** 170 passed, 0 errors
+**Date:** 2026-07-24 | **Git HEAD:** `cf944ab` | **Suite:** 170 passed, 0 errors
 **Specification:** `specs/scraper-engine-blueprint-v2.md` v2.0, §1.1.6
 
 Covers ONLY the `lease()` fix. Prior items already documented in `docs/round-6-critical-fixes.md`.
@@ -162,4 +162,4 @@ async def test_pool_full_lifecycle_no_leak():
 | Idle timeout in acquire() | Prevent stale context reuse | **MET** | Code shown, max_idle_seconds=300 enforced |
 | Lifecycle test updated | Verify new API works | **MET** | 1 passed, pre=0→mid=1→final=0 |
 
-105 commits, 170/0 suite, ruff clean, clean tree.
+106 commits, 170/0 suite, ruff clean, clean tree.
