@@ -31,7 +31,7 @@ Every drained item classified exactly once: selected, kept, or torn down. Only `
 ### Current `acquire()` (Fixed)
 
 ```python
-async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
+    async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
         """Get a live browser context from the pool or launch a new one.
 
         Drains pool once, classifies each candidate as selected/keep/
@@ -83,6 +83,9 @@ async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -
         )
         self._active_wrappers.append(wrapper)
         return await wrapper.__aenter__()
+
+
+    @asynccontextmanager
 ```
 
 ---
