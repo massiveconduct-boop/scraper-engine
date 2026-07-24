@@ -144,7 +144,7 @@ Count trajectory 0→1→0 proves browser was launched and reaped. No process le
 6 independently-operated free sources (5 hosting failure domains) accepted as permanent ceiling. Blueprint's "50+ sources" language retired. Replaced with monitored floor on validated proxies.
 
 ### Implementation Status
-`ProxyPoolCriticallyLow` alert specified in blueprint v2 §9. Should fire on `COUNT(*) FROM proxy_pool WHERE reliability_score >= 40` (validated count), not raw source count. Alert infrastructure exists in `monitoring/alerts/prometheus_rules.yml`.
+`ProxyPoolCriticallyLow` alert in `monitoring/alerts/prometheus_rules.yml` updated to fire on `reliability_score >= 40` (validated count at L1 threshold). Commit: `96e610e`. Was previously `proxy_pool_size{tier="elite"} < 5` — now matches validated-count requirement.
 
 ### Operator Table
 | # | Operator | Sources | Domain |
