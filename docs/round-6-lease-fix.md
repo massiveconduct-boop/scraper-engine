@@ -162,4 +162,4 @@ async def test_pool_full_lifecycle_no_leak():
 | Idle timeout in acquire() | Prevent stale context reuse | **MET** | Code shown, max_idle_seconds=300 enforced |
 | Lifecycle test updated | Verify new API works | **MET** | 1 passed, pre=0→mid=1→final=0 |
 
-103 commits, 170/0 suite, ruff clean, clean tree.
+104 commits, 170/0 suite, ruff clean, clean tree.
