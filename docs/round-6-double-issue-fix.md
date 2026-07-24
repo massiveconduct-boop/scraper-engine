@@ -83,9 +83,6 @@ async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -
         )
         self._active_wrappers.append(wrapper)
         return await wrapper.__aenter__()
-
-
-    @asynccontextmanager
 ```
 
 ---
@@ -100,45 +97,72 @@ $ .venv/bin/pytest tests/unit/test_browser.py::TestAcquireDoubleIssue -v
 
 test_two_sequential_acquires_get_different_contexts PASSED
 test_three_sequential_all_different PASSED
-4 passed in 0.14s
+2 passed in 0.12s
 ```
 
 ### Test: Two Sequential Acquires Get Different Contexts
 ```python
-async def test_two_sequential_acquires_get_different_contexts(self):
-    pool = BrowserPool(tenant_id=TenantId("doubletest"), prewarm_count=0)
-    await pool.start()
-    fake_ctx = object()
-    fake_wrapper = MagicMock()
-    fake_wrapper._last_domain = None
-    await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+    async def test_two_sequential_acquires_get_different_contexts(self):
+        """Two sequential acquire() calls with a queued context must not
+        return the same object. Verbatim regression test for the double-issue
+        bug where acquire() re-queued items to self._pool before selecting,
+        leaving the selected item still in the queue for the next call."""
+        pool = BrowserPool(tenant_id=TenantId("doubletest"), prewarm_count=0)
+        await pool.start()
 
-    ctx1 = await pool.acquire()
-    assert ctx1 is fake_ctx, "first acquire should return the queued context"
+        # Inject a fake live context into the pool (simulating prewarm)
+        fake_ctx = object()
+        fake_wrapper = MagicMock()
+        fake_wrapper._last_domain = None
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
 
-    # Second acquire — pool must be empty, must launch fresh
-    ctx2 = await pool.acquire()
-    assert ctx2 is not fake_ctx, (
-        "DOUBLE-ISSUE BUG: second acquire returned same context"
-    )
+        # First acquire — should get the fake context
+        ctx1 = await pool.acquire()
+        assert ctx1 is fake_ctx, "first acquire should return the queued context"
+
+        # Second acquire — pool should be empty, must NOT return same ctx
+        with patch.object(pool, '_active_wrappers', []), \
+             patch('browser.pool.CamoufoxWrapper') as mock_cw:
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+            mock_cw.side_effect = make_mock
+            ctx2 = await pool.acquire()
+            assert ctx2 is not fake_ctx, (
+                "DOUBLE-ISSUE BUG: second acquire returned same context. "
+                "The item was selected but never removed from self._pool."
+            )
 ```
 
 ### Test: Three Sequential All Different
 ```python
-async def test_three_sequential_all_different(self):
-    pool = BrowserPool(tenant_id=TenantId("tripletest"), prewarm_count=0)
-    await pool.start()
-    fake_ctx = object()
-    fake_wrapper = MagicMock()
-    await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+    async def test_three_sequential_all_different(self):
+        """Three acquires with one pre-loaded context: first gets it, rest launch fresh."""
+        pool = BrowserPool(tenant_id=TenantId("tripletest"), prewarm_count=0)
+        await pool.start()
 
-    ctx1 = await pool.acquire()
-    ctx2 = await pool.acquire()
-    ctx3 = await pool.acquire()
-    assert ctx1 is fake_ctx
-    assert ctx2 is not fake_ctx
-    assert ctx3 is not fake_ctx
-    assert ctx2 is not ctx3
+        fake_ctx = object()
+        fake_wrapper = MagicMock()
+        fake_wrapper._last_domain = None
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+
+        ctx1 = await pool.acquire()
+        assert ctx1 is fake_ctx
+
+        with patch.object(pool, '_active_wrappers', []), \
+             patch('browser.pool.CamoufoxWrapper') as mock_cw:
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+            mock_cw.side_effect = make_mock
+
+            ctx2 = await pool.acquire()
+            ctx3 = await pool.acquire()
+            assert ctx2 is not fake_ctx
+            assert ctx3 is not fake_ctx
+            assert ctx2 is not ctx3, "two sequential launches must create distinct contexts"
 ```
 
 ---
@@ -147,7 +171,7 @@ async def test_three_sequential_all_different(self):
 
 | Item | Status | Evidence |
 |---|---|---|
-| Double-issue bug | **FIXED** | acquire() rewrite + 4 regression tests PASS |
+| Double-issue bug | **FIXED** | acquire() rewrite + 2 regression tests PASS |
 | Regression tests | **2 passed** | Raw pytest output, 0.14s |
 | Domain guard | **Bundled** | Domain mismatch teardown in same classify loop |
 | Idle timeout | **Bundled** | Expiry teardown in same classify loop |
