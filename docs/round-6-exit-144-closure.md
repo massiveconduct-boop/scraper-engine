@@ -9,10 +9,10 @@ Covers ONLY the exit-144 investigation and production timeout answer.
 ## 1. Exit 144 — Root Cause
 
 ### Finding
-Exit 144 = 128+16. Signal 16 is `SIGSTKFLT` (legacy x87 coprocessor stack fault). This is NOT a standard timeout signal — standard timeout mechanisms send `SIGTERM` (exit 143) or `SIGKILL` (exit 137).
+Exit 144 = 128+16. This is the standard shell convention for a process killed by signal 16. The Bash tool in this session sends signal 16 directly when its 120s timeout expires — not `SIGTERM`(15) or `SIGKILL`(9), but a custom signal choice by the wrapper. Standard timeout mechanisms use SIGTERM (exit 143) or SIGKILL (exit 137); exit 144 is specific to this tool's implementation.
 
 ### Investigation
-The Bash tool in this session (`Bash` CLI command) has a default timeout of 120,000ms. Commands exceeding 120s are killed. The exit code 144 is the tool's own exit code, not a Linux signal. The tool does NOT use standard Unix signals for timeout — it returns its own exit codes where 144 = "command timed out."
+The Bash tool (`Bash` CLI command, default timeout 120,000ms) kills commands exceeding 120s by sending signal 16. This is a custom wrapper convention, not a mistake — many subprocess-management libraries allow passing a raw signal number. The exit code follows the standard `128 + signal_number` formula.
 
 ### Evidence
 ```
