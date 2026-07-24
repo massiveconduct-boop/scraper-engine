@@ -1,6 +1,6 @@
 # Scraper Engine — Critical Fixes Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `cd4d3ef` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
+**Date:** 2026-07-24 | **Git HEAD:** `82baf2d` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
 **Specification:** `specs/scraper-engine-blueprint-v2.md` v2.0 | **Directive:** `docs/round-6-directive.md`
 **Execution:** Python 3.12.3 (.venv), Docker 29.5.3, pytest 9.1.1
 
@@ -216,11 +216,60 @@ Commit: `2ae78ae`.
 
 ---
 
+## Fix 4: Second INSERT + Column Name Consistency
+
+### Finding
+Adversarial audit found a second, unfixed INSERT in `_harvest_via_broker()` at line 291 — still had `ON CONFLICT (ip, port) DO NOTHING` (missing `protocol`) with old column name `anonymity`. Also `promote_tcp_only()` used `SET anonymity=$2` (old column name).
+
+### Fix
+Both sites updated to use `anonymity_level` and correct 3-column `ON CONFLICT (ip, port, protocol)` with score merge. `_harvest_via_broker` INSERT now has 6-param VALUES including `reliability_score`.
+
+```python
+# Before: 5 params, wrong constraint, wrong column
+VALUES ($1,$2,$3,$4,$5) ON CONFLICT (ip, port) DO NOTHING
+
+# After: 6 params, correct constraint, score merge  
+VALUES ($1,$2,$3,$4,$5,$6)
+ON CONFLICT (ip, port, protocol) DO UPDATE SET
+  reliability_score = GREATEST(...), anonymity_level = ..., last_validated = NOW()
+```
+
+Commit: `82baf2d`.
+
+## Fix 5: Idle Timeout + Fingerprint-Staleness
+
+### Finding
+`max_idle_seconds=300` was stored but never checked. Pool contexts lived forever until shutdown. Fingerprint-staleness risk from reusing same browser across targets was unaddressed.
+
+### Fix
+`acquire()` now evicts idle contexts beyond `max_idle_seconds` before returning. Tear-down loop closes expired browsers. Fingerprint-staleness documented: Camoufox owns 100% of fingerprint surface (§3.4), `persistent_profile_id` ensures stable fingerprints within profile lifetime (≤300s).
+
+Zombie browser risk also fixed: `release()` tears down unknown wrappers instead of queuing `None`.
+
+Commit: `82baf2d`.
+
+## Fix 6: Prometheus Gauge Wired
+
+### Finding
+Gauge was defined but never `.set()`. Alert would never fire (or permanently fire, depending on default).
+
+### Fix
+`harvest_once()` now calls `_count_validated()` after each cycle, which queries `COUNT(*) FROM proxy_pool WHERE reliability_score >= 40`, and calls `proxy_pool_validated_count.set(validated)`.
+
+```python
+async def _count_validated(self, tenant: TenantId) -> int:
+    rows = await self._pg.fetch(tenant,
+        "SELECT COUNT(*) as n FROM proxy_pool WHERE reliability_score >= 40")
+    return rows[0]["n"] if rows else 0
+```
+
+Commit: `82baf2d`.
+
 ## Additional Fix: Broker Timeout
 
-Broker subprocess timeout reduced from 90s to 30s. Broker is now a supplementary path, not the primary — it should not dominate the harvest cycle. With `harvest_once()` calling both paths every cycle, the broker's subprocess overhead matters.
+Broker subprocess timeout reduced from 90s to 30s. Broker is now a supplementary path.
 
-Commit: `2ae78ae`.
+Commit: `82baf2d`.
 
 ---
 
@@ -236,12 +285,12 @@ Commit: `2ae78ae`.
 ### Fix 2: Hot-Browser Pool
 - **Objective:** G-02, F-14, F-16 — real prewarm for cold-start latency reduction, bounded concurrency.
 - **Status: MET.** Pool stores live Camoufox contexts. `start()` launches browsers. `acquire()` returns ready context.
-- **Limitation:** `persistent_profile_id` increases Camoufox profile storage footprint. Idle timeout eviction (max_idle_seconds=300) not yet wired — all pooled contexts kept alive until shutdown or unhealthy release. Implementation deferred to follow-up.
+- **Limitation:** `persistent_profile_id` increases Camoufox profile storage footprint. Fingerprint-staleness mitigated by Camoufox owning 100% of fingerprint surface per blueprint §3.4 — no application-level rotation needed within profile lifetime (max_idle_seconds=300).
 
 ### Fix 3: Prometheus Gauge
 - **Objective:** ProxyPoolCriticallyLow alert must evaluate on validated proxy count.
 - **Status: MET.** Gauge `proxy_pool_validated_count` exported. Alert rule uses valid PromQL.
-- **Limitation:** Gauge update requires harvester to call `proxy_pool_validated_count.set()` after each cycle. The setter call site in harvester is documented but not yet wired — deferred to follow-up harvest cycle handler.
+- **Limitation:** Gauge updated via `_count_validated()` querying `COUNT(*) WHERE reliability_score >= 40` after each harvest cycle. Requires real Postgres connection (test mocks use in-memory objects).
 
 ---
 
@@ -249,9 +298,12 @@ Commit: `2ae78ae`.
 
 | # | Fix | Objective | Status | Evidence |
 |---|---|---|---|---|
-| 1 | ON CONFLICT restored | BD-01 dedup | **MET** | Constraint verified, merge logic shown |
-| 2 | Hot-browser pool | G-02, F-14, F-16 | **MET** | Code blocks + pool imports OK |
-| 3 | Prometheus gauge | §9 monitoring | **MET** | Gauge definition + valid PromQL alert rule |
+| 1 | ON CONFLICT restored | BD-01 dedup | **MET** | Constraint (ip,port,protocol) verified, merge logic in code |
+| 2 | Hot-browser pool | G-02, F-14, F-16 | **MET** | Live contexts, idle timeout, fingerprint mitigation |
+| 3 | Prometheus gauge wired | §9 monitoring | **MET** | Gauge defined + .set() wired + valid PromQL |
+| 4 | Second INSERT + column names | BD-01 dedup | **MET** | Both INSERT sites match, promote_tcp_only fixed |
+| 5 | Idle timeout + fingerprint | G-02 | **MET** | acquire() evicts expired, docstring explains |
+| 6 | Broker timeout 30s | harvest perf | **MET** | subprocess timeout 90→30s |
 
 ## Final Summary
 
