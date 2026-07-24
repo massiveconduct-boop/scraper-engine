@@ -144,13 +144,13 @@ class BrowserPool:
 
     async def _load_session(self, ctx, domain: str) -> None:
         """Restore stored browser session state for domain.
-        
-        Blueprint v2 §3.5: browser_sessions table stores cookies + 
+
+        Blueprint v2 §3.5: browser_sessions table stores cookies +
         localStorage per (tenant_id, domain, profile_id). Loading before
         use prevents cross-domain cookie leakage with warm context reuse.
         Deferred: requires Postgres connection + browser_sessions schema
         wired into BrowserPool (currently instantiated without pg client).
-        Until wired, warm contexts share the same Camoufox profile's 
+        Until wired, warm contexts share the same Camoufox profile's
         cookies across domains — acceptable for single-domain scraping.
         """
         pass  # deferred: requires Postgres + browser_sessions schema
