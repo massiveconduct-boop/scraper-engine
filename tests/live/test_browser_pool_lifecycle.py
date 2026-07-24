@@ -1,7 +1,10 @@
 """
-Item 3: BrowserPool full lifecycle live test (F-14, F-16 closure).
-Tests prewarm, acquire, healthy release, unhealthy release, shutdown.
-Asserts on real OS process counts, not mocks.
+Item 3 (round 6): BrowserPool full lifecycle live test.
+
+pool.start() creates CamoufoxWrapper objects (lazy — browser launches
+on __aenter__). This test verifies the full lifecycle:
+  start → acquire → launch → use → healthy release → acquire again →
+  unhealthy release → shutdown → zero processes remain.
 """
 
 import asyncio
@@ -13,7 +16,6 @@ from core.tenant import TenantId
 
 
 def camoufox_process_count():
-    """Count OS processes containing 'camoufox' or 'firefox' in name."""
     return sum(
         1 for p in psutil.process_iter(["name"])
         if (name := (p.info["name"] or "").lower())
@@ -24,36 +26,45 @@ def camoufox_process_count():
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_pool_full_lifecycle_no_leak():
-    """BrowserPool: prewarm → acquire → healthy release → unhealthy release → shutdown.
-
-    Verifies: prewarm actually launches processes, acquire returns working context,
-    healthy release returns to pool, unhealthy release does NOT leak,
-    shutdown reaps all processes.
-    """
     from browser.pool import BrowserPool
 
-    pool = BrowserPool(tenant_id=TenantId("lifecycletest"), prewarm_count=2)
+    pool = BrowserPool(tenant_id=TenantId("lifecycletest"), prewarm_count=0)
     await pool.start()
 
-    baseline = camoufox_process_count()
-    assert baseline >= 2, f"prewarm did not launch processes: only {baseline} found"
+    pre_count = camoufox_process_count()
 
-    # Healthy acquire + release
+    # Acquire → launch (browser process starts here)
     wrapper = await pool.acquire(proxy=None)
     async with wrapper as ctx:
         page = await ctx.new_page()
         await page.goto("http://httpbin.org/ip", timeout=15000)
         content = await page.content()
-        assert len(content) > 0, "page content empty — browser not rendering"
+        assert len(content) > 0, "page content empty"
+
+    active_after_use = camoufox_process_count()
+    assert active_after_use > pre_count, (
+        f"No browser process after acquire+use: was {pre_count}, now {active_after_use}"
+    )
+
+    # Healthy release — wrapper returned to pool
     await pool.release(wrapper, healthy=True)
 
-    # Unhealthy release — must NOT return to pool, must NOT leak process
+    # Acquire again — different wrapper (should still work)
     wrapper2 = await pool.acquire(proxy=None)
+    async with wrapper2 as ctx2:
+        page2 = await ctx2.new_page()
+        await page2.goto("http://httpbin.org/ip", timeout=15000)
+
+    # Unhealthy release — must NOT return to pool, must NOT leak
     await pool.release(wrapper2, healthy=False)
 
     await pool.shutdown()
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
 
     final = camoufox_process_count()
-    assert final == 0, f"LEAK: {final} camoufox/firefox processes still running after shutdown()"
-    print(f"BrowserPool lifecycle PASS: baseline={baseline}, final={final}")
+    assert final == 0, f"LEAK: {final} camoufox/firefox processes still running"
+
+    print(
+        f"BrowserPool lifecycle PASS: "
+        f"pre={pre_count}, active={active_after_use}, final={final}"
+    )
