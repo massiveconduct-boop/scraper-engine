@@ -4,15 +4,16 @@ groups:
   - name: scraper_engine
     rules:
       # Proxy pool critical low — fires when validated proxy count drops below minimum.
-      # Uses reliability_score >= 40 (L1 threshold) per round 6 acceptance criteria.
+      # Uses proxy_pool_validated_count gauge (observability/metrics.py) updated
+      # by harvester after each cycle. Threshold: <5 validated proxies.
       - alert: ProxyPoolCriticallyLow
-        expr: sum(proxy_pool_size) by (reliability_score >= 40) < 5
+        expr: proxy_pool_validated_count < 5
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Validated proxy pool (score>=40) critically low — escalations may fail"
-          description: "Validated proxy count is {{ $value }}. Minimum safe threshold is 5. Fires on score>=40 (L1 threshold)."
+          description: "Validated proxy count is {{ $value }}. Minimum safe threshold is 5. Updated by harvester after each cycle."
 
       # Browser pool exhausted
       - alert: BrowserPoolExhausted

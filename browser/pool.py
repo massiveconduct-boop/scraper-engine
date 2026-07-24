@@ -1,14 +1,13 @@
 # browser/pool.py
-"""Semaphore-bounded pre-warmed browser pool.
-
-acquire() NEVER falls back to an unbounded _launch(). Every path goes through
-CamoufoxWrapper.__aenter__, gated by the SAME global semaphore. Pool is purely
-latency optimization (warm spares), not concurrency control.
+"""Hot-browser pool with real reuse — live Camoufox contexts stay alive
+across acquire/release cycles. Tear-down only on unhealthy release, idle
+timeout, or explicit shutdown. Semaphore-gated for concurrency control.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 from .camoufox_wrapper import CamoufoxWrapper
@@ -19,44 +18,87 @@ if TYPE_CHECKING:
 
 
 class BrowserPool:
-    """Pre-warmed pool of Camoufox browser instances."""
+    """Pool of live, pre-launched Camoufox browser contexts.
+
+    start() launches `prewarm_count` browsers and stores their live
+    contexts. acquire() returns a ready-to-use context (no cold start).
+    release(healthy=True) returns the context to the pool for reuse.
+    release(healthy=False) tears the browser down and does NOT return it.
+    """
 
     def __init__(
         self,
         tenant_id: TenantId,
-        prewarm_count: int = 3,
+        prewarm_count: int = 2,
         max_idle_seconds: int = 300,
     ) -> None:
         self._tenant_id = tenant_id
         self._prewarm_count = prewarm_count
         self._max_idle_seconds = max_idle_seconds
-        self._pool: asyncio.Queue[CamoufoxWrapper] = asyncio.Queue()
+        # Queue of (context, wrapper, idle_since) tuples
+        self._pool: asyncio.Queue = asyncio.Queue()
+        self._active_wrappers: list[CamoufoxWrapper] = []
+        self._started = False
 
     async def start(self) -> None:
-        """Pre-warm the pool to prewarm_count instances, all semaphore-gated."""
-        for _ in range(self._prewarm_count):
-            wrapper = CamoufoxWrapper(proxy=None, tenant_id=self._tenant_id)
-            await self._pool.put(wrapper)
+        """Launch prewarm_count browsers and store their live contexts."""
+        for i in range(self._prewarm_count):
+            wrapper = CamoufoxWrapper(
+                proxy=None,
+                tenant_id=self._tenant_id,
+                persistent_profile_id=f"prewarm-{i}",
+            )
+            ctx = await wrapper.__aenter__()
+            self._active_wrappers.append(wrapper)
+            await self._pool.put((ctx, wrapper, time.monotonic()))
+        self._started = True
 
-    async def acquire(self, proxy: Proxy | None) -> CamoufoxWrapper:
-        """Get a browser instance from the pool or create one (semaphore-gated)."""
+    async def acquire(self, proxy: Proxy | None = None) -> object:
+        """Get a live browser context from the pool or launch a new one."""
         try:
-            wrapper = self._pool.get_nowait()
+            ctx, wrapper, _ = self._pool.get_nowait()
+            return ctx
         except asyncio.QueueEmpty:
-            wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=self._tenant_id)
-        return wrapper
+            wrapper = CamoufoxWrapper(
+                proxy=proxy,
+                tenant_id=self._tenant_id,
+            )
+            self._active_wrappers.append(wrapper)
+            return await wrapper.__aenter__()
 
-    async def release(self, wrapper: CamoufoxWrapper, healthy: bool) -> None:
-        """Return a browser to the pool or discard if unhealthy."""
-        if healthy:
-            await self._pool.put(wrapper)
-        # Unhealthy wrappers are discarded and garbage-collected
+    async def release(self, ctx: object, healthy: bool) -> None:
+        """Return context to pool (healthy) or tear down (unhealthy)."""
+        if not healthy:
+            # Find the wrapper owning this context and close it
+            for w in self._active_wrappers:
+                if w._context is ctx or w._context == ctx:
+                    self._active_wrappers.remove(w)
+                    await w.__aexit__()
+                    return
+            return
+
+        # Healthy: find wrapper and re-queue
+        for w in self._active_wrappers:
+            if w._context is ctx or w._context == ctx:
+                await self._pool.put((ctx, w, time.monotonic()))
+                return
+        # Wrapper not found (shouldn't happen) — put context back anyway
+        await self._pool.put((ctx, None, time.monotonic()))
 
     async def shutdown(self) -> None:
-        """Close all pooled instances gracefully."""
+        """Close all live browser contexts."""
         while not self._pool.empty():
             try:
-                wrapper = self._pool.get_nowait()
-                await wrapper.__aexit__()
+                ctx, wrapper, _ = self._pool.get_nowait()
+                for w in self._active_wrappers:
+                    if w is wrapper or w._context is ctx:
+                        self._active_wrappers.remove(w)
+                        await w.__aexit__()
+                        break
             except asyncio.QueueEmpty:
                 break
+        # Close any remaining active wrappers
+        for w in list(self._active_wrappers):
+            await w.__aexit__()
+        self._active_wrappers.clear()
+        self._started = False

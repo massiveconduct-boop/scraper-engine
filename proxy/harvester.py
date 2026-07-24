@@ -123,7 +123,11 @@ class ProxyHarvester:
                     tenant,
                     """INSERT INTO proxy_pool (ip, port, protocol, anonymity_level, asn_class, reliability_score)
                        VALUES ($1,$2,$3,$4,$5,$6)
-                       """,
+                       ON CONFLICT (ip, port, protocol) DO UPDATE SET
+                         reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
+                         anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
+                         last_validated = NOW()""",
                     ip, port, protocol, anonymity.value, "unknown", score,
                 )
                 count += 1
@@ -231,7 +235,7 @@ async def main():
     async def d():
         while len(r)<{limit}:
             try:
-                p=await asyncio.wait_for(q.get(),timeout=90)
+                p=await asyncio.wait_for(q.get(),timeout=30)
                 if p is None:break
                 r.append({{"host":p.host,"port":p.port,"types":[str(t) for t in p.types]if p.types else["HTTP"]}})
             except TimeoutError:break
@@ -251,7 +255,7 @@ asyncio.run(main())'''
                 sys.executable, path, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         except TimeoutError:
             logger.warning("proxybroker2 subprocess timed out")
             return 0
