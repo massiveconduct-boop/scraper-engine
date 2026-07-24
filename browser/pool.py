@@ -61,7 +61,7 @@ class BrowserPool:
             await self._pool.put((ctx, wrapper, time.monotonic()))
         self._started = True
 
-    async def acquire(self, proxy: Proxy | None = None) -> object:
+    async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
         """Get a live browser context from the pool or launch a new one."""
         # Evict idle contexts beyond max_idle_seconds before acquiring
         now = time.monotonic()
@@ -84,8 +84,23 @@ class BrowserPool:
             await self._pool.put(item)
 
         if fresh:
-            ctx, wrapper, _ = fresh.pop(0)
-            return ctx
+            if domain:
+                # Return context whose last-used domain matches
+                for ctx, wrapper, idle_since in fresh:
+                    if getattr(wrapper, '_last_domain', None) == domain:
+                        fresh.remove((ctx, wrapper, idle_since))
+                        return ctx
+                # No match — tear down all and launch fresh below
+                for ctx, wrapper, idle_since in fresh:
+                    for w in self._active_wrappers:
+                        if w is wrapper or w._context is ctx:
+                            self._active_wrappers.remove(w)
+                            await w.__aexit__()
+                            break
+                fresh.clear()
+            else:
+                ctx, wrapper, _ = fresh.pop(0)
+                return ctx
         try:
             ctx, wrapper, _ = self._pool.get_nowait()
             return ctx
@@ -118,6 +133,11 @@ class BrowserPool:
         else:
             if domain:
                 await self._save_session(ctx, domain)
+            # Tag wrapper with last-used domain for reuse matching
+            for w in self._active_wrappers:
+                if w._context is ctx:
+                    w._last_domain = domain if domain else None
+                    break
             await self.release(ctx, healthy=True)
 
     async def release(self, ctx: object, healthy: bool) -> None:
