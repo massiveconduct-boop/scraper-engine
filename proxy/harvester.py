@@ -287,3 +287,32 @@ asyncio.run(main())'''
             except Exception:
                 continue
         return count
+
+    # ── background promotion ──────────────────────────────────────────
+
+    async def promote_tcp_only(self, limit: int = 50, tenant: "TenantId" = None) -> int:
+        """Promote TCP-only proxies (score=25) to validated (score=60).
+
+        Re-checks proxies with reliability_score < 40 via HTTP validator.
+        Called on a schedule by the harvester daemon.
+        """
+        from core.tenant import TenantId
+        if tenant is None:
+            tenant = TenantId("system")
+        rows = await self._pg.fetch(
+            tenant,
+            "SELECT ip, port, protocol FROM proxy_pool WHERE reliability_score < 40 LIMIT $1",
+            limit,
+        )
+        promoted = 0
+        for row in rows:
+            ip, port, protocol = row["ip"], row["port"], row["protocol"]
+            is_valid, anonymity = await self._http_validate(ip, port, protocol)
+            if is_valid:
+                await self._pg.execute(
+                    tenant,
+                    "UPDATE proxy_pool SET reliability_score=$1, anonymity=$2 WHERE ip=$3 AND port=$4",
+                    SCORE_VALIDATED, anonymity.value, ip, port,
+                )
+                promoted += 1
+        return promoted
