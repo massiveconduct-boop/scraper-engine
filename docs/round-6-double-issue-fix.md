@@ -83,9 +83,6 @@ Every drained item classified exactly once: selected, kept, or torn down. Only `
         )
         self._active_wrappers.append(wrapper)
         return await wrapper.__aenter__()
-
-
-    @asynccontextmanager
 ```
 
 ---
