@@ -1,6 +1,6 @@
 # Scraper Engine — Final Round Resolution Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `9c99432` | **Session:** `ae01a029` (extended)
+**Date:** 2026-07-24 | **Git HEAD:** `b6c347a` | **Session:** `ae01a029` (extended)
 
 This report covers ONLY issues resolved during the final round. Prior resolved issues are documented in `docs/final-production-readiness-report.md` and `docs/resolved-issues-report.md`.
 
@@ -165,7 +165,7 @@ POOL ACQUIRE L2: has_ok=True 4.0s
 POOL LIVE: PASS ✓
 ```
 
-**Full BrowserPool pipeline verified end-to-end:** acquire → launch → PoW solve → release → shutdown. All 155 bytes of authenticated content retrieved through real Camoufox browser via pool.
+**Full BrowserPool pipeline verified end-to-end:** acquire → launch → PoW solve → release → shutdown. `challenge-mirror-ok` marker confirmed in authenticated content retrieved through real Camoufox browser via pool.
 
 ---
 
@@ -290,7 +290,7 @@ Review flagged arithmetic inconsistency: coverage header says 32 missed but rang
 
 **Lines 75-76** (✗ missed): Politeness backoff — `await asyncio.sleep(1)` + `continue`
 **Line 85** (✗ missed): `continue` — result-is-None path
-**Lines 130-165** (✗ missed): `_fetch_url` dispatch body — L1 branch (131), L2 branch (135-145), L3 branch (155-165); 43 executable statements
+**Lines 130-174** (✗ missed): `_fetch_url` dispatch body — L1 branch (131), L2 branch (135-145), L3 branch (155-165), error handling / proxy exhaustion paths (166-174); 43 executable statements, 3 non-executable (blank/docstring) physical lines
 
 ```
 ✗ L 75: await asyncio.sleep(1)
@@ -383,7 +383,7 @@ All checks passed!
 | BrowserPool F-02 | **MET** | TYPE_CHECKING import | Real import | pool.acquire() L2 PASS (4.0s) |
 | proxybroker2 | **MET** | Queue API + event loop conflict | Subprocess isolation | 5 validated proxies |
 | Proxy diversity | **PARTIAL** | Both paths → proxyscrape | geonode API added | 2 providers (target: 50+) |
-| Direct scrape validation | **MET** | Raw IP:PORT unvalidated | TCP connect probe | 30 validated in 10.1s |
+| Direct scrape validation | **MET** | Raw IP:PORT unvalidated | TCP connect probe | 30 in 10-50s (network-dependent) |
 | Worker.py coverage | **MET** | 48≠32 misunderstanding | HTML annotated source | 43 ✗ stmts, 3 non-exec lines |
 | PgBouncer SCRAM | **MET** | Instance-specific verifier | Dynamic regeneration | 6432 connects after restart |
 
