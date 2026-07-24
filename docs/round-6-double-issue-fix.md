@@ -172,7 +172,7 @@ test_three_sequential_all_different PASSED
 | Item | Status | Evidence |
 |---|---|---|
 | Double-issue bug | **FIXED** | acquire() rewrite + 2 regression tests PASS |
-| Regression tests | **2 passed** | Raw pytest output, 0.14s |
+| Regression tests | **2 passed** | Raw pytest output, 0.12s |
 | Domain guard | **Bundled** | Domain mismatch teardown in same classify loop |
 | Idle timeout | **Bundled** | Expiry teardown in same classify loop |
 
