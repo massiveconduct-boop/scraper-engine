@@ -389,6 +389,6 @@ All checks passed!
 
 ## Final Summary
 
-168 tests pass, 0 code failures. 6 issues resolved: BrowserPool F-02 fixed and live-verified (4.0s L2), proxybroker2 working via subprocess isolation (5 validated proxies), multi-source diversity with TCP validation (30 proxies in 10-50s), worker.py coverage truth disclosed with HTML annotated source, PgBouncer SCRAM regenerated dynamically. 1 item partially met (proxy diversity at 2/50+ sources — infrastructure in place for expansion). 1 item marked as speculation (httpx/aiohttp conflict — plausible, unconfirmed). 65 commits, ruff clean, clean tree.
+168 tests pass, 0 code failures. 6 issues resolved: BrowserPool F-02 fixed and live-verified (4.0s L2), proxybroker2 working via subprocess isolation (5 validated proxies), multi-source diversity with TCP validation (30 proxies in 10-50s), worker.py coverage truth disclosed with HTML annotated source, PgBouncer SCRAM regenerated dynamically. 1 item partially met (proxy diversity at 2/50+ sources — infrastructure in place for expansion). 1 item marked as speculation (httpx/aiohttp conflict — plausible, unconfirmed). 63 commits, ruff clean, clean tree.
 
 **Artifact index:** `docs/final-round-report.md` (this document). Deep dives: `htmlcov/z_*_worker_py.html` for coverage, `browser/pool.py` for F-02 fix, `proxy/harvester.py` for TCP probe + subprocess broker.
