@@ -1,10 +1,6 @@
 """
-Item 3 (round 6): BrowserPool full lifecycle live test.
-
-pool.start() creates CamoufoxWrapper objects (lazy — browser launches
-on __aenter__). This test verifies the full lifecycle:
-  start → acquire → launch → use → healthy release → acquire again →
-  unhealthy release → shutdown → zero processes remain.
+Item 3: BrowserPool full lifecycle — updated for lease() API (invariant §1.1.6).
+Tests: start → lease → use → healthy return → unhealthy teardown → shutdown.
 """
 
 import asyncio
@@ -26,45 +22,34 @@ def camoufox_process_count():
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_pool_full_lifecycle_no_leak():
+    """Verify: prewarm → lease → use → healthy release → shutdown → 0 processes."""
     from browser.pool import BrowserPool
 
     pool = BrowserPool(tenant_id=TenantId("lifecycletest"), prewarm_count=0)
     await pool.start()
 
-    pre_count = camoufox_process_count()
+    pre = camoufox_process_count()
 
-    # Acquire → launch (browser process starts here)
-    wrapper = await pool.acquire(proxy=None)
-    async with wrapper as ctx:
+    # lease() is the async context manager — structural cleanup guaranteed
+    async with pool.lease() as ctx:
         page = await ctx.new_page()
         await page.goto("http://httpbin.org/ip", timeout=15000)
         content = await page.content()
-        assert len(content) > 0, "page content empty"
+        assert len(content) > 0
+        mid = camoufox_process_count()
+        assert mid > pre, f"No browser launched: {pre}→{mid}"
 
-    active_after_use = camoufox_process_count()
-    assert active_after_use > pre_count, (
-        f"No browser process after acquire+use: was {pre_count}, now {active_after_use}"
-    )
-
-    # Healthy release — wrapper returned to pool
-    await pool.release(wrapper, healthy=True)
-
-    # Acquire again — different wrapper (should still work)
-    wrapper2 = await pool.acquire(proxy=None)
-    async with wrapper2 as ctx2:
-        page2 = await ctx2.new_page()
-        await page2.goto("http://httpbin.org/ip", timeout=15000)
-
-    # Unhealthy release — must NOT return to pool, must NOT leak
-    await pool.release(wrapper2, healthy=False)
+    # __aexit__ fires → release(healthy=True, because no exception)
+    # Unhealthy path: exception inside lease() block triggers release(healthy=False)
+    try:
+        async with pool.lease() as ctx2:
+            raise RuntimeError("simulated failure")
+    except RuntimeError:
+        pass  # expected — lease() converted to unhealthy release
 
     await pool.shutdown()
     await asyncio.sleep(3)
 
     final = camoufox_process_count()
-    assert final == 0, f"LEAK: {final} camoufox/firefox processes still running"
-
-    print(
-        f"BrowserPool lifecycle PASS: "
-        f"pre={pre_count}, active={active_after_use}, final={final}"
-    )
+    assert final == 0, f"LEAK: {final} processes remain"
+    print(f"LIFECYCLE: pre={pre} mid={mid} final={final} PASS")

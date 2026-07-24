@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from .camoufox_wrapper import CamoufoxWrapper
@@ -96,6 +97,29 @@ class BrowserPool:
             self._active_wrappers.append(wrapper)
             return await wrapper.__aenter__()
 
+
+    @asynccontextmanager
+    async def lease(self, proxy: Proxy | None = None, domain: str | None = None):
+        """Async context manager — structural cleanup (invariant §1.1.6).
+
+        ``async with pool.lease() as ctx:`` guarantees release() on exit
+        even if the block raises. Healthy release on normal exit; unhealthy
+        (teardown) on exception. Restores __aexit__ contract that raw
+        acquire()/release() lost when API switched to bare context objects.
+        """
+        ctx = await self.acquire(proxy=proxy)
+        if domain:
+            await self._load_session(ctx, domain)
+        try:
+            yield ctx
+        except Exception:
+            await self.release(ctx, healthy=False)
+            raise
+        else:
+            if domain:
+                await self._save_session(ctx, domain)
+            await self.release(ctx, healthy=True)
+
     async def release(self, ctx: object, healthy: bool) -> None:
         """Return context to pool (healthy) or tear down (unhealthy)."""
         if not healthy:
@@ -113,23 +137,21 @@ class BrowserPool:
                 await self._pool.put((ctx, w, time.monotonic()))
                 return
         # Wrapper not found (shouldn't happen) — tear down to avoid zombie
-        try:
+        import contextlib
+        with contextlib.suppress(Exception):
             await ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
         while not self._pool.empty():
-            try:
+            import contextlib
+            with contextlib.suppress(asyncio.QueueEmpty):
                 ctx, wrapper, _ = self._pool.get_nowait()
                 for w in self._active_wrappers:
                     if w is wrapper or w._context is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
-            except asyncio.QueueEmpty:
-                break
         # Close any remaining active wrappers
         for w in list(self._active_wrappers):
             await w.__aexit__()
