@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-24 | **Spec:** `specs/scraper-engine-blueprint-v2.md` v2.0
 **Git:** fix in `browser/pool.py` (classify-once pattern). Tests at `tests/unit/test_browser.py::TestAcquireDoubleIssue`.
-Audit trail: `git log -- browser/pool.py` shows the acquire() rewrite.
+Fix commit: `a116a9e` (double-issue bug + regression test).
 
 Covers ONLY the `acquire()` double-issue bug flagged in the last review.
 
@@ -99,7 +99,7 @@ $ .venv/bin/pytest tests/unit/test_browser.py::TestAcquireDoubleIssue -v
 
 test_two_sequential_acquires_get_different_contexts PASSED
 test_three_sequential_all_different PASSED
-2 passed in 0.12s
+2 passed in 0.10s
 ```
 
 ### Test: Two Sequential Acquires Get Different Contexts
@@ -174,7 +174,7 @@ test_three_sequential_all_different PASSED
 | Item | Status | Evidence |
 |---|---|---|
 | Double-issue bug | **FIXED** | acquire() rewrite + 2 regression tests PASS |
-| Regression tests | **2 passed** | Raw pytest output, 0.12s |
+| Regression tests | **2 passed** | Raw pytest output, 0.10s |
 | Domain guard | **Bundled** | Domain mismatch teardown in same classify loop |
 | Idle timeout | **Bundled** | Expiry teardown in same classify loop |
 
