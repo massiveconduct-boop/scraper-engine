@@ -71,13 +71,13 @@ docker compose up -d redis pgbouncer-init pgbouncer
 alembic upgrade head
 
 # Run suite
-pytest tests/unit/ tests/integration/ tests/chaos/ -q
+.venv/bin/pytest tests/unit/ tests/integration/ tests/chaos/ -q
 
 # Run live tests (requires internet + challenge mirror)
 docker build -t challenge-mirror challenge-mirror/
 docker run -d --rm --name challenge-mirror -p 8090:8090 \
   -e CHALLENGE_MIRROR_SECRET_KEY=$(openssl rand -hex 32) challenge-mirror
-CHALLENGE_MIRROR_URL=http://127.0.0.1:8090 pytest tests/live/ -v
+CHALLENGE_MIRROR_URL=http://127.0.0.1:8090 .venv/bin/pytest tests/live/ -v
 
 # Start self-hosted judge for proxy validation
 python judge_server.py &
@@ -91,7 +91,7 @@ ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
 ## Suite: 170 passed, 0 errors, 0 failures
 
 ```
-$ pytest tests/unit/ tests/integration/ tests/chaos/ -q
+$ .venv/bin/pytest tests/unit/ tests/integration/ tests/chaos/ -q
 170 passed, 2 skipped, 1 warning
 ```
 
@@ -128,7 +128,7 @@ $ docker exec -e PGPASSWORD=scraper scraper_engine-pgbouncer-1 psql \
 G-05 PgBouncer isolation test also passes through port 6432:
 
 ```
-$ pytest tests/chaos/test_pgbouncer_search_path_isolation.py -v
+$ .venv/bin/pytest tests/chaos/test_pgbouncer_search_path_isolation.py -v
 test_search_path_holds_under_50_concurrent PASSED
 1 passed
 ```
@@ -143,7 +143,7 @@ test_search_path_holds_under_50_concurrent PASSED
 Fresh lifecycle test with process counts:
 
 ```
-$ python -c "
+$ .venv/bin/python -c "
 import asyncio, psutil
 from core.tenant import TenantId
 from browser.pool import BrowserPool
@@ -193,7 +193,7 @@ Browser launches during active use (proof: process count goes 0→1→0), reaps 
 Self-hosted judge at `http://127.0.0.1:8089/` (`judge_server.py`). Echoes headers + origin. Harvested through it to real Postgres:
 
 ```
-$ python -c "
+$ .venv/bin/python -c "
 import asyncio, asyncpg
 from core.tenant import TenantId
 from proxy.harvester import ProxyHarvester, JUDGE_URL
@@ -259,7 +259,7 @@ Two bugs found and fixed during this run:
 Same-script back-to-back test:
 
 ```
-$ python -c "WITH vs WITHOUT httpx, same script"
+$ .venv/bin/python -c "WITH vs WITHOUT httpx, same script"
 WITHOUT httpx: 3 proxies
 WITH httpx:    3 proxies
 ```
@@ -297,7 +297,7 @@ Blueprint target of 50+ operators not achievable with free sources alone. Curren
 $ ls -la htmlcov/z_870c8b05ae87daee_worker_py.html
 -rw-rw-r-- 1 ubuntu ubuntu 55846 Jul 24 00:40
 
-$ pytest tests/unit/test_worker.py tests/integration/test_worker_escalation.py \
+$ .venv/bin/pytest tests/unit/test_worker.py tests/integration/test_worker_escalation.py \
     --cov=orchestrator.worker --cov-report=term-missing
 Name                     Stmts   Miss  Cover   Missing
 orchestrator/worker.py      82     32    61%   75-76, 85, 130-174
