@@ -72,6 +72,7 @@ class ProxyHarvester:
         ("openproxylist", "https://api.openproxylist.xyz/http.txt", "ip_port"),
         ("thespeedx_github", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "ip_port"),
         ("monosans_github", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "ip_port"),
+        ("pubproxy", "http://pubproxy.com/api/proxy?limit=100&format=txt", "ip_port"),
     ]
 
     async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
