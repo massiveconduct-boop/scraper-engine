@@ -62,55 +62,57 @@ class BrowserPool:
         self._started = True
 
     async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
-        """Get a live browser context from the pool or launch a new one."""
-        # Evict idle contexts beyond max_idle_seconds before acquiring
+        """Get a live browser context from the pool or launch a new one.
+
+        Drains pool once, classifies each candidate as selected/keep/
+        teardown. Only keepers go back into the pool. Nothing is ever
+        simultaneously returned AND still queued — prevents double-issue.
+        """
         now = time.monotonic()
-        fresh: list = []
+        drained = []
         while not self._pool.empty():
             try:
-                ctx, wrapper, idle_since = self._pool.get_nowait()
-                if now - idle_since > self._max_idle_seconds:
-                    # Idle timeout — tear down this context
-                    for w in self._active_wrappers:
-                        if w is wrapper or w._context is ctx:
-                            self._active_wrappers.remove(w)
-                            await w.__aexit__()
-                            break
-                else:
-                    fresh.append((ctx, wrapper, idle_since))
+                drained.append(self._pool.get_nowait())
             except asyncio.QueueEmpty:
                 break
-        for item in fresh:
+
+        selected = None
+        keep = []
+        for ctx, wrapper, idle_since in drained:
+            # Idle timeout — tear down
+            if now - idle_since > self._max_idle_seconds:
+                for w in self._active_wrappers:
+                    if w is wrapper or w._context is ctx:
+                        self._active_wrappers.remove(w)
+                        await w.__aexit__()
+                        break
+                continue
+            # Domain mismatch — tear down (stale cookies flushed)
+            if domain is not None and getattr(wrapper, '_last_domain', None) != domain:
+                for w in self._active_wrappers:
+                    if w is wrapper or w._context is ctx:
+                        self._active_wrappers.remove(w)
+                        await w.__aexit__()
+                        break
+                continue
+            # First candidate (no domain) or domain match — select
+            if selected is None:
+                selected = (ctx, wrapper)
+            else:
+                keep.append((ctx, wrapper, idle_since))
+
+        for item in keep:
             await self._pool.put(item)
 
-        if fresh:
-            if domain:
-                # Return context whose last-used domain matches
-                for ctx, wrapper, _idle_since in fresh:
-                    if getattr(wrapper, '_last_domain', None) == domain:
-                        fresh.remove((ctx, wrapper, _idle_since))
-                        return ctx
-                # No match — tear down all and launch fresh below
-                for ctx, wrapper, _idle_since in fresh:
-                    for w in self._active_wrappers:
-                        if w is wrapper or w._context is ctx:
-                            self._active_wrappers.remove(w)
-                            await w.__aexit__()
-                            break
-                fresh.clear()
-            else:
-                ctx, wrapper, _ = fresh.pop(0)
-                return ctx
-        try:
-            ctx, wrapper, _ = self._pool.get_nowait()
-            return ctx
-        except asyncio.QueueEmpty:
-            wrapper = CamoufoxWrapper(
-                proxy=proxy,
-                tenant_id=self._tenant_id,
-            )
-            self._active_wrappers.append(wrapper)
-            return await wrapper.__aenter__()
+        if selected is not None:
+            return selected[0]
+
+        wrapper = CamoufoxWrapper(
+            proxy=proxy,
+            tenant_id=self._tenant_id,
+        )
+        self._active_wrappers.append(wrapper)
+        return await wrapper.__aenter__()
 
 
     @asynccontextmanager
