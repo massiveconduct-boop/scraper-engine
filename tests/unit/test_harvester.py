@@ -54,6 +54,14 @@ class TestProxyHarvester:
         assert await h.harvest_once(limit=10) == 0
 
     @pytest.mark.asyncio
+    async def test_harvest_once_merges_both_paths(self, pg, classifier):
+        """Requirement B: direct returns 3, broker adds 5, total 8."""
+        h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
+        h._direct_scrape = AsyncMock(return_value=3)
+        h._harvest_via_broker = AsyncMock(return_value=5)
+        assert await h.harvest_once(limit=10) == 8
+
+    @pytest.mark.asyncio
     async def test_direct_scrape_works(self, pg, classifier):
         """Direct scrape returns proxies."""
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)

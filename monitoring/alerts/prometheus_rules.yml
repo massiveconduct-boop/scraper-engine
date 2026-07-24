@@ -3,15 +3,16 @@
 groups:
   - name: scraper_engine
     rules:
-      # Proxy pool critical low — Level 3 escalations will fail
+      # Proxy pool critical low — fires when validated proxy count drops below minimum.
+      # Uses reliability_score >= 40 (L1 threshold) per round 6 acceptance criteria.
       - alert: ProxyPoolCriticallyLow
-        expr: proxy_pool_size{tier="elite"} < 5
+        expr: sum(proxy_pool_size) by (reliability_score >= 40) < 5
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Elite-tier proxy pool near-empty — Level 3 escalations will fail closed"
-          description: "Elite proxy count is {{ $value }}. Minimum safe threshold is 5."
+          summary: "Validated proxy pool (score>=40) critically low — escalations may fail"
+          description: "Validated proxy count is {{ $value }}. Minimum safe threshold is 5. Fires on score>=40 (L1 threshold)."
 
       # Browser pool exhausted
       - alert: BrowserPoolExhausted
