@@ -94,6 +94,8 @@ Standalone: 5 proxies
   145.220.226.168:8080
 ```
 
+**Note on event loop conflict diagnosis:** The httpx vs aiohttp conflict is recorded as **"plausible, unconfirmed."** The `HarvesterLike` comparison class changes more than just the httpx import (different class entirely, potentially different transitive imports from `storage/`). The subprocess isolation fix is sound regardless and masks almost any in-process conflict. Future maintainers: do not re-import httpx into this module on the strength of an unverified diagnosis.
+
 ---
 
 ## Issue 3: Proxy Diversity — Multi-Source With Independent Upstreams
@@ -113,6 +115,8 @@ sources = [
 ```
 
 Parsers: `_parse_ip_port()` (proxyscrape), `_parse_geonode()` (JSON API).
+
+**Status disclosure:** Current sources are 2 providers (proxyscrape + geonode), not the blueprint's 50+ sources. The proxybroker2 architecture supports adding provider URLs as they are validated. Additional sources are tracked but not yet integrated — the infrastructure for multi-source resilience is in place.
 
 ---
 
