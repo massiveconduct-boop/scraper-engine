@@ -49,7 +49,7 @@ $ grep -A8 'async def harvest_once' proxy/harvester.py
 ### Tests
 ```
 $ .venv/bin/pytest tests/unit/test_harvester.py -q
-7 passed
+8 passed (includes new merged-path test)
 ```
 
 ---
