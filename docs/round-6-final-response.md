@@ -82,9 +82,9 @@ async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -
     if fresh:
         if domain:
             # Return context whose last-used domain matches
-            for ctx, wrapper, idle_since in fresh:
+            for ctx, wrapper, _idle_since in fresh:
                 if getattr(wrapper, '_last_domain', None) == domain:
-                    fresh.remove((ctx, wrapper, idle_since))
+                    fresh.remove((ctx, wrapper, _idle_since))
                     return ctx
             # No match — tear down all and launch fresh below
             for ctx, wrapper, _idle_since in fresh:
