@@ -62,11 +62,16 @@ class PostgresClient:
             raise ValueError(f"Invalid tenant_id rejected at storage boundary: {tenant_str}")
 
         async with self._shared_pool.acquire() as conn:
+            # PgBouncer transaction-pooling: each autocommit statement may
+            # land on a different backend. BEGIN...COMMIT guarantees SET
+            # search_path and all queries within yield hit the same backend.
+            await conn.execute("BEGIN")
             await conn.execute(f"SET search_path = {tenant_str}")
             try:
                 yield conn
             finally:
                 await conn.execute("SET search_path = public")
+                await conn.execute("COMMIT")
 
     async def execute(self, tenant_id: TenantId, query: str, *args: Any) -> str:
         """Execute a query within a tenant scope. Returns status string."""

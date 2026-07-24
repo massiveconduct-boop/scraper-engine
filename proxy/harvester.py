@@ -290,7 +290,7 @@ asyncio.run(main())'''
 
     # ── background promotion ──────────────────────────────────────────
 
-    async def promote_tcp_only(self, limit: int = 50, tenant: "TenantId" = None) -> int:
+    async def promote_tcp_only(self, limit: int = 50, tenant: TenantId = None) -> int:
         """Promote TCP-only proxies (score=25) to validated (score=60).
 
         Re-checks proxies with reliability_score < 40 via HTTP validator.

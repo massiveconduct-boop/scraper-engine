@@ -23,7 +23,6 @@ identically in CI, in docker-compose, and standalone during development.
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import os
 import secrets
@@ -32,9 +31,9 @@ import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 # ---------------------------------------------------------------------------
 # Configuration
