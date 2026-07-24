@@ -52,12 +52,14 @@ class ProxyHarvester:
         self._classifier = asn_classifier or FakeClassifier()
 
     async def harvest_once(self, limit: int = 100) -> int:
+        """Run one harvest cycle from both paths. Returns total proxies."""
         from core.tenant import TenantId
         system_tenant = TenantId("system")
         count = await self._direct_scrape(limit, system_tenant)
-        if count <= 0:
+        if count < limit:
             try:
-                count = await self._harvest_via_broker(limit, system_tenant)
+                broker_count = await self._harvest_via_broker(max(limit - count, 5), system_tenant)
+                count += broker_count
             except Exception as exc:
                 logger.warning("proxybroker2 harvest failed: %s", exc)
         return count
