@@ -56,8 +56,6 @@ System memory: 11GB total, 9.8GB available. No OOM killer events (dmesg clean).
 
 ---
 
----
-
 ## Reproducibility
 
 ```bash
@@ -145,12 +143,41 @@ test_search_path_holds_under_50_concurrent PASSED
 Fresh lifecycle test with process counts:
 
 ```
-$ python -c "BrowserPool lifecycle test with psutil"
+$ python -c "
+import asyncio, psutil
+from core.tenant import TenantId
+from browser.pool import BrowserPool
 
-start: 0    (pool.start() creates lazy wrappers)
-active: 1   (acquire → __aenter__ launches Camoufox process)
-exited: 0   (context manager exit reaps browser)
-final: 0    (shutdown clean, zero processes remain)
+def count():
+    return sum(1 for p in psutil.process_iter(['name'])
+               if (n:=(p.info['name'] or '').lower())
+               and ('firefox' in n or 'camoufox' in n))
+
+async def t():
+    pool = BrowserPool(tenant_id=TenantId('lifetest'), prewarm_count=0)
+    await pool.start()
+    print('start:', count())
+    w = await pool.acquire(proxy=None)
+    async with w as ctx:
+        pg = await ctx.new_page()
+        await pg.goto('http://httpbin.org/ip', timeout=15000)
+        print('active:', count())
+    print('exited:', count())
+    await pool.release(w, healthy=True)
+    w2 = await pool.acquire(proxy=None)
+    await pool.release(w2, healthy=False)
+    await pool.shutdown()
+    await asyncio.sleep(3)
+    print('final:', count())
+    assert count() == 0
+    print('LIFECYCLE: PASS')
+asyncio.run(t())
+"
+
+start: 0
+active: 1
+exited: 0
+final: 0
 LIFECYCLE: PASS
 ```
 
@@ -166,7 +193,46 @@ Browser launches during active use (proof: process count goes 0→1→0), reaps 
 Self-hosted judge at `http://127.0.0.1:8089/` (`judge_server.py`). Echoes headers + origin. Harvested through it to real Postgres:
 
 ```
-$ python -c "harvest + pool query"
+$ python -c "
+import asyncio, asyncpg
+from core.tenant import TenantId
+from proxy.harvester import ProxyHarvester, JUDGE_URL
+
+async def main():
+    print('Judge:', JUDGE_URL)
+    pool = await asyncpg.create_pool(
+        'postgresql://scraper:scraper@localhost:5432/scraper_engine',
+        min_size=1, max_size=2)
+
+    class RealPg:
+        async def execute(self, t, sql, *a):
+            async with pool.acquire() as c:
+                try: await c.execute(sql, *a)
+                except Exception: pass
+
+    h = ProxyHarvester(pg=RealPg(), sources=[],
+        asn_classifier=type('F',(),{'classify':staticmethod(lambda x:'x')})())
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as c:
+        for name, url, fmt in h.SOURCES:
+            if 'geonode' in name: continue
+            n = await h._scrape_one(name, url, fmt, 1, TenantId('sys'), c)
+            if n > 0: print(f'  {name}: {n}')
+
+    async with pool.acquire() as c:
+        total = await c.fetchval('SELECT count(*) FROM proxy_pool')
+        print(f'Total rows: {total}')
+        rows = await c.fetch(
+            'SELECT anonymity_level, COUNT(*) as n, '
+            'AVG(reliability_score)::int as avg, '
+            'MIN(reliability_score) as min, MAX(reliability_score) as max '
+            'FROM proxy_pool GROUP BY anonymity_level')
+        for r in rows:
+            print(f'POOL: {r[\"anonymity_level\"]:15s} count={r[\"n\"]} '
+                  f'avg={r[\"avg\"]} min={r[\"min\"]} max={r[\"max\"]}')
+    await pool.close()
+asyncio.run(main())
+"
 
 Judge: http://127.0.0.1:8089/
   proxyscrape_https: 1
@@ -175,11 +241,6 @@ Judge: http://127.0.0.1:8089/
   pubproxy: 1
   proxyscrape_getproxies: 1
 Total rows: 5
-
-SELECT anonymity_level, COUNT(*), AVG(reliability_score)::int as avg,
-       MIN(reliability_score) as min, MAX(reliability_score) as max
-FROM proxy_pool GROUP BY anonymity_level;
-
 POOL: transparent     count=5 avg=25 min=25.0 max=25.0
 ```
 
@@ -282,6 +343,6 @@ Annotated HTML shows: L75-76 `<p class="mis show_mis">` (missed), L85 mis, L130-
 
 ## Final Summary
 
-170 passed, 0 errors, 0 failures. 5 of 6 items MET, 1 PARTIALLY MET (BD-01: 6/50+ operators — product owner decision pending). Self-hosted judge operational (:8089). PgBouncer auto-entrypoint working. BrowserPool lifecycle leak-free. Two INSERT bugs found and fixed. Fake OOM diagnosis corrected (Bash timeout, not kernel kill). 88 commits, ruff clean, clean tree.
+170 passed, 0 errors, 0 failures. 5 of 6 items MET, 1 PARTIALLY MET (BD-01: 6/50+ operators — product owner decision pending). Self-hosted judge operational (:8089). PgBouncer auto-entrypoint working. BrowserPool lifecycle leak-free. Two INSERT bugs found and fixed. Fake OOM diagnosis corrected (Bash timeout, not kernel kill). 84 commits, ruff clean, clean tree.
 
 **Artifact index:** `docs/round-6-final-report.md` (this document). Deep dives: `htmlcov/z_870c8b05ae87daee_worker_py.html` for coverage, `proxy/harvester.py` for multi-source harvest + validation, `judge_server.py` for self-hosted judge, `tests/live/test_browser_pool_lifecycle.py` for lifecycle test.
