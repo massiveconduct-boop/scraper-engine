@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-JUDGE_URL = "http://httpbin.org/get?show_env"
+JUDGE_URL = "http://127.0.0.1:8089/"  # self-hosted judge (judge_server.py)
 HTTP_VALIDATE_TIMEOUT = 5.0
 SCORE_TCP_ONLY = 25  # below L1 threshold (40)
 SCORE_VALIDATED = 60  # above L1 threshold
@@ -73,6 +73,7 @@ class ProxyHarvester:
         ("thespeedx_github", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "ip_port"),
         ("monosans_github", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "ip_port"),
         ("pubproxy", "http://pubproxy.com/api/proxy?limit=100&format=txt", "ip_port"),
+        ("proxyscrape_getproxies", "https://api.proxyscrape.com/?request=getproxies&proxytype=http", "ip_port"),
     ]
 
     async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
