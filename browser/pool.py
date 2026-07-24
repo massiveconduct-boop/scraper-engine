@@ -86,12 +86,12 @@ class BrowserPool:
         if fresh:
             if domain:
                 # Return context whose last-used domain matches
-                for ctx, wrapper, idle_since in fresh:
+                for ctx, wrapper, _idle_since in fresh:
                     if getattr(wrapper, '_last_domain', None) == domain:
                         fresh.remove((ctx, wrapper, idle_since))
                         return ctx
                 # No match — tear down all and launch fresh below
-                for ctx, wrapper, idle_since in fresh:
+                for ctx, wrapper, _idle_since in fresh:
                     for w in self._active_wrappers:
                         if w is wrapper or w._context is ctx:
                             self._active_wrappers.remove(w)
