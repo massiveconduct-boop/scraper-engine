@@ -119,9 +119,9 @@ class ProxyHarvester:
             try:
                 await self._pg.execute(
                     tenant,
-                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity, asn_class, reliability_score)
+                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity_level, asn_class, reliability_score)
                        VALUES ($1,$2,$3,$4,$5,$6)
-                       ON CONFLICT (ip, port) DO UPDATE SET reliability_score = EXCLUDED.reliability_score""",
+                       """,
                     ip, port, protocol, anonymity.value, "unknown", score,
                 )
                 count += 1
