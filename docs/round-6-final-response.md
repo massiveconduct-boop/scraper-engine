@@ -11,7 +11,47 @@ Covers ONLY the three items from the last review.
 Broker subprocess hangs on this host (exit 144, Bash timeout). Direct scrape only.
 
 ```
-$ .venv/bin/python -c "harvest + pool query fresh run"
+$ .venv/bin/python -c "
+import asyncio, asyncpg
+from core.tenant import TenantId
+from proxy.harvester import ProxyHarvester
+
+async def main():
+    pool = await asyncpg.create_pool(
+        'postgresql://scraper:scraper@localhost:5432/scraper_engine',
+        min_size=1, max_size=2)
+
+    class RealPg:
+        async def execute(self, t, sql, *a):
+            async with pool.acquire() as c:
+                try: await c.execute(sql, *a)
+                except Exception: pass
+
+    h = ProxyHarvester(pg=RealPg(), sources=[],
+        asn_classifier=type('F',(),{'classify':staticmethod(lambda x:'x')})())
+    import httpx
+    total = 0
+    async with httpx.AsyncClient(timeout=10) as c:
+        for name, url, fmt in h.SOURCES:
+            if 'geonode' in name: continue
+            n = await h._scrape_one(name, url, fmt, 2, TenantId('sys'), c)
+            total += n
+            if n > 0: print(f'  {name}: {n}')
+    print(f'Harvest total: {total}')
+
+    async with pool.acquire() as c:
+        rows = await c.fetch(
+            'SELECT anonymity_level, COUNT(*) as n, '
+            'AVG(reliability_score)::int as avg, '
+            'MIN(reliability_score) as min, MAX(reliability_score) as max '
+            'FROM proxy_pool GROUP BY anonymity_level')
+        if rows:
+            for r in rows:
+                print(f'POOL: {r[\"anonymity_level\"]:15s} count={r[\"n\"]} '
+                      f'avg={r[\"avg\"]} min={r[\"min\"]} max={r[\"max\"]}')
+    await pool.close()
+asyncio.run(main())
+"
 
   proxyscrape_http: 2
   proxyscrape_https: 1
@@ -20,11 +60,6 @@ $ .venv/bin/python -c "harvest + pool query fresh run"
   pubproxy: 2
   proxyscrape_getproxies: 2
 Harvest total: 11
-
-SELECT anonymity_level, COUNT(*), AVG(reliability_score)::int as avg,
-       MIN(reliability_score) as min, MAX(reliability_score) as max
-FROM proxy_pool GROUP BY anonymity_level;
-
 POOL: transparent     count=16 avg=25 min=25.0 max=25.0
 ```
 
@@ -50,7 +85,7 @@ $ grep -A5 'domain-keyed' browser/pool.py
         can follow when browser_sessions schema is wired.
 ```
 
-**Status:** Guard active. Cross-domain cookie leakage prevented. Full `browser_sessions` persistence remains follow-up.
+**Status:** Guard code active — domain forwarding wired, matching logic in acquire(). Untested: no test exercises `domain=` parameter (requires real Camoufox + multi-domain scrape). Full `browser_sessions` persistence remains follow-up.
 
 ---
 
