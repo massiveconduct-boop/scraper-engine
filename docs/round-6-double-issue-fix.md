@@ -31,51 +31,61 @@ Every drained item classified exactly once: selected, kept, or torn down. Only `
 ### Current `acquire()` (Fixed)
 
 ```python
-async def acquire(self, proxy=None, domain=None):
-    """Drain once, classify each as selected/keep/teardown. Only keep
-    goes back into pool. Nothing simultaneously returned AND queued."""
-    now = time.monotonic()
-    drained = []
-    while not self._pool.empty():
-        try:
-            drained.append(self._pool.get_nowait())
-        except asyncio.QueueEmpty:
-            break
+async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
+        """Get a live browser context from the pool or launch a new one.
 
-    selected = None
-    keep = []
-    for ctx, wrapper, idle_since in drained:
-        # Idle timeout — tear down
-        if now - idle_since > self._max_idle_seconds:
-            for w in self._active_wrappers:
-                if w is wrapper or w._context is ctx:
-                    self._active_wrappers.remove(w)
-                    await w.__aexit__()
-                    break
-            continue
-        # Domain mismatch — tear down (stale cookies flushed)
-        if domain is not None and getattr(wrapper, '_last_domain', None) != domain:
-            for w in self._active_wrappers:
-                if w is wrapper or w._context is ctx:
-                    self._active_wrappers.remove(w)
-                    await w.__aexit__()
-                    break
-            continue
-        # First candidate or domain match — select exactly once
-        if selected is None:
-            selected = (ctx, wrapper)
-        else:
-            keep.append((ctx, wrapper, idle_since))
+        Drains pool once, classifies each candidate as selected/keep/
+        teardown. Only keepers go back into the pool. Nothing is ever
+        simultaneously returned AND still queued — prevents double-issue.
+        """
+        now = time.monotonic()
+        drained = []
+        while not self._pool.empty():
+            try:
+                drained.append(self._pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
 
-    for item in keep:
-        await self._pool.put(item)
+        selected = None
+        keep = []
+        for ctx, wrapper, idle_since in drained:
+            # Idle timeout — tear down
+            if now - idle_since > self._max_idle_seconds:
+                for w in self._active_wrappers:
+                    if w is wrapper or w._context is ctx:
+                        self._active_wrappers.remove(w)
+                        await w.__aexit__()
+                        break
+                continue
+            # Domain mismatch — tear down (stale cookies flushed)
+            if domain is not None and getattr(wrapper, '_last_domain', None) != domain:
+                for w in self._active_wrappers:
+                    if w is wrapper or w._context is ctx:
+                        self._active_wrappers.remove(w)
+                        await w.__aexit__()
+                        break
+                continue
+            # First candidate (no domain) or domain match — select
+            if selected is None:
+                selected = (ctx, wrapper)
+            else:
+                keep.append((ctx, wrapper, idle_since))
 
-    if selected is not None:
-        return selected[0]
+        for item in keep:
+            await self._pool.put(item)
 
-    wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=self._tenant_id)
-    self._active_wrappers.append(wrapper)
-    return await wrapper.__aenter__()
+        if selected is not None:
+            return selected[0]
+
+        wrapper = CamoufoxWrapper(
+            proxy=proxy,
+            tenant_id=self._tenant_id,
+        )
+        self._active_wrappers.append(wrapper)
+        return await wrapper.__aenter__()
+
+
+    @asynccontextmanager
 ```
 
 ---
