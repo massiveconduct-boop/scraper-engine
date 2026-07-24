@@ -1,14 +1,17 @@
-# ruff: noqa: E501  -- subprocess script strings contain embedded Python code
+# ruff: noqa: E501  -- SOURCES tuples + subprocess script strings
 # proxy/harvester.py
-"""Proxy harvester — discovers, validates, and persists free proxies.
+"""Proxy harvester — multi-source discovery with HTTP validation.
 
-Primary: direct API scraping (fast, reliable).
-Secondary: proxybroker2 subprocess (validated, slower).
+6+ independent upstream sources per round-6 directive:
+  proxyscrape (HTTP+HTTPS), geonode, openproxylist.xyz,
+  TheSpeedX (GitHub), monosans (GitHub)
+HTTP round-trip validation via judge endpoint. Two-tier scoring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,6 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+JUDGE_URL = "http://httpbin.org/get?show_env"
+HTTP_VALIDATE_TIMEOUT = 5.0
+SCORE_TCP_ONLY = 25  # below L1 threshold (40)
+SCORE_VALIDATED = 60  # above L1 threshold
+
 
 class FakeClassifier:
     async def classify(self, ip: str) -> str:
@@ -34,11 +42,8 @@ class FakeClassifier:
 
 
 class ProxyHarvester:
-    """Discovers proxies from free sources and persists them."""
-
     def __init__(
-        self,
-        pg: PostgresClient,
+        self, pg: PostgresClient,
         sources: list[str] | None = None,
         asn_classifier: object | None = None,
     ) -> None:
@@ -47,200 +52,126 @@ class ProxyHarvester:
         self._classifier = asn_classifier or FakeClassifier()
 
     async def harvest_once(self, limit: int = 100) -> int:
-        """Run one harvest cycle. Returns count of newly persisted proxies."""
         from core.tenant import TenantId
-
         system_tenant = TenantId("system")
-
-        # Primary: direct API scraping (fast, reliable, no dependencies)
         count = await self._direct_scrape(limit, system_tenant)
-        if count > 0:
-            return count
-
-        # Fallback: proxybroker2 (validated, uses aiohttp event loop)
-        try:
-            count = await self._harvest_via_broker(limit, system_tenant)
-        except Exception as exc:
-            logger.warning("proxybroker2 harvest failed: %s", exc)
-
+        if count <= 0:
+            try:
+                count = await self._harvest_via_broker(limit, system_tenant)
+            except Exception as exc:
+                logger.warning("proxybroker2 harvest failed: %s", exc)
         return count
 
-    async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
-        """proxybroker2 via subprocess — isolates aiohttp from httpx event loop.
+    # ── direct multi-source scrape ──────────────────────────────────────
 
-        Uses proxyscrape API providers (HTTP, HTTPS, SOCKS4, SOCKS5) which
-        proxybroker2 validates through its default judges, returning only
-        confirmed-working proxies.
-        """
-        provider_list = self._sources if self._sources else [
-            "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
-            "https://api.proxyscrape.com/?request=getproxies&proxytype=https",
-            "https://api.proxyscrape.com/?request=getproxies&proxytype=socks4",
-            "https://api.proxyscrape.com/?request=getproxies&proxytype=socks5",
-        ]
-        providers_repr = "[" + ",".join(repr(p) for p in provider_list) + "]"
-
-        script = f'''import asyncio, json
-from proxybroker2 import Broker
-async def main():
-    q=asyncio.Queue()
-    b=Broker(q,providers={providers_repr},timeout=15,max_conn=50,max_tries=1,verify_ssl=False)
-    r=[]
-    async def d():
-        while len(r)<{limit}:
-            try:
-                p=await asyncio.wait_for(q.get(),timeout=90)
-                if p is None:break
-                r.append({{"host":p.host,"port":p.port,"types":[str(t) for t in p.types]if p.types else["HTTP"]}})
-            except TimeoutError:break
-    await asyncio.gather(b.find(types=["HTTP","HTTPS","SOCKS4","SOCKS5"],limit={limit}),d())
-    b.stop()
-    print(json.dumps(r))
-asyncio.run(main())'''
-
-        fd, path = tempfile.mkstemp(suffix=".py")
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(script)
-
-            venv_python = sys.executable
-            env = os.environ.copy()
-            env["VIRTUAL_ENV"] = os.path.dirname(os.path.dirname(sys.executable))
-            env["PATH"] = os.path.dirname(sys.executable) + ":" + env.get("PATH", "")
-            proc = await asyncio.create_subprocess_exec(
-                venv_python, path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
-        except TimeoutError:
-            logger.warning("proxybroker2 subprocess timed out")
-            return 0
-        finally:
-            import contextlib
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-
-        if proc.returncode != 0:
-            err = stderr.decode() if stderr else "no stderr"
-            logger.warning("proxybroker2 subprocess failed (rc=%d): %s", proc.returncode, err[-500:])
-            return 0
-
-        try:
-            proxies = json.loads(stdout.decode())
-        except json.JSONDecodeError as exc:
-            logger.warning("proxybroker2 JSON parse failed: %s", exc)
-            return 0
-
-        count = 0
-        for pdata in proxies:
-            try:
-                ip = pdata["host"]
-                port = pdata["port"]
-                proto_str = pdata["types"][0] if pdata["types"] else "HTTP"
-                protocol = ProxyProtocol.HTTP if "HTTP" in proto_str else (
-                    ProxyProtocol.HTTPS if "HTTPS" in proto_str else ProxyProtocol.SOCKS5
-                )
-                try:
-                    asn = await self._classifier.classify(ip)
-                except Exception:
-                    asn = "unknown"
-                asn_class = (
-                    AsnClass.RESIDENTIAL if "residential" in asn.lower()
-                    else AsnClass.DATACENTER if "datacenter" in asn.lower()
-                    else AsnClass.UNKNOWN
-                )
-                await self._pg.execute(
-                    tenant,
-                    """INSERT INTO proxy_pool
-                       (ip, port, protocol, anonymity, asn_class)
-                       VALUES ($1, $2, $3, $4, $5)
-                       ON CONFLICT (ip, port) DO NOTHING""",
-                    ip, port, protocol.value,
-                    AnonymityLevel.ANONYMOUS.value,
-                    asn_class.value,
-                )
-                count += 1
-            except Exception:
-                continue
-
-        return count
+    # All sources parse to ip_port format (IP:PORT per line), except geonode_json.
+    SOURCES = [
+        ("proxyscrape_http", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all", "ip_port"),
+        ("proxyscrape_https", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=10000&country=all&ssl=all&anonymity=all", "ip_port"),
+        ("geonode", "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%%2Chttps", "geonode_json"),
+        ("openproxylist", "https://api.openproxylist.xyz/http.txt", "ip_port"),
+        ("thespeedx_github", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "ip_port"),
+        ("monosans_github", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "ip_port"),
+    ]
 
     async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
-        """Scrape proxy APIs directly with fast TCP validation.
+        counts: dict[str, int] = {}
+        total = 0
+        async with httpx.AsyncClient(timeout=15) as client:
+            for name, url, fmt in self.SOURCES:
+                n = await self._scrape_one(name, url, fmt, limit - total, tenant, client)
+                counts[name] = n
+                total += n
+                if total >= limit:
+                    break
+        if any(counts.values()):
+            logger.info("harvest source breakdown: %s",
+                        ", ".join(f"{k}={v}" for k, v in counts.items()))
+        return total
 
-        Uses multiple independent upstream sources so no single provider
-        going dark takes down the entire pool. Each proxy gets a quick
-        TCP connect test before insert — drops ~96% of dead ones without
-        the full HTTP round-trip overhead of proxybroker2's judge check.
-        """
-        sources = [
-            # proxyscrape — raw IP:PORT lines
-            (
-                "https://api.proxyscrape.com/v2/"
-                "?request=displayproxies&protocol=http&timeout=10000"
-                "&country=all&ssl=all&anonymity=all",
-                "ip_port",
-            ),
-            (
-                "https://api.proxyscrape.com/v2/"
-                "?request=displayproxies&protocol=https&timeout=10000"
-                "&country=all&ssl=all&anonymity=all",
-                "ip_port",
-            ),
-            # geonode — JSON list, independent upstream from proxyscrape
-            (
-                "https://proxylist.geonode.com/api/proxy-list"
-                "?limit=100&page=1&sort_by=lastChecked&sort_type=desc"
-                "&protocols=http%2Chttps",
-                "geonode_json",
-            ),
-        ]
+    async def _scrape_one(self, name: str, url: str, fmt: str,
+                          limit: int, tenant: TenantId,
+                          client: httpx.AsyncClient) -> int:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("%s: fetch failed — %s", name, exc)
+            return 0
+
+        if fmt == "ip_port":
+            proxies = self._parse_ip_port(resp.text, limit)
+        elif fmt == "geonode_json":
+            proxies = self._parse_geonode(resp.json(), limit)
+        else:
+            return 0
 
         count = 0
-        async with httpx.AsyncClient(timeout=15) as client:
-            for url, fmt in sources:
-                try:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
-                    if not resp.text.strip():
-                        continue
-
-                    if fmt == "ip_port":
-                        proxies = self._parse_ip_port(resp.text, limit)
-                    elif fmt == "geonode_json":
-                        proxies = self._parse_geonode(resp.json(), limit)
-                    else:
-                        continue
-
-                    for ip, port, protocol in proxies:
-                        if not await self._tcp_probe(ip, port):
-                            continue
-                        try:
-                            await self._pg.execute(
-                                tenant,
-                                """INSERT INTO proxy_pool
-                                   (ip, port, protocol, anonymity, asn_class, reliability_score)
-                                   VALUES ($1, $2, $3, $4, $5, $6)
-                                   ON CONFLICT (ip, port) DO NOTHING""",
-                                ip, port, protocol, "anonymous", "unknown", 50,
-                            )
-                            count += 1
-                            if count >= limit:
-                                return count
-                        except Exception:
-                            continue
-
-                except Exception as exc:
-                    logger.warning("direct proxy scrape failed for %s: %s", url, str(exc))
-                    continue
-
+        for ip, port, protocol in proxies:
+            # TCP probe (fast)
+            if not await self._tcp_probe(ip, port):
+                continue
+            # HTTP validation (proves proxy forwards traffic)
+            is_valid, anonymity = await self._http_validate(ip, port, protocol)
+            score = SCORE_VALIDATED if is_valid else SCORE_TCP_ONLY
+            try:
+                await self._pg.execute(
+                    tenant,
+                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity, asn_class, reliability_score)
+                       VALUES ($1,$2,$3,$4,$5,$6)
+                       ON CONFLICT (ip, port) DO UPDATE SET reliability_score = EXCLUDED.reliability_score""",
+                    ip, port, protocol, anonymity.value, "unknown", score,
+                )
+                count += 1
+                if count >= limit:
+                    return count
+            except Exception:
+                continue
         return count
+
+    # ── HTTP validation ─────────────────────────────────────────────────
+
+    @staticmethod
+    async def _http_validate(ip: str, port: int, protocol: str,
+                             timeout: float = HTTP_VALIDATE_TIMEOUT,
+                             ) -> tuple[bool, AnonymityLevel]:
+        """Full HTTP round-trip through proxy to judge endpoint.
+
+        Returns (is_valid, anonymity_level).
+        Never returns True on TCP-connect success alone.
+        """
+        proxy_url = f"{protocol.lower()}://{ip}:{port}"
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url, timeout=timeout, follow_redirects=False,
+            ) as client:
+                resp = await client.get(JUDGE_URL)
+                if resp.status_code != 200:
+                    return False, AnonymityLevel.TRANSPARENT
+                data = resp.json()
+                if "headers" not in data and "origin" not in data:
+                    return False, AnonymityLevel.TRANSPARENT
+        except Exception:
+            return False, AnonymityLevel.TRANSPARENT
+
+        # Classify anonymity from response headers
+        via = resp.headers.get("Via", "")
+        xff = resp.headers.get("X-Forwarded-For", "")
+        proxy_conn = resp.headers.get("Proxy-Connection", "")
+
+        if not via and not xff and not proxy_conn:
+            level = AnonymityLevel.ELITE
+        elif not xff:
+            level = AnonymityLevel.ANONYMOUS
+        else:
+            level = AnonymityLevel.TRANSPARENT
+
+        return True, level
+
+    # ── parsers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _parse_ip_port(text: str, limit: int) -> list[tuple[str, int, str]]:
-        """Parse raw IP:PORT lines from proxyscrape API."""
         result = []
         for line in text.split("\n")[:limit * 2]:
             line = line.strip()
@@ -258,34 +189,101 @@ asyncio.run(main())'''
 
     @staticmethod
     def _parse_geonode(data: dict, limit: int) -> list[tuple[str, int, str]]:
-        """Parse JSON response from geonode proxy-list API."""
         result = []
         for entry in data.get("data", [])[:limit * 2]:
             ip = entry.get("ip", "")
             port = entry.get("port", 0)
             protocols = entry.get("protocols", [])
-            proto = "HTTP" if "http" in protocols else (
-                "HTTPS" if "https" in protocols else "HTTP"
-            )
+            proto = "HTTP" if "http" in protocols else ("HTTPS" if "https" in protocols else "HTTP")
             if ip and port and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                 result.append((ip, int(port), proto))
         return result
 
+    # ── TCP probe (fast pre-filter) ──────────────────────────────────────
+
     @staticmethod
     async def _tcp_probe(ip: str, port: int, timeout: float = 2.0) -> bool:
-        """Fast TCP connect test — confirms proxy is alive before pool insert.
-
-        Returns True if TCP connection succeeds within timeout.
-        2s timeout × 2s overhead ≈ 2.5s per proxy worst case,
-        ~0.01s for unreachable (connection refused is instant).
-        """
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port),
-                timeout=timeout,
-            )
+            _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
             writer.close()
             await writer.wait_closed()
             return True
         except Exception:
             return False
+
+    # ── proxybroker2 subprocess fallback ─────────────────────────────────
+
+    async def _harvest_via_broker(self, limit: int, tenant: TenantId) -> int:
+        provider_list = self._sources if self._sources else [
+            "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
+        ]
+        providers_repr = "[" + ",".join(repr(p) for p in provider_list) + "]"
+        script = f'''import asyncio, json
+from proxybroker2 import Broker
+async def main():
+    q=asyncio.Queue()
+    b=Broker(q,providers={providers_repr},timeout=15,max_conn=50,max_tries=1,verify_ssl=False)
+    r=[]
+    async def d():
+        while len(r)<{limit}:
+            try:
+                p=await asyncio.wait_for(q.get(),timeout=90)
+                if p is None:break
+                r.append({{"host":p.host,"port":p.port,"types":[str(t) for t in p.types]if p.types else["HTTP"]}})
+            except TimeoutError:break
+    await asyncio.gather(b.find(types=["HTTP","HTTPS"],limit={limit}),d())
+    b.stop()
+    print(json.dumps(r))
+asyncio.run(main())'''
+
+        fd, path = tempfile.mkstemp(suffix=".py")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(script)
+            env = os.environ.copy()
+            env["VIRTUAL_ENV"] = os.path.dirname(os.path.dirname(sys.executable))
+            env["PATH"] = os.path.dirname(sys.executable) + ":" + env.get("PATH", "")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, path, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except TimeoutError:
+            logger.warning("proxybroker2 subprocess timed out")
+            return 0
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+        if proc.returncode != 0:
+            err = stderr.decode() if stderr else "no stderr"
+            logger.warning("proxybroker2 subprocess failed (rc=%d): %s", proc.returncode, err[-500:])
+            return 0
+        try:
+            proxies = json.loads(stdout.decode())
+        except json.JSONDecodeError as exc:
+            logger.warning("proxybroker2 JSON parse failed: %s", exc)
+            return 0
+
+        count = 0
+        for pdata in proxies:
+            try:
+                ip, port = pdata["host"], pdata["port"]
+                proto_str = pdata["types"][0] if pdata["types"] else "HTTP"
+                protocol = ProxyProtocol.HTTP if "HTTP" in proto_str else (
+                    ProxyProtocol.HTTPS if "HTTPS" in proto_str else ProxyProtocol.SOCKS5)
+                try:
+                    asn = await self._classifier.classify(ip)
+                except Exception:
+                    asn = "unknown"
+                asn_class = (AsnClass.RESIDENTIAL if "residential" in asn.lower()
+                             else AsnClass.DATACENTER if "datacenter" in asn.lower()
+                             else AsnClass.UNKNOWN)
+                await self._pg.execute(tenant,
+                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity, asn_class)
+                       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (ip, port) DO NOTHING""",
+                    ip, port, protocol.value, AnonymityLevel.ANONYMOUS.value, asn_class.value)
+                count += 1
+            except Exception:
+                continue
+        return count
