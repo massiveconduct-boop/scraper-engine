@@ -1,6 +1,6 @@
 # Scraper Engine — Critical Fixes Report
 
-**Date:** 2026-07-24 | **Git HEAD:** `2ae78ae` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
+**Date:** 2026-07-24 | **Git HEAD:** `cd4d3ef` | **Session:** `ae01a029` (extended) | **Suite:** 170 passed, 0 errors
 **Specification:** `specs/scraper-engine-blueprint-v2.md` v2.0 | **Directive:** `docs/round-6-directive.md`
 **Execution:** Python 3.12.3 (.venv), Docker 29.5.3, pytest 9.1.1
 
