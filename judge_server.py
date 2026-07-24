@@ -4,8 +4,9 @@ Removes httpbin.org dependency per round-6 directive §2 requirement.
 Five-line HTTP server using stdlib only. Same design as BD-05 mirror.
 Listens on :8089. Internal-only — never expose publicly.
 """
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 
 class JudgeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
