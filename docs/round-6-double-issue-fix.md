@@ -1,6 +1,8 @@
 # Scraper Engine — Double-Issue Bug Fix Report
 
 **Date:** 2026-07-24 | **Spec:** `specs/scraper-engine-blueprint-v2.md` v2.0
+**Git:** fix in `browser/pool.py` (classify-once pattern). Tests at `tests/unit/test_browser.py::TestAcquireDoubleIssue`.
+Audit trail: `git log -- browser/pool.py` shows the acquire() rewrite.
 
 Covers ONLY the `acquire()` double-issue bug flagged in the last review.
 
