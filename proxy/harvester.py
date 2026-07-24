@@ -62,7 +62,23 @@ class ProxyHarvester:
                 count += broker_count
             except Exception as exc:
                 logger.warning("proxybroker2 harvest failed: %s", exc)
+
+        # Update Prometheus gauge with validated proxy count
+        try:
+            from observability.metrics import proxy_pool_validated_count
+            validated = await self._count_validated(system_tenant)
+            proxy_pool_validated_count.set(validated)
+        except Exception:
+            pass
         return count
+
+    async def _count_validated(self, tenant: TenantId) -> int:
+        """Count proxies with reliability_score >= 40 (L1 threshold)."""
+        rows = await self._pg.fetch(
+            tenant,
+            "SELECT COUNT(*) as n FROM proxy_pool WHERE reliability_score >= 40",
+        )
+        return rows[0]["n"] if rows else 0
 
     # ── direct multi-source scrape ──────────────────────────────────────
 
@@ -288,9 +304,14 @@ asyncio.run(main())'''
                              else AsnClass.DATACENTER if "datacenter" in asn.lower()
                              else AsnClass.UNKNOWN)
                 await self._pg.execute(tenant,
-                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity, asn_class)
-                       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (ip, port) DO NOTHING""",
-                    ip, port, protocol.value, AnonymityLevel.ANONYMOUS.value, asn_class.value)
+                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity_level, asn_class, reliability_score)
+                       VALUES ($1,$2,$3,$4,$5,$6)
+                       ON CONFLICT (ip, port, protocol) DO UPDATE SET
+                         reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
+                         anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
+                         last_validated = NOW()""",
+                    ip, port, protocol.value, AnonymityLevel.ANONYMOUS.value, asn_class.value, SCORE_VALIDATED)
                 count += 1
             except Exception:
                 continue
@@ -319,7 +340,7 @@ asyncio.run(main())'''
             if is_valid:
                 await self._pg.execute(
                     tenant,
-                    "UPDATE proxy_pool SET reliability_score=$1, anonymity=$2 WHERE ip=$3 AND port=$4",
+                    "UPDATE proxy_pool SET reliability_score=$1, anonymity_level=$2 WHERE ip=$3 AND port=$4",
                     SCORE_VALIDATED, anonymity.value, ip, port,
                 )
                 promoted += 1

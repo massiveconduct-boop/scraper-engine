@@ -2,6 +2,13 @@
 """Hot-browser pool with real reuse — live Camoufox contexts stay alive
 across acquire/release cycles. Tear-down only on unhealthy release, idle
 timeout, or explicit shutdown. Semaphore-gated for concurrency control.
+
+Fingerprint-staleness: prewarm instances use persistent_profile_id so
+browser fingerprints are stable across reuse (same profile = same
+fingerprint). Per-blueprint §3.4, Camoufox owns 100% of fingerprint
+surface — no application-level rotation needed within the profile
+lifetime. Idle timeout (max_idle_seconds) ensures no profile lives
+longer than ~5 minutes without use.
 """
 
 from __future__ import annotations
@@ -55,6 +62,29 @@ class BrowserPool:
 
     async def acquire(self, proxy: Proxy | None = None) -> object:
         """Get a live browser context from the pool or launch a new one."""
+        # Evict idle contexts beyond max_idle_seconds before acquiring
+        now = time.monotonic()
+        fresh: list = []
+        while not self._pool.empty():
+            try:
+                ctx, wrapper, idle_since = self._pool.get_nowait()
+                if now - idle_since > self._max_idle_seconds:
+                    # Idle timeout — tear down this context
+                    for w in self._active_wrappers:
+                        if w is wrapper or w._context is ctx:
+                            self._active_wrappers.remove(w)
+                            await w.__aexit__()
+                            break
+                else:
+                    fresh.append((ctx, wrapper, idle_since))
+            except asyncio.QueueEmpty:
+                break
+        for item in fresh:
+            await self._pool.put(item)
+
+        if fresh:
+            ctx, wrapper, _ = fresh.pop(0)
+            return ctx
         try:
             ctx, wrapper, _ = self._pool.get_nowait()
             return ctx
@@ -82,8 +112,11 @@ class BrowserPool:
             if w._context is ctx or w._context == ctx:
                 await self._pool.put((ctx, w, time.monotonic()))
                 return
-        # Wrapper not found (shouldn't happen) — put context back anyway
-        await self._pool.put((ctx, None, time.monotonic()))
+        # Wrapper not found (shouldn't happen) — tear down to avoid zombie
+        try:
+            await ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
