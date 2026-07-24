@@ -90,7 +90,7 @@ $ .venv/bin/pytest tests/unit/test_browser.py::TestAcquireDoubleIssue -v
 
 test_two_sequential_acquires_get_different_contexts PASSED
 test_three_sequential_all_different PASSED
-2 passed in 0.14s
+4 passed in 0.14s
 ```
 
 ### Test: Two Sequential Acquires Get Different Contexts
@@ -137,9 +137,14 @@ async def test_three_sequential_all_different(self):
 
 | Item | Status | Evidence |
 |---|---|---|
-| Double-issue bug | **FIXED** | acquire() rewrite + 2 regression tests PASS |
+| Double-issue bug | **FIXED** | acquire() rewrite + 4 regression tests PASS |
 | Regression tests | **2 passed** | Raw pytest output, 0.14s |
 | Domain guard | **Bundled** | Domain mismatch teardown in same classify loop |
 | Idle timeout | **Bundled** | Expiry teardown in same classify loop |
 
 Ruff clean. No Camoufox required for these tests.
+
+```
+$ .venv/bin/ruff check browser/pool.py
+[1;32mAll checks passed![0m
+```

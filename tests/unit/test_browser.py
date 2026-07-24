@@ -4,6 +4,7 @@ Tests Camoufox wrapper, pool, and session state with mocks.
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,7 +31,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, time.monotonic()))
 
         # First acquire — should get the fake context
         ctx1 = await pool.acquire()
@@ -59,7 +60,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, time.monotonic()))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
@@ -82,6 +83,16 @@ class TestAcquireDoubleIssue:
             assert ctx2 is not fake_ctx
             assert ctx3 is not fake_ctx
             assert ctx2 is not ctx3, "two sequential launches must create distinct contexts"
+
+    @pytest.mark.asyncio
+    async def test_idle_expiry_tears_down_expired(self):
+        """Idle timeout: expired context must be torn down, not handed out."""
+        pool = BrowserPool(tenant_id=TenantId("idletest"), prewarm_count=0,
+
+    @pytest.mark.asyncio
+    async def test_domain_mismatch_tears_down_and_launches_fresh(self):
+        """Domain mismatch: wrong-domain context torn down, fresh launched."""
+        pool = BrowserPool(tenant_id=TenantId("domaintest"), prewarm_count=0)
 
 
 @pytest.fixture
@@ -134,6 +145,50 @@ class TestBrowserPool:
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         # shutdown on empty pool should not error
         asyncio.run(pool.shutdown())
+
+
+
+
+                          max_idle_seconds=1)
+        await pool.start()
+        pool._max_idle_seconds = -1  # force immediate expiry
+        fake_wrapper = MagicMock()
+        fake_wrapper.__aexit__ = AsyncMock()
+        fake_wrapper._last_domain = None
+        import time
+        pool._active_wrappers.append(fake_wrapper)
+        await pool._pool.put((object(), fake_wrapper, time.monotonic()))
+
+        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+            mock_cw.side_effect = make_mock
+            with patch.object(pool, '_active_wrappers', [fake_wrapper]):
+                # Since idle expiry tears down, pool is empty → fallback launch
+                ctx = await pool.acquire()
+                assert fake_wrapper.__aexit__.called, "expired wrapper must be torn down"
+
+        await pool.start()
+        fake_wrapper = MagicMock()
+        fake_wrapper.__aexit__ = AsyncMock()
+        fake_wrapper._last_domain = "site-a.com"
+        import time
+        pool._active_wrappers.append(fake_wrapper)
+        await pool._pool.put((object(), fake_wrapper, time.monotonic()))
+
+        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+            def make_mock(*a, **kw):
+                inst = MagicMock()
+                inst.__aenter__ = AsyncMock(return_value=object())
+                return inst
+            mock_cw.side_effect = make_mock
+            with patch.object(pool, '_active_wrappers', [fake_wrapper]):
+                ctx = await pool.acquire(domain="site-b.com")
+                assert fake_wrapper.__aexit__.called, (
+                    "domain mismatch: wrong-domain context must be torn down"
+                )
 
 
 class TestSessionState:
