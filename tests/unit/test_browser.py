@@ -1,5 +1,4 @@
 """
-import time
 Browser package unit tests — closes G-02 (browser/ coverage).
 Tests Camoufox wrapper, pool, and session state with mocks.
 """
@@ -31,7 +30,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, time.monotonic()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
 
         # First acquire — should get the fake context
         ctx1 = await pool.acquire()
@@ -58,7 +57,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, time.monotonic()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
