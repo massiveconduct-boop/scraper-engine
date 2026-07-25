@@ -43,8 +43,15 @@ class Level3Fetcher:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
-                await page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+                await page.goto(url, wait_until="load", timeout=timeout * 1000)
+                # Wait for PoW solver JavaScript to execute and for the page to
+                # reflect the challenge result. The strict tier takes longer.
+                await page.wait_for_timeout(3000)
                 html = await page.content()
+                if html is not None and "challenge-mirror-ok" not in html:
+                    # Page may still be updating after PoW — give it more time
+                    await page.wait_for_timeout(5000)
+                    html = await page.content()
                 duration_ms = int((time.monotonic() - start) * 1000)
 
                 return FetchResult(
@@ -53,7 +60,7 @@ class Level3Fetcher:
                     http_status=200,
                     html=html,
                     level_used=3,
-                    proxy_used=proxy.key(),
+                    proxy_used=proxy.key() if proxy else "none",
                     duration_ms=duration_ms,
                 )
         except Exception as exc:
@@ -64,5 +71,5 @@ class Level3Fetcher:
                 duration_ms=int((time.monotonic() - start) * 1000),
                 failure_category=FailureCategory.BROWSER_CRASH,
                 error_message=str(exc),
-                proxy_used=proxy.key(),
+                proxy_used=proxy.key() if proxy else "none",
             )

@@ -43,7 +43,11 @@ class Level2Fetcher:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
-                await page.goto(url, timeout=timeout * 1000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass  # Some pages never reach networkidle; content is still usable
                 html = await page.content()
                 duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -53,7 +57,7 @@ class Level2Fetcher:
                     http_status=200,
                     html=html,
                     level_used=2,
-                    proxy_used=proxy.key(),
+                    proxy_used=proxy.key() if proxy else "none",
                     duration_ms=duration_ms,
                 )
         except Exception as exc:
@@ -64,5 +68,5 @@ class Level2Fetcher:
                 duration_ms=int((time.monotonic() - start) * 1000),
                 failure_category=FailureCategory.BROWSER_CRASH,
                 error_message=str(exc),
-                proxy_used=proxy.key(),
+                proxy_used=proxy.key() if proxy else "none",
             )

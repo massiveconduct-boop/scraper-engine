@@ -18,21 +18,21 @@ infra = ["pgbouncer/*.ini"]
 monitoring = ["alerts/*.yml", "dashboards/*.json"]
 
 dependencies = [
-    "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.27.0",
-    "pydantic>=2.5.0",
-    "pydantic-core>=2.14.0",
-    "httpx>=0.26.0",
-    "scrapling>=0.1.0",
-    "asyncpg>=0.29.0",
-    "redis>=5.0.0",
-    "rq>=1.16.0",
-    "camoufox>=3.0.0",
-    "structlog>=24.1.0",
-    "prometheus-client>=0.19.0",
-    "pyyaml>=6.0",
-    "boto3>=1.34.0",
-    "python-dotenv>=1.0.0",
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "httpx==0.28.1",
+    "scrapling==0.4.11",
+    "asyncpg==0.31.0",
+    "redis==8.0.1",
+    "rq==2.10.0",
+    "camoufox==0.5.4",
+    "structlog==26.1.0",
+    "prometheus-client==0.25.0",
+    "pyyaml==6.0.3",
+    "boto3==1.43.52",
+    "python-dotenv==1.2.2",
 ]
 
 [project.optional-dependencies]
@@ -42,9 +42,9 @@ dev = [
     "pytest-cov>=4.1.0",
     "pytest-xdist>=3.5.0",
     "ruff>=0.3.0",
-    "mypy>=1.8.0",
+    "mypy==2.3.0",
     "types-pyyaml>=6.0.0",
-    "types-redis>=5.0.0",
+    "types-redis>=4.6.0",
 ]
 
 [tool.ruff]
@@ -60,7 +60,7 @@ ignore = ["UP042"]  # str+Enum pattern matches spec; StrEnum changes Pydantic se
 known-first-party = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api", "cli", "config", "observability"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 warn_unreachable = true
 warn_unused_ignores = true
@@ -74,6 +74,11 @@ warn_unused_ignores = false
 module = "migrations.*"
 ignore_missing_imports = true
 warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
