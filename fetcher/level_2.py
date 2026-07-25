@@ -42,12 +42,12 @@ class Level2Fetcher:
         try:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
+                import contextlib
+
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-                try:
+                with contextlib.suppress(Exception):
                     await page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:
-                    pass  # Some pages never reach networkidle; content is still usable
                 html = await page.content()
                 duration_ms = int((time.monotonic() - start) * 1000)
 
