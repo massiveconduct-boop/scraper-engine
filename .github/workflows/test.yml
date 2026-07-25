@@ -70,7 +70,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv \
+            pyyaml boto3 python-dotenv fakeredis \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
@@ -113,7 +113,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv \
+            pyyaml boto3 python-dotenv fakeredis \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
