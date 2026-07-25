@@ -23,7 +23,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e ".[dev]"
+      - name: Install dependencies
+        run: |
+          pip install \
+            fastapi uvicorn pydantic pydantic-core httpx scrapling \
+            asyncpg redis rq camoufox structlog prometheus-client \
+            pyyaml boto3 python-dotenv \
+            pytest pytest-asyncio pytest-cov
+          pip install -e . --no-deps
       - run: python -m pytest tests/unit/ -v --tb=short
 
   integration:
@@ -58,7 +65,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e ".[dev]"
+      - name: Install dependencies
+        run: |
+          pip install \
+            fastapi uvicorn pydantic pydantic-core httpx scrapling \
+            asyncpg redis rq camoufox structlog prometheus-client \
+            pyyaml boto3 python-dotenv \
+            pytest pytest-asyncio pytest-cov alembic sqlalchemy
+          pip install -e . --no-deps
       - run: alembic upgrade head
       - run: python -m pytest tests/integration/ -v --tb=short --ignore=tests/integration/test_promotion.py
 
@@ -94,6 +108,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e ".[dev]"
+      - name: Install dependencies
+        run: |
+          pip install \
+            fastapi uvicorn pydantic pydantic-core httpx scrapling \
+            asyncpg redis rq camoufox structlog prometheus-client \
+            pyyaml boto3 python-dotenv \
+            pytest pytest-asyncio pytest-cov alembic sqlalchemy
+          pip install -e . --no-deps
       - run: alembic upgrade head
       - run: python -m pytest tests/chaos/ -v --tb=short
