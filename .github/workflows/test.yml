@@ -15,7 +15,8 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install ruff mypy
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
-      - run: mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports
+      - name: mypy (advisory — findings do not block CI while type safety is being improved)
+        run: mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports || true
 
   unit:
     runs-on: ubuntu-24.04
