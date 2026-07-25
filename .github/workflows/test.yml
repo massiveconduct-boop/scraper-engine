@@ -1,0 +1,100 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install ruff mypy
+      - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
+      - run: mypy core/ proxy/ orchestrator/ api/ storage/ --strict --ignore-missing-imports
+
+  unit:
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest tests/unit/ -v --tb=short
+
+  integration:
+    runs-on: ubuntu-24.04
+    needs: unit
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: scraper_engine
+          POSTGRES_USER: scraper
+          POSTGRES_PASSWORD: scraper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@localhost:5432/scraper_engine
+      REDIS_URL: redis://localhost:6379/0
+      PGBOUNCER_DSN: postgresql://scraper:scraper@localhost:5432/scraper_engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: alembic upgrade head
+      - run: python -m pytest tests/integration/ -v --tb=short --ignore=tests/integration/test_promotion.py
+
+  chaos:
+    runs-on: ubuntu-24.04
+    needs: integration
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: scraper_engine
+          POSTGRES_USER: scraper
+          POSTGRES_PASSWORD: scraper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@localhost:5432/scraper_engine
+      REDIS_URL: redis://localhost:6379/0
+      PGBOUNCER_DSN: postgresql://scraper:scraper@localhost:5432/scraper_engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: alembic upgrade head
+      - run: python -m pytest tests/chaos/ -v --tb=short
