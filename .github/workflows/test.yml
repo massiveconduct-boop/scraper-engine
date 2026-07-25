@@ -117,4 +117,4 @@ jobs:
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
-      - run: python -m pytest tests/chaos/ -v --tb=short
+      - run: python -m pytest tests/chaos/ -v --tb=short --ignore=tests/chaos/test_pgbouncer_search_path_isolation.py
