@@ -42,7 +42,7 @@ async def test_pool_full_lifecycle_no_leak():
     # __aexit__ fires → release(healthy=True, because no exception)
     # Unhealthy path: exception inside lease() block triggers release(healthy=False)
     try:
-        async with pool.lease() as ctx2:
+        async with pool.lease() as _ctx2:
             raise RuntimeError("simulated failure")
     except RuntimeError:
         pass  # expected — lease() converted to unhealthy release
