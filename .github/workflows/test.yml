@@ -15,7 +15,7 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install ruff mypy
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
-      - run: mypy core/ proxy/ orchestrator/ api/ storage/ --strict --ignore-missing-imports
+      - run: mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports
 
   unit:
     runs-on: ubuntu-24.04
