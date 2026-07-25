@@ -42,16 +42,16 @@ class Level3Fetcher:
         try:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
+                import contextlib
+
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
                 await page.goto(url, wait_until="load", timeout=timeout * 1000)
-                # Wait for PoW solver JavaScript to execute and for the page to
-                # reflect the challenge result. The strict tier takes longer.
-                await page.wait_for_timeout(3000)
+                # CPU-bound client-side JS (e.g. PoW solvers) cannot be detected
+                # by networkidle — the browser is computing, not fetching. Use a
+                # generous fixed post-load delay (10s) so the solver has time to
+                # complete before we call page.content().
+                await page.wait_for_timeout(10000)
                 html = await page.content()
-                if html is not None and "challenge-mirror-ok" not in html:
-                    # Page may still be updating after PoW — give it more time
-                    await page.wait_for_timeout(5000)
-                    html = await page.content()
                 duration_ms = int((time.monotonic() - start) * 1000)
 
                 return FetchResult(

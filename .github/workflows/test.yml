@@ -15,8 +15,24 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install ruff mypy
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
-      - name: mypy (advisory — findings do not block CI while type safety is being improved)
-        run: mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports || true
+      - name: mypy ratchet (fails only on NEW errors beyond known baseline)
+        run: |
+          mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
+          grep "^[^ ]*:[0-9]*: error:" /tmp/mypy.out | sort >/tmp/mypy-current.txt
+          echo "=== Current mypy findings ===" && cat /tmp/mypy-current.txt
+          echo "" && echo "=== Baseline (known, accepted) ===" && cat tools/mypy-baseline.txt
+          sort tools/mypy-baseline.txt >/tmp/baseline-sorted.txt
+          NEW=$(comm -13 /tmp/baseline-sorted.txt /tmp/mypy-current.txt)
+          if [ -n "$NEW" ]; then
+            echo "" && echo "NEW mypy errors detected (failing build):" && echo "$NEW"
+            exit 1
+          fi
+          echo ""
+          REMOVED=$(comm -23 /tmp/baseline-sorted.txt /tmp/mypy-current.txt)
+          if [ -n "$REMOVED" ]; then
+            echo "FIXED findings (update baseline):" && echo "$REMOVED"
+          fi
+          echo "mypy ratchet: no new errors — OK"
 
   unit:
     runs-on: ubuntu-24.04
