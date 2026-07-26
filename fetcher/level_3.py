@@ -42,8 +42,6 @@ class Level3Fetcher:
         try:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
-                import contextlib
-
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
                 await page.goto(url, wait_until="load", timeout=timeout * 1000)
                 # CPU-bound client-side JS (e.g. PoW solvers) cannot be detected
