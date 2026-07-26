@@ -9,3 +9,22 @@ camoufox:
 politeness:
   default_concurrency: 1   # conservative — respect target sites under real load
   default_delay_seconds: 10.0
+
+# Level-specific fetcher configuration — blueprint §8
+levels:
+  level_1:
+    timeout_seconds: 30
+    max_retries: 3
+
+  level_2:
+    timeout_seconds: 40
+    goto_wait_until: "domcontentloaded"
+    networkidle_timeout_ms: 5000
+    max_total_wait_ms: 15000     # standard challenges solve in 3-5s; 15s is generous
+
+  level_3:
+    timeout_seconds: 60
+    goto_wait_until: "load"
+    post_load_fixed_wait_ms: 10000   # strict PoW can take 8-12s of pure CPU
+    max_total_wait_ms: 30000          # hard ceiling, leaves room for DLQ write
+    retry_wait_increment_ms: 5000     # one extra wait cycle before giving up
