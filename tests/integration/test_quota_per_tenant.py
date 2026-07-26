@@ -31,9 +31,21 @@ async def pg():
 async def redis():
     client = RedisClient(redis_url="redis://localhost:6379/0")
     await client.start()
-    await client.raw.flushall()
+    # Ensure clean state before and after test
+    cursor = 0
+    while True:
+        cursor, keys = await client.raw.scan(cursor, match="quota:*", count=1000)
+        if keys:
+            await client.raw.delete(*keys)
+        if cursor == 0:
+            break
     yield client
-    await client.raw.flushall()
+    while True:
+        cursor, keys = await client.raw.scan(cursor, match="quota:*", count=1000)
+        if keys:
+            await client.raw.delete(*keys)
+        if cursor == 0:
+            break
     await client.stop()
 
 

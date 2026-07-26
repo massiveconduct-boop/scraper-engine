@@ -37,7 +37,7 @@ class TenantResolver:
         system_tenant = TenantId("system")
         row = await self._pg.fetchrow(
             system_tenant,
-            "SELECT tenant_slug FROM public.api_keys WHERE api_key = $1 AND revoked = false",
+            "SELECT tenant_slug FROM public.api_keys WHERE api_key = $1 AND revoked_at IS NULL",
             api_key,
         )
         if row is None:

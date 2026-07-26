@@ -36,7 +36,7 @@ class QuotaManager:
         from datetime import datetime
 
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        return f"quota:daily:{today}"
+        return f"quota:daily:{today}:{tenant_id}"
 
     async def check_and_increment(self, tenant_id: TenantId, count: int = 1) -> None:
         """Atomically check quota and increment. Raises QuotaExceededError if limit hit."""

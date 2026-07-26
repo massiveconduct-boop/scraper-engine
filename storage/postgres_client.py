@@ -66,7 +66,7 @@ class PostgresClient:
             # land on a different backend. BEGIN...COMMIT guarantees SET
             # search_path and all queries within yield hit the same backend.
             await conn.execute("BEGIN")
-            await conn.execute(f"SET search_path = {tenant_str}")
+            await conn.execute(f"SET search_path = {tenant_str}, public")
             try:
                 yield conn
             finally:
