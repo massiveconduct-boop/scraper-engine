@@ -9,20 +9,32 @@ fingerprint). Per-blueprint §3.4, Camoufox owns 100% of fingerprint
 surface — no application-level rotation needed within the profile
 lifetime. Idle timeout (max_idle_seconds) ensures no profile lives
 longer than ~5 minutes without use.
+
+Session isolation (§3.5, plan §5.4): when session_mgr is supplied,
+storage_state is loaded in acquire() and passed through CamoufoxWrapper
+constructor — baked in at launch time, not patched in later via sub-context.
+The classify-loop in acquire() is never touched by session code.
+State is saved back to Postgres on healthy release inside lease().
+
+Session save failures: logged at WARNING with domain, not swallowed
+silently. A failed save means session state is lost but the pool must
+continue serving requests — the exception is logged, not propagated.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .camoufox_wrapper import CamoufoxWrapper
 
 if TYPE_CHECKING:
     from core.models import Proxy
     from core.tenant import TenantId
+    from browser.session_state import SessionStateManager
 
 
 class BrowserPool:
@@ -39,11 +51,12 @@ class BrowserPool:
         tenant_id: TenantId,
         prewarm_count: int = 2,
         max_idle_seconds: int = 300,
+        session_mgr: SessionStateManager | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._prewarm_count = prewarm_count
         self._max_idle_seconds = max_idle_seconds
-        # Queue of (context, wrapper, idle_since) tuples
+        self._session_mgr = session_mgr
         self._pool: asyncio.Queue = asyncio.Queue()
         self._active_wrappers: list[CamoufoxWrapper] = []
         self._started = False
@@ -62,12 +75,7 @@ class BrowserPool:
         self._started = True
 
     async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
-        """Get a live browser context from the pool or launch a new one.
-
-        Drains pool once, classifies each candidate as selected/keep/
-        teardown. Only keepers go back into the pool. Nothing is ever
-        simultaneously returned AND still queued — prevents double-issue.
-        """
+        """Get a live browser context from the pool or launch a new one."""
         now = time.monotonic()
         drained = []
         while not self._pool.empty():
@@ -79,23 +87,20 @@ class BrowserPool:
         selected = None
         keep = []
         for ctx, wrapper, idle_since in drained:
-            # Idle timeout — tear down
             if now - idle_since > self._max_idle_seconds:
                 for w in self._active_wrappers:
-                    if w is wrapper or w._context is ctx:
+                    if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
                 continue
-            # Domain mismatch — tear down (stale cookies flushed)
             if domain is not None and getattr(wrapper, '_last_domain', None) != domain:
                 for w in self._active_wrappers:
-                    if w is wrapper or w._context is ctx:
+                    if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
                 continue
-            # First candidate (no domain) or domain match — select
             if selected is None:
                 selected = (ctx, wrapper)
             else:
@@ -107,37 +112,43 @@ class BrowserPool:
         if selected is not None:
             return selected[0]
 
+        session_state = None
+        if domain is not None and self._session_mgr is not None:
+            session_state = await self._session_mgr.load(self._tenant_id, domain)
+
         wrapper = CamoufoxWrapper(
             proxy=proxy,
             tenant_id=self._tenant_id,
+            storage_state=session_state,
         )
         self._active_wrappers.append(wrapper)
-        return await wrapper.__aenter__()
-
+        ctx = await wrapper.__aenter__()
+        return ctx
 
     @asynccontextmanager
     async def lease(self, proxy: Proxy | None = None, domain: str | None = None):
-        """Async context manager — structural cleanup (invariant §1.1.6).
-
-        ``async with pool.lease() as ctx:`` guarantees release() on exit
-        even if the block raises. Healthy release on normal exit; unhealthy
-        (teardown) on exception. Restores __aexit__ contract that raw
-        acquire()/release() lost when API switched to bare context objects.
-        """
+        """Async context manager — structural cleanup (invariant §1.1.6)."""
         ctx = await self.acquire(proxy=proxy, domain=domain)
-        if domain:
-            await self._load_session(ctx, domain)
         try:
             yield ctx
         except Exception:
             await self.release(ctx, healthy=False)
             raise
         else:
-            if domain:
-                await self._save_session(ctx, domain)
-            # Tag wrapper with last-used domain for reuse matching
+            if domain and self._session_mgr is not None:
+                try:
+                    state = await ctx.storage_state()
+                    await self._session_mgr.save(self._tenant_id, domain, state)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Failed to persist session state for domain=%s — "
+                        "session will be lost on next pool recycle", domain,
+                        exc_info=True,
+                    )
+
             for w in self._active_wrappers:
-                if w._context is ctx:
+                if w._context is ctx or w._isolated_ctx is ctx:
                     w._last_domain = domain if domain else None
                     break
             await self.release(ctx, healthy=True)
@@ -145,41 +156,20 @@ class BrowserPool:
     async def release(self, ctx: object, healthy: bool) -> None:
         """Return context to pool (healthy) or tear down (unhealthy)."""
         if not healthy:
-            # Find the wrapper owning this context and close it
             for w in self._active_wrappers:
-                if w._context is ctx or w._context == ctx:
+                if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
                     self._active_wrappers.remove(w)
                     await w.__aexit__()
                     return
             return
 
-        # Healthy: find wrapper and re-queue
         for w in self._active_wrappers:
-            if w._context is ctx or w._context == ctx:
+            if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
                 await self._pool.put((ctx, w, time.monotonic()))
                 return
-        # Wrapper not found (shouldn't happen) — tear down to avoid zombie
         import contextlib
         with contextlib.suppress(Exception):
             await ctx.__aexit__(None, None, None)
-
-
-    async def _load_session(self, ctx, domain: str) -> None:
-        """Restore stored browser session state for domain.
-
-        Blueprint v2 §3.5: browser_sessions table stores cookies +
-        localStorage per (tenant_id, domain, profile_id). Loading before
-        use prevents cross-domain cookie leakage with warm context reuse.
-        Deferred: requires Postgres connection + browser_sessions schema
-        wired into BrowserPool (currently instantiated without pg client).
-        Until wired, warm contexts share the same Camoufox profile's
-        cookies across domains — acceptable for single-domain scraping.
-        """
-        pass  # deferred: requires Postgres + browser_sessions schema
-
-    async def _save_session(self, ctx, domain: str) -> None:
-        """Persist current browser session state for domain to Postgres."""
-        pass  # deferred: requires Postgres + browser_sessions schema
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
@@ -188,11 +178,10 @@ class BrowserPool:
             with contextlib.suppress(asyncio.QueueEmpty):
                 ctx, wrapper, _ = self._pool.get_nowait()
                 for w in self._active_wrappers:
-                    if w is wrapper or w._context is ctx:
+                    if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
-        # Close any remaining active wrappers
         for w in list(self._active_wrappers):
             await w.__aexit__()
         self._active_wrappers.clear()

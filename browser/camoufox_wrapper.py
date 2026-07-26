@@ -6,6 +6,11 @@ Application code never touches navigator, WebGL*, or Canvas* prototypes.
 
 Lifecycle: strictly `async with` — never manually .launch()/.close() outside a context
 manager (closes F-16 driver-process leak).
+
+Plan §5.3a/5.3b: storage_state passed through constructor (not __aenter__ args).
+Path A (AsyncCamoufox storage_state kwarg) confirmed unavailable — AsyncCamoufox
+does not forward storage_state to Playwright's context creation. Path B applies:
+create BrowserContext via browser.new_context(storage_state=blob) after launch.
 """
 
 from __future__ import annotations
@@ -25,6 +30,9 @@ class CamoufoxWrapper:
     Acquires core.budget.BROWSER_SEMAPHORE BEFORE spawning any process (closes F-14).
     Delegates 100% of fingerprint surface to camoufox.async_api.AsyncCamoufox.
 
+    Plan §5.3a: storage_state passed via constructor, applied in __aenter__
+    via browser.new_context(storage_state=blob) after launch.
+
     ~80MB RSS per instance (measured 2026-07-22, Camoufox v152).
     This figure is the binding constraint for max_total_instances, not CPU.
     """
@@ -34,15 +42,27 @@ class CamoufoxWrapper:
         proxy: Proxy | None,
         tenant_id: TenantId,
         persistent_profile_id: str | None = None,
+        storage_state: dict[str, object] | None = None,
     ) -> None:
         self.proxy = proxy
         self.tenant_id = tenant_id
         self.persistent_profile_id = persistent_profile_id
+        self._storage_state = storage_state
         self._browser: Any = None
         self._context: Any | None = None
+        self._isolated_ctx: Any | None = None
 
     async def __aenter__(self) -> object:
-        """Acquire semaphore, launch Camoufox, return BrowserContext."""
+        """Acquire semaphore, launch Camoufox, apply storage_state if set.
+
+        Always returns a BrowserContext (never raw Browser).
+        When storage_state is loaded: context created with that state.
+        When no storage_state: clean context created.
+
+        Plan §5.3b Path B: browser.new_context(storage_state=blob) after launch.
+        Path A unavailable — AsyncCamoufox does not forward storage_state
+        to Playwright context creation.
+        """
         await BROWSER_SEMAPHORE.acquire()
         try:
             from camoufox.async_api import AsyncCamoufox
@@ -58,17 +78,32 @@ class CamoufoxWrapper:
                 proxy=proxy_config,
             )
             self._context = await self._browser.__aenter__()
-            return self._context
+
+            kwargs: dict[str, Any] = {}
+            if self._storage_state is not None:
+                kwargs["storage_state"] = self._storage_state
+            self._isolated_ctx = await self._context.new_context(**kwargs)
+            return self._isolated_ctx
         except Exception:
             BROWSER_SEMAPHORE.release()
             raise
 
     async def __aexit__(self, *exc: object) -> None:
-        """Guaranteed browser + Playwright driver cleanup, release semaphore."""
+        """Guaranteed browser + Playwright driver cleanup, release semaphore.
+
+        Closes isolated BrowserContext (if created) before closing the Browser.
+        """
         try:
-            if self._browser is not None:
-                await self._browser.__aexit__(*exc)
+            if self._isolated_ctx is not None:
+                import contextlib
+                with contextlib.suppress(Exception):
+                    await self._isolated_ctx.close()
+                self._isolated_ctx = None
         finally:
-            self._browser = None
-            self._context = None
-            BROWSER_SEMAPHORE.release()
+            try:
+                if self._browser is not None:
+                    await self._browser.__aexit__(*exc)
+            finally:
+                self._browser = None
+                self._context = None
+                BROWSER_SEMAPHORE.release()
