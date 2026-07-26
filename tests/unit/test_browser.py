@@ -132,42 +132,67 @@ class TestBrowserPool:
 
 
 class TestSessionState:
-    """Tests for SessionStateManager — browser session persistence."""
+    """Tests for SessionStateManager — browser session persistence (Postgres-backed)."""
+
+    @staticmethod
+    def _make_pg_mock(*, fetchrow_return=None):
+        """Return a PostgresClient mock wired for SessionStateManager use."""
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=fetchrow_return)
+        conn.execute = AsyncMock()
+
+        class _FakeAcquireCtx:
+            async def __aenter__(self):
+                return conn
+            async def __aexit__(self, *args):
+                pass
+
+        pg = MagicMock()
+        pg.acquire = MagicMock(return_value=_FakeAcquireCtx())
+        return pg
 
     def test_save_and_load(self, tenant):
-        redis = AsyncMock()
-        redis.set.return_value = None
-        redis.get.return_value = '{"cookies": [{"name": "test"}]}'
-
-        mgr = SessionStateManager(redis=redis)
+        pg = self._make_pg_mock(
+            fetchrow_return={"storage_state": {"cookies": [{"name": "test"}]}},
+        )
+        mgr = SessionStateManager(pg=pg)
 
         async def run():
-            await mgr.save(tenant, "prof-1", {"cookies": [{"name": "test"}]})
-            state = await mgr.load(tenant, "prof-1")
+            await mgr.save(tenant, "example.com", {"cookies": [{"name": "test"}]})
+            state = await mgr.load(tenant, "example.com")
             assert state is not None
             assert state["cookies"][0]["name"] == "test"
 
-        import asyncio
         asyncio.run(run())
 
     def test_load_missing_returns_none(self, tenant):
-        redis = AsyncMock()
-        redis.get.return_value = None
-        mgr = SessionStateManager(redis=redis)
+        pg = self._make_pg_mock(fetchrow_return=None)
+        mgr = SessionStateManager(pg=pg)
 
         async def run():
-            state = await mgr.load(tenant, "missing")
+            state = await mgr.load(tenant, "missing.example.com")
             assert state is None
 
-        import asyncio
         asyncio.run(run())
 
     def test_delete_clears_entry(self, tenant):
-        redis = AsyncMock()
-        mgr = SessionStateManager(redis=redis)
+        pg = self._make_pg_mock()
+        mgr = SessionStateManager(pg=pg)
 
         async def run():
-            await mgr.delete(tenant, "prof-old")
+            await mgr.delete(tenant, "old.example.com")
 
-        import asyncio
+        asyncio.run(run())
+
+    def test_save_json_string_loaded_correctly(self, tenant):
+        pg = self._make_pg_mock(
+            fetchrow_return={"storage_state": '{"cookies":[{"name":"sid","value":"abc"}],"origins":[]}'},
+        )
+        mgr = SessionStateManager(pg=pg)
+
+        async def run():
+            state = await mgr.load(tenant, "example.com")
+            assert state is not None
+            assert state["cookies"][0]["name"] == "sid"
+
         asyncio.run(run())
