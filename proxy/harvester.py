@@ -330,7 +330,10 @@ asyncio.run(main())'''
             tenant = TenantId("system")
         rows = await self._pg.fetch(
             tenant,
-            "SELECT ip, port, protocol FROM proxy_pool WHERE reliability_score < 40 LIMIT $1",
+            """SELECT ip, port, protocol FROM proxy_pool
+               WHERE reliability_score < 40
+               ORDER BY last_promotion_attempt_at ASC NULLS FIRST
+               LIMIT $1""",
             limit,
         )
         promoted = 0
@@ -340,8 +343,21 @@ asyncio.run(main())'''
             if is_valid:
                 await self._pg.execute(
                     tenant,
-                    "UPDATE proxy_pool SET reliability_score=$1, anonymity_level=$2 WHERE ip=$3 AND port=$4",
-                    SCORE_VALIDATED, anonymity.value, ip, port,
+                    """UPDATE proxy_pool
+                       SET reliability_score = $1, anonymity_level = $2,
+                           promotion_attempts = promotion_attempts + 1,
+                           last_promotion_attempt_at = NOW()
+                       WHERE ip = $3 AND port = $4 AND protocol = $5""",
+                    SCORE_VALIDATED, anonymity.value, ip, port, protocol,
                 )
                 promoted += 1
+            else:
+                await self._pg.execute(
+                    tenant,
+                    """UPDATE proxy_pool
+                       SET promotion_attempts = promotion_attempts + 1,
+                           last_promotion_attempt_at = NOW()
+                       WHERE ip = $3 AND port = $4 AND protocol = $5""",
+                    ip, port, protocol,
+                )
         return promoted
