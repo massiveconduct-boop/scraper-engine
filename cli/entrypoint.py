@@ -50,9 +50,10 @@ def main() -> None:
 async def _create_tenant(tenant_slug: str) -> None:
     """Create a new tenant and print its API key (BD-04)."""
     from api.auth import TenantResolver
+    from config.loader import load_config
     from storage.postgres_client import PostgresClient
 
-    pg = PostgresClient("postgresql://scraper@pgbouncer:6432/scraper_engine")
+    pg = PostgresClient(load_config().storage.database_url)
     await pg.start()
 
     resolver = TenantResolver(pg)

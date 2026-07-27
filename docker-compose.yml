@@ -5,6 +5,9 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
       - postgres
       - redis
@@ -15,6 +18,9 @@ services:
     build: .
     command: rq worker scraper-level1
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
       - postgres
       - redis
@@ -24,6 +30,9 @@ services:
     build: .
     command: rq worker scraper-level2
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
       - postgres
       - redis
@@ -33,6 +42,9 @@ services:
     build: .
     command: rq worker scraper-level3
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
       - postgres
       - redis
@@ -42,6 +54,9 @@ services:
     build: .
     command: python -m proxy.harvester
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
       - postgres
       - redis

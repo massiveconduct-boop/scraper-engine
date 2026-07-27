@@ -38,6 +38,12 @@ class PostgresClient:
             self._dsn,
             min_size=2,
             max_size=self.pool_size,
+            # PgBouncer transaction-pooling reassigns the backend per transaction,
+            # so asyncpg's prepared-statement cache (keyed to a specific backend)
+            # is unsafe through the pooler. Disabling it makes this client correct
+            # for the shared PgBouncer pool (invariant G-05). Safe: no code path
+            # calls conn.prepare(), so nothing depends on statement caching.
+            statement_cache_size=0,
         )
 
     async def stop(self) -> None:

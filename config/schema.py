@@ -1,7 +1,7 @@
 # config/schema.py
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LevelConfig(BaseModel):
@@ -92,10 +92,38 @@ class SessionRetentionConfig(BaseModel):
     domain_ban_history_retention_days: int = 7
 
 
+class StorageConfig(BaseModel):
+    """Single source of truth for the database and Redis connection strings.
+
+    The application connects to Postgres with raw asyncpg, which needs a plain
+    ``postgresql://`` DSN. Alembic/SQLAlchemy (in alembic.ini) use the
+    ``postgresql+asyncpg://`` form instead — a different consumer with a
+    different format. The validator below strips any ``+driver`` suffix so a
+    value written in the SQLAlchemy form still works for asyncpg here.
+
+    Defaults point at the docker-compose service names and route the database
+    through PgBouncer (invariant G-05). Override per environment via the
+    ``${DATABASE_URL}`` / ``${REDIS_URL}`` placeholders in base.yaml.
+    """
+
+    database_url: str = "postgresql://scraper:scraper@pgbouncer:6432/scraper_engine"
+    redis_url: str = "redis://redis:6379/0"
+
+    @field_validator("database_url")
+    @classmethod
+    def _strip_sqlalchemy_driver(cls, v: str) -> str:
+        # asyncpg.create_pool rejects the SQLAlchemy "postgresql+asyncpg://" form;
+        # normalise it down to the plain scheme asyncpg expects.
+        if v.startswith("postgresql+"):
+            return "postgresql://" + v.split("://", 1)[1]
+        return v
+
+
 class AppConfig(BaseModel):
     """Root configuration schema matching config/base.yaml."""
 
     tenant_id: str | None = None  # only for log enrichment (ContextVar), never for routing
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     levels: LevelsConfig = Field(default_factory=LevelsConfig)
     camoufox: CamoufoxConfig = Field(default_factory=CamoufoxConfig)
     proxy_harvester: ProxyHarvesterConfig = Field(default_factory=ProxyHarvesterConfig)
