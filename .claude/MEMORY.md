@@ -60,11 +60,17 @@ Index of all knowledge documents. Read this first to discover what exists before
 - **CAPTCHA solver wired into the fetch path (round 20 — RESOLVED).** L2/L3 now
   detect a widget → solve → inject → re-poll via `fetcher/_captcha.py`; worker
   builds the solver once, factory threads it. See `docs/round-20-evidence.md`.
-  Remaining: DOM detect/inject is unit-tested with a fake page but **not
-  live-verified end to end** — needs an active NoCaptchaAI reCAPTCHA entitlement
-  (round-19 account sat `idle`) + a real solvable target.
+  **Live-verified (round 20, `tools/verify_captcha_live.py`)**: real Camoufox +
+  Google reCAPTCHA demo — DOM detection PASS (extracted real sitekey), token
+  injection PASS (marker read back from `#g-recaptcha-response`). The only
+  unexercised step is a site *accepting* a solved token, blocked by provider
+  account state (below), not code.
+- **CAPTCHA provider token-grant blocked (account/credential, not code).**
+  NoCaptchaAI reCAPTCHA capability inactive (perpetual `idle`); CapSolver
+  fallback key returns `ERROR_KEY_DENIED_ACCESS` (401). Fix: activate reCAPTCHA
+  on the NoCaptchaAI account and/or replace `CAPSOLVER_API_KEY` in `.env`. Then
+  a clean end-to-end pass also needs a target that grades the token.
 - **AWS WAF** captcha unverified — needs a real AWS-WAF target (per-request runtime data).
-- **CapSolver fallback key invalid** (401) — replace in `.env` to enable fallback.
 - **Branch `rounds-12-17`** holds rounds 12–19; local, unpushed. main = PR + 4 CI checks.
 - **Deployable image** (`scraper-engine:round18`) predates the captcha + mypy-strict work — rebuild for HEAD.
 

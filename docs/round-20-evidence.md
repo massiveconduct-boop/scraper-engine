@@ -80,16 +80,46 @@ through the factory, and the direct-construction in tests is under `tests/`.
 
 ---
 
-## Honest scope / limits
+## Live run — real Camoufox + real reCAPTCHA (tools/verify_captcha_live.py)
 
-The **DOM detect + token injection is unit-tested, not live-verified** end to
-end against a real CAPTCHA. Same blocker as round 19: NoCaptchaAI reCAPTCHA sat
-perpetually `idle` (account capability not active) and there is no reliable free
-solvable target. The pieces proven live in round 19 (auth → createTask → poll →
-solution parse → billing, and ImageToText solving) are unchanged and still
-carry the token; this round adds the page-side detect/inject/re-poll around
-them. A real end-to-end confirmation still needs (1) an active solver
-entitlement and (2) a live target — recorded as remaining operator items.
+Ran the real `solve_captcha_on_page` against a headless Camoufox loading Google's
+reCAPTCHA v2 demo (`https://www.google.com/recaptcha/api2/demo`). Reproduce:
+`set -a && . ./.env && set +a && .venv/bin/python tools/verify_captcha_live.py`.
+
+```
+[1] DOM detect  → {'kind': 'recaptcha_v2',
+                   'sitekey': '6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-'}   # live, real sitekey
+[2+3] solve_captcha_on_page (real provider + real inject)…
+    solve_captcha_on_page returned: False
+    #g-recaptcha-response length after: 0
+[inject-only] force a marker token into the live DOM…
+    textarea == marker: True (got len=28)                                   # inject mutates real DOM
+=== summary ===
+live DOM detection: PASS
+live injection:     PASS
+live provider solve: NO TOKEN
+```
+
+Provider output during the run:
+```
+capsolver_create_task_error: ERROR_KEY_DENIED_ACCESS   # fallback key still 401 (known debt)
+captcha solve returned no token kind=recaptcha_v2      # NoCaptchaAI reCAPTCHA still idle
+```
+
+**What this proves live (previously only fake-page tested):**
+- DOM detection reads the correct `kind` + `sitekey` from a real reCAPTCHA
+  widget in a real browser — extracted Google's actual demo sitekey.
+- Token injection mutates the real DOM — a marker written via
+  `_INJECT_RECAPTCHA_JS` reads back verbatim from `#g-recaptcha-response`.
+
+**What is still blocked (account/credential, NOT code):** neither provider
+returns a reCAPTCHA token — NoCaptchaAI's reCAPTCHA capability is inactive
+(perpetual `idle`, round 19) and the CapSolver fallback key is denied
+(`ERROR_KEY_DENIED_ACCESS`). So the one step not exercisable is the site
+*accepting* a real solved token, which requires (1) an active solver
+entitlement and (2) — for a clean pass — a target that grades the token. The
+round-19 live proofs (auth → createTask → poll → solution parse → billing, and
+ImageToText solving) remain valid and carry the token unchanged.
 
 The reCAPTCHA callback-walk and Turnstile hidden-input creation are the
 standard integration shapes but are inherently target-specific; they are
