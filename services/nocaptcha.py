@@ -1,11 +1,9 @@
-# services/capsolver.py
-"""CapSolver integration for CAPTCHA solving (fallback provider — see
-services/captcha_solver.py for the NoCaptchaAI-primary / CapSolver-fallback
-orchestrator).
+# services/nocaptcha.py
+"""NoCaptchaAI integration — the PRIMARY CAPTCHA solving provider.
 
-All solve tasks are gated by:
-  - core.budget.CapSolverBudget (per-tenant daily $1.00 ceiling, BD-03)
-  - core.budget.CAPSOLVER_CONCURRENCY (bounds long-polls, closes F-13)
+Same anti-captcha createTask/getTaskResult protocol as CapSolver; only the
+endpoints and cost estimate differ. Budget/concurrency gating is shared via
+services._anticaptcha. CapSolver is the fallback (services/captcha_solver.py).
 """
 
 from __future__ import annotations
@@ -19,17 +17,17 @@ if TYPE_CHECKING:
     from core.budget import CapSolverBudget
     from core.tenant import TenantId
 
-CREATE_TASK_URL = "https://api.capsolver.com/createTask"
-GET_RESULT_URL = "https://api.capsolver.com/getTaskResult"
-GET_BALANCE_URL = "https://api.capsolver.com/getBalance"
+CREATE_TASK_URL = "https://api.nocaptchaai.com/createTask"
+GET_RESULT_URL = "https://api.nocaptchaai.com/getTaskResult"
+GET_BALANCE_URL = "https://api.nocaptchaai.com/getBalance"
 
-PROVIDER = "capsolver"
+PROVIDER = "nocaptchaai"
 
 
-class CapSolverClient:
-    """Client for CapSolver CAPTCHA solving service."""
+class NoCaptchaAIClient:
+    """Client for the NoCaptchaAI CAPTCHA solving service (primary provider)."""
 
-    ESTIMATED_RECAPTCHA_COST = 0.002  # ~$0.002 per reCAPTCHA v2 solve
+    ESTIMATED_RECAPTCHA_COST = 0.002
     ESTIMATED_HCAPTCHA_COST = 0.002
 
     def __init__(self, api_key: str, budget: CapSolverBudget) -> None:
@@ -39,7 +37,7 @@ class CapSolverClient:
     async def solve_recaptcha_v2(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        """Solve reCAPTCHA v2. Returns token or None if budget/concurrency exhausted."""
+        """Solve reCAPTCHA v2. Returns token or None on budget/error."""
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -56,7 +54,7 @@ class CapSolverClient:
     async def solve_hcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        """Solve hCaptcha. Returns token or None if budget/concurrency exhausted."""
+        """Solve hCaptcha. Returns token or None on budget/error."""
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -71,5 +69,5 @@ class CapSolverClient:
         )
 
     async def get_balance(self) -> float:
-        """Return current CapSolver account balance."""
+        """Return current NoCaptchaAI account balance."""
         return await _get_balance(api_key=self._api_key, balance_url=GET_BALANCE_URL)
