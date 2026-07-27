@@ -107,3 +107,67 @@ class TestImageToText:
         budget.check_and_reserve.return_value = False
         client = NoCaptchaAIClient("k", budget)
         assert await client.solve_image_to_text(TENANT, "b64img") is None
+
+
+class TestProviderTaskTypes:
+    """Each solve method must send the provider's correct task type + fields.
+    Task-type strings validated against NoCaptchaAI's official task-type list;
+    the solve pipeline itself is live-proven end-to-end via image-to-text."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method,expected_type", [
+        ("solve_recaptcha_v2", "ReCaptchaV2TaskProxyLess"),
+        ("solve_turnstile", "TurnstileTaskProxyLess"),
+        ("solve_aws_waf", "AWSWAFTask"),
+        ("solve_mtcaptcha", "MTCaptchaTask"),
+    ])
+    async def test_nocaptcha_sends_correct_type(self, monkeypatch, method, expected_type):
+        import services.nocaptcha as nc
+        captured = {}
+
+        async def fake_solve(**kw):
+            captured.update(kw["task"])
+            return "tok"
+
+        monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
+        budget = AsyncMock()
+        budget.check_and_reserve.return_value = True
+        client = nc.NoCaptchaAIClient("k", budget)
+        tok = await getattr(client, method)(TENANT, "sk", "http://x")
+        assert tok == "tok"
+        assert captured["type"] == expected_type
+        assert captured["websiteURL"] == "http://x"
+
+    @pytest.mark.asyncio
+    async def test_nocaptcha_geetest_gt_field(self, monkeypatch):
+        import services.nocaptcha as nc
+        captured = {}
+
+        async def fake_solve(**kw):
+            captured.update(kw["task"])
+            return "gtok"
+
+        monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
+        budget = AsyncMock()
+        budget.check_and_reserve.return_value = True
+        client = nc.NoCaptchaAIClient("k", budget)
+        assert await client.solve_geetest(TENANT, "GT123", "http://x") == "gtok"
+        assert captured["type"] == "GeeTestTaskProxyLess"
+        assert captured["gt"] == "GT123"
+
+    @pytest.mark.asyncio
+    async def test_nocaptcha_hcaptcha_defers_to_fallback(self):
+        # NoCaptchaAI has no hCaptcha — returns None so orchestrator falls through
+        from services.nocaptcha import NoCaptchaAIClient
+        budget = AsyncMock()
+        client = NoCaptchaAIClient("k", budget)
+        assert await client.solve_hcaptcha(TENANT, "sk", "http://x") is None
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_turnstile_fallback(self):
+        primary = _provider()
+        primary.solve_turnstile = AsyncMock(return_value=None)
+        fallback = _provider()
+        fallback.solve_turnstile = AsyncMock(return_value="cf-tok")
+        solver = CaptchaSolver(primary, fallback)
+        assert await solver.solve_turnstile(TENANT, "sk", "http://x") == "cf-tok"

@@ -1,7 +1,7 @@
 # services/capsolver.py
-"""CapSolver integration for CAPTCHA solving (fallback provider — see
-services/captcha_solver.py for the NoCaptchaAI-primary / CapSolver-fallback
-orchestrator).
+"""CapSolver integration — the FALLBACK CAPTCHA provider (primary is NoCaptchaAI;
+see services/captcha_solver.py). CapSolver additionally covers hCaptcha, which
+NoCaptchaAI's API does not.
 
 All solve tasks are gated by:
   - core.budget.CapSolverBudget (per-tenant daily $1.00 ceiling, BD-03)
@@ -27,19 +27,17 @@ PROVIDER = "capsolver"
 
 
 class CapSolverClient:
-    """Client for CapSolver CAPTCHA solving service."""
+    """Client for CapSolver CAPTCHA solving service (fallback provider)."""
 
-    ESTIMATED_RECAPTCHA_COST = 0.002  # ~$0.002 per reCAPTCHA v2 solve
-    ESTIMATED_HCAPTCHA_COST = 0.002
+    ESTIMATED_TOKEN_COST = 0.002
 
     def __init__(self, api_key: str, budget: CapSolverBudget) -> None:
         self._api_key = api_key
         self._budget = budget
 
-    async def solve_recaptcha_v2(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+    async def _solve_token(
+        self, tenant_id: TenantId, task: dict[str, object]
     ) -> str | None:
-        """Solve reCAPTCHA v2. Returns token or None if budget/concurrency exhausted."""
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -47,28 +45,66 @@ class CapSolverClient:
             get_result_url=GET_RESULT_URL,
             budget=self._budget,
             tenant_id=tenant_id,
-            task_type="RecaptchaV2TaskProxyless",
-            website_url=page_url,
-            website_key=site_key,
-            estimated_cost=self.ESTIMATED_RECAPTCHA_COST,
+            task=task,
+            estimated_cost=self.ESTIMATED_TOKEN_COST,
         )
+
+    async def solve_recaptcha_v2(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._solve_token(tenant_id, {
+            "type": "RecaptchaV2TaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
 
     async def solve_hcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        """Solve hCaptcha. Returns token or None if budget/concurrency exhausted."""
-        return await solve_anticaptcha(
-            provider=PROVIDER,
-            api_key=self._api_key,
-            create_task_url=CREATE_TASK_URL,
-            get_result_url=GET_RESULT_URL,
-            budget=self._budget,
-            tenant_id=tenant_id,
-            task_type="HCaptchaTaskProxyless",
-            website_url=page_url,
-            website_key=site_key,
-            estimated_cost=self.ESTIMATED_HCAPTCHA_COST,
-        )
+        return await self._solve_token(tenant_id, {
+            "type": "HCaptchaTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_turnstile(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._solve_token(tenant_id, {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_aws_waf(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._solve_token(tenant_id, {
+            "type": "AntiAwsWafTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_geetest(
+        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+    ) -> str | None:
+        task: dict[str, object] = {
+            "type": "GeeTestTaskProxyless",
+            "websiteURL": page_url,
+            "gt": gt,
+        }
+        if challenge is not None:
+            task["challenge"] = challenge
+        return await self._solve_token(tenant_id, task)
+
+    async def solve_mtcaptcha(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._solve_token(tenant_id, {
+            "type": "MtCaptchaTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
 
     async def get_balance(self) -> float:
         """Return current CapSolver account balance."""

@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 class CaptchaProvider(Protocol):
-    """Common interface both provider clients satisfy."""
+    """Common interface both provider clients satisfy — the captcha types most
+    common in real-world scraping."""
 
     async def solve_recaptcha_v2(
         self, tenant_id: TenantId, site_key: str, page_url: str
@@ -30,11 +31,27 @@ class CaptchaProvider(Protocol):
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None: ...
 
+    async def solve_turnstile(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None: ...
+
+    async def solve_aws_waf(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None: ...
+
+    async def solve_mtcaptcha(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None: ...
+
+    async def solve_geetest(
+        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = ...
+    ) -> str | None: ...
+
     async def get_balance(self) -> float: ...
 
 
 class CaptchaSolver:
-    """Primary-with-fallback CAPTCHA solver."""
+    """Primary-with-fallback CAPTCHA solver covering the common real-world types."""
 
     def __init__(
         self, primary: CaptchaProvider, fallback: CaptchaProvider | None = None
@@ -42,26 +59,57 @@ class CaptchaSolver:
         self._primary = primary
         self._fallback = fallback
 
-    async def solve_recaptcha_v2(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+    async def _key_url(
+        self, method: str, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        token = await self._primary.solve_recaptcha_v2(tenant_id, site_key, page_url)
+        """Try primary.<method>(tenant, site_key, page_url), then fallback."""
+        token: str | None = await getattr(self._primary, method)(
+            tenant_id, site_key, page_url
+        )
         if token is not None:
             return token
         if self._fallback is not None:
-            logger.info("captcha_primary_miss recaptcha_v2 — trying fallback")
-            return await self._fallback.solve_recaptcha_v2(tenant_id, site_key, page_url)
+            logger.info("captcha_primary_miss %s — trying fallback", method)
+            fb: str | None = await getattr(self._fallback, method)(
+                tenant_id, site_key, page_url
+            )
+            return fb
         return None
+
+    async def solve_recaptcha_v2(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._key_url("solve_recaptcha_v2", tenant_id, site_key, page_url)
 
     async def solve_hcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        token = await self._primary.solve_hcaptcha(tenant_id, site_key, page_url)
+        return await self._key_url("solve_hcaptcha", tenant_id, site_key, page_url)
+
+    async def solve_turnstile(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._key_url("solve_turnstile", tenant_id, site_key, page_url)
+
+    async def solve_aws_waf(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._key_url("solve_aws_waf", tenant_id, site_key, page_url)
+
+    async def solve_mtcaptcha(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        return await self._key_url("solve_mtcaptcha", tenant_id, site_key, page_url)
+
+    async def solve_geetest(
+        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+    ) -> str | None:
+        token = await self._primary.solve_geetest(tenant_id, gt, page_url, challenge)
         if token is not None:
             return token
         if self._fallback is not None:
-            logger.info("captcha_primary_miss hcaptcha — trying fallback")
-            return await self._fallback.solve_hcaptcha(tenant_id, site_key, page_url)
+            logger.info("captcha_primary_miss solve_geetest — trying fallback")
+            return await self._fallback.solve_geetest(tenant_id, gt, page_url, challenge)
         return None
 
 

@@ -32,37 +32,48 @@ async def solve_anticaptcha(
     get_result_url: str,
     budget: CapSolverBudget,
     tenant_id: TenantId,
-    task_type: str,
-    website_url: str,
-    website_key: str,
+    task: dict[str, object],
     estimated_cost: float,
 ) -> str | None:
     """Solve a token CAPTCHA via the anti-captcha protocol.
 
+    `task` is the full provider-specific task object (e.g.
+    {"type": "TurnstileTaskProxyLess", "websiteURL": ..., "websiteKey": ...}).
     Budget- and concurrency-gated. Returns the solved token, or None on budget
     exhaustion, API error, or timeout (caller may then try a fallback provider).
-    Uses the anti-captcha field names websiteURL / websiteKey (both CapSolver and
-    NoCaptchaAI expect these).
     """
     if not await budget.check_and_reserve(tenant_id, estimated_cost):
         logger.warning("%s_budget_exceeded: %s", provider, str(tenant_id))
         return None
 
+    def _token(solution: dict[str, object]) -> str | None:
+        # providers/captcha-types vary in the solution field name
+        val = (
+            solution.get("gRecaptchaResponse")
+            or solution.get("token")
+            or solution.get("captcha_token")
+            or solution.get("cookie")
+        )
+        return str(val) if val else None
+
     async with CAPSOLVER_CONCURRENCY:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                create_resp = await client.post(
-                    create_task_url,
-                    json={
-                        "clientKey": api_key,
-                        "task": {
-                            "type": task_type,
-                            "websiteURL": website_url,
-                            "websiteKey": website_key,
-                        },
-                    },
-                )
-                task_id = create_resp.json().get("taskId")
+                create = (
+                    await client.post(
+                        create_task_url,
+                        json={"clientKey": api_key, "task": task},
+                    )
+                ).json()
+
+                if create.get("errorId") not in (0, None):
+                    logger.warning("%s_create_task_error: %s", provider, create.get("errorCode"))
+                    return None
+                # some tasks solve synchronously (solution in the createTask response)
+                if create.get("status") == "ready":
+                    return _token(create.get("solution", {}))
+
+                task_id = create.get("taskId")
                 if not task_id:
                     logger.warning("%s_create_task_failed", provider)
                     return None
@@ -77,10 +88,7 @@ async def solve_anticaptcha(
                     ).json()
 
                     if result_data.get("status") == "ready":
-                        solution = result_data.get("solution", {})
-                        # providers vary: gRecaptchaResponse (recaptcha) or token
-                        token = solution.get("gRecaptchaResponse") or solution.get("token")
-                        return str(token) if token else None
+                        return _token(result_data.get("solution", {}))
 
                     if result_data.get("errorId") not in (0, None):
                         logger.warning(

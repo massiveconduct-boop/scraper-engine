@@ -1,9 +1,12 @@
 # services/nocaptcha.py
 """NoCaptchaAI integration — the PRIMARY CAPTCHA solving provider.
 
-Same anti-captcha createTask/getTaskResult protocol as CapSolver; only the
-endpoints and cost estimate differ. Budget/concurrency gating is shared via
-services._anticaptcha. CapSolver is the fallback (services/captcha_solver.py).
+Anti-captcha createTask/getTaskResult protocol. Supports the captcha types most
+common in real-world scraping (verified against NoCaptchaAI's task-type list):
+reCAPTCHA v2, Cloudflare Turnstile, AWS WAF, GeeTest, MTCaptcha, and image-to-text.
+hCaptcha / reCAPTCHA v3 are NOT offered by this API — those route to the CapSolver
+fallback (services/captcha_solver.py). Budget/concurrency gating is shared via
+services._anticaptcha.
 """
 
 from __future__ import annotations
@@ -28,18 +31,17 @@ PROVIDER = "nocaptchaai"
 class NoCaptchaAIClient:
     """Client for the NoCaptchaAI CAPTCHA solving service (primary provider)."""
 
-    ESTIMATED_RECAPTCHA_COST = 0.002
-    ESTIMATED_HCAPTCHA_COST = 0.002
+    # Rough per-solve cost estimates for budget reservation (BD-03 daily ceiling).
+    ESTIMATED_TOKEN_COST = 0.002
     ESTIMATED_IMAGE_TO_TEXT_COST = 0.0003  # cheapest; measured ~$0.0002/solve
 
     def __init__(self, api_key: str, budget: CapSolverBudget) -> None:
         self._api_key = api_key
         self._budget = budget
 
-    async def solve_recaptcha_v2(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+    async def _solve_token(
+        self, tenant_id: TenantId, task: dict[str, object]
     ) -> str | None:
-        """Solve reCAPTCHA v2. Returns token or None on budget/error."""
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -47,35 +49,78 @@ class NoCaptchaAIClient:
             get_result_url=GET_RESULT_URL,
             budget=self._budget,
             tenant_id=tenant_id,
-            task_type="ReCaptchaV2TaskProxyLess",
-            website_url=page_url,
-            website_key=site_key,
-            estimated_cost=self.ESTIMATED_RECAPTCHA_COST,
+            task=task,
+            estimated_cost=self.ESTIMATED_TOKEN_COST,
         )
+
+    # ── the captcha types most common in real-world scraping ────────────────
+
+    async def solve_recaptcha_v2(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        """Solve reCAPTCHA v2. Returns token or None."""
+        return await self._solve_token(tenant_id, {
+            "type": "ReCaptchaV2TaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_turnstile(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        """Solve Cloudflare Turnstile (the most common modern challenge). Token or None."""
+        return await self._solve_token(tenant_id, {
+            "type": "TurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_aws_waf(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        """Solve AWS WAF challenge. Returns token/cookie or None."""
+        return await self._solve_token(tenant_id, {
+            "type": "AWSWAFTask",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
+
+    async def solve_geetest(
+        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+    ) -> str | None:
+        """Solve GeeTest (common on Asian sites). Returns solution token or None."""
+        task: dict[str, object] = {
+            "type": "GeeTestTaskProxyLess",
+            "websiteURL": page_url,
+            "gt": gt,
+        }
+        if challenge is not None:
+            task["challenge"] = challenge
+        return await self._solve_token(tenant_id, task)
+
+    async def solve_mtcaptcha(
+        self, tenant_id: TenantId, site_key: str, page_url: str
+    ) -> str | None:
+        """Solve MTCaptcha. Returns token or None."""
+        return await self._solve_token(tenant_id, {
+            "type": "MTCaptchaTask",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        })
 
     async def solve_hcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        """Solve hCaptcha. Returns token or None on budget/error."""
-        return await solve_anticaptcha(
-            provider=PROVIDER,
-            api_key=self._api_key,
-            create_task_url=CREATE_TASK_URL,
-            get_result_url=GET_RESULT_URL,
-            budget=self._budget,
-            tenant_id=tenant_id,
-            task_type="HCaptchaTaskProxyLess",
-            website_url=page_url,
-            website_key=site_key,
-            estimated_cost=self.ESTIMATED_HCAPTCHA_COST,
-        )
+        """hCaptcha is NOT offered by NoCaptchaAI's API — always returns None so
+        the orchestrator falls through to the CapSolver fallback (which supports it)."""
+        return None
 
     async def solve_image_to_text(
         self, tenant_id: TenantId, image_b64: str
     ) -> str | None:
-        """Solve an image-to-text (OCR) CAPTCHA. Returns recognized text or None.
+        """Solve an image-to-text (OCR) CAPTCHA. Recognized text or None.
 
-        The cheapest task type; solves synchronously. Live-verified round 19.
+        Cheapest task type; solves synchronously. Live-verified round 19.
         """
         return await _solve_image_to_text(
             provider=PROVIDER,
