@@ -22,6 +22,7 @@ from .result import FetchResult
 if TYPE_CHECKING:
     from core.models import ConfigOverrides, Proxy
     from core.tenant import TenantId
+    from services.captcha_solver import CaptchaSolver
 
 
 class Level2Fetcher:
@@ -39,6 +40,7 @@ class Level2Fetcher:
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
         challenge_detector: ChallengeDetector | None = None,
+        captcha_solver: CaptchaSolver | None = None,
         force_engine: str | None = None,  # TEST-ONLY. See guard below.
     ) -> None:
         """Level 2 fetcher with config-driven wait strategy + challenge-gated retry.
@@ -70,6 +72,7 @@ class Level2Fetcher:
         self._scroll_passes = scroll_passes
         self._scroll_wait_ms = scroll_wait_ms
         self._challenge_detector = challenge_detector or ChallengeDetector()
+        self._captcha_solver = captcha_solver
 
     async def fetch(
         self,
@@ -116,6 +119,12 @@ class Level2Fetcher:
                     retry_wait_increment_ms=self._retry_wait_increment_ms,
                     waited_ms=0,
                 )
+                # Still a challenge after waiting? A token-grant widget (reCAPTCHA
+                # /hCaptcha/Turnstile) won't clear by waiting — solve it: read the
+                # sitekey, get a token from the provider, inject it, then re-poll.
+                # Best-effort and gated on a solver being configured; no-op
+                # otherwise (round 20 — wires services/captcha_solver into fetch).
+                html = await self._maybe_solve_captcha(page, url, tenant_id, html)
                 # Lazy-load / infinite-scroll: once past any challenge, scroll to
                 # load the rest, then re-read the fully-populated DOM (round 15
                 # follow-up — a single read only captured the first batch).
@@ -149,6 +158,38 @@ class Level2Fetcher:
                 error_message=str(exc),
                 proxy_used=proxy.key() if proxy else "none",
             )
+
+    async def _maybe_solve_captcha(
+        self, page: Any, url: str, tenant_id: TenantId | None, html: str | None
+    ) -> str | None:
+        """Attempt an in-page CAPTCHA solve when the page still looks like a
+        challenge and a solver + tenant are available. Returns the re-read HTML
+        after a successful solve, or the original `html` unchanged otherwise."""
+        if (
+            self._captcha_solver is None
+            or tenant_id is None
+            or html is None
+            or not self._challenge_detector.is_challenge_page(
+                html, 200, short_page_is_suspect=False
+            )
+        ):
+            return html
+        from fetcher._captcha import solve_captcha_on_page
+
+        solved = await solve_captcha_on_page(
+            page, solver=self._captcha_solver, tenant_id=tenant_id, url=url
+        )
+        if not solved:
+            return html
+        # Token injected — let the site validate it / redirect, then re-poll.
+        await page.wait_for_timeout(self._retry_wait_increment_ms)
+        return await poll_until_solved(
+            page,
+            self._challenge_detector,
+            max_total_wait_ms=self._max_total_wait_ms,
+            retry_wait_increment_ms=self._retry_wait_increment_ms,
+            waited_ms=0,
+        )
 
     async def _fetch_via_raw_playwright(
         self,

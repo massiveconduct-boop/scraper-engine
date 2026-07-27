@@ -27,6 +27,22 @@ safe_content_none_total = Counter(
     registry=REGISTRY,
 )
 
+captcha_solve_attempts_total = Counter(
+    "captcha_solve_attempts_total",
+    "In-page CAPTCHA solve attempts — a solvable widget was detected on a "
+    "challenge page and a token solve was requested from the provider.",
+    ["kind"],
+    registry=REGISTRY,
+)
+
+captcha_solved_total = Counter(
+    "captcha_solved_total",
+    "In-page CAPTCHA solves that produced a token and injected it into the "
+    "page (does not assert the site accepted it — only that injection ran).",
+    ["kind"],
+    registry=REGISTRY,
+)
+
 
 async def count_validated_proxies(pg: PostgresClient, tenant: TenantId) -> int:
     """Return count of proxies with reliability_score >= 40.

@@ -113,10 +113,10 @@ All routes enforce 4 invariants per blueprint:
 - **Escalation additions:** worker escalates JS-gated L1 shells (`looks_javascript_gated`)
   and dead-letters HOST_UNREACHABLE immediately (no futile L1→L2→L3).
 
-## CAPTCHA Solving (Round 19)
+## CAPTCHA Solving (Round 19 provider layer, Round 20 fetch-path wiring)
 
-Provider-abstracted, primary-with-fallback. **NOT yet wired into the fetch path** —
-fetchers detect challenges but do not yet call the solver (see MEMORY.md tech debt).
+Provider-abstracted, primary-with-fallback, **wired into the L2/L3 fetch path**
+(round 20 — was provider-only in round 19).
 
 ```
 CaptchaSolver(primary=NoCaptchaAI, fallback=CapSolver)   [services/captcha_solver.py]
@@ -133,6 +133,27 @@ services/capsolver.py      — CapSolverClient (fallback; also covers hCaptcha)
 Both gated by `CapSolverBudget` (per-tenant $/day, BD-03) + `CAPSOLVER_CONCURRENCY`.
 Task-type strings are provider-specific and were live-corrected from stale docs
 (see troubleshooting.md).
+
+**Fetch-path wiring (round 20):** the worker builds the solver once
+(`build_captcha_solver(CapSolverBudget(redis))`) and threads it through the
+factory into L2/L3. After `poll_until_solved`, if the page still classifies as a
+challenge, `Level*Fetcher._maybe_solve_captcha` calls
+`fetcher/_captcha.solve_captcha_on_page`:
+
+```
+solve_captcha_on_page(page, solver, tenant_id, url)      [fetcher/_captcha.py]
+  detect widget (page.evaluate → {kind, sitekey})  # recaptcha_v2 | hcaptcha | turnstile
+    → solver.solve_<kind>(tenant, sitekey, url)  → token
+    → inject token (kind-specific JS; recaptcha also fires ___grecaptcha_cfg callback)
+    → caller waits, re-polls; ChallengeDetector still gates success
+```
+
+Best-effort: returns False (never raises) on no widget / no sitekey / no token /
+inject failure → degrades to "still a challenge", never a false positive. Null-safe:
+no provider key → solver is None → fetch runs with solving skipped. Observable via
+`captcha_solve_attempts_total{kind}` / `captcha_solved_total{kind}`. DOM detect/inject
+is unit-tested with a fake page; not yet live-verified end to end (see
+`docs/round-20-evidence.md`).
 
 ---
 

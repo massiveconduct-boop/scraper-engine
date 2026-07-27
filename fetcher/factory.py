@@ -25,6 +25,7 @@ from fetcher.level_3 import Level3Fetcher
 
 if TYPE_CHECKING:
     from config.schema import AppConfig
+    from services.captcha_solver import CaptchaSolver
 
 
 def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
@@ -34,9 +35,15 @@ def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
 
 
 def build_level2_fetcher(
-    config: AppConfig, challenge_detector: ChallengeDetector | None = None
+    config: AppConfig,
+    challenge_detector: ChallengeDetector | None = None,
+    captcha_solver: CaptchaSolver | None = None,
 ) -> Level2Fetcher:
-    """Construct the L2 (Botasaurus+Camoufox) fetcher from config.levels.level_2."""
+    """Construct the L2 (Botasaurus+Camoufox) fetcher from config.levels.level_2.
+
+    captcha_solver is optional — the worker builds it once (env keys + budget)
+    and threads it through so an in-page CAPTCHA can be solved mid-fetch. None
+    disables solving (fetch still runs, challenges just aren't token-solved)."""
     lvl = config.levels.level_2
     return Level2Fetcher(
         goto_wait_until=lvl.goto_wait_until,
@@ -46,13 +53,18 @@ def build_level2_fetcher(
         scroll_passes=lvl.scroll_passes,
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
+        captcha_solver=captcha_solver,
     )
 
 
 def build_level3_fetcher(
-    config: AppConfig, challenge_detector: ChallengeDetector | None = None
+    config: AppConfig,
+    challenge_detector: ChallengeDetector | None = None,
+    captcha_solver: CaptchaSolver | None = None,
 ) -> Level3Fetcher:
-    """Construct the L3 (Camoufox-only) fetcher from config.levels.level_3."""
+    """Construct the L3 (Camoufox-only) fetcher from config.levels.level_3.
+
+    captcha_solver is threaded through the same way as for L2 (see above)."""
     lvl = config.levels.level_3
     return Level3Fetcher(
         goto_wait_until=lvl.goto_wait_until,
@@ -62,4 +74,5 @@ def build_level3_fetcher(
         scroll_passes=lvl.scroll_passes,
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
+        captcha_solver=captcha_solver,
     )

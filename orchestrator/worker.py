@@ -55,6 +55,14 @@ class Worker:
         # JS-gated shells) — same single source of truth the fetchers use.
         from fetcher.challenge_detector import ChallengeDetector
         self._challenge_detector = ChallengeDetector()
+        # Build the CAPTCHA solver once (env keys + per-tenant budget on Redis)
+        # and thread it into the browser fetchers via the factory. None when no
+        # provider key is set — solving stays disabled, fetch still runs. Built
+        # here (not per-fetch) for the same reason config is: one authoritative
+        # construction site (round 20 — wires services/captcha_solver in).
+        from core.budget import CapSolverBudget
+        from services.captcha_solver import build_captcha_solver
+        self._captcha_solver = build_captcha_solver(CapSolverBudget(self._redis))
         # Circuit breaker and politeness use raw Redis (not tenant-scoped),
         # so pass the underlying client for system-level key operations
         if hasattr(circuit_breaker, '_redis'):
@@ -168,7 +176,9 @@ class Worker:
             try:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
                 async with lease:
-                    l2_fetcher = build_level2_fetcher(self._config)
+                    l2_fetcher = build_level2_fetcher(
+                        self._config, captcha_solver=self._captcha_solver
+                    )
                     return await l2_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:
                 return FetchResult(
@@ -188,7 +198,9 @@ class Worker:
             try:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))
                 async with lease:
-                    l3_fetcher = build_level3_fetcher(self._config)
+                    l3_fetcher = build_level3_fetcher(
+                        self._config, captcha_solver=self._captcha_solver
+                    )
                     return await l3_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:
                 return FetchResult(

@@ -49,17 +49,20 @@ Index of all knowledge documents. Read this first to discover what exists before
 | `docs/round-16-evidence.md` | Infinite-scroll/lazy-load `autoscroll` (consecutive-stable stop; live-proven 10→30 quotes) | Scroll handling |
 | `docs/round-17-evidence.md` | Full-stack e2e smoke (auth/SSRF/quota/persist/retrieve); GET /v1/jobs 500 fix (asyncpg UUID→str) | Live API pipeline + UUID bug |
 | `docs/round-19-evidence.md` | CAPTCHA solver — NoCaptchaAI primary/CapSolver fallback; ImageToText solved live; provider-specific task-type corrections (docs stale) | CAPTCHA solving subsystem |
+| `docs/round-20-evidence.md` | CAPTCHA solver wired into L2/L3 fetch path — `fetcher/_captcha.py` (DOM detect→solve→inject→re-poll), worker builds solver once, factory threads it, best-effort/null-safe, 15 tests | CAPTCHA fetch-path integration |
 | `docs/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
 | `docs/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
 | `.github/workflows/test.yml` | Live CI (lint incl. mypy-strict + fetcher-factory + force_engine grep-gates + challenge-mirror ruff baseline; unit/integration/chaos) | CI configuration reference |
 | `tools/mypy-baseline.txt` | EMPTY since round 18 — mypy `--strict` clean; CI fails on any error | mypy strict gate |
 
-## Technical Debt / Open Threads (as of round 19)
+## Technical Debt / Open Threads (as of round 20)
 
-- **CAPTCHA solver not wired into the fetch path.** `services/captcha_solver.py` works
-  and is tested, but L2/L3 detect challenges (ChallengeDetector) without calling it.
-  Next: on a detected reCAPTCHA/Turnstile, extract the sitekey from the page →
-  `solver.solve_*()` → inject token → continue. See `docs/round-19-evidence.md`.
+- **CAPTCHA solver wired into the fetch path (round 20 — RESOLVED).** L2/L3 now
+  detect a widget → solve → inject → re-poll via `fetcher/_captcha.py`; worker
+  builds the solver once, factory threads it. See `docs/round-20-evidence.md`.
+  Remaining: DOM detect/inject is unit-tested with a fake page but **not
+  live-verified end to end** — needs an active NoCaptchaAI reCAPTCHA entitlement
+  (round-19 account sat `idle`) + a real solvable target.
 - **AWS WAF** captcha unverified — needs a real AWS-WAF target (per-request runtime data).
 - **CapSolver fallback key invalid** (401) — replace in `.env` to enable fallback.
 - **Branch `rounds-12-17`** holds rounds 12–19; local, unpushed. main = PR + 4 CI checks.
