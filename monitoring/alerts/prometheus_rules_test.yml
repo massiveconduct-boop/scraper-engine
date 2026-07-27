@@ -1,0 +1,48 @@
+# promtool alert unit tests (round 13 D1).
+# Proves the two new alerts actually FIRE on the conditions they claim to watch,
+# using synthetic time series — the deterministic equivalent of the "seed the
+# counter and watch it trip" proof used for ProxyPoolCriticallyLow in an earlier
+# round, without waiting out the real 30m / 6h `for:` durations against a live
+# clock.
+#
+# Run:  promtool test rules monitoring/alerts/prometheus_rules_test.yml
+rule_files:
+  - prometheus_rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── SafeContentGuardFiringFrequently ──────────────────────────────────────
+  # safe_content_none_total climbing 60/min = 1/s, far above the 0.1/s threshold.
+  # Held past the 30m `for:` → alert must be FIRING at 90m.
+  - interval: 1m
+    input_series:
+      - series: 'safe_content_none_total'
+        values: '0+60x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SafeContentGuardFiringFrequently
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Level3Fetcher's _safe_content guard is firing more than incidentally"
+              description: "This was a theoretical, untested code path (round 12.4). A sustained nonzero rate means it's firing for real — investigate which targets are triggering the mid-navigation race before assuming the guard alone is sufficient."
+
+  # ── ProxySourceWentDark ───────────────────────────────────────────────────
+  # proxyscrape stuck at 0 (dark) for 400 min > the 6h `for:` → FIRING at 400m,
+  # with the source_name templated into the summary.
+  - interval: 1m
+    input_series:
+      - series: 'proxy_source_healthy{source_name="proxyscrape"}'
+        values: '0x400'
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: ProxySourceWentDark
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              source_name: "proxyscrape"
+            exp_annotations:
+              summary: "proxyscrape has returned zero proxies for 6+ hours"
+              description: "One of the (already small) pool of independent proxy sources appears to be dead. Check if it needs replacing per the round-6/6.1 diversity work — this is exactly the class of silent single-source failure that motivated that work."

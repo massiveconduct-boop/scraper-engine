@@ -109,3 +109,27 @@ groups:
         annotations:
           summary: "Scraper engine metrics endpoint unreachable"
           description: "Prometheus cannot scrape metrics from scraper-engine. Service may be down."
+
+      # ── Round 13 D1: watch a previously-disclosed-but-unwatched code path ──
+      - alert: SafeContentGuardFiringFrequently
+        expr: rate(safe_content_none_total[1h]) > 0.1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Level3Fetcher's _safe_content guard is firing more than incidentally"
+          description: "This was a theoretical, untested code path (round 12.4). A sustained
+            nonzero rate means it's firing for real — investigate which targets are triggering
+            the mid-navigation race before assuming the guard alone is sufficient."
+
+      # ── Round 13 D2: per-source proxy health, not just aggregate pool count ──
+      - alert: ProxySourceWentDark
+        expr: proxy_source_healthy == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.source_name }} has returned zero proxies for 6+ hours"
+          description: "One of the (already small) pool of independent proxy sources appears to
+            be dead. Check if it needs replacing per the round-6/6.1 diversity work — this is
+            exactly the class of silent single-source failure that motivated that work."

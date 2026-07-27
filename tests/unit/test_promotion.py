@@ -105,8 +105,8 @@ class TestProxyPromotionJob:
         conn.execute = AsyncMock()
 
         class _FakeCtx:
-            async def __aenter__(s): return conn
-            async def __aexit__(s, *a): pass
+            async def __aenter__(self): return conn
+            async def __aexit__(self, *a): pass
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
@@ -127,7 +127,8 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_semaphore_bounds_concurrency(self, tenant):
         """Verify semaphore is created with PROMOTION_CONCURRENCY=5."""
-        validate = AsyncMock(return_value=(False, __import__("core.models", fromlist=["AnonymityLevel"]).AnonymityLevel.TRANSPARENT))
+        from core.models import AnonymityLevel
+        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
         job = ProxyPromotionJob(pg=_make_pg_mock(), http_validate_fn=validate, system_tenant=tenant)
 
         # Semaphore should exist and have value of 5 (plan §4.2: PROMOTION_CONCURRENCY=5)

@@ -69,10 +69,14 @@ class Level1Fetcher:
                 error_message="Request timed out",
             )
         except Exception as exc:
+            from fetcher._failure import classify_fetch_exception
             return FetchResult(
                 url=url,
                 success=False,
                 level_used=1,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                failure_category=classify_fetch_exception(
+                    exc, FailureCategory.NETWORK_TIMEOUT
+                ),
                 error_message=str(exc),
             )

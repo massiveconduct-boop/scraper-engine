@@ -60,6 +60,10 @@ class FailureCategory(str, Enum):
     CIRCUIT_OPEN = "circuit_open"
     SSRF_BLOCKED = "ssrf_blocked"
     QUOTA_EXCEEDED = "quota_exceeded"
+    # DNS / unresolvable-host failures. Non-retryable: escalating L1→L2→L3 or
+    # retrying a domain that doesn't resolve just wastes browser launches
+    # (round 15 — surfaced by a dead test domain crashing through all levels).
+    HOST_UNREACHABLE = "host_unreachable"
 
 
 class FetchResult(BaseModel):

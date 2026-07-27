@@ -26,15 +26,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from .camoufox_wrapper import CamoufoxWrapper
 
 if TYPE_CHECKING:
+    from browser.session_state import SessionStateManager
     from core.models import Proxy
     from core.tenant import TenantId
-    from browser.session_state import SessionStateManager
 
 
 class BrowserPool:
@@ -57,7 +58,7 @@ class BrowserPool:
         self._prewarm_count = prewarm_count
         self._max_idle_seconds = max_idle_seconds
         self._session_mgr = session_mgr
-        self._pool: asyncio.Queue = asyncio.Queue()
+        self._pool: asyncio.Queue[Any] = asyncio.Queue()
         self._active_wrappers: list[CamoufoxWrapper] = []
         self._started = False
 
@@ -74,7 +75,7 @@ class BrowserPool:
             await self._pool.put((ctx, wrapper, time.monotonic()))
         self._started = True
 
-    async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> object:
+    async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> Any:
         """Get a live browser context from the pool or launch a new one."""
         now = time.monotonic()
         drained = []
@@ -126,7 +127,9 @@ class BrowserPool:
         return ctx
 
     @asynccontextmanager
-    async def lease(self, proxy: Proxy | None = None, domain: str | None = None):
+    async def lease(
+        self, proxy: Proxy | None = None, domain: str | None = None
+    ) -> AsyncIterator[Any]:
         """Async context manager — structural cleanup (invariant §1.1.6)."""
         ctx = await self.acquire(proxy=proxy, domain=domain)
         try:
@@ -153,7 +156,7 @@ class BrowserPool:
                     break
             await self.release(ctx, healthy=True)
 
-    async def release(self, ctx: object, healthy: bool) -> None:
+    async def release(self, ctx: Any, healthy: bool) -> None:
         """Return context to pool (healthy) or tear down (unhealthy)."""
         if not healthy:
             for w in self._active_wrappers:
@@ -167,14 +170,12 @@ class BrowserPool:
             if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
                 await self._pool.put((ctx, w, time.monotonic()))
                 return
-        import contextlib
         with contextlib.suppress(Exception):
             await ctx.__aexit__(None, None, None)
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
         while not self._pool.empty():
-            import contextlib
             with contextlib.suppress(asyncio.QueueEmpty):
                 ctx, wrapper, _ = self._pool.get_nowait()
                 for w in self._active_wrappers:

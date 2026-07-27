@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, FastAPI, Header, HTTPException
 
 from core.models import JobStatus, JobStatusResponse, ScrapeRequest
 
@@ -28,7 +27,7 @@ def _validate_uuid(value: str, name: str = "id") -> str:
         raise HTTPException(
             status_code=422,
             detail=f"Invalid {name}: '{value}' is not a valid UUID",
-        )
+        ) from None
     return value
 
 
@@ -38,7 +37,7 @@ async def scrape(
     x_api_key: str = Header(..., alias="X-API-Key"),
 ) -> dict[str, object]:
     """Enqueue a scrape job with SSRF validation, tenant auth, and quota check."""
-    from api.dependencies import _tenant_resolver, _storage_pg, _storage_redis, _worker
+    from api.dependencies import _storage_pg, _storage_redis, _tenant_resolver
     from core.exceptions import AuthenticationError, SSRFBlockedError
     from core.ssrf_guard import SSRFGuard
 
@@ -48,7 +47,7 @@ async def scrape(
     try:
         tenant_id = await _tenant_resolver.resolve(x_api_key)
     except AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
 
     # SSRF validation on every URL
     ssrf = SSRFGuard()
@@ -56,7 +55,7 @@ async def scrape(
         try:
             await ssrf.validate(str(url_val))
         except SSRFBlockedError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # Quota enforcement
     if _storage_redis is not None and _storage_pg is not None:
@@ -75,7 +74,7 @@ async def scrape(
                 redis=_storage_redis, daily_limit=daily_limit,
             ).check_and_increment(tenant_id, count=len(request.urls))
         except QuotaExceededError:
-            raise HTTPException(status_code=429, detail="Daily quota exceeded")
+            raise HTTPException(status_code=429, detail="Daily quota exceeded") from None
 
     # Persist job
     job_id = str(uuid.uuid4())
@@ -109,7 +108,7 @@ async def get_job(
     x_api_key: str = Header(..., alias="X-API-Key"),
 ) -> JobStatusResponse:
     """Get the status and results of a scrape job from the live database."""
-    from api.dependencies import _tenant_resolver, _storage_pg
+    from api.dependencies import _storage_pg, _tenant_resolver
     from core.exceptions import AuthenticationError
 
     _validate_uuid(job_id)
@@ -119,7 +118,7 @@ async def get_job(
     try:
         tenant_id = await _tenant_resolver.resolve(x_api_key)
     except AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
 
     if _storage_pg is None:
         return JobStatusResponse(job_id=job_id, status=JobStatus.PENDING, progress=0.0)
@@ -134,7 +133,10 @@ async def get_job(
 
     row = rows[0]
     return JobStatusResponse(
-        job_id=row["job_id"],
+        # asyncpg returns a uuid.UUID for the UUID column; JobStatusResponse.job_id
+        # is typed str, so coerce explicitly (round 16 — this 500'd on every
+        # existing job, caught by the full-stack e2e smoke).
+        job_id=str(row["job_id"]),
         status=JobStatus(row["status"]),
         progress=0.0,
     )
@@ -146,7 +148,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def register_routes(app: Any) -> None:
+def register_routes(app: FastAPI) -> None:
     """Register all API routes on the FastAPI app, including /metrics."""
     from fastapi import Response
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -154,6 +156,7 @@ def register_routes(app: Any) -> None:
     @app.get("/metrics")
     async def metrics() -> Response:
         from prometheus_client import REGISTRY
+
         from api.dependencies import _storage_pg
         from core.tenant import TenantId
         from observability.metrics import count_validated_proxies, proxy_pool_validated_count

@@ -93,6 +93,45 @@ class TestWorker:
         assert response.results is not None and response.results[0].level_used == 2
 
     @pytest.mark.asyncio
+    async def test_js_gated_l1_escalates(self, tenant, worker):
+        """L1 returns 200 but a JS-gated SPA shell (round 15) — must NOT be
+        accepted as content; escalates to L2 which renders the real page."""
+        shell = FetchResult(
+            url="http://example.com", success=True, level_used=1, duration_ms=10,
+            http_status=200,
+            html='<html><body><div id="root"></div><script src=a.js></script></body></html>',
+        )
+        real_l2 = FetchResult(
+            url="http://example.com", success=True, level_used=2, duration_ms=50,
+            http_status=200, html="<html><body>" + "real product data " * 40 + "</body></html>",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[shell, real_l2])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-jsgate", request)
+        assert response.status == JobStatus.COMPLETED
+        # accepted the L2 render, not the L1 shell
+        assert response.results is not None and response.results[0].level_used == 2
+
+    @pytest.mark.asyncio
+    async def test_host_unreachable_dead_letters_without_escalation(self, tenant, worker):
+        """A dead/unresolvable host (round 15) dead-letters immediately — a
+        browser can't resolve DNS the HTTP client couldn't, so escalating is
+        futile. _fetch_url must be called exactly once (no L2/L3 attempts)."""
+        dead = FetchResult(
+            url="http://nonexistent.invalid", success=False, level_used=1, duration_ms=5,
+            failure_category=FailureCategory.HOST_UNREACHABLE,
+            error_message="NS_ERROR_UNKNOWN_HOST",
+        )
+        worker._fetch_url = AsyncMock(return_value=dead)
+        request = ScrapeRequest(urls=[HttpUrl("http://nonexistent.invalid")])
+
+        response = await worker.process_job(tenant, "job-dns", request)
+        assert response.status == JobStatus.FAILED
+        worker._dlq.enqueue.assert_called_once()
+        assert worker._fetch_url.await_count == 1  # no escalation to L2/L3
+
+    @pytest.mark.asyncio
     async def test_extract_domain(self, worker):
         assert worker._extract_domain("http://example.com/path") == "example.com"
         assert worker._extract_domain("https://sub.dom.com:8080/x") == "sub.dom.com"

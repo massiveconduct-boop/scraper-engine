@@ -18,6 +18,8 @@
 | API | uvicorn | 8000 | FastAPI server |
 | Workers L1/L2/L3 | RQ | — | Escalation-level queue workers |
 | Proxy harvester | standalone Python | — | Background proxy collection |
+| Prometheus | prom/prometheus:latest | 9090 | Metrics collection + alert evaluation |
+| Alertmanager | prom/alertmanager:latest | 9093 | Alert routing to Slack (two-tier: default + paging-channel) |
 | PgBouncer init | postgres:16-alpine | — | SCRAM userlist auto-regeneration |
 
 ---
@@ -47,7 +49,7 @@ docker compose logs -f  # watch logs
 | File | Purpose |
 |---|---|
 | `docker-compose.yml` | Service definitions, networks, volumes |
-| `.env` | Secrets (CapSolver key, Postgres password, MinIO credentials) |
+| `.env` | Secrets (NOCAPTCHA_AI_API_KEY primary + CAPSOLVER_API_KEY fallback, Postgres/MinIO/Slack) |
 | `config/base.yaml` | Application config (timeouts, retries, quotas) |
 | `pyproject.toml` | Python project config, lint rules, test settings |
 | `infra/pgbouncer/pgbouncer.ini` | PgBouncer config (pool mode, max clients, auth) |
@@ -63,24 +65,34 @@ docker compose logs -f  # watch logs
 
 ### Alerts
 - `ProxyPoolCriticallyLow`: fires when `proxy_pool_validated_count < 5` for 5 minutes. Severity: critical.
+- `BrowserPoolExhausted`, `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined.
 - Rules in `monitoring/alerts/prometheus_rules.yml`.
+
+### Alertmanager
+- Two-tier Slack routing: `default` receiver → `#alerts` (repeat 4h), `paging-channel` receiver → `#alerts-critical` for severity=critical (repeat 30m).
+- `send_resolved: true` on both receivers — resolution notifications dispatched.
+- Webhook URL from `.env` (`SLACK_WEBHOOK_URL`), never committed. `docker-entrypoint.sh` substitutes via `sed` at container start.
+- Global `slack_api_url` required (Alertmanager v0.33.1 — per-receiver `api_url` silently ignored).
 
 ---
 
-## CI Pipeline (Recommended)
+## CI Pipeline (Live)
 
-```yaml
-# .github/workflows/test.yml
-steps:
-  - name: Start infrastructure
-    run: docker compose up -d postgres redis pgbouncer && sleep 4
-  - name: Migrate
-    run: alembic upgrade head
-  - name: Test
-    run: pytest tests/unit/ tests/integration/ tests/chaos/ -q --cov=core --cov=proxy --cov=orchestrator
-  - name: Lint
-    run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
-```
+**File:** `.github/workflows/test.yml` — 4-stage pipeline, GitHub Actions hosted, green as of round 11.
+
+**Stages:**
+- **lint (round 13-18):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across core/proxy/orchestrator/api/storage/fetcher/browser/observability) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + challenge-mirror ruff baseline + mypy-shrinkage advisory.
+- **unit:** 148 tests, explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently).
+- **integration:** Postgres 16 + Redis 7 as GitHub Actions services. Alembic upgrade head before tests. Excludes `test_promotion.py` (needs judge server subprocess) and Camoufox-dependent tests.
+- **chaos:** Same services. Excludes `test_pgbouncer_search_path_isolation.py` (no PgBouncer service in CI).
+
+**Run URL:** https://github.com/massiveconduct-boop/scraper-engine/actions
+
+**Excluded from CI (by design):**
+- 2 Camoufox-dependent unit tests (binary ~300MB, run locally)
+- L2/L3 live escalation tests (Camoufox + challenge mirror)
+- `test_promotion.py` (judge server subprocess)
+- `test_pgbouncer_search_path_isolation.py` (no PgBouncer service)
 
 ---
 
@@ -94,12 +106,34 @@ steps:
 | Browser pool | 8 instances | `max_total_instances` in config; per-worker |
 | PostgreSQL | Single | Read replicas for multi-tenant |
 | Redis | Single | Sentinel for HA |
+| Prometheus | 1 instance | Federation for multi-DC |
+| Alertmanager | 1 instance | Cluster mode for HA |
+
+---
+
+## Config-Driven Timeouts
+
+L2/L3 fetcher timeout values live in `config/production.yaml` under `levels.level_2` and `levels.level_3`. Not hardcoded in fetcher code:
+
+```yaml
+levels:
+  level_2:
+    goto_wait_until: "domcontentloaded"
+    networkidle_timeout_ms: 5000
+    max_total_wait_ms: 15000
+  level_3:
+    goto_wait_until: "load"
+    post_load_fixed_wait_ms: 10000
+    max_total_wait_ms: 30000
+    retry_wait_increment_ms: 5000
+```
 
 ---
 
 ## Known Operational Gaps
 
 1. **PgBouncer pg_hba.conf:** Requires `host all all 172.0.0.0/8 md5` rule added to Postgres. Without it, auth_type must be scram-sha-256 in both pgbouncer.ini and pg_hba.conf.
-2. **`promote_tcp_only()` not scheduled:** Background proxy re-validation job exists but not wired to cron/scheduler. TCP-only proxies remain at score 25 until manually promoted.
-3. **`_load_session`/`_save_session` stubs:** Per-domain browser session persistence needs `browser_sessions` schema + Postgres client in BrowserPool. Until wired, warm context reuse shares cookies across domains (single-domain scraping unaffected).
-4. **CapSolver untested:** `services/capsolver.py` client code exists. No API key available for live-solve test.
+2. **CAPTCHA solving (round 19 provider, round 20 wiring):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha live-accepted. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject unit-tested, not yet live-verified end to end (needs active reCAPTCHA entitlement + real target — round-19 account sat `idle`). AWS WAF needs a real target. Current CAPSOLVER_API_KEY is invalid (401) — replace to enable fallback.
+3. **mypy `--strict` clean (RESOLVED, round 18):** was 23 baseline findings; all fixed. `strict = true` in pyproject, `mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/` → "Success: no issues found in 57 source files". `tools/mypy-baseline.txt` is now empty and the CI gate fails on ANY error (no tolerance). Fixes included a real bug (`api/main.py` called `redis.close()`, which doesn't exist — the method is `stop()`); the rest were type precision (Protocol for the ASN classifier, `Any` for duck-typed Playwright pages/contexts, optional/generic args, a justified `type: ignore[no-untyped-call]` on the untyped `AsyncCamoufox`).
+4. **Docker image ~4 GB:** Camoufox Firefox binary ~300 MB unavoidable (BD-02). Accepted as final for Oracle Cloud VPS (100 GB boot volume). Round 13 fixed the launch-lib chain (xvfb, libgtk-3-0, libx11-xcb1, camoufox[geoip]) — the image now actually launches a browser, not just ships one.
+5. **Stale Dockerfile Python pin (RESOLVED, round 14):** The committed Dockerfile text pinned `python:3.11-slim` from initial commit through round 12, but every *built* image (incl. the deployed `scraper_engine-api`) ran Python 3.12.13 — matching local venv (3.12.3) and CI (3.12). So the pin was documentation drift, never a runtime exposure; 3.11 was never deployed. Round 13 aligned the text to `python:3.12-slim`. Recorded here so the historical mismatch is explicit, not implicit in a diff.

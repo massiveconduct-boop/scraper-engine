@@ -113,11 +113,13 @@ def _challenge_html(challenge_id: str, target: str, difficulty: str) -> str:
     # Client-side PoW solver: brute-forces an integer nonce such that
     # sha256(challenge_id + ":" + nonce) starts with `target` (hex-zero prefix),
     # then POSTs the solution along with a small fingerprint-signal bundle.
+    min_solve_ms = int(DIFFICULTY_CONFIG[difficulty]["min_solve_seconds"] * 1000)
     return f"""<!DOCTYPE html>
 <html><head><title>Verifying your browser…</title></head>
 <body>
 <p id="status">Checking your browser before continuing…</p>
 <script>
+const MIN_SOLVE_MS = {min_solve_ms};
 // Synchronous, from-scratch SHA-256 (FIPS 180-4), verified bit-for-bit against
 // Python's hashlib.sha256 (incl. the 55/56/64-byte padding-boundary cases) before
 // being ported here. Deliberately NOT crypto.subtle.digest: SubtleCrypto.digest()
@@ -178,6 +180,7 @@ function yieldToUI() {{
 }}
 
 async function solve() {{
+  const startTime = Date.now();
   const challengeId = {json.dumps(challenge_id)};
   const target = {json.dumps(target)};
   let nonce = 0;
@@ -190,6 +193,13 @@ async function solve() {{
       await yieldToUI();
     }}
   }} while (!digest.startsWith(target));
+
+  // Respect server-enforced minimum solve time — if the PoW completed
+  // faster than MIN_SOLVE_MS, wait for the remainder before submitting.
+  const elapsed = Date.now() - startTime;
+  if (elapsed < MIN_SOLVE_MS) {{
+    await new Promise(r => setTimeout(r, MIN_SOLVE_MS - elapsed));
+  }}
 
   const signals = {{
     webdriver: navigator.webdriver === true,

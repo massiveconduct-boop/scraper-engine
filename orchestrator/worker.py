@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 
 if TYPE_CHECKING:
+    from config.schema import AppConfig
     from core.models import ScrapeRequest
     from core.tenant import TenantId
     from storage.dlq import DeadLetterQueue
@@ -35,11 +36,33 @@ class Worker:
         circuit_breaker: CircuitBreaker,
         politeness: PolitenessController,
         dlq: DeadLetterQueue,
+        config: AppConfig | None = None,
     ) -> None:
         self._redis = redis
         self._circuit_breaker = circuit_breaker
         self._politeness = politeness
         self._dlq = dlq
+        # config drives fetcher construction via fetcher/factory.py. Loaded once
+        # here (not per-fetch) so production.yaml values are authoritative for
+        # every fetch this worker dispatches. Falls back to load_config() so
+        # callers that don't pass one still get YAML-driven fetchers, never
+        # bare constructor defaults.
+        if config is None:
+            from config.loader import load_config
+            config = load_config()
+        self._config = config
+        # One ChallengeDetector for escalation decisions (challenge pages and
+        # JS-gated shells) — same single source of truth the fetchers use.
+        from fetcher.challenge_detector import ChallengeDetector
+        self._challenge_detector = ChallengeDetector()
+        # Build the CAPTCHA solver once (env keys + per-tenant budget on Redis)
+        # and thread it into the browser fetchers via the factory. None when no
+        # provider key is set — solving stays disabled, fetch still runs. Built
+        # here (not per-fetch) for the same reason config is: one authoritative
+        # construction site (round 20 — wires services/captcha_solver in).
+        from core.budget import CapSolverBudget
+        from services.captcha_solver import build_captcha_solver
+        self._captcha_solver = build_captcha_solver(CapSolverBudget(self._redis))
         # Circuit breaker and politeness use raw Redis (not tenant-scoped),
         # so pass the underlying client for system-level key operations
         if hasattr(circuit_breaker, '_redis'):
@@ -86,6 +109,16 @@ class Worker:
 
                 if result.success:
                     await self._circuit_breaker.record_success(domain)
+                    # A JS-gated shell from a non-final level is not real content
+                    # — an HTTP-only L1 fetch of a SPA returns 200 with an empty
+                    # mount point. Escalate to a browser level that runs JS instead
+                    # of caching the shell (round 15 — closes the "200 but
+                    # under-rendered" gap). Browser levels render JS so they won't
+                    # trip this; the final level accepts whatever it got.
+                    if level < LEVELS[-1] and self._challenge_detector.looks_javascript_gated(
+                        result.html or ""
+                    ):
+                        continue
                     results.append(result)
                     break
                 else:
@@ -94,6 +127,9 @@ class Worker:
                         FailureCategory.SSRF_BLOCKED,
                         FailureCategory.QUOTA_EXCEEDED,
                         FailureCategory.PROXY_EXHAUSTED,
+                        # Escalating a dead/unresolvable host is futile — a browser
+                        # can't resolve DNS the HTTP client couldn't (round 15).
+                        FailureCategory.HOST_UNREACHABLE,
                     ):
                         await self._dlq.enqueue(
                             tenant_id, job_id, url_str,
@@ -128,11 +164,11 @@ class Worker:
     ) -> FetchResult | None:
         """Dispatch fetch to the appropriate level fetcher."""
         if level == 1:
-            from fetcher.level_1 import Level1Fetcher
-            l1_fetcher = Level1Fetcher()
+            from fetcher.factory import build_level1_fetcher
+            l1_fetcher = build_level1_fetcher(self._config)
             return await l1_fetcher.fetch(url, tenant_id)
         elif level == 2:
-            from fetcher.level_2 import Level2Fetcher
+            from fetcher.factory import build_level2_fetcher
             from proxy.manager import ProxyManager
 
             pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
@@ -140,7 +176,9 @@ class Worker:
             try:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
                 async with lease:
-                    l2_fetcher = Level2Fetcher()
+                    l2_fetcher = build_level2_fetcher(
+                        self._config, captcha_solver=self._captcha_solver
+                    )
                     return await l2_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:
                 return FetchResult(
@@ -152,7 +190,7 @@ class Worker:
                     error_message="Proxy pool exhausted",
                 )
         elif level == 3:
-            from fetcher.level_3 import Level3Fetcher
+            from fetcher.factory import build_level3_fetcher
             from proxy.manager import ProxyManager
 
             pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
@@ -160,7 +198,9 @@ class Worker:
             try:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))
                 async with lease:
-                    l3_fetcher = Level3Fetcher()
+                    l3_fetcher = build_level3_fetcher(
+                        self._config, captcha_solver=self._captcha_solver
+                    )
                     return await l3_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:
                 return FetchResult(

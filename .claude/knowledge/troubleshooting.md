@@ -93,3 +93,82 @@
 **Symptom:** pytest hangs or crashes on test collection for files importing `browser.*`.
 **Root cause:** pytest collection triggers module imports. `browser.camoufox_wrapper` imports `camoufox.async_api.AsyncCamoufox` → Firefox binary loading.
 **Fix:** Mark Camoufox-dependent tests with `@pytest.mark.skip`. Run them standalone via `python -c` when Camoufox available.
+
+---
+
+## Force-Push Recovery Patterns (Round 11)
+
+### Test Files Silently Not Collected (Untracked in Git)
+**Symptom:** Test count drops from 209 to 197. No collection errors — files simply not discovered.
+**Root cause:** `git reset --hard` reverts the working tree to a prior commit. Files created after that commit become untracked. Pytest only discovers tracked files in the working tree.
+**Diagnosis:** `git status --short` — look for `?? tests/` lines. These files exist on disk but are not in the index.
+**Fix:** `git add tests/<path>` for each untracked test file. Verify with `pytest --collect-only -q`.
+**Occurrence:** Round 11 — 5 test files lost: `tests/unit/test_promotion.py`, `tests/unit/test_session_isolation.py`, `tests/live/test_session_persistence.py`, `tests/integration/test_promotion.py`, `tests/integration/test_quota_per_tenant.py`. 13 tests. All restored via `git add` + commit.
+
+### Production Code Reverted by Force-Push
+**Symptom:** Previously-working tests fail with signature errors, import errors, or missing attributes.
+**Root cause:** `git reset --hard <old-commit>` also reverts production files that were modified in later commits. Test files that import those modules then fail at runtime (not collection time).
+**Diagnosis:** Check key production files for reverted content. Compare function counts: `grep -c "def\|class" <file>` against expected. Check for missing parameters (`__init__` signature changed), missing methods, wrong backends (Redis vs Postgres).
+**Fix:** Restore each reverted production file from prior evidence. Check: `browser/session_state.py` (Redis→Postgres), `browser/pool.py` (logging + session wiring), `browser/camoufox_wrapper.py` (storage_state constructor), `api/routes.py` (SSRF+quota+DB wiring), `api/main.py` (lifespan vs on_event), `observability/metrics.py` (REGISTRY + count_validated_proxies), `core/quota.py` (tenant_id in key), `api/auth.py` (revoked_at), `storage/postgres_client.py` (public in search_path).
+
+### InFailedSQLTransactionError After search_path Fix
+**Symptom:** `asyncpg.exceptions.InFailedSQLTransactionError: current transaction is aborted, commands ignored until end of transaction block`.
+**Root cause:** `PostgresClient.acquire()` wraps `SET search_path` + yield in `BEGIN...COMMIT`. If the first query after `SET search_path` fails (e.g., `UndefinedTableError` because `public` schema was excluded from the path), the transaction is aborted. All subsequent queries in the same `acquire()` block fail with `InFailedSQLTransactionError`.
+**Fix:** Always include `public` in search_path: `SET search_path = {tenant_str}, public`. The `proxy_pool` table lives in `public` schema, not per-tenant schemas.
+**Occurrence:** Round 11 — `test_promotion.py` fixture tried `DELETE FROM proxy_pool` with search_path set to only `system` (no `public`). First query failed → transaction aborted → cleanup SET search_path also failed → cascade error on next acquire.
+
+### UndefinedTableError: relation "proxy_pool" does not exist
+**Symptom:** `asyncpg.exceptions.UndefinedTableError: relation "proxy_pool" does not exist`.
+**Root cause:** Same as above — `SET search_path` set to tenant schema only, missing `public`. `proxy_pool` is a global table in `public` schema.
+**Fix:** `SET search_path = {tenant_str}, public` — tenant schema first (so per-tenant tables shadow public if name collision), public as fallback.
+
+### SessionStateManager.__init__() got unexpected keyword argument 'pg'
+**Symptom:** `TypeError: SessionStateManager.__init__() got an unexpected keyword argument 'pg'`.
+**Root cause:** `browser/session_state.py` was reverted to the old Redis-based version (`__init__(self, redis: RedisClient)`). The test file and `browser/pool.py` expect the Postgres-based version (`__init__(self, pg: PostgresClient, ttl_days: int = 30)`).
+**Fix:** Restore the Postgres-based `SessionStateManager` from round 7 evidence. Signature must be `__init__(self, pg: PostgresClient, ttl_days: int = 30)`. Internals: `load`/`save`/`delete` use `self._pg.acquire(tenant_id)`, query `browser_sessions` table.
+
+---
+
+## CAPTCHA Provider Gotchas (Round 19)
+
+### NoCaptchaAI public docs are STALE — use live-verified task forms
+The docs at docs.nocaptchaai.com under-specify/mis-state several tasks. Live-probed
+correct forms (createTask accepted, HTTP 200 errorId 0):
+- **ImageToText:** image field is `image`, NOT the docs' `body` (`body` → `ERROR_INVALID_TASK_DATA "No images found"`). Solves SYNCHRONOUSLY (solution in the createTask response). `solution.text` is a **list**.
+- **reCAPTCHA v2:** `ReCaptchaV2TaskProxyLess` (casing: ReCaptcha…ProxyLess). Docs' `RecaptchaV2TaskProxyless` is accepted but sits `idle` forever (no solver).
+- **Cloudflare Turnstile:** `AntiTurnstileTask`. Docs' `TurnstileTaskProxyLess`/`CloudflareTurnstileTaskProxyLess` → HTTP 400 "Payload not valid".
+- **GeeTest v4:** `captchaId` field. Docs' `gt`/`challenge` (v3) → "No images found".
+- **MTCaptcha:** `MTCaptchaTask` accepted.
+- **AWS WAF:** `AWSWAFTask` needs per-request runtime data (awsKey/awsIv/awsContext/awsChallengeJS) extracted from the live page — no static site key. Synthetic input → "Payload not valid".
+
+### Captcha task accepted but stuck `status:"idle"` forever
+Two causes seen: (1) account's "use wallet balance for solving" toggle OFF — tasks
+accepted+queued but never funded/solved; (2) the target is unsolvable (Google's
+reCAPTCHA demo key never routes to a solver). Diagnose: check `getBalance` (`packages`,
+balance) and try a known-solvable task (ImageToText with a generated text image).
+Demo/test sitekeys generally do NOT route to solvers — test with real production
+sitekeys or ImageToText.
+
+### CapSolver key rejected — HTTP 401 ERROR_KEY_DENIED_ACCESS
+The current `.env` CAPSOLVER_API_KEY is invalid (fallback non-functional until
+replaced). Not a code issue — the same shared code path talks to NoCaptchaAI fine.
+
+---
+
+## Docker Image Ships Camoufox but Can't Launch a Browser (Round 13)
+
+**Symptom:** app imports fine, camoufox binary present, but a real browser fetch
+fails inside the container. Chain of errors, each a missing runtime dep the minimal
+`slim` base lacks:
+1. `camoufox.exceptions.CannotFindXvfb` → add `xvfb` (production config uses headless_mode=virtual)
+2. `NotInstalledGeoIPExtra` → install `camoufox[geoip]` (config geoip=true), not plain camoufox
+3. `libgtk-3.so.0: cannot open shared object file` → add `libgtk-3-0`
+4. `BrowserType.launch: Failed` → add `libx11-xcb1`
+
+Also: Camoufox fetches to `/root/.cache/camoufox`, NOT `/root/.camoufox` (stale
+pre-round-13 Dockerfile path). Surfaced only by running the browser suite IN-container
+(`docker run --network host … pytest tests/chaos/test_safe_content_guard.py`).
+
+**4GB image export exceeds the harness 120s command cap.** Build detached:
+`nohup docker build -t <tag> . > /tmp/build.log 2>&1 &` — orphaned process ignores
+the tool timeout; poll the log / `docker images` across turns.

@@ -12,7 +12,7 @@ same pattern as the rest of the storage layer. No separate connection path.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ class SessionStateManager:
 
         Upserts: overwrites existing session for same domain, extends TTL.
         """
-        expires_at = datetime.now(timezone.utc) + timedelta(days=self._ttl_days)
+        expires_at = datetime.now(UTC) + timedelta(days=self._ttl_days)
         async with self._pg.acquire(tenant_id) as conn:
             await conn.execute(
                 """INSERT INTO browser_sessions (domain, storage_state, last_used_at, expires_at)

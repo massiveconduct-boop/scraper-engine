@@ -82,13 +82,14 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_promotes_validating_proxy(self, pg, classifier):
         """Proxy that passes HTTP validation is promoted from 25→60."""
+        from core.models import AnonymityLevel
         from core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": "1.2.3.4", "port": 3128, "protocol": "HTTP"},
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         h._http_validate = AsyncMock(
-            return_value=(True, __import__("core.models", fromlist=["AnonymityLevel"]).AnonymityLevel.ELITE),
+            return_value=(True, AnonymityLevel.ELITE),
         )
         promoted = await h.promote_tcp_only(limit=5, tenant=TenantId("system"))
         assert promoted == 1
@@ -99,8 +100,8 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_skips_non_validating_proxy(self, pg, classifier):
         """Proxy that fails HTTP validation is not promoted, but attempt IS tracked."""
-        from core.tenant import TenantId
         from core.models import AnonymityLevel
+        from core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": "5.6.7.8", "port": 8080, "protocol": "HTTP"},
         ]
@@ -125,8 +126,8 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_limit_caps_rows_processed(self, pg, classifier):
         """limit= parameter caps how many rows are fetched for re-validation."""
-        from core.tenant import TenantId
         from core.models import AnonymityLevel
+        from core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": f"10.0.0.{i}", "port": 3128, "protocol": "HTTP"} for i in range(3)
         ]
