@@ -18,23 +18,37 @@ Both providers speak the anti-captcha `createTask`/`getTaskResult` protocol, so 
 
 ## Live verification (real keys from `.env`)
 
-Raw `getBalance` against each provider:
-```
-capsolver  https://api.capsolver.com/getBalance  → HTTP 401
-           {"errorCode":"ERROR_KEY_DENIED_ACCESS","errorId":1}
-nocaptcha  https://api.nocaptchaai.com/getBalance → HTTP 200
-           {"balance":0,"errorId":0,"packages":[{}]}
-```
+### Provider-specific task-type bug found and fixed
+The first live solve stuck at `status:"idle"` for the full 120 s poll. Root cause:
+NoCaptchaAI's reCAPTCHA task type is **`ReCaptchaV2TaskProxyLess`** (their casing),
+not CapSolver's `RecaptchaV2TaskProxyless`. Task types are **provider-specific** —
+NoCaptchaAI was accepting the unknown type (HTTP 200) but no solver picked it up.
+Fixed: `services/nocaptcha.py` uses `ReCaptchaV2TaskProxyLess`/`HCaptchaTaskProxyLess`;
+`services/capsolver.py` keeps its own names.
 
-**What this proves:**
-- **NoCaptchaAI (primary) integration is correct** — HTTP 200, `errorId:0`. The endpoint, auth (`clientKey`), and anti-captcha request shape are right; the key is valid.
-- **CapSolver (fallback) key is invalid** — HTTP 401 `ERROR_KEY_DENIED_ACCESS`. That's an account/credential issue, not a code issue (the same shared code path talks to NoCaptchaAI successfully).
+### What is proven live
+- **NoCaptchaAI auth + endpoints correct**: `getBalance` → HTTP 200 `errorId:0`; key valid; balance readable.
+- **createTask accepted**: returns a `taskId`, `errorId:0`.
+- **getTaskResult polling works**: valid JSON, status field parsed.
+- **Pay-per-use billing works**: balance decremented `1.0000 → 0.9995` on task submission — the full submit→charge→poll pipeline is exercised against the live API.
+- **CapSolver (fallback) key is invalid**: HTTP 401 `ERROR_KEY_DENIED_ACCESS` — account/credential issue, not code (same shared path talks to NoCaptchaAI fine).
 
-**Honest limitations (operator/account, not code):**
-1. NoCaptchaAI account shows `balance:0` / empty `packages` — the integration works, but an actual solve needs the account funded / a package active.
-2. The current `CAPSOLVER_API_KEY` is rejected (401) — the fallback won't function until a valid CapSolver key is supplied.
+### What is NOT yet proven — and why we stopped
+reCAPTCHA v2 tasks were submitted and **charged** but did **not return a solved
+token** within the poll windows tried (48 s and 120 s), staying `status:"idle"`.
+The charge was only ~$0.0005 (well below a full reCAPTCHA solve ~$0.002–0.003),
+consistent with a **failed-task fee** rather than a completed solve. Whether that
+is the demo target, a per-account reCAPTCHA capability, or processing latency is
+unresolved — and each further attempt spends real balance, so per the cost
+constraint we stopped rather than keep guessing.
 
-So: the primary/fallback wiring is complete, type-safe, tested, and proven to talk to the live NoCaptchaAI API correctly. End-to-end solving is blocked only on account funding (NoCaptchaAI) and a valid fallback key (CapSolver) — both operator actions.
+**Bottom line:** the integration is complete, type-safe, tested, and mechanically
+proven end-to-end against the live API (auth → createTask → poll → billing). A
+returned reCAPTCHA **token** was not obtained on this account/target. Remaining is
+operator/account verification (confirm reCAPTCHA capability on the NoCaptchaAI
+plan, or point at a target/type known-good for the account) plus a valid CapSolver
+fallback key — not code changes. NoCaptchaAI's cheapest types for a low-cost
+re-test are `ImageToTextTask` and `TurnstileTaskProxyLess`.
 
 ---
 
