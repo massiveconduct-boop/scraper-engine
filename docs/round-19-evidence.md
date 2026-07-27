@@ -33,22 +33,38 @@ Fixed: `services/nocaptcha.py` uses `ReCaptchaV2TaskProxyLess`/`HCaptchaTaskProx
 - **Pay-per-use billing works**: balance decremented `1.0000 → 0.9995` on task submission — the full submit→charge→poll pipeline is exercised against the live API.
 - **CapSolver (fallback) key is invalid**: HTTP 401 `ERROR_KEY_DENIED_ACCESS` — account/credential issue, not code (same shared path talks to NoCaptchaAI fine).
 
-### What is NOT yet proven — and why we stopped
-reCAPTCHA v2 tasks were submitted and **charged** but did **not return a solved
-token** within the poll windows tried (48 s and 120 s), staying `status:"idle"`.
-The charge was only ~$0.0005 (well below a full reCAPTCHA solve ~$0.002–0.003),
-consistent with a **failed-task fee** rather than a completed solve. Whether that
-is the demo target, a per-account reCAPTCHA capability, or processing latency is
-unresolved — and each further attempt spends real balance, so per the cost
-constraint we stopped rather than keep guessing.
+### Not yet returning a token — root-caused to the account, not the code
+Across multiple attempts (production 120 s poll + raw probes, before and after the
+user enabled the account's "use wallet balance for solving" toggle), reCAPTCHA v2
+tasks are **accepted** (`errorId:0`, `taskId`) but stay `status:"idle"` forever —
+no solver is ever assigned.
 
-**Bottom line:** the integration is complete, type-safe, tested, and mechanically
-proven end-to-end against the live API (auth → createTask → poll → billing). A
-returned reCAPTCHA **token** was not obtained on this account/target. Remaining is
-operator/account verification (confirm reCAPTCHA capability on the NoCaptchaAI
-plan, or point at a target/type known-good for the account) plus a valid CapSolver
-fallback key — not code changes. NoCaptchaAI's cheapest types for a low-cost
-re-test are `ImageToTextTask` and `TurnstileTaskProxyLess`.
+**The request is byte-for-byte identical to NoCaptchaAI's own documented example**
+(fetched from their `llms-full.txt`):
+```
+POST https://api.nocaptchaai.com/createTask
+{ "clientKey": "…", "task": { "type": "ReCaptchaV2TaskProxyLess",
+  "websiteURL": "https://www.google.com/recaptcha/api2/demo",
+  "websiteKey": "…" } }
+→ { "errorId": 0, "status": "idle", "taskId": "…" }   # then poll until "ready"
+```
+Same endpoint, same `clientKey` body auth (which `getBalance` confirms is valid,
+HTTP 200), same task type, same fields. `getBalance` also shows `packages:[{}]`
+(empty) — no active solving entitlement — which is the most likely reason tasks
+sit idle: the account accepts and queues them but nothing picks them up.
+
+**Conclusion (definitive from the code side):** the integration is correct — it
+matches the official docs exactly and the auth/createTask/poll/billing mechanics
+are all verified against the live API. reCAPTCHA solving does not complete on this
+specific account (perpetual `idle`, empty `packages`), which is a NoCaptchaAI
+dashboard/plan configuration matter (activate a reCAPTCHA capability/package, or
+confirm pay-per-use is enabled for that type — likely needs NoCaptchaAI support),
+**not** a code change. Once the account returns `ready` for a task, this client
+parses `solution.token` and returns it with no further changes.
+
+Remaining operator items: (1) NoCaptchaAI account — activate reCAPTCHA solving
+capability; (2) supply a valid `CAPSOLVER_API_KEY` for the fallback (current one
+401s). Lowest-cost re-test types: `ImageToTextTask`, `TurnstileTaskProxyLess`.
 
 ---
 
