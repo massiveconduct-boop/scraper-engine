@@ -33,7 +33,10 @@ PROMOTION_CONCURRENCY = 5       # bounded parallel HTTP validations
 PROMOTION_COOLDOWN_SECONDS = 900  # 15 minutes between attempts per proxy
 
 ValidateFn = Callable[
-    [str, int, str, float],
+    # timeout is an impl detail with a default on the concrete function, so the
+    # contract is the 3 required args; a fn with an extra defaulted param still
+    # satisfies this.
+    [str, int, str],
     Coroutine[None, None, tuple[bool, "AnonymityLevel"]],
 ]
 

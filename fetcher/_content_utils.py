@@ -15,13 +15,18 @@ the same "one source of truth" principle already applied to ChallengeDetector.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fetcher.challenge_detector import ChallengeDetector
 
+# `page` is a Playwright/Camoufox Page — duck-typed as Any here so these shared
+# helpers don't take a hard dependency on the Playwright types (which aren't
+# consistently importable across the Camoufox stack). The concrete methods
+# (content/evaluate/wait_for_timeout) are exercised by the live/chaos tests.
 
-async def safe_content(page: object) -> str | None:
+
+async def safe_content(page: Any) -> str | None:
     """Return page.content() or None if the page is mid-navigation.
 
     Calls to page.content() while the page is navigating or replacing the DOM
@@ -31,7 +36,8 @@ async def safe_content(page: object) -> str | None:
     (round 12.4).
     """
     try:
-        return await page.content()  # type: ignore[union-attr]
+        content: str = await page.content()
+        return content
     except Exception:
         from observability.metrics import safe_content_none_total
 
@@ -40,7 +46,7 @@ async def safe_content(page: object) -> str | None:
 
 
 async def poll_until_solved(
-    page: object,
+    page: Any,
     challenge_detector: ChallengeDetector,
     *,
     max_total_wait_ms: int,
@@ -72,14 +78,14 @@ async def poll_until_solved(
         )
         and waited_ms < max_total_wait_ms
     ):
-        await page.wait_for_timeout(retry_wait_increment_ms)  # type: ignore[attr-defined]
+        await page.wait_for_timeout(retry_wait_increment_ms)
         waited_ms += retry_wait_increment_ms
         html = await safe_content(page)
     return html
 
 
 async def autoscroll(
-    page: object,
+    page: Any,
     *,
     max_passes: int,
     wait_ms: int,
@@ -105,15 +111,15 @@ async def autoscroll(
         return 0
     passes = 0
     try:
-        last_height = await page.evaluate("() => document.body.scrollHeight")  # type: ignore[attr-defined]
+        last_height = await page.evaluate("() => document.body.scrollHeight")
     except Exception:
         return 0
     stable = 0
     for _ in range(max_passes):
         try:
-            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")  # type: ignore[attr-defined]
-            await page.wait_for_timeout(wait_ms)  # type: ignore[attr-defined]
-            new_height = await page.evaluate("() => document.body.scrollHeight")  # type: ignore[attr-defined]
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(wait_ms)
+            new_height = await page.evaluate("() => document.body.scrollHeight")
         except Exception:
             break
         passes += 1

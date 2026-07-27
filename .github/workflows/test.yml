@@ -49,9 +49,9 @@ jobs:
             exit 1
           fi
           echo "OK — force_engine test seam has zero production call sites"
-      - name: mypy ratchet (fails only on NEW type errors beyond committed baseline)
+      - name: mypy strict (baseline now empty — any error fails the build)
         run: |
-          mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
+          mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
           grep "^[^ ]*:[0-9]*: error:" /tmp/mypy.out | sort >/tmp/mypy-current.txt
           sort tools/mypy-baseline.txt >/tmp/baseline-sorted.txt
           echo "=== Current findings ===" && cat /tmp/mypy-current.txt

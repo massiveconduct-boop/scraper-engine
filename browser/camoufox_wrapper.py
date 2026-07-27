@@ -40,7 +40,7 @@ class CamoufoxWrapper:
     def __init__(
         self,
         proxy: Proxy | None,
-        tenant_id: TenantId,
+        tenant_id: TenantId | None,
         persistent_profile_id: str | None = None,
         storage_state: dict[str, object] | None = None,
     ) -> None:
@@ -51,6 +51,8 @@ class CamoufoxWrapper:
         self._browser: Any = None
         self._context: Any | None = None
         self._isolated_ctx: Any | None = None
+        # set by BrowserPool.lease on healthy return, read for domain-match reuse
+        self._last_domain: str | None = None
 
     async def __aenter__(self) -> object:
         """Acquire semaphore, launch Camoufox, apply storage_state if set.
@@ -71,7 +73,7 @@ class CamoufoxWrapper:
             if self.proxy is not None:
                 proxy_config = {"server": self.proxy.url()}
 
-            self._browser = AsyncCamoufox(
+            self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
                 geoip=True,
                 humanize=1.5,
                 headless="virtual",

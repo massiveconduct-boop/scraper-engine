@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
@@ -36,6 +36,12 @@ SCORE_TCP_ONLY = 25  # below L1 threshold (40)
 SCORE_VALIDATED = 60  # above L1 threshold
 
 
+class SupportsClassify(Protocol):
+    """Anything that can classify an IP's ASN class (the harvester only needs this)."""
+
+    async def classify(self, ip: str) -> str: ...
+
+
 class FakeClassifier:
     async def classify(self, ip: str) -> str:
         return "unknown"
@@ -45,11 +51,11 @@ class ProxyHarvester:
     def __init__(
         self, pg: PostgresClient,
         sources: list[str] | None = None,
-        asn_classifier: object | None = None,
+        asn_classifier: SupportsClassify | None = None,
     ) -> None:
         self._pg = pg
         self._sources = sources or []
-        self._classifier = asn_classifier or FakeClassifier()
+        self._classifier: SupportsClassify = asn_classifier or FakeClassifier()
 
     async def harvest_once(self, limit: int = 100) -> int:
         """Run one harvest cycle from both paths. Returns total proxies."""
@@ -216,7 +222,7 @@ class ProxyHarvester:
         return result
 
     @staticmethod
-    def _parse_geonode(data: dict, limit: int) -> list[tuple[str, int, str]]:
+    def _parse_geonode(data: dict[str, Any], limit: int) -> list[tuple[str, int, str]]:
         result = []
         for entry in data.get("data", [])[:limit * 2]:
             ip = entry.get("ip", "")
@@ -323,7 +329,9 @@ asyncio.run(main())'''
 
     # ── background promotion ──────────────────────────────────────────
 
-    async def promote_tcp_only(self, limit: int = 50, tenant: TenantId = None) -> int:
+    async def promote_tcp_only(
+        self, limit: int = 50, tenant: TenantId | None = None
+    ) -> int:
         """Promote TCP-only proxies (score=25) to validated (score=60).
 
         Re-checks proxies with reliability_score < 40 via HTTP validator.

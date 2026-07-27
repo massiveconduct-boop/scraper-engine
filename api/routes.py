@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, FastAPI, Header, HTTPException
 
 from core.models import JobStatus, JobStatusResponse, ScrapeRequest
 
@@ -149,7 +148,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def register_routes(app: Any) -> None:
+def register_routes(app: FastAPI) -> None:
     """Register all API routes on the FastAPI app, including /metrics."""
     from fastapi import Response
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
@@ -173,7 +173,13 @@ class Level2Fetcher:
                 browser = await p.firefox.launch(headless=True)
                 context = await browser.new_context()
                 page = await context.new_page()
-                await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
+                # goto_wait_until is a config str; Playwright wants a Literal. Cast
+                # rather than constrain config to the enum (test-only raw path).
+                await page.goto(
+                    url,
+                    wait_until=cast("Any", self._goto_wait_until),
+                    timeout=timeout * 1000,
+                )
                 with contextlib.suppress(Exception):
                     await page.wait_for_load_state(
                         "networkidle", timeout=self._networkidle_timeout_ms

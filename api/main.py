@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,7 +15,7 @@ def create_app() -> FastAPI:
     from .routes import register_routes
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Connect Postgres, Redis, and initialise TenantResolver at startup."""
         import api.dependencies as deps
         from api.auth import TenantResolver
@@ -40,7 +41,7 @@ def create_app() -> FastAPI:
         if deps._storage_pg is not None:
             await deps._storage_pg.stop()
         if deps._storage_redis is not None:
-            await deps._storage_redis.close()
+            await deps._storage_redis.stop()
 
     app = FastAPI(
         title="Scraper Engine",
