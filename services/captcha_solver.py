@@ -36,7 +36,7 @@ class CaptchaProvider(Protocol):
     ) -> str | None: ...
 
     async def solve_aws_waf(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+        self, tenant_id: TenantId, page_url: str, **aws_fields: str
     ) -> str | None: ...
 
     async def solve_mtcaptcha(
@@ -44,7 +44,8 @@ class CaptchaProvider(Protocol):
     ) -> str | None: ...
 
     async def solve_geetest(
-        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = ...
+        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        challenge: str | None = ...,
     ) -> str | None: ...
 
     async def get_balance(self) -> float: ...
@@ -91,25 +92,34 @@ class CaptchaSolver:
     ) -> str | None:
         return await self._key_url("solve_turnstile", tenant_id, site_key, page_url)
 
-    async def solve_aws_waf(
-        self, tenant_id: TenantId, site_key: str, page_url: str
-    ) -> str | None:
-        return await self._key_url("solve_aws_waf", tenant_id, site_key, page_url)
-
     async def solve_mtcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
         return await self._key_url("solve_mtcaptcha", tenant_id, site_key, page_url)
 
-    async def solve_geetest(
-        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+    async def solve_aws_waf(
+        self, tenant_id: TenantId, page_url: str, **aws_fields: str
     ) -> str | None:
-        token = await self._primary.solve_geetest(tenant_id, gt, page_url, challenge)
+        token = await self._primary.solve_aws_waf(tenant_id, page_url, **aws_fields)
+        if token is not None:
+            return token
+        if self._fallback is not None:
+            logger.info("captcha_primary_miss solve_aws_waf — trying fallback")
+            return await self._fallback.solve_aws_waf(tenant_id, page_url, **aws_fields)
+        return None
+
+    async def solve_geetest(
+        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        challenge: str | None = None,
+    ) -> str | None:
+        token = await self._primary.solve_geetest(tenant_id, captcha_id, page_url, challenge)
         if token is not None:
             return token
         if self._fallback is not None:
             logger.info("captcha_primary_miss solve_geetest — trying fallback")
-            return await self._fallback.solve_geetest(tenant_id, gt, page_url, challenge)
+            return await self._fallback.solve_geetest(
+                tenant_id, captcha_id, page_url, challenge
+            )
         return None
 
 

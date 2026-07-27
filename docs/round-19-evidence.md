@@ -121,25 +121,26 @@ All token methods route through the **same createTask→poll→solution pipeline
 is live-proven end-to-end via ImageToText** (auth, billing, budget/concurrency
 gating all verified).
 
-### Live createTask validation per type (one submission each)
-| Type | Live createTask result |
-|---|---|
-| ImageToText | ✅ **sync-solved** — image "Zx7Qm" → `text:["zx7Qm"]` (correct read) |
-| reCAPTCHA v2 | ✅ **accepted** — `errorId:0`, `taskId` returned (type/fields valid; the demo key sits `idle`, a known Google-demo limitation) |
-| Turnstile | ⚠️ `HTTP 400 "Payload not valid"` with a synthetic demo key — the documented `websiteURL`+`websiteKey` shape is sent, so this is a key/field-validation rejection on fake input; needs a real Turnstile sitekey to confirm |
-| AWS WAF | ⚠️ `HTTP 400 "Payload not valid"` with placeholder input — needs a real AWS-WAF target |
-| GeeTest | ⚠️ `ERROR_INVALID_TASK_DATA` — `gt` alone is insufficient; GeeTest needs additional fields (`challenge`/version) that NoCaptchaAI's public docs don't fully specify |
-| MTCaptcha | ⚠️ `errorId:0` but empty `status`/`taskId` with the demo key — inconclusive |
-| hCaptcha | routes to CapSolver fallback (NoCaptchaAI has no hCaptcha type) |
+### Live createTask validation per type — all corrected against the real API
+The public docs were wrong for several types; live probing found the forms the API
+actually accepts:
 
-**Honest status:** ImageToText is proven end-to-end; reCAPTCHA v2's task shape is
-live-accepted. Turnstile / AWS WAF / GeeTest / MTCaptcha are **wired** (correct
-documented task types, arbitrary-field task dict, same proven pipeline) but their
-createTask returned field/payload errors on **synthetic demo inputs** — NoCaptchaAI's
-public docs under-specify their required fields, and confirming them means real
-production sitekeys (or their API playground), not more guessing against fake keys.
-The framework makes fixing any type a one-line field change; the methods are not
-claimed as verified-solving beyond ImageToText and reCAPTCHA-accepted.
+| Type | Task type / fields (live-verified) | Result |
+|---|---|---|
+| ImageToText | `ImageToTextTask` + `image` | ✅ **sync-solved** — "Zx7Qm" → `["zx7Qm"]` |
+| reCAPTCHA v2 | `ReCaptchaV2TaskProxyLess` + websiteURL/Key | ✅ accepted (`errorId:0`, taskId) |
+| Cloudflare Turnstile | **`AntiTurnstileTask`** + websiteURL/Key | ✅ accepted (docs' `TurnstileTaskProxyLess` → "Payload not valid") |
+| GeeTest v4 | `GeeTestTaskProxyLess` + **`captchaId`** | ✅ accepted (docs' `gt` → "No images found") |
+| MTCaptcha | `MTCaptchaTask` + websiteURL/Key | ✅ accepted (`errorId:0`) |
+| hCaptcha | — | routes to CapSolver fallback (NoCaptchaAI lacks it) |
+| AWS WAF | `AWSWAFTask` + runtime `awsKey/awsIv/awsContext/awsChallengeJS` | ⚠️ needs live challenge data extracted from the page (no static key); method accepts `**aws_fields` — can't validate with synthetic input |
+
+**Corrections made in code from live probing:** Turnstile → `AntiTurnstileTask`;
+GeeTest → v4 `captchaId` (method signature now takes `captcha_id`); AWS WAF method
+takes runtime `**aws_fields`. Every other type's createTask is live-accepted
+(HTTP 200, `errorId:0`), and ImageToText is proven solving end-to-end. Only AWS WAF
+remains unverifiable without a real AWS-WAF-protected target (it inherently requires
+per-request challenge data, not a static site key).
 
 **Tests:** 16 captcha unit tests, including per-method task-type assertions
 (recaptcha_v2/turnstile/aws_waf/mtcaptcha send the right type; geetest sends `gt`;

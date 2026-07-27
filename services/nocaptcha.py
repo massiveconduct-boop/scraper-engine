@@ -68,31 +68,38 @@ class NoCaptchaAIClient:
     async def solve_turnstile(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        """Solve Cloudflare Turnstile (the most common modern challenge). Token or None."""
+        """Solve Cloudflare Turnstile (the most common modern challenge). Token or None.
+
+        NoCaptchaAI's accepted type is AntiTurnstileTask (live-verified; the docs'
+        TurnstileTaskProxyLess is rejected 'Payload not valid')."""
         return await self._solve_token(tenant_id, {
-            "type": "TurnstileTaskProxyLess",
+            "type": "AntiTurnstileTask",
             "websiteURL": page_url,
             "websiteKey": site_key,
         })
 
     async def solve_aws_waf(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+        self, tenant_id: TenantId, page_url: str, **aws_fields: str
     ) -> str | None:
-        """Solve AWS WAF challenge. Returns token/cookie or None."""
+        """Solve AWS WAF. Requires runtime challenge data extracted from the live
+        page (awsKey/awsIv/awsContext/awsChallengeJS) — passed as **aws_fields —
+        since AWS WAF has no static site key."""
         return await self._solve_token(tenant_id, {
             "type": "AWSWAFTask",
             "websiteURL": page_url,
-            "websiteKey": site_key,
+            **aws_fields,
         })
 
     async def solve_geetest(
-        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        challenge: str | None = None,
     ) -> str | None:
-        """Solve GeeTest (common on Asian sites). Returns solution token or None."""
+        """Solve GeeTest v4. Uses captchaId (live-verified accepted; the v3 gt/
+        challenge form is rejected by this API). Returns solution or None."""
         task: dict[str, object] = {
             "type": "GeeTestTaskProxyLess",
             "websiteURL": page_url,
-            "gt": gt,
+            "captchaId": captcha_id,
         }
         if challenge is not None:
             task["challenge"] = challenge

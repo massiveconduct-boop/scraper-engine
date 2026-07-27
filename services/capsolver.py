@@ -77,21 +77,22 @@ class CapSolverClient:
         })
 
     async def solve_aws_waf(
-        self, tenant_id: TenantId, site_key: str, page_url: str
+        self, tenant_id: TenantId, page_url: str, **aws_fields: str
     ) -> str | None:
         return await self._solve_token(tenant_id, {
             "type": "AntiAwsWafTaskProxyLess",
             "websiteURL": page_url,
-            "websiteKey": site_key,
+            **aws_fields,
         })
 
     async def solve_geetest(
-        self, tenant_id: TenantId, gt: str, page_url: str, challenge: str | None = None
+        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        challenge: str | None = None,
     ) -> str | None:
         task: dict[str, object] = {
             "type": "GeeTestTaskProxyless",
             "websiteURL": page_url,
-            "gt": gt,
+            "captchaId": captcha_id,
         }
         if challenge is not None:
             task["challenge"] = challenge
