@@ -51,6 +51,9 @@ class ProxyHarvesterConfig(BaseModel):
         default_factory=lambda: ["proxifly", "proxyscrape", "iplocate", "proxripper"]
     )
     interval_seconds: int = 600
+    # The daemon runs three loops on independent timers (proxy/harvester_daemon.py).
+    promotion_interval_seconds: int = 900
+    health_interval_seconds: int = 300
 
 
 class PolitenessConfig(BaseModel):

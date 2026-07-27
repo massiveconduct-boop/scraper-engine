@@ -42,9 +42,28 @@ def main() -> None:
         uvicorn.run("api.main:app", host=args.host, port=args.port, reload=True)
     elif args.command == "create-tenant":
         asyncio.run(_create_tenant(args.tenant_slug))
+    elif args.command == "harvest":
+        asyncio.run(_harvest_once())
     else:
         print(f"Command '{args.command}' not yet implemented. Use --help for available commands.")
         sys.exit(1)
+
+
+async def _harvest_once() -> None:
+    """Run a single proxy-harvest cycle (manual trigger; the daemon runs it on a
+    timer). Builds the harvester from config and prints how many proxies it found."""
+    from config.loader import load_config
+    from proxy.harvester import ProxyHarvester
+    from storage.postgres_client import PostgresClient
+
+    cfg = load_config()
+    pg = PostgresClient(cfg.storage.database_url)
+    await pg.start()
+    try:
+        count = await ProxyHarvester(pg, sources=cfg.proxy_harvester.sources).harvest_once()
+        print(f"Harvest complete: {count} proxies collected")
+    finally:
+        await pg.stop()
 
 
 async def _create_tenant(tenant_slug: str) -> None:
