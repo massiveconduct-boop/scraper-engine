@@ -43,6 +43,16 @@ captcha_solved_total = Counter(
     registry=REGISTRY,
 )
 
+captcha_provider_configured = Gauge(
+    "captcha_provider_configured",
+    "1 if a CAPTCHA provider API key is present in the environment, else 0. "
+    "Configured != verified: a key can be present but rejected (inactive "
+    "capability / 401). Run tools/validate_captcha_keys.py to confirm the key "
+    "is actually accepted by the provider.",
+    ["provider"],
+    registry=REGISTRY,
+)
+
 
 async def count_validated_proxies(pg: PostgresClient, tenant: TenantId) -> int:
     """Return count of proxies with reliability_score >= 40.

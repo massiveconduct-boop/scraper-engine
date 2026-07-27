@@ -137,20 +137,90 @@ def build_captcha_solver(budget: CapSolverBudget) -> CaptchaSolver | None:
     nocaptcha_key = os.environ.get("NOCAPTCHA_AI_API_KEY")
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY")
 
+    # Surface configuration state in monitoring: a present key sets the gauge to
+    # 1, an absent one to 0. This is "configured", NOT "verified" — a key can be
+    # present but rejected by the provider (inactive capability / 401). The
+    # tools/validate_captcha_keys.py preflight confirms the deeper "accepted" case.
+    try:
+        from observability.metrics import captcha_provider_configured
+
+        captcha_provider_configured.labels(provider="nocaptchaai").set(
+            1 if nocaptcha_key else 0
+        )
+        captcha_provider_configured.labels(provider="capsolver").set(
+            1 if capsolver_key else 0
+        )
+    except Exception:  # pragma: no cover - metrics must never break startup
+        pass
+
     if nocaptcha_key:
         primary: CaptchaProvider = NoCaptchaAIClient(nocaptcha_key, budget)
         fallback: CaptchaProvider | None = (
             CapSolverClient(capsolver_key, budget) if capsolver_key else None
         )
         logger.info(
-            "captcha solver: primary=nocaptchaai fallback=%s",
+            "captcha solver: primary=nocaptchaai fallback=%s "
+            "(keys present — run tools/validate_captcha_keys.py to confirm accepted)",
             "capsolver" if fallback else "none",
         )
         return CaptchaSolver(primary, fallback)
 
     if capsolver_key:
-        logger.info("captcha solver: primary=capsolver (NoCaptchaAI key absent)")
+        logger.info(
+            "captcha solver: primary=capsolver (NoCaptchaAI key absent) "
+            "— run tools/validate_captcha_keys.py to confirm accepted"
+        )
         return CaptchaSolver(CapSolverClient(capsolver_key, budget))
 
-    logger.warning("captcha solver: no provider keys set — solving disabled")
+    logger.warning(
+        "captcha solver: NO provider keys set — CAPTCHA solving is DISABLED. "
+        "Set NOCAPTCHA_AI_API_KEY and/or CAPSOLVER_API_KEY to enable it."
+    )
     return None
+
+
+async def validate_captcha_keys() -> dict[str, dict[str, object]]:
+    """Actively check each configured provider key by calling its balance endpoint.
+
+    A present key that the provider *accepts* returns a balance; a present-but-
+    rejected key (inactive capability / expired / 401) raises. This is the honest
+    "does the key actually work" check that build_captcha_solver can't do without
+    a network call. Used by tools/validate_captcha_keys.py.
+
+    Returns ``{provider: {"configured": bool, "ok": bool, "detail": str}}``.
+    Never raises — provider errors are captured per-provider.
+    """
+    from typing import Any, cast
+
+    from services.capsolver import CapSolverClient
+    from services.nocaptcha import NoCaptchaAIClient
+
+    # get_balance() does not use the budget; pass a null placeholder.
+    null_budget = cast("CapSolverBudget", None)
+    providers: list[tuple[str, str, Any]] = [
+        ("nocaptchaai", "NOCAPTCHA_AI_API_KEY", NoCaptchaAIClient),
+        ("capsolver", "CAPSOLVER_API_KEY", CapSolverClient),
+    ]
+    out: dict[str, dict[str, object]] = {}
+    for name, env_var, cls in providers:
+        key = os.environ.get(env_var)
+        if not key:
+            out[name] = {
+                "configured": False, "ok": False, "balance": None, "detail": "no key set",
+            }
+            continue
+        try:
+            # get_balance() proves the key AUTHENTICATES; it does not prove the
+            # specific captcha capability is active. A funded, authenticating key
+            # is the strongest signal we can get without spending on a real solve.
+            balance = await cls(key, null_budget).get_balance()
+            out[name] = {
+                "configured": True, "ok": True, "balance": float(balance),
+                "detail": f"balance={balance}",
+            }
+        except Exception as exc:
+            out[name] = {
+                "configured": True, "ok": False, "balance": None,
+                "detail": str(exc)[:160],
+            }
+    return out
