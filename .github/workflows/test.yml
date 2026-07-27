@@ -13,7 +13,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install ruff mypy
+      # mypy --strict needs the real runtime deps installed to resolve types —
+      # without pydantic/fastapi/redis, BaseModel/decorators/returns collapse to
+      # Any and mypy emits spurious subclass/untyped-decorator/no-any-return
+      # errors. Mirror the unit job's install list so CI type-checks against the
+      # same real types the local venv does (the remaining stub-only libs are
+      # covered by --ignore-missing-imports in the mypy step).
+      - run: |
+          pip install ruff mypy
+          pip install \
+            fastapi uvicorn pydantic pydantic-core httpx scrapling \
+            asyncpg redis rq camoufox structlog prometheus-client \
+            pyyaml boto3 python-dotenv
       # challenge-mirror excluded here — linted separately against its own
       # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
