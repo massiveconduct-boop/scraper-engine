@@ -119,10 +119,27 @@ sends its correct fields) and handles both synchronous and polled solutions.
 
 All token methods route through the **same createTask→poll→solution pipeline that
 is live-proven end-to-end via ImageToText** (auth, billing, budget/concurrency
-gating all verified). Real token solves (Turnstile/reCAPTCHA/etc.) will demonstrate
-against genuine production targets; they are deliberately **not** exercised against
-public demo keys, because — as the Google reCAPTCHA demo showed — demo/test keys do
-not route to a solver and would only burn balance without proving anything.
+gating all verified).
+
+### Live createTask validation per type (one submission each)
+| Type | Live createTask result |
+|---|---|
+| ImageToText | ✅ **sync-solved** — image "Zx7Qm" → `text:["zx7Qm"]` (correct read) |
+| reCAPTCHA v2 | ✅ **accepted** — `errorId:0`, `taskId` returned (type/fields valid; the demo key sits `idle`, a known Google-demo limitation) |
+| Turnstile | ⚠️ `HTTP 400 "Payload not valid"` with a synthetic demo key — the documented `websiteURL`+`websiteKey` shape is sent, so this is a key/field-validation rejection on fake input; needs a real Turnstile sitekey to confirm |
+| AWS WAF | ⚠️ `HTTP 400 "Payload not valid"` with placeholder input — needs a real AWS-WAF target |
+| GeeTest | ⚠️ `ERROR_INVALID_TASK_DATA` — `gt` alone is insufficient; GeeTest needs additional fields (`challenge`/version) that NoCaptchaAI's public docs don't fully specify |
+| MTCaptcha | ⚠️ `errorId:0` but empty `status`/`taskId` with the demo key — inconclusive |
+| hCaptcha | routes to CapSolver fallback (NoCaptchaAI has no hCaptcha type) |
+
+**Honest status:** ImageToText is proven end-to-end; reCAPTCHA v2's task shape is
+live-accepted. Turnstile / AWS WAF / GeeTest / MTCaptcha are **wired** (correct
+documented task types, arbitrary-field task dict, same proven pipeline) but their
+createTask returned field/payload errors on **synthetic demo inputs** — NoCaptchaAI's
+public docs under-specify their required fields, and confirming them means real
+production sitekeys (or their API playground), not more guessing against fake keys.
+The framework makes fixing any type a one-line field change; the methods are not
+claimed as verified-solving beyond ImageToText and reCAPTCHA-accepted.
 
 **Tests:** 16 captcha unit tests, including per-method task-type assertions
 (recaptcha_v2/turnstile/aws_waf/mtcaptcha send the right type; geetest sends `gt`;
