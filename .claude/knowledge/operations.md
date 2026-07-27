@@ -42,6 +42,17 @@ docker compose up -d
 docker compose logs -f  # watch logs
 ```
 
+**Container vs host hostnames (round 20 deploy fix).** `.env` sets
+`REDIS_URL=redis://localhost:6379/0` and `DATABASE_URL=...@localhost:5432...`
+for **host** tools (alembic, `tools/` scripts). Inside containers `localhost`
+is the container itself, so the app services (`api`, `worker-l1/l2/l3`,
+`proxy-harvester`) each carry a compose `environment:` block overriding these to
+the service hostnames — `redis://redis:6379/0` and
+`...@pgbouncer:6432/scraper_engine` (DB through PgBouncer, invariant G-05).
+Compose `environment:` wins over `env_file:`, so `.env` keeps localhost while
+containers get service names. Symptom if missing:
+`Error 111 connecting to localhost:6379. Connection refused`, workers Exited(1).
+
 ---
 
 ## Configuration
@@ -136,4 +147,17 @@ levels:
 2. **CAPTCHA solving (round 19 provider, round 20 wiring):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha live-accepted. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject unit-tested, not yet live-verified end to end (needs active reCAPTCHA entitlement + real target — round-19 account sat `idle`). AWS WAF needs a real target. Current CAPSOLVER_API_KEY is invalid (401) — replace to enable fallback.
 3. **mypy `--strict` clean (RESOLVED, round 18):** was 23 baseline findings; all fixed. `strict = true` in pyproject, `mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/` → "Success: no issues found in 57 source files". `tools/mypy-baseline.txt` is now empty and the CI gate fails on ANY error (no tolerance). Fixes included a real bug (`api/main.py` called `redis.close()`, which doesn't exist — the method is `stop()`); the rest were type precision (Protocol for the ASN classifier, `Any` for duck-typed Playwright pages/contexts, optional/generic args, a justified `type: ignore[no-untyped-call]` on the untyped `AsyncCamoufox`).
 4. **Docker image ~4 GB:** Camoufox Firefox binary ~300 MB unavoidable (BD-02). Accepted as final for Oracle Cloud VPS (100 GB boot volume). Round 13 fixed the launch-lib chain (xvfb, libgtk-3-0, libx11-xcb1, camoufox[geoip]) — the image now actually launches a browser, not just ships one.
-5. **Stale Dockerfile Python pin (RESOLVED, round 14):** The committed Dockerfile text pinned `python:3.11-slim` from initial commit through round 12, but every *built* image (incl. the deployed `scraper_engine-api`) ran Python 3.12.13 — matching local venv (3.12.3) and CI (3.12). So the pin was documentation drift, never a runtime exposure; 3.11 was never deployed. Round 13 aligned the text to `python:3.12-slim`. Recorded here so the historical mismatch is explicit, not implicit in a diff.
+5. **`proxy-harvester` daemon (RESOLVED, post-round-20).** The container
+   command was `python -m proxy.harvester`, which loaded a module with no
+   `if __name__ == "__main__"` and exited 0 immediately — so the harvest /
+   promotion / health routines were never scheduled and the container Exited(0)
+   silently on every deploy (not a round-20 regression). Fixed by
+   `proxy/harvester_daemon.py` (`python -m proxy.harvester_daemon`): a supervisor
+   that builds `ProxyHarvester`, `ProxyPromotionJob`, and `HealthMonitor` from
+   config and runs three independent timers (`harvest_once` @ `interval_seconds`
+   600, `run_once` @ `promotion_interval_seconds` 900, `check_all` @
+   `health_interval_seconds` 300), each isolating its own failures, with graceful
+   SIGTERM/SIGINT shutdown. The CLI `harvest` command now runs one cycle manually
+   (was a `"not yet implemented"` stub). Connection strings come from the single
+   `StorageConfig` source (DB through PgBouncer).
+6. **Stale Dockerfile Python pin (RESOLVED, round 14):** The committed Dockerfile text pinned `python:3.11-slim` from initial commit through round 12, but every *built* image (incl. the deployed `scraper_engine-api`) ran Python 3.12.13 — matching local venv (3.12.3) and CI (3.12). So the pin was documentation drift, never a runtime exposure; 3.11 was never deployed. Round 13 aligned the text to `python:3.12-slim`. Recorded here so the historical mismatch is explicit, not implicit in a diff.

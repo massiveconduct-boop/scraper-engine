@@ -52,7 +52,7 @@ services:
 
   proxy-harvester:
     build: .
-    command: python -m proxy.harvester
+    command: python -m proxy.harvester_daemon
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
