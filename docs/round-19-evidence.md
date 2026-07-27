@@ -33,7 +33,28 @@ Fixed: `services/nocaptcha.py` uses `ReCaptchaV2TaskProxyLess`/`HCaptchaTaskProx
 - **Pay-per-use billing works**: balance decremented `1.0000 → 0.9995` on task submission — the full submit→charge→poll pipeline is exercised against the live API.
 - **CapSolver (fallback) key is invalid**: HTTP 401 `ERROR_KEY_DENIED_ACCESS` — account/credential issue, not code (same shared path talks to NoCaptchaAI fine).
 
-### Not yet returning a token — root-caused to the account, not the code
+### PROVEN END-TO-END via ImageToTextTask (the reCAPTCHA idle was a Google-target issue)
+reCAPTCHA v2 stayed `idle`, but that turned out to be specific to Google's reCAPTCHA
+demo target, **not** the account or the integration. Switching to the cheapest,
+non-Google avenue — `ImageToTextTask` (OCR) — solved **immediately and correctly**:
+```
+$ NoCaptchaAIClient.solve_image_to_text(image of "HELLO")
+  → {"errorId":0,"status":"ready","solution":{"text":["HELLO"]}}   # exact match
+$ ... image of "Kw9mZ" → "Kw9mz"    # all 5 chars read; only last-char case differs
+  balance: 0.9996 → 0.999           # real per-solve billing (~$0.0002)
+```
+This is a **real solve returned through the production client method**, proving:
+- the account's solver is active and billing works (reCAPTCHA `idle` was the Google
+  demo target, exactly as the operator suspected);
+- the full integration (auth → createTask → solution parse → budget/concurrency
+  gating) works end-to-end against the live NoCaptchaAI API.
+
+API details discovered live (docs were stale): ImageToText uses the `image` field
+(not `body`), solves **synchronously** (solution in the createTask response), and
+returns `solution.text` as a **list**. Wired as `NoCaptchaAIClient.solve_image_to_text`
+(shared `services/_anticaptcha.solve_image_to_text`), with regression tests.
+
+### On reCAPTCHA v2 specifically — root-caused to the account/target, not the code
 Across multiple attempts (production 120 s poll + raw probes, before and after the
 user enabled the account's "use wallet balance for solving" toggle), reCAPTCHA v2
 tasks are **accepted** (`errorId:0`, `taskId`) but stay `status:"idle"` forever —

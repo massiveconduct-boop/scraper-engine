@@ -94,6 +94,79 @@ async def solve_anticaptcha(
             return None
 
 
+async def solve_image_to_text(
+    *,
+    provider: str,
+    api_key: str,
+    create_task_url: str,
+    get_result_url: str,
+    budget: CapSolverBudget,
+    tenant_id: TenantId,
+    image_b64: str,
+    estimated_cost: float,
+) -> str | None:
+    """Solve an image-to-text (OCR) CAPTCHA — the cheapest task type.
+
+    NoCaptchaAI's ImageToTextTask takes the base64 image in the `image` field
+    (NOT the docs' stale `body`) and typically solves synchronously: createTask
+    returns status "ready" with solution.text (a list) right away. Falls back to
+    polling if a taskId is returned instead. Budget-gated; returns the recognized
+    text or None. (Live-verified round 19: image of "HELLO" → solution.text
+    ["HELLO"].)
+    """
+    if not await budget.check_and_reserve(tenant_id, estimated_cost):
+        logger.warning("%s_budget_exceeded: %s", provider, str(tenant_id))
+        return None
+
+    def _extract(solution: dict[str, object]) -> str | None:
+        text = solution.get("text")
+        if isinstance(text, list):
+            return str(text[0]) if text else None
+        return str(text) if text else None
+
+    async with CAPSOLVER_CONCURRENCY:
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = (
+                    await client.post(
+                        create_task_url,
+                        json={
+                            "clientKey": api_key,
+                            "task": {"type": "ImageToTextTask", "image": image_b64},
+                        },
+                    )
+                ).json()
+
+                if resp.get("errorId") not in (0, None):
+                    logger.warning("%s_ocr_error: %s", provider, resp.get("errorCode"))
+                    return None
+
+                # synchronous: solution present immediately
+                if resp.get("status") == "ready":
+                    return _extract(resp.get("solution", {}))
+
+                # async fallback: poll by taskId
+                task_id = resp.get("taskId")
+                if not task_id:
+                    return None
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    j = (
+                        await client.post(
+                            get_result_url,
+                            json={"clientKey": api_key, "taskId": task_id},
+                        )
+                    ).json()
+                    if j.get("status") == "ready":
+                        return _extract(j.get("solution", {}))
+                    if j.get("errorId") not in (0, None):
+                        return None
+                return None
+        except Exception:
+            logger.warning("%s_ocr_exception", provider, exc_info=True)
+            return None
+
+
 async def get_balance(*, api_key: str, balance_url: str) -> float:
     """Return the provider account balance, or 0.0 on error."""
     try:

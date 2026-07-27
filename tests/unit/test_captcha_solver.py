@@ -73,3 +73,37 @@ class TestFactory:
         monkeypatch.delenv("NOCAPTCHA_AI_API_KEY", raising=False)
         monkeypatch.delenv("CAPSOLVER_API_KEY", raising=False)
         assert build_captcha_solver(AsyncMock()) is None
+
+
+class TestImageToText:
+    @pytest.mark.asyncio
+    async def test_ocr_extracts_list_text(self, monkeypatch):
+        """NoCaptchaAI ImageToText solves synchronously; solution.text is a list
+        — the client must return its first element (round 19 live-verified)."""
+        import services._anticaptcha as ac
+
+        class _Resp:
+            def json(self):
+                return {"errorId": 0, "status": "ready", "solution": {"text": ["HELLO"]}}
+
+        class _Client:
+            def __init__(self, *a, **k): ...
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, *a, **k): return _Resp()
+
+        monkeypatch.setattr(ac.httpx, "AsyncClient", _Client)
+
+        from services.nocaptcha import NoCaptchaAIClient
+        budget = AsyncMock()
+        budget.check_and_reserve.return_value = True
+        client = NoCaptchaAIClient("k", budget)
+        assert await client.solve_image_to_text(TENANT, "b64img") == "HELLO"
+
+    @pytest.mark.asyncio
+    async def test_ocr_budget_gate_blocks(self):
+        from services.nocaptcha import NoCaptchaAIClient
+        budget = AsyncMock()
+        budget.check_and_reserve.return_value = False
+        client = NoCaptchaAIClient("k", budget)
+        assert await client.solve_image_to_text(TENANT, "b64img") is None
