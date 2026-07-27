@@ -144,7 +144,33 @@ levels:
 ## Known Operational Gaps
 
 1. **PgBouncer pg_hba.conf:** Requires `host all all 172.0.0.0/8 md5` rule added to Postgres. Without it, auth_type must be scram-sha-256 in both pgbouncer.ini and pg_hba.conf.
-2. **CAPTCHA solving (round 19 provider, round 20 wiring):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha live-accepted. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject unit-tested, not yet live-verified end to end (needs active reCAPTCHA entitlement + real target — round-19 account sat `idle`). AWS WAF needs a real target. Current CAPSOLVER_API_KEY is invalid (401) — replace to enable fallback.
+2. **CAPTCHA solving (round 19 provider, round 20 wiring):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha live-accepted. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject unit-tested, not yet live-verified end to end (needs active reCAPTCHA entitlement + real target — round-19 account sat `idle`).
+
+   **Provider-key health is now observable (post-round-20).** A present key is
+   NOT a working key — NoCaptchaAI can have an inactive reCAPTCHA capability and
+   CapSolver keys can 401. Two mechanisms surface this:
+   - `captcha_provider_configured{provider}` gauge — 1 if a key is present, 0 if
+     absent (set at solver build, no network). Shows *missing* config in
+     monitoring immediately.
+   - `tools/validate_captcha_keys.py` — active preflight that calls each
+     provider's balance endpoint and reports WORKING / REJECTED / no-key (keys
+     masked). Exit 0 if any provider works, 1 if none.
+
+   **Operator runbook when captcha solving isn't producing tokens:**
+   1. `set -a && . ./.env && set +a && .venv/bin/python tools/validate_captcha_keys.py`
+      — confirm which provider is REJECTED and why.
+   2. `NO FUNDS` → top up that provider's balance. `REJECTED` → replace the key.
+      reCAPTCHA still `idle` despite a funded, authenticating key → activate the
+      reCAPTCHA capability on the account (plan/capability toggle).
+   3. Re-run the preflight (expect WORKING), then the full end-to-end check
+      `tools/verify_captcha_live.py`.
+   **Current state (last preflight):** both keys *authenticate* —
+   NoCaptchaAI balance ≈ $1.00 (funded; reCAPTCHA capability still to be
+   confirmed by a live solve — round-19 saw it `idle`), CapSolver balance
+   **$0.00** (authenticates but can't pay for solves — top up to enable the
+   fallback). `get_balance` proves the key/account, not the specific capability;
+   only `tools/verify_captcha_live.py` proves an end-to-end solve. All
+   account/billing actions, not code.
 3. **mypy `--strict` clean (RESOLVED, round 18):** was 23 baseline findings; all fixed. `strict = true` in pyproject, `mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/` → "Success: no issues found in 57 source files". `tools/mypy-baseline.txt` is now empty and the CI gate fails on ANY error (no tolerance). Fixes included a real bug (`api/main.py` called `redis.close()`, which doesn't exist — the method is `stop()`); the rest were type precision (Protocol for the ASN classifier, `Any` for duck-typed Playwright pages/contexts, optional/generic args, a justified `type: ignore[no-untyped-call]` on the untyped `AsyncCamoufox`).
 4. **Docker image ~4 GB:** Camoufox Firefox binary ~300 MB unavoidable (BD-02). Accepted as final for Oracle Cloud VPS (100 GB boot volume). Round 13 fixed the launch-lib chain (xvfb, libgtk-3-0, libx11-xcb1, camoufox[geoip]) — the image now actually launches a browser, not just ships one.
 5. **`proxy-harvester` daemon (RESOLVED, post-round-20).** The container
@@ -161,3 +187,4 @@ levels:
    (was a `"not yet implemented"` stub). Connection strings come from the single
    `StorageConfig` source (DB through PgBouncer).
 6. **Stale Dockerfile Python pin (RESOLVED, round 14):** The committed Dockerfile text pinned `python:3.11-slim` from initial commit through round 12, but every *built* image (incl. the deployed `scraper_engine-api`) ran Python 3.12.13 — matching local venv (3.12.3) and CI (3.12). So the pin was documentation drift, never a runtime exposure; 3.11 was never deployed. Round 13 aligned the text to `python:3.12-slim`. Recorded here so the historical mismatch is explicit, not implicit in a diff.
+7. **AWS WAF captcha unverified (BACKLOG — needs a real target).** The solver supports AWS WAF (`solve_aws_waf`) but it has never been exercised against a live AWS-WAF-protected site (per-request runtime data can't be mocked faithfully). To verify when a target is available: point `tools/verify_captcha_live.py` at the target, confirm DOM detection extracts the AWS WAF challenge and that a solved token is accepted. Low priority.
