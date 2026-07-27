@@ -1,6 +1,14 @@
 # Base configuration — defaults inherited by all environments
 # Values with ${ENV_VAR} are resolved from environment variables at startup
 
+# Single source of truth for connection strings. Every service (api, workers,
+# harvester, cli) reads these — no connection string is hardcoded in code.
+# Defaults use the docker-compose service names and route the DB through
+# PgBouncer (invariant G-05). Host tools set DATABASE_URL/REDIS_URL in .env.
+storage:
+  database_url: "${DATABASE_URL:postgresql://scraper:scraper@pgbouncer:6432/scraper_engine}"
+  redis_url: "${REDIS_URL:redis://redis:6379/0}"
+
 levels:
   level_1:
     engine: scrapling
