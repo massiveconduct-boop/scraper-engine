@@ -98,7 +98,10 @@ class TestBrowserPool:
         assert pool._prewarm_count == 5
         assert pool._max_idle_seconds == 600
 
-    @pytest.mark.skip(reason="CamoufoxWrapper requires real Firefox process (~80MB) + geoip check — runs on host, not CI")
+    @pytest.mark.skip(reason=(
+        "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
+        "— runs on host, not CI"
+    ))
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
         """Pool without warm instances creates a new wrapper on acquire."""
         from browser.pool import BrowserPool
@@ -176,13 +179,15 @@ class TestSessionIsolation:
         """acquire() loads session via session_mgr.load and passes to CamoufoxWrapper."""
         conn = MagicMock()
         conn.fetchrow = AsyncMock(
-            return_value={"storage_state": {"cookies": [{"name": "x", "value": "y"}], "origins": []}},
+            return_value={
+                "storage_state": {"cookies": [{"name": "x", "value": "y"}], "origins": []}
+            },
         )
 
         class _FakeAcquireCtx:
-            async def __aenter__(s):
+            async def __aenter__(self):
                 return conn
-            async def __aexit__(s, *a):
+            async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
@@ -198,7 +203,7 @@ class TestSessionIsolation:
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper
 
-            ctx = await pool.acquire(proxy=None, domain="example.com")
+            _ctx = await pool.acquire(proxy=None, domain="example.com")
             call_kwargs = mock_cw.call_args[1]
             assert "storage_state" in call_kwargs
             assert call_kwargs["storage_state"] == {
@@ -213,9 +218,9 @@ class TestSessionIsolation:
         conn.execute = AsyncMock()
 
         class _FakeCtx:
-            async def __aenter__(s):
+            async def __aenter__(self):
                 return conn
-            async def __aexit__(s, *a):
+            async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
@@ -246,9 +251,9 @@ class TestSessionIsolation:
         conn.execute = AsyncMock()
 
         class _FakeCtx:
-            async def __aenter__(s):
+            async def __aenter__(self):
                 return conn
-            async def __aexit__(s, *a):
+            async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
@@ -266,10 +271,9 @@ class TestSessionIsolation:
         pool._active_wrappers = [fake_wrapper]
 
         with patch.object(pool, 'acquire', new_callable=AsyncMock, return_value=fake_ctx), \
-             patch.object(pool, 'release', new_callable=AsyncMock):
-            with pytest.raises(RuntimeError):
-                async with pool.lease(domain="example.com"):
-                    raise RuntimeError("simulated failure")
+             patch.object(pool, 'release', new_callable=AsyncMock), pytest.raises(RuntimeError):
+            async with pool.lease(domain="example.com"):
+                raise RuntimeError("simulated failure")
         fake_ctx.storage_state.assert_not_called()
 
     @pytest.mark.asyncio
@@ -364,7 +368,9 @@ class TestSessionState:
 
     def test_save_json_string_loaded_correctly(self, tenant):
         pg = self._make_pg_mock(
-            fetchrow_return={"storage_state": '{"cookies":[{"name":"sid","value":"abc"}],"origins":[]}'},
+            fetchrow_return={
+                "storage_state": '{"cookies":[{"name":"sid","value":"abc"}],"origins":[]}'
+            },
         )
         mgr = SessionStateManager(pg=pg)
 

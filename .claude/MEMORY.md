@@ -35,6 +35,21 @@ Index of all knowledge documents. Read this first to discover what exists before
 | `docs/round-6-critical-fixes.md` | ON CONFLICT restore, hot-browser pool, Prometheus gauge | Understanding the three critical fixes from final review round |
 | `docs/round-6-lease-fix.md` | `lease()` async context manager — invariant §1.1.6 restoration | Understanding pool safety contract |
 | `docs/final-production-readiness-report.md` | Comprehensive production readiness (round 5) | Overall project status |
+| `docs/round-7-evidence-report.md` | Session isolation (Postgres), proxy promotion (attempt tracking), alert wiring (Slack) | Round 7 deliverables + evidence |
+| `docs/round-8-deliverables.md` | Debug endpoint deletion, pool.py full trace, cookie persistence, deps pinned, api/routes.py wired, per-tenant quota | Round 8 deliverables |
+| `docs/round-8-closure-evidence.md` | Quota enforcement fix — exception-based, per-tenant limits, three-curl evidence | Quota implementation details |
+| `docs/per-tenant-quota-enforcement.md` | Per-tenant quota curl evidence (system=2, other=5) | Two-tenant isolation verification |
+| `docs/round-9-evidence-report.md` | Camoufox binary confirmed, CI pipeline (4-stage green), L2/L3 page.content() race fix, mypy --strict findings | Round 9 deliverables |
+| `docs/round-10.03-ratchet-proven.md` | mypy ratchet gate proven on real CI (probe file caught, exit 1, reverted) | Ratchet mechanism verification |
+| `docs/round-11-evidence.md` | Force-push recovery, all 6 bugs fixed, 209 collected/203 passed/6 skipped/0 failed, config-driven timeouts | Final round closure |
+| `docs/round-12-final.md` | Force-push root cause (`git reset --hard`), branch protection, `v1.0.0-rc1` tag, ChallengeDetector + `_safe_content` guard | Rounds 12–12.4 consolidated |
+| `docs/round-13-evidence.md` | Config DI factory + CI gate, `force_engine` negative-control seam, monitoring dashboard/alerts (Slack-proven), per-source health gauge, ruff 45→0, mirror ruff baseline, Docker multi-stage + launch-lib chain fix | Round 13 deliverables |
+| `docs/round-14-evidence.md` | L2 flakiness fixed (shared `poll_until_solved` retry loop, deterministic A/B), host-vs-container 202/201 reconciled (pgbouncer test), Python 3.11 never-deployed (stale pin) | Round 14 deliverables |
+| `docs/round-15-evidence.md` | Real-target validation (books/quotes/scrapethissite/webscraper/nowsecure/sannysoft/scrapecups) — Cloudflare passed, no webdriver leak; `HOST_UNREACHABLE` non-retryable DNS category added | Round 15 real-site validation + DNS taxonomy fix |
+| `docs/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
+| `docs/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
+| `.github/workflows/test.yml` | Live 4-stage CI pipeline (lint/unit/integration/chaos) | CI configuration reference |
+| `tools/mypy-baseline.txt` | 23 known mypy findings, ratchet-protected | mypy regression prevention |
 
 ## Reference
 

@@ -14,7 +14,41 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install ruff mypy
+      # challenge-mirror excluded here — linted separately against its own
+      # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
+      - name: challenge-mirror ruff baseline (diff against committed baseline, fail on NEW)
+        run: |
+          ruff check challenge-mirror/ --output-format=concise 2>&1 | grep "^challenge-mirror/" | sort >/tmp/mirror-current.txt || true
+          sort challenge-mirror/.ruff-baseline.txt >/tmp/mirror-baseline.txt
+          NEW=$(comm -13 /tmp/mirror-baseline.txt /tmp/mirror-current.txt)
+          if [ -n "$NEW" ]; then
+            echo "=== NEW challenge-mirror ruff findings (failing build) ===" && echo "$NEW"
+            exit 1
+          fi
+          echo "challenge-mirror ruff baseline OK — no new findings"
+      - name: no direct fetcher construction outside factory
+        run: |
+          HITS=$(grep -rn "Level1Fetcher(\|Level2Fetcher(\|Level3Fetcher(" --include="*.py" . \
+            | grep -v "fetcher/factory.py" | grep -v "fetcher/level_1.py" \
+            | grep -v "fetcher/level_2.py" | grep -v "fetcher/level_3.py" \
+            | grep -v "tests/" || true)
+          if [ -n "$HITS" ]; then
+            echo "Direct fetcher construction found outside fetcher/factory.py:"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "OK — all production fetcher construction goes through fetcher/factory.py"
+      - name: force_engine test-seam never reachable from production
+        run: |
+          HITS=$(grep -rn "force_engine=" --include="*.py" . \
+            | grep -v "fetcher/level_2.py" | grep -v "tests/" || true)
+          if [ -n "$HITS" ]; then
+            echo "force_engine passed outside fetcher/level_2.py + tests/ (production reachability!):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "OK — force_engine test seam has zero production call sites"
       - name: mypy ratchet (fails only on NEW type errors beyond committed baseline)
         run: |
           mypy core/ proxy/ orchestrator/ api/ storage/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
@@ -31,6 +65,8 @@ jobs:
             echo "=== FIXED findings (update baseline) ===" && echo "$FIXED"
           fi
           echo "mypy ratchet OK — no regressions"
+      - name: mypy baseline shrinkage (advisory — warns, never fails)
+        run: bash tools/check_baseline_shrinkage.sh
 
   unit:
     runs-on: ubuntu-24.04

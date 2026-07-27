@@ -11,11 +11,23 @@ levels:
     proxy_tier_min_score: 70.0
     timeout_seconds: 40
     capsolver_enabled: true
+    goto_wait_until: "domcontentloaded"
+    networkidle_timeout_ms: 5000
+    max_total_wait_ms: 15000
+    retry_wait_increment_ms: 5000   # round 14: ChallengeDetector-gated retry poll
+    scroll_passes: 8                # round 15: lazy-load/infinite-scroll (early-exits on stable height)
+    scroll_wait_ms: 2000
   level_3:
     engine: camoufox
     proxy_tier_min_score: 90.0
     timeout_seconds: 60
     capsolver_enabled: true
+    goto_wait_until: "load"
+    post_load_fixed_wait_ms: 10000
+    max_total_wait_ms: 30000
+    retry_wait_increment_ms: 5000
+    scroll_passes: 10
+    scroll_wait_ms: 2000
 
 camoufox:
   geoip: true

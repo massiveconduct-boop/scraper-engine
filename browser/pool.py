@@ -27,14 +27,14 @@ import asyncio
 import contextlib
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .camoufox_wrapper import CamoufoxWrapper
 
 if TYPE_CHECKING:
+    from browser.session_state import SessionStateManager
     from core.models import Proxy
     from core.tenant import TenantId
-    from browser.session_state import SessionStateManager
 
 
 class BrowserPool:
@@ -167,14 +167,12 @@ class BrowserPool:
             if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
                 await self._pool.put((ctx, w, time.monotonic()))
                 return
-        import contextlib
         with contextlib.suppress(Exception):
             await ctx.__aexit__(None, None, None)
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
         while not self._pool.empty():
-            import contextlib
             with contextlib.suppress(asyncio.QueueEmpty):
                 ctx, wrapper, _ = self._pool.get_nowait()
                 for w in self._active_wrappers:

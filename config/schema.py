@@ -9,6 +9,16 @@ class LevelConfig(BaseModel):
     proxy_tier_min_score: float
     timeout_seconds: int
     capsolver_enabled: bool = False
+    # L2/L3 wait strategy — config-driven, not hardcoded (round 12.1)
+    goto_wait_until: str = "load"
+    networkidle_timeout_ms: int = 5000
+    max_total_wait_ms: int = 30000
+    post_load_fixed_wait_ms: int = 10000
+    retry_wait_increment_ms: int = 5000
+    # Lazy-load / infinite-scroll (round 15 follow-up). scroll_passes=0 disables;
+    # >0 scrolls to bottom up to N times, early-exiting when height stops growing.
+    scroll_passes: int = 0
+    scroll_wait_ms: int = 1500
 
 
 class LevelsConfig(BaseModel):

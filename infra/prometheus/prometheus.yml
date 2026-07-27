@@ -1,0 +1,31 @@
+# infra/prometheus/prometheus.yml
+# Prometheus configuration for scraper-engine.
+#
+# Scrapes the scraper-engine API metrics endpoint and evaluates
+# alert rules from monitoring/alerts/prometheus_rules.yml.
+# Delivers alerts to Alertmanager at alertmanager:9093.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - "/etc/prometheus/alerts/prometheus_rules.yml"
+
+scrape_configs:
+  - job_name: scraper-engine
+    static_configs:
+      - targets:
+          - api:8000
+    metrics_path: /metrics
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

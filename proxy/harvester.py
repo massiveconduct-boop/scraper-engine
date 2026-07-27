@@ -101,6 +101,10 @@ class ProxyHarvester:
             for name, url, fmt in self.SOURCES:
                 n = await self._scrape_one(name, url, fmt, limit - total, tenant, client)
                 counts[name] = n
+                # Per-source health gauge (round 13 D2) — a source going dark
+                # becomes a specific named signal, not just a drop in the aggregate.
+                from proxy.source_health import record_source_health
+                record_source_health(name, n)
                 total += n
                 if total >= limit:
                     break

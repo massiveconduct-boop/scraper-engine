@@ -1,0 +1,48 @@
+{
+  "__comment": "Round 13 D1 — production-health dashboard. Every metric below already exists in code from prior rounds but had no panel or threshold until now. Grafana schema abbreviated to the query + threshold intent per panel; import into Grafana (Dashboards → Import) and bind to the Prometheus datasource.",
+  "title": "Scraper Engine — Production Health",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "title": "Validated Proxy Pool",
+      "type": "timeseries",
+      "targets": [{ "expr": "proxy_pool_validated_count" }],
+      "thresholds": { "warn_below": 10, "critical_below": 5 },
+      "note": "critical_below matches the existing ProxyPoolCriticallyLow alert (< 5)."
+    },
+    {
+      "title": "Safe-Content Guard Firings (Level 3)",
+      "type": "timeseries",
+      "targets": [{ "expr": "rate(safe_content_none_total[1h])" }],
+      "thresholds": { "warn_above": 0.1 },
+      "note": "Expected near-zero. Sustained nonzero means real targets are triggering the mid-navigation race this guard protects against (round 12.4). Bound to the SafeContentGuardFiringFrequently alert."
+    },
+    {
+      "title": "Per-Source Proxy Health",
+      "type": "state-timeline",
+      "targets": [{ "expr": "proxy_source_healthy" }],
+      "note": "1 = source returned >=1 proxy last cycle, 0 = dark. Bound to ProxySourceWentDark (round 13 D2). One row per source_name label."
+    },
+    {
+      "title": "CapSolver Daily Spend",
+      "type": "gauge",
+      "targets": [{ "expr": "capsolver_daily_spend" }],
+      "thresholds": { "warn_above_pct_of_ceiling": 80 },
+      "note": "Matches CapSolverBudgetExhausted (> 0.9 of the $1.00/day ceiling)."
+    },
+    {
+      "title": "Per-Tenant Quota Utilization",
+      "type": "timeseries",
+      "targets": [{ "expr": "quota_current_usage / quota_daily_limit" }],
+      "thresholds": { "warn_above_pct": 90 },
+      "note": "Per-tenant. Emitted into a void until this panel existed."
+    },
+    {
+      "title": "Circuit Breaker Trips (24h)",
+      "type": "stat",
+      "targets": [{ "expr": "increase(circuit_state[24h])" }],
+      "thresholds": { "warn_above": 5 },
+      "note": "Matches CircuitBreakerFrequentTrips (rate > 5)."
+    }
+  ]
+}

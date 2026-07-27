@@ -65,7 +65,7 @@ def sha256_manual(msg: bytes) -> str:
             hh, g, f, e = g, f, e, (d + temp1) & MASK
             d, c, b, a = c, b, a, (temp1 + temp2) & MASK
 
-        h = [(x + y) & MASK for x, y in zip(h, [a, b, c, d, e, f, g, hh])]
+        h = [(x + y) & MASK for x, y in zip(h, [a, b, c, d, e, f, g, hh], strict=True)]
 
     return "".join(f"{x:08x}" for x in h)
 

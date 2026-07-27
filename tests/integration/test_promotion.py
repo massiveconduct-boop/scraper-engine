@@ -91,7 +91,8 @@ async def test_promote_tcp_only_promotes_seeded_proxy(pg, judge_server):
     # Fetch updated score
     rows = await pg.fetch(
         tenant,
-        "SELECT reliability_score, anonymity_level FROM proxy_pool WHERE ip = $1 AND port = $2 AND protocol = $3",
+        "SELECT reliability_score, anonymity_level FROM proxy_pool "
+        "WHERE ip = $1 AND port = $2 AND protocol = $3",
         ip,
         port,
         protocol,

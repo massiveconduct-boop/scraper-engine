@@ -37,7 +37,9 @@ When adding a Prometheus gauge: define it in `observability/metrics.py`, update 
 ### Integration Tests
 - Require Docker (Postgres, Redis, PgBouncer).
 - Start infrastructure: `docker compose up -d postgres redis pgbouncer && alembic upgrade head`.
+- Verify migration state before running: `alembic current` must equal `alembic heads`.
 - Test real database interactions, schema creation, concurrency.
+- Tests that mutate global tables (`DELETE FROM proxy_pool`) against the live DB are documented as a known risk. Acceptable on disposable CI instances; not acceptable if DB is shared.
 
 ### Chaos Tests
 - Race conditions: multi-worker politeness, PgBouncer isolation, resource exhaustion.
@@ -65,6 +67,14 @@ Every report must have: Header Metadata (date, spec ref), Environment & Infrastr
 - Per-item limitation subsections naming specific blocking conditions and decision owners.
 - Separate objective fact from interpretation. Mark speculation as such.
 - "Documented as limitation" is NOT closure — it's a placeholder.
+
+### mypy Baseline Management
+- `tools/mypy-baseline.txt` contains known type findings (23 entries). Committed to repo.
+- CI ratchet step diffs current mypy output (`grep "^error:"` lines) against baseline via `comm -13`.
+- Any NEW error beyond baseline fails the build. Known findings are advisory.
+- `mypy==2.3.0` pinned in `pyproject.toml` — no version drift between local and CI.
+- PRs touching files in the baseline should resolve those entries, shrinking the baseline over time.
+- Local and CI produce different finding counts due to different stub resolution (pydantic, starlette versions). Baseline is CI-specific.
 
 ### Banned Patterns
 - Paraphrased commands (`python -c "harvest + pool query"` instead of actual code)

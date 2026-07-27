@@ -69,11 +69,14 @@ harvest_once()
 - `lease(proxy, domain)` — async context manager wrapping acquire/release
 - `shutdown()` — tears down all live contexts
 
+**Session persistence (round 7):** When `session_mgr` is supplied, storage_state is loaded in `acquire()` (outside the classify-loop), passed through `CamoufoxWrapper.__init__(storage_state=...)`, applied in `__aenter__` via `browser.new_context(storage_state=blob)` (Path B — Path A unavailable, AsyncCamoufox does not forward the kwarg). State saved back to Postgres on healthy `lease()` exit. Save failures logged at WARNING with `exc_info=True` — pool continues serving.
+
 **Safety properties:**
 - Semaphore-gated: `BROWSER_SEMAPHORE` prevents unbounded spawn (F-14).
 - No double-issue: `acquire()` classifies each item exactly once — selected item never re-queued.
 - Process cleanup: `__aexit__` always runs, browser process reaped.
 - Domain guard: `lease(domain=X)` only reuses context whose `_last_domain` matches.
+- Session I/O outside classify-loop: load at line 125, classify-loop return at line 119. Session code never executes during queue bookkeeping.
 
 ---
 
@@ -85,10 +88,23 @@ harvest_once()
 
 ---
 
+## API Routing (Round 8-11 — Fully Wired)
+
+All routes enforce 4 invariants per blueprint:
+
+1. **Tenant/auth** — `TenantResolver.resolve(api_key)` via `X-API-Key` header → `TenantId`. 401 on bad key.
+2. **SSRF guard** — `SSRFGuard.validate(url)` on every URL before processing. 403 on blocked ranges.
+3. **Quota enforcement** — `QuotaManager.check_and_increment(tenant_id)` reads per-tenant limit from `public.tenants.quota_daily_limit`. Raises `QuotaExceededError` → 429. No bare except.
+4. **DB persistence** — `INSERT INTO scrape_jobs` before returning. `GET /v1/jobs/{job_id}` queries live `scrape_jobs` table. 404 on missing.
+
+**Startup:** `api/main.py` uses `lifespan` context manager to initialize `PostgresClient`, `RedisClient`, and `TenantResolver` singletons. `@app.on_event("startup")` was unreliable in FastAPI 0.139.2.
+
+---
+
 ## Data Flow
 
 ```
-API Client → FastAPI (/v1/scrape) → RQ Queue → Worker
+API Client → FastAPI (/v1/scrape) → TenantResolver → SSRFGuard → QuotaManager → DB Insert → RQ Queue → Worker
                                                 ├─ CircuitBreaker.allow_request()
                                                 ├─ PolitenessController.acquire_slot()
                                                 ├─ ProxyManager.get_proxy() → ProxyHarvester.harvest_once()

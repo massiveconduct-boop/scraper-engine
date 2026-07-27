@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING
 
 from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
+from fetcher._content_utils import autoscroll, poll_until_solved, safe_content
+from fetcher._failure import classify_fetch_exception
+from fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
 
@@ -25,8 +28,35 @@ class Level3Fetcher:
 
     TIMEOUT_SECONDS = 60
 
-    def __init__(self) -> None:
-        """Level 3 fetcher — no initialization required."""
+    def __init__(
+        self,
+        *,
+        goto_wait_until: str = "load",
+        post_load_fixed_wait_ms: int = 10000,
+        max_total_wait_ms: int = 30000,
+        retry_wait_increment_ms: int = 5000,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+        challenge_detector: ChallengeDetector | None = None,
+    ) -> None:
+        """Level 3 fetcher with config-driven bounded retry for CPU-bound challenges.
+
+        Args:
+            goto_wait_until: page.goto() wait_until strategy (default "load").
+            post_load_fixed_wait_ms: initial post-load delay for PoW solver.
+            max_total_wait_ms: hard ceiling on total post-load wait time.
+            retry_wait_increment_ms: additional wait per retry cycle when
+                the page still looks like an unsolved challenge interstitial.
+            challenge_detector: classifier for challenge pages. A
+                default-configured instance is used when None.
+        """
+        self._goto_wait_until = goto_wait_until
+        self._post_load_fixed_wait_ms = post_load_fixed_wait_ms
+        self._max_total_wait_ms = max_total_wait_ms
+        self._retry_wait_increment_ms = retry_wait_increment_ms
+        self._scroll_passes = scroll_passes
+        self._scroll_wait_ms = scroll_wait_ms
+        self._challenge_detector = challenge_detector or ChallengeDetector()
 
     async def fetch(
         self,
@@ -43,13 +73,30 @@ class Level3Fetcher:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
-                await page.goto(url, wait_until="load", timeout=timeout * 1000)
+                await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
                 # CPU-bound client-side JS (e.g. PoW solvers) cannot be detected
                 # by networkidle — the browser is computing, not fetching. Use a
-                # generous fixed post-load delay (10s) so the solver has time to
-                # complete before we call page.content().
-                await page.wait_for_timeout(10000)
-                html = await page.content()
+                # config-driven bounded retry loop: wait an initial fixed period,
+                # then poll at retry_wait_increment_ms intervals until
+                # ChallengeDetector no longer classifies the page as a challenge
+                # interstitial, or max_total_wait_ms ceiling is hit.
+                await page.wait_for_timeout(self._post_load_fixed_wait_ms)
+                html = await poll_until_solved(
+                    page,
+                    self._challenge_detector,
+                    max_total_wait_ms=self._max_total_wait_ms,
+                    retry_wait_increment_ms=self._retry_wait_increment_ms,
+                    waited_ms=self._post_load_fixed_wait_ms,
+                )
+                # Lazy-load / infinite-scroll: scroll to load the rest once past
+                # the challenge, then re-read the fully-populated DOM.
+                if self._scroll_passes > 0:
+                    await autoscroll(
+                        page,
+                        max_passes=self._scroll_passes,
+                        wait_ms=self._scroll_wait_ms,
+                    )
+                    html = await safe_content(page)
                 duration_ms = int((time.monotonic() - start) * 1000)
 
                 return FetchResult(
@@ -67,7 +114,9 @@ class Level3Fetcher:
                 success=False,
                 level_used=3,
                 duration_ms=int((time.monotonic() - start) * 1000),
-                failure_category=FailureCategory.BROWSER_CRASH,
+                failure_category=classify_fetch_exception(
+                    exc, FailureCategory.BROWSER_CRASH
+                ),
                 error_message=str(exc),
                 proxy_used=proxy.key() if proxy else "none",
             )
