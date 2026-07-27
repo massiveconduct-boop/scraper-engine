@@ -46,10 +46,24 @@ Index of all knowledge documents. Read this first to discover what exists before
 | `docs/round-13-evidence.md` | Config DI factory + CI gate, `force_engine` negative-control seam, monitoring dashboard/alerts (Slack-proven), per-source health gauge, ruff 45→0, mirror ruff baseline, Docker multi-stage + launch-lib chain fix | Round 13 deliverables |
 | `docs/round-14-evidence.md` | L2 flakiness fixed (shared `poll_until_solved` retry loop, deterministic A/B), host-vs-container 202/201 reconciled (pgbouncer test), Python 3.11 never-deployed (stale pin) | Round 14 deliverables |
 | `docs/round-15-evidence.md` | Real-target validation (books/quotes/scrapethissite/webscraper/nowsecure/sannysoft/scrapecups) — Cloudflare passed, no webdriver leak; `HOST_UNREACHABLE` non-retryable DNS category added | Round 15 real-site validation + DNS taxonomy fix |
+| `docs/round-16-evidence.md` | Infinite-scroll/lazy-load `autoscroll` (consecutive-stable stop; live-proven 10→30 quotes) | Scroll handling |
+| `docs/round-17-evidence.md` | Full-stack e2e smoke (auth/SSRF/quota/persist/retrieve); GET /v1/jobs 500 fix (asyncpg UUID→str) | Live API pipeline + UUID bug |
+| `docs/round-19-evidence.md` | CAPTCHA solver — NoCaptchaAI primary/CapSolver fallback; ImageToText solved live; provider-specific task-type corrections (docs stale) | CAPTCHA solving subsystem |
 | `docs/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
 | `docs/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
-| `.github/workflows/test.yml` | Live 4-stage CI pipeline (lint/unit/integration/chaos) | CI configuration reference |
-| `tools/mypy-baseline.txt` | 23 known mypy findings, ratchet-protected | mypy regression prevention |
+| `.github/workflows/test.yml` | Live CI (lint incl. mypy-strict + fetcher-factory + force_engine grep-gates + challenge-mirror ruff baseline; unit/integration/chaos) | CI configuration reference |
+| `tools/mypy-baseline.txt` | EMPTY since round 18 — mypy `--strict` clean; CI fails on any error | mypy strict gate |
+
+## Technical Debt / Open Threads (as of round 19)
+
+- **CAPTCHA solver not wired into the fetch path.** `services/captcha_solver.py` works
+  and is tested, but L2/L3 detect challenges (ChallengeDetector) without calling it.
+  Next: on a detected reCAPTCHA/Turnstile, extract the sitekey from the page →
+  `solver.solve_*()` → inject token → continue. See `docs/round-19-evidence.md`.
+- **AWS WAF** captcha unverified — needs a real AWS-WAF target (per-request runtime data).
+- **CapSolver fallback key invalid** (401) — replace in `.env` to enable fallback.
+- **Branch `rounds-12-17`** holds rounds 12–19; local, unpushed. main = PR + 4 CI checks.
+- **Deployable image** (`scraper-engine:round18`) predates the captcha + mypy-strict work — rebuild for HEAD.
 
 ## Reference
 

@@ -101,6 +101,41 @@ All routes enforce 4 invariants per blueprint:
 
 ---
 
+## Fetcher Construction & Shared Content Helpers (Round 13-16)
+
+- **DI factory:** `fetcher/factory.py::build_level1/2/3_fetcher(config)` is the ONLY
+  production path to a fetcher (CI grep-gate enforces it). Reads `config.levels.level_N`
+  (unified `LevelConfig`: goto/networkidle/max_total/post_load/retry_increment/scroll fields).
+- **Shared helpers** (`fetcher/_content_utils.py`, used by L2 + L3):
+  `safe_content` (mid-nav guard), `poll_until_solved` (ChallengeDetector-gated retry),
+  `autoscroll` (lazy-load/infinite-scroll, consecutive-stable stop).
+- **`fetcher/_failure.py::classify_fetch_exception`** maps DNS errors → HOST_UNREACHABLE.
+- **Escalation additions:** worker escalates JS-gated L1 shells (`looks_javascript_gated`)
+  and dead-letters HOST_UNREACHABLE immediately (no futile L1→L2→L3).
+
+## CAPTCHA Solving (Round 19)
+
+Provider-abstracted, primary-with-fallback. **NOT yet wired into the fetch path** —
+fetchers detect challenges but do not yet call the solver (see MEMORY.md tech debt).
+
+```
+CaptchaSolver(primary=NoCaptchaAI, fallback=CapSolver)   [services/captcha_solver.py]
+  ├─ solve_recaptcha_v2 / solve_turnstile / solve_hcaptcha / solve_aws_waf
+  │  / solve_geetest / solve_mtcaptcha  → try primary, on None → fallback
+  └─ build_captcha_solver(budget)  ← env keys (NOCAPTCHA_AI_API_KEY, CAPSOLVER_API_KEY)
+
+services/_anticaptcha.py   — shared createTask/getTaskResult (arbitrary task dict),
+                              solve_image_to_text (OCR, sync), get_balance
+services/nocaptcha.py      — NoCaptchaAIClient (primary)  [provider-specific task types]
+services/capsolver.py      — CapSolverClient (fallback; also covers hCaptcha)
+```
+
+Both gated by `CapSolverBudget` (per-tenant $/day, BD-03) + `CAPSOLVER_CONCURRENCY`.
+Task-type strings are provider-specific and were live-corrected from stale docs
+(see troubleshooting.md).
+
+---
+
 ## Data Flow
 
 ```
