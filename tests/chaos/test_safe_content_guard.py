@@ -19,10 +19,31 @@ the point is that _safe_content never throws.
 import asyncio
 import os
 
+import pytest
+
 from core.tenant import TenantId
 from fetcher._content_utils import safe_content
 
 MIRROR = os.environ.get("CHALLENGE_MIRROR_URL", "http://127.0.0.1:8090")
+
+
+def _camoufox_installed() -> bool:
+    """True only if the Camoufox browser binary is actually fetched. The pip
+    package is present in CI but the ~300MB browser is not (`camoufox fetch`),
+    so these real-browser races must skip there — same "run locally, skip in CI"
+    convention as the other Camoufox-dependent tests."""
+    try:
+        from camoufox.pkgman import installed_verstr
+
+        return bool(installed_verstr())
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _camoufox_installed(),
+    reason="Camoufox browser binary not installed (run `camoufox fetch`); skipped in CI",
+)
 
 
 async def test_mid_poll_reload_with_delay() -> None:
