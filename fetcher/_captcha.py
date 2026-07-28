@@ -17,8 +17,8 @@ use for `_content_utils`.
 Best-effort by design: every step returns False rather than raising, so a solve
 attempt can never turn a recoverable fetch into a crash. The DOM detect/inject
 JS is unit-tested with a fake page; a real end-to-end solve depends on a live
-solver entitlement + a real target (see docs/archive/round-19-evidence.md — the
-NoCaptchaAI account's reCAPTCHA capability was not active at build time).
+solver entitlement + a real target — the NoCaptchaAI account's reCAPTCHA
+capability was not active at build time, so this hasn't been live-verified.
 
 The injection scripts are module constants (not inlined) so unit tests can
 assert on them and so the reCAPTCHA callback-walk stays reviewable.

@@ -22,7 +22,7 @@ Index of all knowledge documents. Read this first to discover what exists before
 | Document | Purpose | When to read |
 |---|---|---|
 | `.claude/knowledge/operations.md` | Deployment, infrastructure, CI, monitoring, alert config | Deploying; setting up CI; configuring alerts |
-| `docs/deployment.md` | Production deployment guide with scaling, security, troubleshooting | First-time deployment; production incidents |
+| `docs/guides/deployment.md` | Production deployment guide with scaling, security, troubleshooting | First-time deployment; production incidents |
 
 ## History & Evidence
 
@@ -687,7 +687,7 @@ Index of all knowledge documents. Read this first to discover what exists before
 
 | Document | Purpose | When to read |
 |---|---|---|
-| `docs/api-reference.md` | API endpoint reference (scrape, jobs, health, admin) | Integrating with the API |
+| `docs/reference/api-reference.md` | API endpoint reference (scrape, jobs, health, admin) | Integrating with the API |
 | `docs/auditable-verification-report.md` | Auditable report from round 4 | Historical reference |
 
 ## Update Policy

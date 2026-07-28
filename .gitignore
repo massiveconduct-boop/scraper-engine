@@ -19,3 +19,4 @@ profiles/
 .claude/
 !.claude/knowledge/
 !.claude/MEMORY.md
+.archive/

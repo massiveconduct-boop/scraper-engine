@@ -29,7 +29,7 @@ curl http://localhost:8000/v1/health
 ```
 
 Full production deployment steps (docker-compose full stack, migrations,
-tenant creation, scaling, monitoring): `docs/deployment.md`.
+tenant creation, scaling, monitoring): `docs/guides/deployment.md`.
 
 ## Tests
 
@@ -46,15 +46,24 @@ mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ -
 |---|---|
 | `core/`, `proxy/`, `browser/`, `fetcher/`, `orchestrator/`, `api/`, `storage/`, `config/`, `cli/`, `observability/`, `services/` | Application source — see `CLAUDE.md` → Module Map for responsibilities |
 | `tests/` | Unit, integration, chaos, and live test suites |
-| `docs/` | Current reference docs (`api-reference.md`, `deployment.md`); `docs/archive/` holds historical per-round evidence/directive reports, kept for record but not living documentation |
+| `docs/reference/` | API reference |
+| `docs/guides/` | Deployment and operational guides |
 | `.claude/knowledge/` | Living architecture, decisions, standards, troubleshooting, and operations docs |
 | `.claude/MEMORY.md` | Full round-by-round project history and technical debt log |
 | `specs/` | Authoritative blueprint spec |
 | `challenge-mirror/` | Self-hosted Cloudflare-like test target used for live L2/L3 anti-detection verification (not part of the production stack) |
 | `infra/`, `monitoring/` | PgBouncer config, Prometheus/Grafana dashboards and alert rules |
+| `CHANGELOG.md` | Per-PR summary of what shipped |
+| `CONTRIBUTING.md` | Dev setup, test/lint commands, PR workflow |
+| `LICENSE`, `NOTICE` | Apache License 2.0 |
+
+Historical per-round evidence/directive/closure reports (60+ point-in-time
+build artifacts) are kept locally under `.archive/`, gitignored — not part
+of the tracked repo.
 
 ## Navigation
 
 - **Start here for architecture/conventions:** `CLAUDE.md`
+- **Contributing:** `CONTRIBUTING.md`
 - **Knowledge catalog:** `.claude/MEMORY.md`
 - **Spec:** `specs/scraper-engine-blueprint-v2.md`
