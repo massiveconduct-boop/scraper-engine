@@ -11,21 +11,28 @@ from fastapi import FastAPI
 
 def create_app() -> FastAPI:
     """Build and return the FastAPI application."""
+    from config.loader import load_config
+    from observability.bootstrap import bootstrap_observability
+
     from .middleware import configure_middleware
     from .routes import register_routes
+
+    cfg = load_config()
+    bootstrap_observability(cfg.observability)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Connect Postgres, Redis, and initialise TenantResolver at startup."""
         import api.dependencies as deps
         from api.auth import TenantResolver
-        from config.loader import load_config
+        from core.ssrf_guard import SSRFGuard
         from orchestrator.job_queue import build_queue
         from storage.postgres_client import PostgresClient
         from storage.redis_client import RedisClient
         from storage.s3_client import S3Client
 
-        cfg = load_config()
+        if deps._ssrf_guard is None:
+            deps._ssrf_guard = SSRFGuard(cfg.ssrf_guard.additional_denied_cidrs)
 
         if deps._storage_pg is None:
             # DB traffic goes through PgBouncer (invariant G-05) via the single
@@ -69,7 +76,16 @@ def create_app() -> FastAPI:
         description="Multi-level web scraping with anti-detection + proxy management",
     )
     configure_middleware(app)
-    register_routes(app)
+    register_routes(app, cfg)
+
+    if cfg.observability.tracing_enabled:
+        # A configured TracerProvider (bootstrap_observability, above) with
+        # nothing creating spans is tracing in name only — this is what
+        # actually emits a span per request.
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app)
+
     return app
 
 

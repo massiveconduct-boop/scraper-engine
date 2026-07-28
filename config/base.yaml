@@ -79,6 +79,7 @@ observability:
   metrics_enabled: true
   tracing_enabled: true
   logging_level: INFO
+  otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:http://jaeger:4317}"
 
 pgbouncer:
   pool_mode: transaction
@@ -88,3 +89,4 @@ pgbouncer:
 session_retention:
   browser_sessions_ttl_days: 30
   domain_ban_history_retention_days: 7
+  cleanup_interval_seconds: 3600

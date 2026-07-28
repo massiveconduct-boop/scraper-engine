@@ -15,6 +15,7 @@ import pytest
 import api.dependencies as deps
 from api.routes import crawl, get_job, scrape
 from core.models import JobStatus
+from core.ssrf_guard import SSRFGuard
 
 
 @pytest.fixture
@@ -73,6 +74,9 @@ def wired_scrape_deps(monkeypatch):
     queue = MagicMock()
     monkeypatch.setattr(deps, "_queue", queue)
 
+    # routes.py now reads the shared deps._ssrf_guard singleton instead of
+    # constructing a fresh SSRFGuard() per request (api/main.py lifespan).
+    monkeypatch.setattr(deps, "_ssrf_guard", SSRFGuard())
     monkeypatch.setattr("core.ssrf_guard.SSRFGuard.validate", AsyncMock(return_value=None))
 
     return pg, redis, queue

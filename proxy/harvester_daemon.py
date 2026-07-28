@@ -28,12 +28,16 @@ import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from opentelemetry import trace
+
 from config.loader import load_config
 from config.schema import AppConfig
+from observability.bootstrap import bootstrap_observability
 from proxy.asn_classifier import build_asn_classifier
 from proxy.harvester import ProxyHarvester
 from proxy.health_monitor import HealthMonitor
 from proxy.promotion import ProxyPromotionJob
+from proxy.retention_reaper import RetentionReaper
 from storage.postgres_client import PostgresClient
 from storage.redis_client import RedisClient
 
@@ -51,9 +55,11 @@ async def _run_periodic(
     a transient network/DB error must not take the whole routine offline.
     Cancellation (graceful shutdown) is propagated.
     """
+    tracer = trace.get_tracer(__name__)
     while True:
         try:
-            result = await cycle()
+            with tracer.start_as_current_span(f"proxy_daemon_{name}"):
+                result = await cycle()
             logger.info("proxy_daemon_%s_cycle: %s", name, result)
         except asyncio.CancelledError:
             raise
@@ -69,6 +75,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     daemon installs SIGTERM/SIGINT handlers so ``docker compose stop`` is graceful.
     """
     cfg = config or load_config()
+    bootstrap_observability(cfg.observability)
     ph = cfg.proxy_harvester
 
     pg = PostgresClient(cfg.storage.database_url)
@@ -80,6 +87,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     # Promotion reuses the harvester's HTTP validator — no duplicated logic.
     promotion = ProxyPromotionJob(pg, ProxyHarvester._http_validate)
     health = HealthMonitor(pg, redis)
+    reaper = RetentionReaper(pg, cfg.session_retention)
 
     tasks = [
         asyncio.create_task(
@@ -91,12 +99,18 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
         asyncio.create_task(
             _run_periodic("health", health.check_all, ph.health_interval_seconds)
         ),
+        asyncio.create_task(
+            _run_periodic(
+                "retention", reaper.run_once, cfg.session_retention.cleanup_interval_seconds
+            )
+        ),
     ]
     logger.info(
-        "proxy daemon started (harvest=%ss promotion=%ss health=%ss, sources=%s)",
+        "proxy daemon started (harvest=%ss promotion=%ss health=%ss retention=%ss, sources=%s)",
         ph.interval_seconds,
         ph.promotion_interval_seconds,
         ph.health_interval_seconds,
+        cfg.session_retention.cleanup_interval_seconds,
         ph.sources,
     )
 
@@ -122,7 +136,6 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(run())
 
 

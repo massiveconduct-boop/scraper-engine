@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rq import Queue
 
+    from core.ssrf_guard import SSRFGuard
     from storage.postgres_client import PostgresClient
     from storage.redis_client import RedisClient
     from storage.s3_client import S3Client
@@ -20,6 +21,7 @@ _storage_pg: PostgresClient | None = None
 _storage_redis: RedisClient | None = None
 _storage_s3: S3Client | None = None
 _queue: Queue | None = None
+_ssrf_guard: SSRFGuard | None = None
 
 
 async def get_tenant_resolver() -> TenantResolver:
@@ -55,3 +57,10 @@ async def get_queue() -> Queue:
     if _queue is None:
         raise RuntimeError("Queue not initialized")
     return _queue
+
+
+async def get_ssrf_guard() -> SSRFGuard:
+    """Dependency: return the SSRFGuard singleton (built with additional_denied_cidrs)."""
+    if _ssrf_guard is None:
+        raise RuntimeError("SSRFGuard not initialized")
+    return _ssrf_guard

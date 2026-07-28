@@ -145,6 +145,40 @@ async def test_run_scrape_job_crawl_type_routes_to_scrapy_adapter(fake_clients, 
     assert len(insert_calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_run_scrape_job_creates_traced_span_with_job_attributes(fake_clients, monkeypatch):
+    """Regression test for a real bug: rq's work-horse process exits via
+    os._exit() (rq/worker/base.py), bypassing atexit — BatchSpanProcessor's
+    background export thread also doesn't survive fork() at all — so without
+    the explicit force_flush() in _run_scrape_job's finally block, every
+    job's span was silently dropped (confirmed live against a real rq
+    worker; the same code invoked directly, not via a forked work-horse,
+    worked immediately). This asserts the span actually exists with the
+    right attributes, not just that force_flush() doesn't crash."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    pg, redis, s3, cfg = fake_clients
+    monkeypatch.setattr(
+        tasks_module, "_run_scrape",
+        AsyncMock(return_value=JobStatusResponse(job_id="job-span", status=JobStatus.COMPLETED)),
+    )
+    monkeypatch.setattr(
+        "orchestrator.webhook.WebhookDispatcher.deliver", AsyncMock(return_value=True)
+    )
+
+    exporter = InMemorySpanExporter()
+    trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(exporter))
+
+    await tasks_module._run_scrape_job("system", "job-span")
+
+    scrape_spans = [s for s in exporter.get_finished_spans() if s.name == "scrape_job"]
+    assert len(scrape_spans) == 1
+    assert scrape_spans[0].attributes["job_id"] == "job-span"
+    assert scrape_spans[0].attributes["tenant_id"] == "system"
+
+
 def test_run_scrape_job_sync_wrapper_runs_the_coroutine(monkeypatch):
     called = {}
 

@@ -14,6 +14,7 @@ services:
       - redis
       - pgbouncer
       - minio
+      - jaeger
 
   # worker-l1/l2/l3 are 3 replicas of the SAME worker pulling from ONE queue
   # ("scraper-jobs"), not per-level queues — Worker.process_job already runs
@@ -32,6 +33,7 @@ services:
       - redis
       - pgbouncer
       - minio
+      - jaeger
 
   worker-l2:
     build: .
@@ -46,6 +48,7 @@ services:
       - redis
       - pgbouncer
       - minio
+      - jaeger
 
   worker-l3:
     build: .
@@ -60,6 +63,7 @@ services:
       - redis
       - pgbouncer
       - minio
+      - jaeger
 
   proxy-harvester:
     build: .
@@ -71,6 +75,7 @@ services:
     depends_on:
       - postgres
       - redis
+      - jaeger
 
   postgres:
     image: postgres:16-alpine
@@ -136,6 +141,19 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+
+  # Real tracing backend — Jaeger's all-in-one image speaks OTLP gRPC natively
+  # (no separate otel-collector needed). observability.otlp_endpoint points
+  # every process here at it instead of the OTel default localhost:4317
+  # (which resolves to the *calling container itself*, not this service).
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
 
 volumes:
   pgdata:

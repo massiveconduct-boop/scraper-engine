@@ -82,6 +82,10 @@ class ObservabilityConfig(BaseModel):
     metrics_enabled: bool = True
     tracing_enabled: bool = True
     logging_level: str = "INFO"
+    # OTLPSpanExporter's own default (localhost:4317) resolves inside whichever
+    # container is exporting, never reaching the separate jaeger service — this
+    # is the single source of truth every process points at instead.
+    otlp_endpoint: str = "http://jaeger:4317"
 
 
 class PgBouncerConfig(BaseModel):
@@ -93,6 +97,7 @@ class PgBouncerConfig(BaseModel):
 class SessionRetentionConfig(BaseModel):
     browser_sessions_ttl_days: int = 30
     domain_ban_history_retention_days: int = 7
+    cleanup_interval_seconds: int = 3600
 
 
 class StorageConfig(BaseModel):

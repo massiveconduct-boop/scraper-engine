@@ -35,6 +35,13 @@ dependencies = [
     "python-dotenv==1.2.2",
     "scrapy==2.17.0",
     "maxminddb==2.8.2",
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
+    "opentelemetry-instrumentation-fastapi==0.65b0",
+    "opentelemetry-instrumentation-httpx==0.65b0",
+    "opentelemetry-instrumentation-asyncpg==0.65b0",
+    "opentelemetry-instrumentation-redis==0.65b0",
 ]
 
 [project.optional-dependencies]
@@ -79,6 +86,14 @@ warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
 module = "numpy.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# No py.typed marker, so mypy fully analyzes their installed source instead of
+# treating them as untyped (ignore_missing_imports only covers modules it
+# can't find at all) — same shape as the numpy override above.
+module = "opentelemetry.instrumentation.*"
 ignore_missing_imports = true
 follow_imports = "skip"
 

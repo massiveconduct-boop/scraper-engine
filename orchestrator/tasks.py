@@ -26,8 +26,12 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import trace
+
+from config.loader import load_config
 from core.models import ConfigOverrides, FetchResult, JobStatus, JobStatusResponse, ScrapeRequest
 from core.tenant import TenantId
+from observability.bootstrap import bootstrap_observability
 
 if TYPE_CHECKING:
     from config.schema import AppConfig
@@ -37,6 +41,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# rq imports this module once per worker process before executing any job —
+# module-level code is the right place to bootstrap once, rather than
+# reconfiguring logging/tracing on every single job inside _run_scrape_job.
+bootstrap_observability(load_config().observability)
+
 
 def run_scrape_job(tenant_id: str, job_id: str) -> None:
     """Sync entry point rq calls. Runs the async pipeline to completion."""
@@ -44,7 +53,6 @@ def run_scrape_job(tenant_id: str, job_id: str) -> None:
 
 
 async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
-    from config.loader import load_config
     from storage.postgres_client import PostgresClient
     from storage.redis_client import RedisClient
     from storage.s3_client import S3Client
@@ -64,57 +72,77 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
     await pg.start()
     await redis.start()
     await s3.start()
+    tracer = trace.get_tracer(__name__)
     try:
-        row = await pg.fetchrow(
-            tenant_id,
-            "SELECT urls, config_used, webhook_url FROM scrape_jobs WHERE job_id = $1::uuid",
-            job_id,
-        )
-        if row is None:
-            logger.error("job_not_found job_id=%s tenant=%s", job_id, tenant_id)
-            return
-
-        config_used: dict[str, Any] = json.loads(row["config_used"]) if row["config_used"] else {}
-        webhook_url: str | None = row["webhook_url"]
-
-        await pg.execute(
-            tenant_id,
-            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
-            JobStatus.PROCESSING.value,
-            job_id,
-        )
-
-        status: JobStatus
-        error: str | None
-        if config_used.get("_job_type") == "crawl":
-            results = await _run_crawl_job(config_used)
-            status = JobStatus.COMPLETED
-            error = None
-        else:
-            request = ScrapeRequest(
-                urls=list(row["urls"]),
-                config_overrides=ConfigOverrides(**config_used) if config_used else None,
+        with tracer.start_as_current_span(
+            "scrape_job", attributes={"job_id": job_id, "tenant_id": tenant_id_raw}
+        ):
+            row = await pg.fetchrow(
+                tenant_id,
+                "SELECT urls, config_used, webhook_url FROM scrape_jobs WHERE job_id = $1::uuid",
+                job_id,
             )
-            response = await _run_scrape(tenant_id, job_id, request, redis, pg, cfg)
-            results = response.results or []
-            status = response.status
-            error = response.error
+            if row is None:
+                logger.error("job_not_found job_id=%s tenant=%s", job_id, tenant_id)
+                return
 
-        await _persist_results(pg, s3, tenant_id, job_id, results)
+            config_used: dict[str, Any] = (
+                json.loads(row["config_used"]) if row["config_used"] else {}
+            )
+            webhook_url: str | None = row["webhook_url"]
 
-        await pg.execute(
-            tenant_id,
-            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
-            status.value,
-            job_id,
-        )
+            await pg.execute(
+                tenant_id,
+                "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+                JobStatus.PROCESSING.value,
+                job_id,
+            )
 
-        if webhook_url:
-            await _dispatch_webhook(webhook_url, job_id, status, results, error)
+            status: JobStatus
+            error: str | None
+            if config_used.get("_job_type") == "crawl":
+                results = await _run_crawl_job(config_used)
+                status = JobStatus.COMPLETED
+                error = None
+            else:
+                request = ScrapeRequest(
+                    urls=list(row["urls"]),
+                    config_overrides=ConfigOverrides(**config_used) if config_used else None,
+                )
+                response = await _run_scrape(tenant_id, job_id, request, redis, pg, cfg)
+                results = response.results or []
+                status = response.status
+                error = response.error
+
+            await _persist_results(pg, s3, tenant_id, job_id, results)
+
+            await pg.execute(
+                tenant_id,
+                "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+                status.value,
+                job_id,
+            )
+
+            if webhook_url:
+                await _dispatch_webhook(webhook_url, job_id, status, results, error)
     finally:
         await s3.stop()
         await redis.stop()
         await pg.stop()
+        # rq runs each job in a forked "work horse" process that exits via
+        # os._exit() (rq/worker/base.py) — that bypasses atexit entirely, so
+        # the BatchSpanProcessor's background export thread (which doesn't
+        # survive fork() anyway — only the calling thread does) never gets a
+        # chance to flush the span queued above. Without this, every job's
+        # trace was silently dropped at process exit (confirmed live: spans
+        # from a real rq worker never reached Jaeger; the identical code path
+        # invoked directly, not via a forked work-horse, worked immediately).
+        # hasattr guard: the default no-op provider has no force_flush at all.
+        # Bounded timeout: an unreachable collector must never stall a job —
+        # this is a best-effort export, not a delivery guarantee.
+        provider = trace.get_tracer_provider()
+        if hasattr(provider, "force_flush"):
+            provider.force_flush(timeout_millis=2000)
 
 
 async def _run_scrape(

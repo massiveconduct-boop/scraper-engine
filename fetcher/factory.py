@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from core.ssrf_guard import SSRFGuard
 from fetcher.challenge_detector import ChallengeDetector
 from fetcher.level_1 import Level1Fetcher
 from fetcher.level_2 import Level2Fetcher
@@ -28,6 +29,13 @@ if TYPE_CHECKING:
     from services.captcha_solver import CaptchaSolver
 
 
+def _build_ssrf_guard(config: AppConfig) -> SSRFGuard:
+    """One shared guard per fetcher build, honoring ssrf_guard.additional_denied_cidrs
+    — without this, every fetcher's `ssrf_guard or SSRFGuard()` fallback silently
+    used the zero-arg default and the config field never took effect."""
+    return SSRFGuard(config.ssrf_guard.additional_denied_cidrs)
+
+
 def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     """Construct the L1 (HTTP/Scrapling) fetcher. Takes no wait-strategy config
     today, but centralised here so every production call site has one path.
@@ -36,7 +44,10 @@ def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     pattern as captcha_solver) for markdown conversion — None disables it."""
     from services.firecrawl_client import build_firecrawl_client
 
-    return Level1Fetcher(firecrawl_client=build_firecrawl_client())
+    return Level1Fetcher(
+        firecrawl_client=build_firecrawl_client(),
+        ssrf_guard=_build_ssrf_guard(config),
+    )
 
 
 def build_level2_fetcher(
@@ -59,6 +70,7 @@ def build_level2_fetcher(
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
         captcha_solver=captcha_solver if lvl.capsolver_enabled else None,
+        ssrf_guard=_build_ssrf_guard(config),
     )
 
 
@@ -80,4 +92,5 @@ def build_level3_fetcher(
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
         captcha_solver=captcha_solver if lvl.capsolver_enabled else None,
+        ssrf_guard=_build_ssrf_guard(config),
     )
