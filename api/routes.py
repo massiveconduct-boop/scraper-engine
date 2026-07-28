@@ -16,6 +16,7 @@ import uuid
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
+from config.schema import AppConfig
 from core.models import (
     CrawlRequest,
     FailureCategory,
@@ -54,9 +55,8 @@ async def scrape(
     x_api_key: str = Header(..., alias="X-API-Key"),
 ) -> dict[str, object]:
     """Enqueue a scrape job with SSRF validation, tenant auth, and quota check."""
-    from api.dependencies import _queue, _storage_pg, _storage_redis, _tenant_resolver
+    from api.dependencies import _queue, _ssrf_guard, _storage_pg, _storage_redis, _tenant_resolver
     from core.exceptions import AuthenticationError, SSRFBlockedError
-    from core.ssrf_guard import SSRFGuard
 
     # Tenant resolution
     if _tenant_resolver is None:
@@ -66,11 +66,13 @@ async def scrape(
     except AuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid API key") from None
 
-    # SSRF validation on every URL
-    ssrf = SSRFGuard()
+    # SSRF validation on every URL — shared singleton so ssrf_guard.
+    # additional_denied_cidrs (config) actually takes effect (see api/main.py lifespan).
+    if _ssrf_guard is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
     for url_val in request.urls:
         try:
-            await ssrf.validate(str(url_val))
+            await _ssrf_guard.validate(str(url_val))
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
@@ -136,9 +138,8 @@ async def crawl(
     500-URL cap. Same auth/SSRF/quota checks; runs on the same job queue/worker
     pool via a distinct code path (orchestrator/tasks.py branches on
     config_used["_job_type"])."""
-    from api.dependencies import _queue, _storage_pg, _storage_redis, _tenant_resolver
+    from api.dependencies import _queue, _ssrf_guard, _storage_pg, _storage_redis, _tenant_resolver
     from core.exceptions import AuthenticationError, SSRFBlockedError
-    from core.ssrf_guard import SSRFGuard
 
     if _tenant_resolver is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -147,10 +148,11 @@ async def crawl(
     except AuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid API key") from None
 
-    ssrf = SSRFGuard()
+    if _ssrf_guard is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
     for url_val in request.start_urls:
         try:
-            await ssrf.validate(str(url_val))
+            await _ssrf_guard.validate(str(url_val))
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
@@ -307,26 +309,27 @@ async def health() -> dict[str, object]:
     return payload
 
 
-def register_routes(app: FastAPI) -> None:
+def register_routes(app: FastAPI, cfg: AppConfig) -> None:
     """Register all API routes on the FastAPI app, including /metrics."""
-    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+    if cfg.observability.metrics_enabled:
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-    @app.get("/metrics")
-    async def metrics() -> Response:
-        from prometheus_client import REGISTRY
+        @app.get("/metrics")
+        async def metrics() -> Response:
+            from prometheus_client import REGISTRY
 
-        from api.dependencies import _storage_pg
-        from core.tenant import TenantId
-        from observability.metrics import count_validated_proxies, proxy_pool_validated_count
+            from api.dependencies import _storage_pg
+            from core.tenant import TenantId
+            from observability.metrics import count_validated_proxies, proxy_pool_validated_count
 
-        if _storage_pg is not None:
-            try:
-                tenant = TenantId("system")
-                count = await count_validated_proxies(_storage_pg, tenant)
-                proxy_pool_validated_count.set(count)
-            except Exception:
-                logger.warning("proxy_pool_validated_count gauge update failed", exc_info=True)
+            if _storage_pg is not None:
+                try:
+                    tenant = TenantId("system")
+                    count = await count_validated_proxies(_storage_pg, tenant)
+                    proxy_pool_validated_count.set(count)
+                except Exception:
+                    logger.warning("proxy_pool_validated_count gauge update failed", exc_info=True)
 
-        return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+            return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     app.include_router(router)

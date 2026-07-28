@@ -116,9 +116,10 @@ curl http://localhost:8000/v1/health
 
 ## Monitoring
 
-- Prometheus metrics: `:9090/metrics`
+- Prometheus metrics: `:8000/metrics` (same app/port as the API; toggle with `observability.metrics_enabled`)
 - Grafana dashboard: `monitoring/dashboards/grafana_overview.json`
 - Alert rules: `monitoring/alerts/prometheus_rules.yml`
+- Distributed tracing: Jaeger UI at `:16686` (toggle with `observability.tracing_enabled`; exporter target set by `observability.otlp_endpoint`, default `http://jaeger:4317`). Covers: every API request (`FastAPIInstrumentor`), one root span per scrape/crawl job (`orchestrator/tasks.py`, spanning the whole job even across the rq work-horse's forked process), one root span per proxy-harvester cycle (`proxy_daemon_harvest`/`promotion`/`health`/`retention`), and every outbound httpx/Postgres/Redis call nested automatically under whichever of those is active.
 
 Key alerts:
 - `ProxyPoolCriticallyLow` — elite proxies < 5
@@ -132,7 +133,7 @@ Key alerts:
 - SSRF guard: blocks all private/loopback/link-local IPs before enqueue
 - SQL injection: `TenantId` regex validation before any DDL construction
 - Middleware: rate limiting (100 req/min), 1 MB body limit, security headers
-- Never expose metrics endpoint (`/v1/metrics`) to public internet
+- Never expose metrics endpoint (`/metrics`) to public internet
 
 ## Troubleshooting
 

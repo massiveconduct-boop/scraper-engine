@@ -28,6 +28,9 @@ def main() -> None:
     # harvest
     _harvest = subparsers.add_parser("harvest", help="Run proxy harvester once")
 
+    # reap (session_retention enforcement)
+    _reap = subparsers.add_parser("reap", help="Run retention reaper once")
+
     # check health
     _check = subparsers.add_parser("check", help="Run a health check")
 
@@ -37,6 +40,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    from config.loader import load_config
+    from observability.bootstrap import bootstrap_observability
+
+    bootstrap_observability(load_config().observability)
+
     if args.command == "serve":
         import uvicorn
         uvicorn.run("api.main:app", host=args.host, port=args.port, reload=True)
@@ -44,6 +52,8 @@ def main() -> None:
         asyncio.run(_create_tenant(args.tenant_slug))
     elif args.command == "harvest":
         asyncio.run(_harvest_once())
+    elif args.command == "reap":
+        asyncio.run(_reap_once())
     elif args.command == "worker":
         _run_worker(args.queues)
     elif args.command == "check":
@@ -87,6 +97,23 @@ async def _harvest_once() -> None:
         )
         count = await harvester.harvest_once()
         print(f"Harvest complete: {count} proxies collected")
+    finally:
+        await pg.stop()
+
+
+async def _reap_once() -> None:
+    """Run a single retention-reap cycle (manual trigger; the daemon runs it on
+    a timer). Deletes expired browser_sessions/domain_ban_history rows."""
+    from config.loader import load_config
+    from proxy.retention_reaper import RetentionReaper
+    from storage.postgres_client import PostgresClient
+
+    cfg = load_config()
+    pg = PostgresClient(cfg.storage.database_url)
+    await pg.start()
+    try:
+        result = await RetentionReaper(pg, cfg.session_retention).run_once()
+        print(f"Reap complete: {result}")
     finally:
         await pg.stop()
 

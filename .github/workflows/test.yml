@@ -24,7 +24,10 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy maxminddb
+            pyyaml boto3 python-dotenv scrapy maxminddb \
+            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
+            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
+            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis
       # challenge-mirror excluded here — linted separately against its own
       # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
@@ -92,6 +95,9 @@ jobs:
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
             pyyaml boto3 python-dotenv scrapy maxminddb \
+            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
+            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
+            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
             pytest pytest-asyncio pytest-cov
           pip install -e . --no-deps
       - run: python -m pytest tests/unit/ -v --tb=short
@@ -134,6 +140,9 @@ jobs:
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
             pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
+            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
+            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
+            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
@@ -173,7 +182,37 @@ jobs:
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
             pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
+            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
+            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
+            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
       - run: python -m pytest tests/chaos/ -v --tb=short
+
+  # Builds and publishes the image CI has been proving works — only on a real
+  # merge to main (never on pull_request, so a fork PR never gets registry
+  # write access), and only after every test job is green. No live deploy
+  # target exists yet (no k8s/systemd/cloud config anywhere in the repo), so
+  # this stops at "publish the image", not "deploy it".
+  build-and-push:
+    runs-on: ubuntu-24.04
+    needs: chaos
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest

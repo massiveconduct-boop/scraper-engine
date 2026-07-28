@@ -28,8 +28,9 @@ class SSRFGuard:
         "fe80::/10",
     ]
 
-    def __init__(self) -> None:
-        self._denied = [ipaddress.ip_network(n) for n in self.DENIED_NETWORKS]
+    def __init__(self, additional_denied_cidrs: list[str] | None = None) -> None:
+        networks = list(self.DENIED_NETWORKS) + list(additional_denied_cidrs or [])
+        self._denied = [ipaddress.ip_network(n) for n in networks]
 
     async def validate(self, url: str) -> None:
         """Raises SSRFBlockedError if ANY address the host resolves to is in a
