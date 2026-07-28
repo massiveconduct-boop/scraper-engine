@@ -9,6 +9,7 @@ asserts promotion from score 25 → 60.
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -17,11 +18,13 @@ from proxy.harvester import ProxyHarvester
 from proxy.promotion import ProxyPromotionJob
 from storage.postgres_client import PostgresClient
 
+JUDGE_SERVER = Path(__file__).resolve().parent.parent / "fixtures" / "judge_server.py"
+
 
 @pytest.fixture(scope="module")
 def judge_server():
     """Start the self-hosted judge server on port 8089 in the background."""
-    p = subprocess.Popen([sys.executable, "tests/fixtures/judge_server.py"])
+    p = subprocess.Popen([sys.executable, str(JUDGE_SERVER)])
     # Give the server a moment to bind and start listening
     time.sleep(1.0)
     yield
