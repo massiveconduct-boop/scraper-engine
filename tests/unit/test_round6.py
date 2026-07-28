@@ -2,11 +2,11 @@
 
 class TestRound6:
     def test_judge_server_importable(self):
-        import judge_server
+        from tests.fixtures import judge_server
         assert hasattr(judge_server, 'JudgeHandler')
 
     def test_judge_handler_creates(self):
 
-        from judge_server import JudgeHandler
+        from tests.fixtures.judge_server import JudgeHandler
         # Verify class exists and has do_GET
         assert hasattr(JudgeHandler, 'do_GET')

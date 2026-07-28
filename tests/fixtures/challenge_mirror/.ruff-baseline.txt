@@ -1,0 +1,6 @@
+tests/fixtures/challenge_mirror/app/server.py:150:101: E501 Line too long (117 > 100)
+tests/fixtures/challenge_mirror/app/server.py:188:101: E501 Line too long (121 > 100)
+tests/fixtures/challenge_mirror/app/server.py:303:101: E501 Line too long (107 > 100)
+tests/fixtures/challenge_mirror/verify_sha256.py:29:101: E501 Line too long (101 > 100)
+tests/fixtures/challenge_mirror/verify_sha256.py:59:13: N806 Variable `S1` in function should be lowercase
+tests/fixtures/challenge_mirror/verify_sha256.py:62:13: N806 Variable `S0` in function should be lowercase

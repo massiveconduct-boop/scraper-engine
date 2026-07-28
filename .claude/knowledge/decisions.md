@@ -3,7 +3,7 @@
 **Purpose:** Record WHY decisions were made, TRADEOFFS considered, ALTERNATIVES rejected.
 **Scope:** Irreversible or high-cost decisions. Routine implementation choices excluded.
 **When to read:** Before changing architecture; when a decision seems wrong and needs context.
-**Related:** `specs/scraper-engine-blueprint-v2.md`, `.claude/knowledge/architecture.md`
+**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/architecture.md`
 
 ---
 

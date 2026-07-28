@@ -3,7 +3,7 @@
 **Purpose:** System design, invariants, module interactions, data flow.
 **Scope:** Complete system architecture. Does NOT duplicate the specification — references it.
 **When to read:** Understanding how components connect; adding new modules; debugging cross-cutting concerns.
-**Related:** `specs/scraper-engine-blueprint-v2.md`, `.claude/knowledge/decisions.md`
+**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`
 
 ---
 

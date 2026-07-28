@@ -10,7 +10,7 @@ Async Python multi-level web scraping system. Levels: L1 (HTTP/Scrapling), L2 (B
 
 1. **Evidence over assertion.** Every claim must be backed by raw terminal output or source code reference. Never paraphrase numbers.
 2. **Root cause solutions, not patches.** Remove broken code instead of deleting it; fix underlying issue. Documenting problem is not same as solving it.
-3. **Invariants are non-negotiable.** 7 design invariants from `specs/scraper-engine-blueprint-v2.md` §1.1 are absolute.
+3. **Invariants are non-negotiable.** 7 design invariants from the design spec (`.local/specs/scraper-engine-blueprint-v2.md`, local-only, not tracked in git) §1.1 are absolute.
 4. **No transient numbers in reports.** Commit hashes and counts change on every commit — use stable references instead.
 5. **Prefer `ctx_execute` over `Bash` for long-running commands.** Bash tool has 120s timeout (signal 16, exit 144). Harvest cycles take ~25s.
 6. **Tests run with `docker compose up -d postgres redis pgbouncer` first.** Integration/chaos tests need infrastructure. PgBouncer must be running for G-05.
@@ -53,7 +53,7 @@ Async Python multi-level web scraping system. Levels: L1 (HTTP/Scrapling), L2 (B
 - **Standards:** `.claude/knowledge/standards.md`
 - **Troubleshooting:** `.claude/knowledge/troubleshooting.md`
 - **Operations:** `.claude/knowledge/operations.md`
-- **Specification:** `specs/scraper-engine-blueprint-v2.md` (authoritative)
+- **Specification:** `.local/specs/scraper-engine-blueprint-v2.md` (authoritative, local-only — not tracked in git)
 - **CI:** `.github/workflows/test.yml` (lint incl. mypy-strict + grep-gates; unit/integration/chaos with real PgBouncer via docker compose, round 23; build-and-push to GHCR on merge to main, round 22) | mypy baseline retired (empty)
 
 ## Quick Commands
@@ -62,6 +62,6 @@ Async Python multi-level web scraping system. Levels: L1 (HTTP/Scrapling), L2 (B
 source .venv/bin/activate
 docker compose up -d postgres redis pgbouncer && alembic upgrade head
 pytest tests/unit/ tests/integration/ tests/chaos/ -q     # 340 pass / 1 skip / 0 error (round 26)
-ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
+ruff check . --exclude 'tests/fixtures/challenge_mirror'
 ```
 

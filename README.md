@@ -36,7 +36,7 @@ tenant creation, scaling, monitoring): `docs/guides/deployment.md`.
 ```bash
 docker compose up -d postgres redis pgbouncer   # integration/chaos tests need real infra
 pytest tests/unit/ tests/integration/ tests/chaos/ -q
-ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
+ruff check . --exclude 'tests/fixtures/challenge_mirror'
 mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ --strict --ignore-missing-imports
 ```
 
@@ -46,24 +46,25 @@ mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ -
 |---|---|
 | `core/`, `proxy/`, `browser/`, `fetcher/`, `orchestrator/`, `api/`, `storage/`, `config/`, `cli/`, `observability/`, `services/` | Application source — see `CLAUDE.md` → Module Map for responsibilities |
 | `tests/` | Unit, integration, chaos, and live test suites |
+| `tests/fixtures/challenge_mirror/` | Self-hosted Cloudflare-like test target used for live L2/L3 anti-detection verification |
+| `tests/fixtures/judge_server.py` | Self-hosted proxy judge used by the promotion integration test |
 | `docs/reference/` | API reference |
 | `docs/guides/` | Deployment and operational guides |
 | `.claude/knowledge/` | Living architecture, decisions, standards, troubleshooting, and operations docs |
 | `.claude/MEMORY.md` | Full round-by-round project history and technical debt log |
-| `specs/` | Authoritative blueprint spec |
-| `challenge-mirror/` | Self-hosted Cloudflare-like test target used for live L2/L3 anti-detection verification (not part of the production stack) |
 | `infra/`, `monitoring/` | PgBouncer config, Prometheus/Grafana dashboards and alert rules |
 | `CHANGELOG.md` | Per-PR summary of what shipped |
 | `CONTRIBUTING.md` | Dev setup, test/lint commands, PR workflow |
 | `LICENSE`, `NOTICE` | Apache License 2.0 |
 
-Historical per-round evidence/directive/closure reports (60+ point-in-time
-build artifacts) are kept locally under `.archive/`, gitignored — not part
-of the tracked repo.
+The authoritative design spec and a couple of build-time-only files
+(superseded duplicates, one-off manual scripts) are kept locally under
+`.local/`, gitignored — not part of the tracked repo. Historical per-round
+evidence/directive/closure reports are similarly kept locally under
+`.archive/`.
 
 ## Navigation
 
 - **Start here for architecture/conventions:** `CLAUDE.md`
 - **Contributing:** `CONTRIBUTING.md`
 - **Knowledge catalog:** `.claude/MEMORY.md`
-- **Spec:** `specs/scraper-engine-blueprint-v2.md`
