@@ -2,6 +2,7 @@
 """Alembic async environment configuration."""
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -11,6 +12,14 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# alembic.ini's sqlalchemy.url is a host-side dev default (localhost:5432) —
+# every real environment (containers, CI) sets DATABASE_URL to the actual
+# reachable DSN (e.g. pgbouncer:6432 inside docker-compose's network), so it
+# must win whenever present rather than silently falling back to the dev
+# default and connecting nowhere.
+if os.environ.get("DATABASE_URL"):
+    config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
 
 target_metadata = None
 
