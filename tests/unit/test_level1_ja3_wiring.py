@@ -26,10 +26,17 @@ class _FakeAsyncClient:
     async def get(self, url): return _FakeResponse()
 
 
+def _fake_ja3_client(session: AsyncMock) -> AsyncMock:
+    ja3 = AsyncMock()
+    ja3.open_session.return_value = session
+    return ja3
+
+
 @pytest.mark.asyncio
 async def test_uses_ja3_result_when_it_succeeds(monkeypatch):
-    ja3 = AsyncMock()
-    ja3.get.return_value = Ja3Response(status_code=200, text="<html>ja3</html>", location=None)
+    session = AsyncMock()
+    session.get.return_value = Ja3Response(status_code=200, text="<html>ja3</html>", location=None)
+    ja3 = _fake_ja3_client(session)
     fetcher = Level1Fetcher(ja3_client=ja3)
 
     import httpx
@@ -39,13 +46,35 @@ async def test_uses_ja3_result_when_it_succeeds(monkeypatch):
 
     assert result.success is True
     assert result.html == "<html>ja3</html>"
-    ja3.get.assert_awaited_once()
+    session.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reuses_one_session_across_redirect_hops(monkeypatch):
+    """A session opened for the first hop must be the same one used for
+    every subsequent redirect — otherwise cookies set by an intermediate
+    hop are lost (the bug found and fixed during PR review)."""
+    session = AsyncMock()
+    session.get.side_effect = [
+        Ja3Response(status_code=302, text="", location="http://example.com/next"),
+        Ja3Response(status_code=200, text="<html>final</html>", location=None),
+    ]
+    ja3 = _fake_ja3_client(session)
+    fetcher = Level1Fetcher(ja3_client=ja3)
+
+    result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+    assert result.success is True
+    assert result.html == "<html>final</html>"
+    ja3.open_session.assert_awaited_once()  # one session, not one per hop
+    assert session.get.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_falls_back_to_httpx_when_ja3_raises(monkeypatch):
-    ja3 = AsyncMock()
-    ja3.get.side_effect = RuntimeError("tls client crashed")
+    session = AsyncMock()
+    session.get.side_effect = RuntimeError("tls client crashed")
+    ja3 = _fake_ja3_client(session)
     fetcher = Level1Fetcher(ja3_client=ja3)
 
     import httpx

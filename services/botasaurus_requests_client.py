@@ -19,7 +19,7 @@ that entirely.
 from __future__ import annotations
 
 import asyncio
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 
 class Ja3Response(NamedTuple):
@@ -28,12 +28,18 @@ class Ja3Response(NamedTuple):
     location: str | None
 
 
-class BotasaurusRequestsClient:
-    """Thin async wrapper over botasaurus_requests' synchronous, JA3-matched
-    `firefox` session client — run in an executor (same sync-library-in-
-    executor pattern as fetcher/botasaurus_wrapper.py's _botasaurus_fetch)."""
+class Ja3Session:
+    """One botasaurus_requests session, scoped to a single top-level fetch
+    (e.g. one Level1Fetcher.fetch() call and every redirect hop it follows)
+    — never reused across separate fetches, so there's no cross-tenant or
+    cross-request cookie leakage the way a process-wide shared session would
+    have. A fresh `firefox.Session()` per `.get()` call (the original round-26
+    design) lost cookies between redirect hops within the *same* fetch —
+    found during PR review, before merge — which this fixes by keeping one
+    session for the caller's own redirect loop."""
 
-    def __init__(self, timeout_seconds: float = 20.0) -> None:
+    def __init__(self, session: Any, timeout_seconds: float) -> None:
+        self._session = session
         self._timeout_seconds = timeout_seconds
 
     async def get(self, url: str, proxy: str | None = None) -> Ja3Response:
@@ -41,10 +47,7 @@ class BotasaurusRequestsClient:
         return await loop.run_in_executor(None, self._get, url, proxy)
 
     def _get(self, url: str, proxy: str | None) -> Ja3Response:
-        from botasaurus_requests.session import firefox
-
-        session = firefox.Session()
-        response = session.get(
+        response = self._session.get(
             url,
             proxies={"http": proxy, "https": proxy} if proxy else None,
             allow_redirects=False,
@@ -55,6 +58,34 @@ class BotasaurusRequestsClient:
             text=response.text,
             location=response.headers.get("location"),
         )
+
+
+class BotasaurusRequestsClient:
+    """Thin async wrapper over botasaurus_requests' synchronous, JA3-matched
+    `firefox` session client — run in an executor (same sync-library-in-
+    executor pattern as fetcher/botasaurus_wrapper.py's _botasaurus_fetch)."""
+
+    def __init__(self, timeout_seconds: float = 20.0) -> None:
+        self._timeout_seconds = timeout_seconds
+
+    async def open_session(self) -> Ja3Session:
+        """Open one session for the caller to reuse across every hop of a
+        single redirect chain — see Ja3Session's docstring for why."""
+        loop = asyncio.get_running_loop()
+        session = await loop.run_in_executor(None, self._new_session)
+        return Ja3Session(session, self._timeout_seconds)
+
+    def _new_session(self) -> Any:
+        from botasaurus_requests.session import firefox
+
+        return firefox.Session()
+
+    async def get(self, url: str, proxy: str | None = None) -> Ja3Response:
+        """One-shot convenience — opens and discards a session for a single
+        call. Callers that need cookie continuity across multiple requests
+        (e.g. a redirect chain) should use open_session() instead."""
+        session = await self.open_session()
+        return await session.get(url, proxy=proxy)
 
 
 def build_ja3_client(

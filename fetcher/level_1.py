@@ -149,14 +149,20 @@ class Level1Fetcher:
         try:
             proxy_url = proxy.url() if proxy else None
             current_url = url
-            response = await self._ja3_client.get(current_url, proxy=proxy_url)
+            # One session for this fetch's entire redirect chain — not
+            # self._ja3_client.get() per hop, which would open a fresh
+            # session (and lose any cookies a redirect hop set) each time.
+            # Scoped to this call only, so no cross-tenant/cross-request
+            # cookie continuity — found during PR review, before merge.
+            session = await self._ja3_client.open_session()
+            response = await session.get(current_url, proxy=proxy_url)
             for _ in range(MAX_REDIRECTS):
                 if response.status_code not in (301, 302, 303, 307, 308) or not response.location:
                     break
                 next_url = str(httpx.URL(current_url).join(response.location))
                 await self._ssrf_guard.validate(next_url)
                 current_url = next_url
-                response = await self._ja3_client.get(current_url, proxy=proxy_url)
+                response = await session.get(current_url, proxy=proxy_url)
 
             success = response.status_code < 400
             markdown = None

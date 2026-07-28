@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from services.botasaurus_requests_client import BotasaurusRequestsClient, build_ja3_client
+from services.botasaurus_requests_client import (
+    BotasaurusRequestsClient,
+    Ja3Session,
+    build_ja3_client,
+)
 
 
 def _fake_session(
@@ -78,3 +82,31 @@ class TestBotasaurusRequestsClient:
             result = await client.get("https://target.example/page")
         assert result.status_code == 302
         assert result.location == "https://target.example/next"
+
+
+class TestJa3Session:
+    @pytest.mark.asyncio
+    async def test_open_session_constructs_one_firefox_session(self):
+        client = BotasaurusRequestsClient()
+        session = _fake_session()
+        with patch("botasaurus_requests.session.firefox") as fake_firefox:
+            fake_firefox.Session.return_value = session
+            ja3_session = await client.open_session()
+        assert isinstance(ja3_session, Ja3Session)
+        fake_firefox.Session.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_session_reused_across_multiple_get_calls(self):
+        """The whole point of open_session(): cookies from the first call
+        stay on the same underlying session for the second — a fresh
+        firefox.Session() per get() (the pre-review design) would lose them."""
+        client = BotasaurusRequestsClient()
+        session = _fake_session()
+        with patch("botasaurus_requests.session.firefox") as fake_firefox:
+            fake_firefox.Session.return_value = session
+            ja3_session = await client.open_session()
+            await ja3_session.get("https://target.example/1")
+            await ja3_session.get("https://target.example/2")
+        # Exactly one underlying firefox.Session() for both calls
+        fake_firefox.Session.assert_called_once()
+        assert session.get.call_count == 2

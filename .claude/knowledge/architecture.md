@@ -413,6 +413,19 @@ dependency of `botasaurus` but is now declared directly (`pyproject.toml`,
 directly — same reasoning as every other direct-import dependency in those
 lists (`.claude/knowledge/operations.md` #12).
 
+**Found during PR review, before merge:** the original design called
+`self._ja3_client.get(url)` per redirect hop inside `Level1Fetcher.
+_fetch_via_ja3`, and each `.get()` constructed a brand-new
+`firefox.Session()` — so a cookie set by an intermediate redirect hop (a
+common consent/session-redirect pattern) never reached the next hop. Fixed
+by adding `BotasaurusRequestsClient.open_session()` → `Ja3Session`, opened
+once per top-level `Level1Fetcher.fetch()` call and reused across every hop
+of that call's own redirect loop — never shared across separate fetches, so
+this doesn't reintroduce the cross-tenant-state class of bug the
+`reuse_driver` finding above already ruled out. `BotasaurusRequestsClient.
+get()` still exists as a one-shot convenience for callers that don't need
+cross-hop continuity.
+
 **Live verification (round 26, corrected):** end-to-end browser verification
 against the local `challenge-mirror` container (`http://localhost:8090/`,
 confirmed via `/proc/net/tcp` + reading its own `server.py` — it isn't
