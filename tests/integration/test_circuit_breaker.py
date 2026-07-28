@@ -4,7 +4,7 @@
 import pytest
 from fakeredis import FakeAsyncRedis
 
-from orchestrator.circuit_breaker import CircuitBreaker, CircuitState
+from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker, CircuitState
 
 
 @pytest.fixture

@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import core.budget
-from core.models import Proxy, ProxyProtocol
-from core.tenant import TenantId
-from fetcher.botasaurus_wrapper import BotasaurusWrapper
-from fetcher.level_2 import Level2Fetcher
+from scraper_engine.core import budget
+from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher.botasaurus_wrapper import BotasaurusWrapper
+from scraper_engine.fetcher.level_2 import Level2Fetcher
 
 TENANT = TenantId("botawire")
 URL = "https://target.example/page"
@@ -32,12 +32,12 @@ class TestBotasaurusWrapper:
         with patch.object(
             wrapper, "_botasaurus_fetch", return_value="<html>ok</html>"
         ) as fetch:
-            assert core.budget.BROWSER_SEMAPHORE.locked() is False
+            assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"
         fetch.assert_called_once_with(URL, _proxy().url(), None)
         # Released after the call, not held open
-        assert core.budget.BROWSER_SEMAPHORE.locked() is False
+        assert budget.BROWSER_SEMAPHORE.locked() is False
 
     def test_parallel_always_forced_to_one(self):
         """caller-supplied config cannot override parallel — closes F-32."""

@@ -4,7 +4,7 @@
 import pytest
 from pydantic import HttpUrl, ValidationError
 
-from core.models import (
+from scraper_engine.core.models import (
     FailureCategory,
     FetchResult,
     JobStatus,

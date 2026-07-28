@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.tenant import TenantId
-from proxy.promotion import ProxyPromotionJob
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.proxy.promotion import ProxyPromotionJob
 
 
 def _make_pg_mock(*, fetch_rows=None):
@@ -48,7 +48,7 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_promotes_validating_proxy(self, tenant):
         """Valid HTTP response → score promoted to 60."""
-        from core.models import AnonymityLevel
+        from scraper_engine.core.models import AnonymityLevel
 
         pg = _make_pg_mock(fetch_rows=[
             {"id": 1, "ip": "10.0.0.1", "port": 3128, "protocol": "HTTP", "promotion_attempts": 0},
@@ -64,7 +64,7 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_failed_validation_increments_attempts(self, tenant):
         """Failed validation → attempt counter incremented, not promoted."""
-        from core.models import AnonymityLevel
+        from scraper_engine.core.models import AnonymityLevel
 
         pg = _make_pg_mock(fetch_rows=[
             {"id": 2, "ip": "10.0.0.2", "port": 8080, "protocol": "HTTP", "promotion_attempts": 2},
@@ -80,7 +80,7 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_proxy_at_max_attempts_is_exhausted(self, tenant):
         """Proxy with 4 attempts, 5th fails → exhausted."""
-        from core.models import AnonymityLevel
+        from scraper_engine.core.models import AnonymityLevel
 
         pg = _make_pg_mock(fetch_rows=[
             {"id": 3, "ip": "10.0.0.3", "port": 3128, "protocol": "HTTP", "promotion_attempts": 4},
@@ -96,7 +96,7 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_query_filters_by_cooldown_and_attempts(self, tenant):
         """Query excludes proxies at max attempts and within cooldown window."""
-        from core.models import AnonymityLevel
+        from scraper_engine.core.models import AnonymityLevel
 
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[
@@ -127,7 +127,7 @@ class TestProxyPromotionJob:
     @pytest.mark.asyncio
     async def test_semaphore_bounds_concurrency(self, tenant):
         """Verify semaphore is created with PROMOTION_CONCURRENCY=5."""
-        from core.models import AnonymityLevel
+        from scraper_engine.core.models import AnonymityLevel
         validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
         job = ProxyPromotionJob(pg=_make_pg_mock(), http_validate_fn=validate, system_tenant=tenant)
 

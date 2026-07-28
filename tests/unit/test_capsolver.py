@@ -12,8 +12,8 @@ the full solve flow against CapSolver's sandbox test keys.
 
 import pytest
 
-from core.budget import CapSolverBudget
-from core.tenant import TenantId
+from scraper_engine.core.budget import CapSolverBudget
+from scraper_engine.core.tenant import TenantId
 
 
 @pytest.fixture
@@ -34,14 +34,14 @@ class TestCapSolverClient:
     """G-08: CapSolver integration — error handling and sandbox flow."""
 
     def test_client_init(self, budget):
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         client = CapSolverClient(api_key="test-key", budget=budget)
         assert client._api_key == "test-key"
 
     @pytest.mark.asyncio
     async def test_get_balance_without_valid_key(self, budget):
         """G-08: get_balance returns 0.0 on API error (no crash)."""
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         balance = await client.get_balance()
         assert isinstance(balance, (int, float))
@@ -50,7 +50,7 @@ class TestCapSolverClient:
     @pytest.mark.asyncio
     async def test_solve_recaptcha_without_valid_key(self, tenant, budget):
         """G-08: solve returns None on auth error (no crash)."""
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         result = await client.solve_recaptcha_v2(
             tenant, site_key="test-site-key", page_url="http://example.com"
@@ -60,7 +60,7 @@ class TestCapSolverClient:
     @pytest.mark.asyncio
     async def test_solve_hcaptcha_without_valid_key(self, tenant, budget):
         """G-08: solve returns None on auth error (no crash)."""
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         result = await client.solve_hcaptcha(
             tenant, site_key="test-site-key", page_url="http://example.com"
@@ -77,7 +77,7 @@ class TestCapSolverClient:
         redis.get.return_value = "0.015"  # already over ceiling
         exhausted_budget = CapSolverBudget(redis=redis, daily_ceiling_credits=0.01)
 
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         client = CapSolverClient(api_key="test-key", budget=exhausted_budget)
         result = await client.solve_recaptcha_v2(
             tenant, site_key="test", page_url="http://example.com"

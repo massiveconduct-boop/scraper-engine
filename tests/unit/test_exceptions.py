@@ -2,7 +2,7 @@
 """Exception hierarchy tests — all custom exceptions."""
 
 
-from core.exceptions import (
+from scraper_engine.core.exceptions import (
     AuthenticationError,
     CapSolverBudgetExceededError,
     CircuitBreakerOpenError,

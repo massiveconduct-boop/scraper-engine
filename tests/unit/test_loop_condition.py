@@ -20,7 +20,7 @@ Those behaviours are tested separately by tests/chaos/test_safe_content_guard.py
 (real-browser integration tests against the challenge mirror).
 """
 
-from fetcher.challenge_detector import ChallengeDetector
+from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 UNSOLVED_HTML = (
     "<html><head><title>Verifying your browser…</title></head>"

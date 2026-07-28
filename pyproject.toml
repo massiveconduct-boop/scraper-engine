@@ -10,10 +10,11 @@ requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 
 [tool.setuptools.packages.find]
-include = ["core*", "proxy*", "browser*", "fetcher*", "services*", "storage*", "orchestrator*", "api*", "cli*", "config*", "observability*", "scrapy_project*", "monitoring*"]
+where = ["src"]
+include = ["scraper_engine*"]
 
 [tool.setuptools.package-data]
-config = ["*.yaml"]
+"scraper_engine.config" = ["*.yaml"]
 infra = ["pgbouncer/*.ini"]
 monitoring = ["alerts/*.yml", "dashboards/*.json"]
 
@@ -73,7 +74,7 @@ exclude = ["tests/fixtures/challenge_mirror", ".venv", ".git", ".wolf", ".claude
 ignore = ["UP042"]  # str+Enum pattern matches spec; StrEnum changes Pydantic serialization
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api", "cli", "config", "observability"]
+known-first-party = ["scraper_engine"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -117,7 +118,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchestrator", "api"]
+source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_engine/browser", "src/scraper_engine/fetcher", "src/scraper_engine/services", "src/scraper_engine/storage", "src/scraper_engine/orchestrator", "src/scraper_engine/api"]
 
 [tool.coverage.report]
 # Per-spec §10: CI gate fails if core/, proxy/, orchestrator/ combined < 90%.
@@ -127,4 +128,4 @@ source = ["core", "proxy", "browser", "fetcher", "services", "storage", "orchest
 # G-02 closure: browser/ measured where possible.
 # G-10 closure: line-level justification provided per file below.
 fail_under = 90
-include = ["core/*", "proxy/*", "orchestrator/*"]
+include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*"]

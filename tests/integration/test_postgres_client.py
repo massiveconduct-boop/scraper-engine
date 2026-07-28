@@ -3,8 +3,8 @@
 
 import pytest
 
-from core.tenant import TenantId
-from storage.postgres_client import PostgresClient
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.storage.postgres_client import PostgresClient
 
 
 @pytest.fixture

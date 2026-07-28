@@ -5,8 +5,8 @@ fetcher/factory.py drops the solver per-level when disabled."""
 
 from unittest.mock import MagicMock
 
-from config.schema import AppConfig, LevelConfig, LevelsConfig
-from fetcher.factory import build_level2_fetcher, build_level3_fetcher
+from scraper_engine.config.schema import AppConfig, LevelConfig, LevelsConfig
+from scraper_engine.fetcher.factory import build_level2_fetcher, build_level3_fetcher
 
 
 def _config_with(capsolver_enabled: bool) -> AppConfig:

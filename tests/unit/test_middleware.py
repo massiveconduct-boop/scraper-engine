@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.middleware import (
+from scraper_engine.api.middleware import (
     RateLimitMiddleware,
     configure_middleware,
 )

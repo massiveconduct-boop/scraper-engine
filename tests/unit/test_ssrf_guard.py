@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.exceptions import SSRFBlockedError
-from core.ssrf_guard import SSRFGuard
+from scraper_engine.core.exceptions import SSRFBlockedError
+from scraper_engine.core.ssrf_guard import SSRFGuard
 
 
 class TestSSRFGuard:

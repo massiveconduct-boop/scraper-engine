@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from proxy.asn_classifier import (
+from scraper_engine.proxy.asn_classifier import (
     MaxMindAsnClassifier,
     NullAsnClassifier,
     build_asn_classifier,

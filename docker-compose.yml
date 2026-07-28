@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     env_file: .env
@@ -67,7 +67,7 @@ services:
 
   proxy-harvester:
     build: .
-    command: python -m proxy.harvester_daemon
+    command: python -m scraper_engine.proxy.harvester_daemon
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0

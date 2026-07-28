@@ -3,7 +3,7 @@
 
 import pytest
 
-from core.tenant import TenantId
+from scraper_engine.core.tenant import TenantId
 
 
 class TestTenantId:

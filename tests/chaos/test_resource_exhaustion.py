@@ -9,8 +9,8 @@ import asyncio
 
 import pytest
 
-from core.budget import BROWSER_SEMAPHORE, CAPSOLVER_CONCURRENCY
-from core.tenant import TenantId
+from scraper_engine.core.budget import BROWSER_SEMAPHORE, CAPSOLVER_CONCURRENCY
+from scraper_engine.core.tenant import TenantId
 
 
 class TestBrowserSemaphore:
@@ -43,7 +43,7 @@ class TestAtomicLua:
 
     def test_acquire_slot_lua_exists(self):
         """Verify the ACQUIRE_SLOT_LUA script is defined and well-formed."""
-        from orchestrator.politeness import ACQUIRE_SLOT_LUA
+        from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA
         assert "SCARD" in ACQUIRE_SLOT_LUA
         assert "SADD" in ACQUIRE_SLOT_LUA
         assert "EXPIRE" in ACQUIRE_SLOT_LUA
@@ -56,7 +56,7 @@ class TestAtomicLua:
         from fakeredis import FakeAsyncRedis
 
         redis = FakeAsyncRedis(decode_responses=True)
-        from orchestrator.politeness import ACQUIRE_SLOT_LUA
+        from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA
 
         tenant = TenantId("test")
         slot_key = f"politeness:slots:{tenant}:chaos.com"

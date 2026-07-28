@@ -22,7 +22,7 @@ import asyncio
 import os
 import sys
 
-from services.captcha_solver import validate_captcha_keys
+from scraper_engine.services.captcha_solver import validate_captcha_keys
 
 
 def _mask(env_var: str) -> str:

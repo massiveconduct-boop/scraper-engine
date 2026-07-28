@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import proxy.harvester_daemon as mod
+import scraper_engine.proxy.harvester_daemon as mod
 
 
 class TestRunPeriodic:
@@ -64,7 +64,7 @@ class TestRun:
         monkeypatch.setattr(mod, "ProxyPromotionJob", MagicMock(return_value=promo))
         monkeypatch.setattr(mod, "HealthMonitor", MagicMock(return_value=health))
 
-        from config.schema import AppConfig
+        from scraper_engine.config.schema import AppConfig
 
         stop = asyncio.Event()
         stop.set()  # request shutdown immediately — exercise start + clean teardown

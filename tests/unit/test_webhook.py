@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
-from core.models import JobStatus, JobStatusResponse
-from orchestrator.webhook import WebhookDispatcher
+from scraper_engine.core.models import JobStatus, JobStatusResponse
+from scraper_engine.orchestrator.webhook import WebhookDispatcher
 
 
 class TestWebhookDispatcher:

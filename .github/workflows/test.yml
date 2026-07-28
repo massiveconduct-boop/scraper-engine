@@ -65,7 +65,7 @@ jobs:
           echo "OK — force_engine test seam has zero production call sites"
       - name: mypy strict (baseline now empty — any error fails the build)
         run: |
-          mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
+          mypy src/scraper_engine/core/ src/scraper_engine/proxy/ src/scraper_engine/orchestrator/ src/scraper_engine/api/ src/scraper_engine/storage/ src/scraper_engine/fetcher/ src/scraper_engine/browser/ src/scraper_engine/observability/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
           grep "^[^ ]*:[0-9]*: error:" /tmp/mypy.out | sort >/tmp/mypy-current.txt
           sort tools/mypy-baseline.txt >/tmp/baseline-sorted.txt
           echo "=== Current findings ===" && cat /tmp/mypy-current.txt

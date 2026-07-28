@@ -62,8 +62,13 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 COPY --from=camoufox-fetch /root/.cache/camoufox /root/.cache/camoufox
 # Application code — the only layer that changes on a typical rebuild.
 COPY . .
+# Registers the scraper_engine package into site-packages (--no-deps: deps
+# are already installed above, this is just the local package itself) so
+# `scraper_engine.*` resolves regardless of cwd — same reasoning as the
+# editable install used in dev, without needing PYTHONPATH.
+RUN pip install --no-cache-dir --no-deps .
 
 ENV PYTHONUNBUFFERED=1
 ENV APP_ENV=production
 EXPOSE 8000 9090
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "scraper_engine.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

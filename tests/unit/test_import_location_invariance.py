@@ -1,8 +1,9 @@
 # tests/unit/test_import_location_invariance.py
-"""Every package (api/core/proxy/...) resolves correctly via the editable
-install regardless of the process's current working directory — proven here
-by running the import in a fresh subprocess with cwd set to somewhere other
-than the repo root, not just asserted from within pytest's own cwd."""
+"""Every package under scraper_engine (api/core/proxy/...) resolves correctly
+via the editable install regardless of the process's current working
+directory — proven here by running the import in a fresh subprocess with cwd
+set to somewhere other than the repo root, not just asserted from within
+pytest's own cwd."""
 
 import subprocess
 import sys
@@ -18,7 +19,8 @@ def test_imports_resolve_from_outside_repo_root():
             [
                 sys.executable,
                 "-c",
-                "import api, core, proxy; print(core.__file__)",
+                "import scraper_engine.api, scraper_engine.core, scraper_engine.proxy;"
+                " print(scraper_engine.core.__file__)",
             ],
             cwd=tmpdir,
             capture_output=True,
@@ -28,4 +30,4 @@ def test_imports_resolve_from_outside_repo_root():
 
     assert result.returncode == 0, result.stderr
     resolved = Path(result.stdout.strip()).resolve()
-    assert resolved == (REPO_ROOT / "core" / "__init__.py")
+    assert resolved == (REPO_ROOT / "src" / "scraper_engine" / "core" / "__init__.py")

@@ -27,13 +27,13 @@ from unittest.mock import AsyncMock
 
 from camoufox.async_api import AsyncCamoufox
 
-from core.tenant import TenantId
-from fetcher._captcha import (
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher._captcha import (
     _DETECT_JS,
     _INJECT_RECAPTCHA_JS,
     solve_captcha_on_page,
 )
-from services.captcha_solver import CaptchaSolver
+from scraper_engine.services.captcha_solver import CaptchaSolver
 
 DEMO_URL = "https://www.google.com/recaptcha/api2/demo"
 TENANT = TenantId("livecheck")
@@ -55,8 +55,8 @@ async def main() -> None:
     # is unit-tested separately; here we want to reach the live provider).
     budget = AsyncMock()
     budget.check_and_reserve.return_value = True
-    from services.capsolver import CapSolverClient
-    from services.nocaptcha import NoCaptchaAIClient
+    from scraper_engine.services.capsolver import CapSolverClient
+    from scraper_engine.services.nocaptcha import NoCaptchaAIClient
 
     primary = NoCaptchaAIClient(nk, budget) if nk else None
     fallback = CapSolverClient(ck, budget) if ck else None

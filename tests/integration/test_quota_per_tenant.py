@@ -9,11 +9,11 @@ actually read (not the Redis-only global-default path from before the fix).
 
 import pytest
 
-from core.exceptions import QuotaExceededError
-from core.quota import QuotaManager
-from core.tenant import TenantId
-from storage.postgres_client import PostgresClient
-from storage.redis_client import RedisClient
+from scraper_engine.core.exceptions import QuotaExceededError
+from scraper_engine.core.quota import QuotaManager
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.storage.postgres_client import PostgresClient
+from scraper_engine.storage.redis_client import RedisClient
 
 
 @pytest.fixture

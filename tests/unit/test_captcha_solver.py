@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.tenant import TenantId
-from services.captcha_solver import CaptchaSolver, build_captcha_solver
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.services.captcha_solver import CaptchaSolver, build_captcha_solver
 
 TENANT = TenantId("captchatest")
 
@@ -55,8 +55,8 @@ class TestFactory:
         monkeypatch.setenv("CAPSOLVER_API_KEY", "ck")
         solver = build_captcha_solver(AsyncMock())
         assert solver is not None
-        from services.capsolver import CapSolverClient
-        from services.nocaptcha import NoCaptchaAIClient
+        from scraper_engine.services.capsolver import CapSolverClient
+        from scraper_engine.services.nocaptcha import NoCaptchaAIClient
         assert isinstance(solver._primary, NoCaptchaAIClient)
         assert isinstance(solver._fallback, CapSolverClient)
 
@@ -65,7 +65,7 @@ class TestFactory:
         monkeypatch.setenv("CAPSOLVER_API_KEY", "ck")
         solver = build_captcha_solver(AsyncMock())
         assert solver is not None
-        from services.capsolver import CapSolverClient
+        from scraper_engine.services.capsolver import CapSolverClient
         assert isinstance(solver._primary, CapSolverClient)
         assert solver._fallback is None
 
@@ -80,7 +80,7 @@ class TestImageToText:
     async def test_ocr_extracts_list_text(self, monkeypatch):
         """NoCaptchaAI ImageToText solves synchronously; solution.text is a list
         — the client must return its first element (round 19 live-verified)."""
-        import services._anticaptcha as ac
+        import scraper_engine.services._anticaptcha as ac
 
         class _Resp:
             def json(self):
@@ -94,7 +94,7 @@ class TestImageToText:
 
         monkeypatch.setattr(ac.httpx, "AsyncClient", _Client)
 
-        from services.nocaptcha import NoCaptchaAIClient
+        from scraper_engine.services.nocaptcha import NoCaptchaAIClient
         budget = AsyncMock()
         budget.check_and_reserve.return_value = True
         client = NoCaptchaAIClient("k", budget)
@@ -102,7 +102,7 @@ class TestImageToText:
 
     @pytest.mark.asyncio
     async def test_ocr_budget_gate_blocks(self):
-        from services.nocaptcha import NoCaptchaAIClient
+        from scraper_engine.services.nocaptcha import NoCaptchaAIClient
         budget = AsyncMock()
         budget.check_and_reserve.return_value = False
         client = NoCaptchaAIClient("k", budget)
@@ -122,7 +122,7 @@ class TestProviderTaskTypes:
         ("solve_mtcaptcha", "MTCaptchaTask"),
     ])
     async def test_nocaptcha_sends_correct_type(self, monkeypatch, method, expected_type):
-        import services.nocaptcha as nc
+        import scraper_engine.services.nocaptcha as nc
         captured = {}
 
         async def fake_solve(**kw):
@@ -140,7 +140,7 @@ class TestProviderTaskTypes:
 
     @pytest.mark.asyncio
     async def test_nocaptcha_geetest_captcha_id_field(self, monkeypatch):
-        import services.nocaptcha as nc
+        import scraper_engine.services.nocaptcha as nc
         captured = {}
 
         async def fake_solve(**kw):
@@ -158,7 +158,7 @@ class TestProviderTaskTypes:
     @pytest.mark.asyncio
     async def test_nocaptcha_hcaptcha_defers_to_fallback(self):
         # NoCaptchaAI has no hCaptcha — returns None so orchestrator falls through
-        from services.nocaptcha import NoCaptchaAIClient
+        from scraper_engine.services.nocaptcha import NoCaptchaAIClient
         budget = AsyncMock()
         client = NoCaptchaAIClient("k", budget)
         assert await client.solve_hcaptcha(TENANT, "sk", "http://x") is None

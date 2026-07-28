@@ -5,9 +5,9 @@ import asyncio
 
 import pytest
 
-from core.models import Proxy, ProxyProtocol
-from core.tenant import TenantId
-from proxy.lease import ProxyLease
+from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.proxy.lease import ProxyLease
 
 
 @pytest.fixture

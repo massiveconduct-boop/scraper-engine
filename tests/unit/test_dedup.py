@@ -30,19 +30,19 @@ class TestDeduplicationEngine:
 
     @pytest.fixture
     def engine(self, redis):
-        from storage.dedup import DeduplicationEngine
+        from scraper_engine.storage.dedup import DeduplicationEngine
         return DeduplicationEngine(redis)
 
     @pytest.mark.asyncio
     async def test_get_returns_none_for_miss(self, engine) -> None:
-        from core.tenant import TenantId
+        from scraper_engine.core.tenant import TenantId
         result = await engine.get("http://example.com/page", TenantId("test"))
         assert result is None
 
     @pytest.mark.asyncio
     async def test_store_and_retrieve(self, engine) -> None:
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         result = FetchResult(
@@ -62,8 +62,8 @@ class TestDeduplicationEngine:
     @pytest.mark.asyncio
     async def test_does_not_cache_failed_results(self, engine) -> None:
         """Design invariant §1.1.5: only successful results are cached."""
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         result = FetchResult(
@@ -80,8 +80,8 @@ class TestDeduplicationEngine:
     @pytest.mark.asyncio
     async def test_does_not_cache_challenge_pages(self, engine) -> None:
         """Design invariant §1.1.5: challenge pages must not be cached."""
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         result = FetchResult(
@@ -99,8 +99,8 @@ class TestDeduplicationEngine:
 
     @pytest.mark.asyncio
     async def test_invalidate(self, engine) -> None:
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         result = FetchResult(
@@ -118,8 +118,8 @@ class TestDeduplicationEngine:
 
     @pytest.mark.asyncio
     async def test_change_detection(self, engine) -> None:
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         old = FetchResult(
@@ -143,8 +143,8 @@ class TestDeduplicationEngine:
 
     @pytest.mark.asyncio
     async def test_no_change_when_same(self, engine) -> None:
-        from core.models import FetchResult
-        from core.tenant import TenantId
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
 
         tenant = TenantId("test")
         result = FetchResult(

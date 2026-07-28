@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from services.botasaurus_requests_client import (
+from scraper_engine.services.botasaurus_requests_client import (
     BotasaurusRequestsClient,
     Ja3Session,
     build_ja3_client,

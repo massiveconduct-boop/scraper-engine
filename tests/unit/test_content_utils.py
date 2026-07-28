@@ -3,7 +3,7 @@
 
 import pytest
 
-from fetcher._content_utils import autoscroll
+from scraper_engine.fetcher._content_utils import autoscroll
 
 
 class _MockPage:

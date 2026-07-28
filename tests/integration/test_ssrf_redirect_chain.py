@@ -13,8 +13,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from core.exceptions import SSRFBlockedError
-from core.ssrf_guard import SSRFGuard
+from scraper_engine.core.exceptions import SSRFBlockedError
+from scraper_engine.core.ssrf_guard import SSRFGuard
 
 
 class _RedirectToMetadataHandler(BaseHTTPRequestHandler):

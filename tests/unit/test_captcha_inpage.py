@@ -12,10 +12,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.tenant import TenantId
-from fetcher._captcha import solve_captcha_on_page
-from fetcher.level_2 import Level2Fetcher
-from fetcher.level_3 import Level3Fetcher
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher._captcha import solve_captcha_on_page
+from scraper_engine.fetcher.level_2 import Level2Fetcher
+from scraper_engine.fetcher.level_3 import Level3Fetcher
 
 TENANT = TenantId("captchawire")
 URL = "https://target.example/protected"

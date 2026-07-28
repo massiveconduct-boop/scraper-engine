@@ -3,7 +3,7 @@
 
 from datetime import UTC, datetime
 
-from core.clock import FrozenClock, SystemClock
+from scraper_engine.core.clock import FrozenClock, SystemClock
 
 
 class TestSystemClock:

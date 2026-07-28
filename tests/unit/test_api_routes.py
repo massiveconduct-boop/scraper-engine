@@ -12,10 +12,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import api.dependencies as deps
-from api.routes import crawl, get_job, scrape
-from core.models import JobStatus
-from core.ssrf_guard import SSRFGuard
+import scraper_engine.api.dependencies as deps
+from scraper_engine.api.routes import crawl, get_job, scrape
+from scraper_engine.core.models import JobStatus
+from scraper_engine.core.ssrf_guard import SSRFGuard
 
 
 @pytest.fixture
@@ -77,14 +77,16 @@ def wired_scrape_deps(monkeypatch):
     # routes.py now reads the shared deps._ssrf_guard singleton instead of
     # constructing a fresh SSRFGuard() per request (api/main.py lifespan).
     monkeypatch.setattr(deps, "_ssrf_guard", SSRFGuard())
-    monkeypatch.setattr("core.ssrf_guard.SSRFGuard.validate", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "scraper_engine.core.ssrf_guard.SSRFGuard.validate", AsyncMock(return_value=None)
+    )
 
     return pg, redis, queue
 
 
 @pytest.mark.asyncio
 async def test_scrape_enqueues_after_persisting_job(wired_scrape_deps):
-    from core.models import ScrapeRequest
+    from scraper_engine.core.models import ScrapeRequest
 
     pg, redis, queue = wired_scrape_deps
     request = ScrapeRequest(urls=["http://example.com"])
@@ -93,14 +95,14 @@ async def test_scrape_enqueues_after_persisting_job(wired_scrape_deps):
 
     queue.enqueue.assert_called_once()
     call_args = queue.enqueue.call_args
-    assert call_args.args[0] == "orchestrator.tasks.run_scrape_job"
+    assert call_args.args[0] == "scraper_engine.orchestrator.tasks.run_scrape_job"
     assert call_args.args[1] == "system"
     assert call_args.args[2] == resp["job_id"]
 
 
 @pytest.mark.asyncio
 async def test_crawl_enqueues_with_crawl_job_type(wired_scrape_deps):
-    from core.models import CrawlRequest
+    from scraper_engine.core.models import CrawlRequest
 
     pg, redis, queue = wired_scrape_deps
     request = CrawlRequest(spider_name="titles", start_urls=["http://example.com"])
@@ -109,7 +111,7 @@ async def test_crawl_enqueues_with_crawl_job_type(wired_scrape_deps):
 
     queue.enqueue.assert_called_once()
     call_args = queue.enqueue.call_args
-    assert call_args.args[0] == "orchestrator.tasks.run_scrape_job"
+    assert call_args.args[0] == "scraper_engine.orchestrator.tasks.run_scrape_job"
     assert call_args.args[2] == resp["job_id"]
 
     # execute(tenant_id, query, job_id, urls, config_used, status, webhook)

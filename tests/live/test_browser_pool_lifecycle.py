@@ -8,7 +8,7 @@ import asyncio
 import psutil
 import pytest
 
-from core.tenant import TenantId
+from scraper_engine.core.tenant import TenantId
 
 
 def camoufox_process_count():
@@ -23,7 +23,7 @@ def camoufox_process_count():
 @pytest.mark.asyncio
 async def test_pool_full_lifecycle_no_leak():
     """Verify: prewarm → lease → use → healthy release → shutdown → 0 processes."""
-    from browser.pool import BrowserPool
+    from scraper_engine.browser.pool import BrowserPool
 
     pool = BrowserPool(tenant_id=TenantId("lifecycletest"), prewarm_count=0)
     await pool.start()

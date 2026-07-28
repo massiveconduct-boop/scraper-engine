@@ -19,7 +19,7 @@ import tempfile
 
 import pytest
 
-from core.tenant import TenantId
+from scraper_engine.core.tenant import TenantId
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ from redis.asyncio import Redis
 async def worker():
     r = Redis(host="localhost", port=6379, decode_responses=True)
     wid = f"subproc-{os.getpid()}-{random.randint(0,9999)}"
-    from orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
+    from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
     key = "politeness:slots:g06_os_test:os-racetest.internal"
     for _ in range(10):
         ok = await r.eval(ACQUIRE_SLOT_LUA, 1, key, wid, 2, 300)

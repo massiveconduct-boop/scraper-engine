@@ -36,8 +36,8 @@ class TestPublicEndpoints:
         """Level 1 fetch against httpbin.org."""
         import asyncio
 
-        from core.tenant import TenantId
-        from fetcher.level_1 import Level1Fetcher
+        from scraper_engine.core.tenant import TenantId
+        from scraper_engine.fetcher.level_1 import Level1Fetcher
 
         for attempt in range(3):
             fetcher = Level1Fetcher()
@@ -60,7 +60,7 @@ class TestPublicEndpoints:
 
         import httpx
 
-        from fetcher.challenge_detector import ChallengeDetector
+        from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
         for attempt in range(3):
             try:
@@ -78,8 +78,8 @@ class TestPublicEndpoints:
     @pytest.mark.asyncio
     async def test_ssrf_guard_blocks_loopback(self):
         """Live SSRF guard test — must block localhost."""
-        from core.exceptions import SSRFBlockedError
-        from core.ssrf_guard import SSRFGuard
+        from scraper_engine.core.exceptions import SSRFBlockedError
+        from scraper_engine.core.ssrf_guard import SSRFGuard
 
         guard = SSRFGuard()
         with pytest.raises(SSRFBlockedError):

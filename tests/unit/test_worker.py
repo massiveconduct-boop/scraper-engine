@@ -6,14 +6,14 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import HttpUrl
 
-from core.models import (
+from scraper_engine.core.models import (
     FailureCategory,
     FetchResult,
     JobStatus,
     ScrapeRequest,
 )
-from core.tenant import TenantId
-from orchestrator.worker import Worker
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.orchestrator.worker import Worker
 
 
 @pytest.fixture

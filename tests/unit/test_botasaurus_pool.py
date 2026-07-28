@@ -10,10 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from browser.botasaurus_pool import BotasaurusPool
-from config.schema import BotasaurusConfig
-from core.models import Proxy, ProxyProtocol
-from core.tenant import TenantId
+from scraper_engine.browser.botasaurus_pool import BotasaurusPool
+from scraper_engine.config.schema import BotasaurusConfig
+from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.tenant import TenantId
 
 TENANT = TenantId("botapool")
 

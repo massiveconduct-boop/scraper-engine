@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.tenant import TenantId
-from fetcher.level_1 import Level1Fetcher
-from services.botasaurus_requests_client import Ja3Response
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher.level_1 import Level1Fetcher
+from scraper_engine.services.botasaurus_requests_client import Ja3Response
 
 
 class _FakeResponse:
