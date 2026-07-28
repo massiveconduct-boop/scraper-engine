@@ -6,7 +6,7 @@ The DOM detect/inject JS runs in a real browser in production; here a FakePage
 stands in for Playwright's page — evaluate() returns a scripted detect result
 and records inject calls, so the orchestration (detect → solve → inject → gate)
 is verified without a browser. End-to-end against a live CAPTCHA is out of scope
-(needs a solver entitlement + real target — see docs/round-19-evidence.md)."""
+(needs a solver entitlement + real target — see docs/archive/round-19-evidence.md)."""
 
 from unittest.mock import AsyncMock
 
