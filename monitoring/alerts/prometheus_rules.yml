@@ -15,25 +15,28 @@ groups:
           summary: "Validated proxy pool (score>=40) critically low — escalations may fail"
           description: "Validated proxy count is {{ $value }}. Minimum safe threshold is 5. Updated by harvester after each cycle."
 
-      # Browser pool exhausted
-      - alert: BrowserPoolExhausted
-        expr: browser_pool_size{status="idle"} == 0
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "No idle browser instances available"
-          description: "All Camoufox instances are currently active. New L2/L3 requests will queue."
+      # BrowserPoolExhausted removed (round 25): BrowserPool now lives inside the
+      # rq work-horse process for one job's lifetime (see orchestrator/tasks.py —
+      # rq forks a fresh process per job that os._exit()s right after). That
+      # process never serves /metrics and is gone before the next Prometheus
+      # scrape could ever see it — a browser_pool_size gauge set there would be
+      # the same "looks wired, never actually reaches Prometheus" failure this
+      # round exists to close. Revisit only if BrowserPool's lifetime changes
+      # (e.g. a persistent worker pool instead of per-job forking).
 
-      # Circuit breaker tripped repeatedly — possible misconfiguration
+      # Circuit breaker tripped repeatedly — possible misconfiguration.
+      # circuit_breaker_trips_total is a global counter (round 25) — Redis has
+      # no cheap way to enumerate every domain a breaker has tripped for, so
+      # this can't carry a domain label; it still catches a misconfigured
+      # cooldown causing frequent trips overall.
       - alert: CircuitBreakerFrequentTrips
-        expr: rate(circuit_state[1h]) > 5
+        expr: rate(circuit_breaker_trips_total[1h]) > 5
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Domain circuit tripped >5x in an hour — cooldown backoff likely misconfigured"
-          description: "Domain {{ $labels.domain }} circuit tripped {{ $value }} times in the last hour."
+          summary: "Circuit breaker tripped >5x/hour across all domains — cooldown backoff likely misconfigured"
+          description: "{{ $value }} circuit trips in the last hour (all domains combined)."
 
       # Dead letter queue growing — jobs accumulating without resolution
       - alert: DeadLetterQueueGrowing
@@ -45,17 +48,22 @@ groups:
           summary: "Dead letter queue has {{ $value }} entries — jobs accumulating"
           description: "More than 100 jobs in the DLQ. Investigate failure patterns."
 
-      # CapSolver budget near ceiling
+      # CapSolver budget near ceiling. Per-tenant now (round 25 — the ceiling
+      # used to be one hardcoded global $1.00/day; tenants.capsolver_daily_credit_ceiling
+      # is read per tenant), so divide by the matching per-tenant ceiling gauge
+      # instead of the old hardcoded 1.0.
       - alert: CapSolverBudgetExhausted
-        expr: capsolver_daily_spend / 1.0 > 0.9
+        expr: capsolver_daily_spend / capsolver_daily_ceiling > 0.9
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "CapSolver daily budget at {{ $value | humanizePercentage }}"
-          description: "CapSolver spend is nearing the $1.00/day ceiling (BD-03). New solves will be rejected."
+          summary: "CapSolver daily budget at {{ $value | humanizePercentage }} for tenant {{ $labels.tenant_id }}"
+          description: "Tenant {{ $labels.tenant_id }}'s CapSolver spend is nearing its daily ceiling. New solves for this tenant will be rejected."
 
-      # Proxy exhaustions increasing — harvester may be failing
+      # Proxy exhaustions increasing — harvester may be failing. Labeled by
+      # level only (round 25) — level is a small fixed set {1,2,3}, domain is
+      # not (unbounded-cardinality label removed).
       - alert: ProxyExhaustionRateHigh
         expr: rate(proxy_exhausted_total[5m]) > 0.1
         for: 5m
@@ -63,9 +71,12 @@ groups:
           severity: warning
         annotations:
           summary: "Proxy pool exhaustion rate elevated: {{ $value }}/s"
-          description: "Domain {{ $labels.domain }} at level {{ $labels.level }} failing to find proxies."
+          description: "Level {{ $labels.level }} failing to find proxies at an elevated rate."
 
-      # High job failure rate
+      # High job failure rate. job_duration_seconds_count/_sum are Redis-backed
+      # gauges (round 25) — see observability/metrics.py for why (rq forks a
+      # fresh process per job that exits right after, so an in-process
+      # Histogram would never be scraped).
       - alert: HighJobFailureRate
         expr: |
           (
@@ -80,7 +91,8 @@ groups:
           summary: "Job failure rate above 50% in the last 10 minutes"
           description: "{{ $value | humanizePercentage }} of jobs are failing. Check target availability and proxy health."
 
-      # API error rate
+      # API error rate. http_requests_total wired round 25 — see
+      # observability/middlewares/http_metrics.py.
       - alert: HighAPIErrorRate
         expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
         for: 5m
@@ -90,9 +102,17 @@ groups:
           summary: "API 5xx error rate elevated"
           description: "{{ $value }}/s 5xx errors in the last 5 minutes."
 
-      # PgBouncer connection pool near limit
+      # PgBouncer connection pool near limit. Round 25: no code anywhere talked
+      # to PgBouncer's admin console, so this was a dead metric referencing
+      # names nothing emitted — fixed via the pgbouncer_exporter sidecar added
+      # to docker-compose.yml (reads real SHOW POOLS/SHOW CONFIG state) rather
+      # than hand-rolling an admin-console client in this app. Metric names
+      # below match prometheuscommunity/pgbouncer-exporter's documented output;
+      # per this round's own plan, confirm with
+      # `curl pgbouncer_exporter:9127/metrics` against the exporter version
+      # actually deployed before trusting this in production.
       - alert: PgBouncerPoolNearLimit
-        expr: pgbouncer_pool_active_connections / pgbouncer_pool_max_connections > 0.8
+        expr: pgbouncer_pools_client_active_connections / pgbouncer_config_max_client_conn > 0.8
         for: 5m
         labels:
           severity: warning

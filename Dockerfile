@@ -45,7 +45,7 @@ WORKDIR /app
 # A container never needs the editable install; the app runs from COPY . . below.
 RUN pip install --no-cache-dir "camoufox[geoip]" \
     fastapi uvicorn pydantic pydantic-core httpx scrapling \
-    asyncpg redis rq structlog prometheus-client \
+    asyncpg redis rq botasaurus botasaurus-requests structlog prometheus-client \
     pyyaml boto3 python-dotenv alembic sqlalchemy scrapy maxminddb \
     opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
     opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \

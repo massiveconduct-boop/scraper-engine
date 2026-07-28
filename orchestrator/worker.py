@@ -15,10 +15,13 @@ from typing import TYPE_CHECKING
 from core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 
 if TYPE_CHECKING:
+    from browser.botasaurus_pool import BotasaurusPool
+    from browser.pool import BrowserPool
     from config.schema import AppConfig
     from core.models import ScrapeRequest
     from core.tenant import TenantId
     from storage.dlq import DeadLetterQueue
+    from storage.postgres_client import PostgresClient
     from storage.redis_client import RedisClient
 
     from .circuit_breaker import CircuitBreaker
@@ -37,11 +40,21 @@ class Worker:
         politeness: PolitenessController,
         dlq: DeadLetterQueue,
         config: AppConfig | None = None,
+        pg: PostgresClient | None = None,
+        browser_pool: BrowserPool | None = None,
+        botasaurus_pool: BotasaurusPool | None = None,
     ) -> None:
         self._redis = redis
         self._circuit_breaker = circuit_breaker
         self._politeness = politeness
         self._dlq = dlq
+        self._pg = pg
+        # None keeps pre-round-25 behavior (fetchers cold-start their own
+        # CamoufoxWrapper). One pool per job process — see orchestrator/tasks.py.
+        self._browser_pool = browser_pool
+        # None keeps every Botasaurus fetch one-shot. One pool per job process
+        # (round 26), same lifetime as browser_pool — see orchestrator/tasks.py.
+        self._botasaurus_pool = botasaurus_pool
         # config drives fetcher construction via fetcher/factory.py. Loaded once
         # here (not per-fetch) so production.yaml values are authoritative for
         # every fetch this worker dispatches. Falls back to load_config() so
@@ -62,7 +75,9 @@ class Worker:
         # construction site (round 20 — wires services/captcha_solver in).
         from core.budget import CapSolverBudget
         from services.captcha_solver import build_captcha_solver
-        self._captcha_solver = build_captcha_solver(CapSolverBudget(self._redis))
+        self._captcha_solver = build_captcha_solver(
+            CapSolverBudget(self._redis, pg=self._pg)
+        )
         # Circuit breaker and politeness use raw Redis (not tenant-scoped),
         # so pass the underlying client for system-level key operations
         if hasattr(circuit_breaker, '_redis'):
@@ -177,7 +192,10 @@ class Worker:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
                 async with lease:
                     l2_fetcher = build_level2_fetcher(
-                        self._config, captcha_solver=self._captcha_solver
+                        self._config,
+                        captcha_solver=self._captcha_solver,
+                        pool=self._browser_pool,
+                        botasaurus_pool=self._botasaurus_pool,
                     )
                     return await l2_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:
@@ -199,7 +217,9 @@ class Worker:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))
                 async with lease:
                     l3_fetcher = build_level3_fetcher(
-                        self._config, captcha_solver=self._captcha_solver
+                        self._config,
+                        captcha_solver=self._captcha_solver,
+                        pool=self._browser_pool,
                     )
                     return await l3_fetcher.fetch(url, tenant_id, proxy=lease.proxy)
             except ProxyPoolExhaustedError:

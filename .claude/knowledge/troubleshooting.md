@@ -94,6 +94,12 @@
 **Root cause:** pytest collection triggers module imports. `browser.camoufox_wrapper` imports `camoufox.async_api.AsyncCamoufox` → Firefox binary loading.
 **Fix:** Mark Camoufox-dependent tests with `@pytest.mark.skip`. Run them standalone via `python -c` when Camoufox available.
 
+### BrowserPool destroyed live browsers on ANY mismatch, not just idle timeout (round 25)
+**Symptom:** No exception, no test failure — just measurably worse pool reuse than expected; prewarmed instances disappeared on their first real use.
+**Root cause:** `acquire()`'s domain-mismatch and (newly-added, same round) proxy-mismatch branches called `w.__aexit__()` (real teardown) instead of just skipping the item. This directly contradicted the module's own docstring ("Tear-down only on unhealthy release, idle timeout, or explicit shutdown"). Compounding it: a prewarmed wrapper's `_last_domain` starts `None`, and `None != "example.com"` was being read as a mismatch — so prewarming was destroyed on literally its first real acquire() call.
+**Fix:** Mismatched wrappers are now kept in the pool as spares (`keep.append(...)`) instead of torn down; only genuine idle-timeout expiry (or explicit unhealthy release/shutdown) destroys a live instance. An unclaimed (`_last_domain is None`) wrapper now matches any domain. Proxy mismatch is deliberately NOT given this same relaxation — see `.claude/knowledge/decisions.md` → "BrowserPool Mismatch Handling" for why that's correct, not an inconsistency, before "fixing" it again.
+**Test:** `tests/unit/test_browser.py::TestBrowserPool::test_prewarmed_wrapper_not_evicted_on_first_domain_mismatch`, `::test_mismatched_wrapper_kept_in_pool_not_destroyed`.
+
 ---
 
 ## Force-Push Recovery Patterns (Round 11)
@@ -214,3 +220,125 @@ pre-round-13 Dockerfile path). Surfaced only by running the browser suite IN-con
 **4GB image export exceeds the harness 120s command cap.** Build detached:
 `nohup docker build -t <tag> . > /tmp/build.log 2>&1 &` — orphaned process ignores
 the tool timeout; poll the log / `docker images` across turns.
+
+---
+
+## Observability / Tracing / Metrics Failures (Rounds 24-25)
+
+### structlog + stdlib logging bridging — two distinct traps
+**Symptom 1:** `configure_logging()` runs, no exception, but log output is still
+plain unstructured text, not JSON.
+**Root cause:** `structlog.configure(processors=[...])` only affects loggers
+obtained via `structlog.get_logger()`. This codebase's loggers are all plain
+`logging.getLogger(__name__)` — structlog's native pipeline never sees them.
+**Fix:** Use `structlog.stdlib.ProcessorFormatter` as the formatter on a
+`logging.StreamHandler` attached to the *root* logger — this is what actually
+intercepts stdlib records and renders them through structlog's processors +
+renderer (JSON or console). See `observability/logging.py::configure_logging()`.
+
+**Symptom 2 (only appears once Symptom 1 is "fixed"):** every single log call
+now fails to format — `--- Logging error ---` spam, `AttributeError` buried in
+the traceback referencing `logger.disabled`.
+**Root cause:** `structlog.stdlib.filter_by_level` was included in the shared
+processor chain passed to `ProcessorFormatter(foreign_pre_chain=...)`.
+`filter_by_level` expects a real `logging.Logger` object with `.disabled` —
+foreign (plain stdlib) records passed through `ProcessorFormatter`'s
+`foreign_pre_chain` don't supply one the same way, so every call crashes.
+**Fix:** Drop `filter_by_level` from the shared/foreign processor chain
+entirely — level filtering is already handled by the root logger's own
+`.setLevel()`, so it's redundant even when it does work.
+**Detection:** if structured-logging output looks right in isolated manual
+testing but production/live containers show `--- Logging error ---` blocks,
+suspect a processor in the chain that assumes a structlog-native logger.
+
+**Also note:** `logging.basicConfig()` is a no-op once the root logger already
+has ANY handler — a very common gotcha, and this codebase's processes always
+have one by the time custom setup runs (something else imports first). Set
+`root_logger.handlers = [...]` directly instead of relying on `basicConfig()`.
+
+### BatchSpanProcessor + fork() — spans vanish with zero errors anywhere
+**Symptom:** Tracing is fully configured (real `TracerProvider`, real spans
+created, no exceptions anywhere in the code under test), but a specific
+process's spans never show up in the trace backend — while the *identical*
+code, run in a fresh one-off process (e.g. `docker exec ... python -c "..."`),
+produces a trace immediately. No error message anywhere points at the cause;
+this is the hardest kind of bug because everything downstream *looks* correct.
+**Root cause:** the process in question forks a child for each unit of work
+(here: `rq`'s `Worker.perform_job()`, which the library's own source docstring
+says "will/should only be called inside the work horse's process" —
+`rq/worker/base.py` confirms the child terminates via `os._exit()`, not a
+normal Python exit). Two independent problems compound:
+1. `os._exit()` skips `atexit` entirely — an `atexit.register(provider.shutdown)`
+   registered before the fork is inherited by the child but never fires.
+2. `BatchSpanProcessor`'s background export thread does not survive `fork()`
+   at all — only the calling thread continues into the child. The child's
+   spans queue into an in-memory buffer with no thread left to drain it.
+Both must be true for spans to vanish silently; either one alone would still
+usually surface *some* symptom (a log warning, a slow shutdown).
+**Fix:** in the forking process's own per-unit-of-work function (not at
+module/process level — that already ran once in the pre-fork parent and
+won't run again), explicitly call
+`trace.get_tracer_provider().force_flush(timeout_millis=<bounded>)` before
+that unit of work returns. Pass an explicit bounded `timeout` to the
+exporter's own constructor too (e.g. `OTLPSpanExporter(timeout=2)`) —
+`force_flush`'s timeout only bounds how long `force_flush` itself waits, not
+an export call already in flight against the exporter's own (usually longer)
+default deadline.
+**Detection method that actually worked:** don't trust "no error in the logs"
+as proof either way — query the trace backend's own API directly (e.g.
+Jaeger's `/api/traces?service=X&tag=job_id:<id>` for the *exact* unit of
+work), and compare the same code path invoked two ways: once through the
+normal forking/queueing mechanism, once called directly in a fresh process.
+A difference in outcome between those two, with identical code, is the
+signature of this bug class.
+**Full narrative + the actual live evidence:** `.claude/knowledge/decisions.md`
+→ "Decision: `force_flush()` in the rq Job's `finally` Block, Not `atexit`".
+
+### FastAPI `/openapi.json` 500s under concurrent load — `from __future__ import annotations` + locally-scoped import
+**Symptom:** A route's return-type annotation (e.g. `-> Response`) causes
+`pydantic.errors.PydanticUserError: TypeAdapter[...ForwardRef('Response')...]
+is not fully defined` when FastAPI builds the OpenAPI schema — intermittently,
+under concurrent requests, not on every call.
+**Root cause:** the module has `from __future__ import annotations`, so every
+annotation (including return types) is stored as a string, resolved lazily
+against the *function's `__globals__`* (module-level globals) when something
+actually needs the real type (schema generation does; normal request handling
+often doesn't, which is why it doesn't fail immediately). If the type used in
+the annotation was only imported inside a nested function's local scope (not
+at module level), resolution fails — but Pydantic's internal caching/mock-
+validator machinery can make this manifest as an intermittent concurrency
+race rather than a deterministic failure on the very first request.
+**Fix:** import the type at module level, not inside whichever function
+happens to use it as a return annotation.
+**Full evidence:** `.claude/MEMORY.md` → Technical Debt (round 23) — this was
+found by the first-ever real run of `tests/load/locustfile.py`, itself a
+separate lesson: an unrun load test is not a passing load test.
+
+### Prometheus metric set from worker/harvester code never appears in `/metrics` (round 25)
+**Symptom:** No exception anywhere. The `Gauge`/`Counter` object is defined,
+imported, and `.set()`/`.inc()` is genuinely called somewhere in the
+codebase — a naive "is this wired?" grep looks clean — but the metric never
+shows up in a real `curl /metrics`, and its alert rule silently never fires
+(no series to evaluate, not an error).
+**Root cause:** `prometheus_client`'s `REGISTRY` is in-process global state.
+`/metrics` is served by the `api` process; the metric was being set inside
+an rq worker process or the `proxy-harvester` daemon — different processes
+entirely. Worse for rq specifically: it forks a fresh "work horse" process
+per job that `os._exit()`s immediately after, so the metric is gone before
+the next scrape could ever see it even in principle.
+**Diagnosis:** don't trust "the `.set()` call exists in the code" as proof.
+Ask which *process* actually executes that line, and whether that's the
+same process that serves `/metrics`. If not, the metric is dead regardless
+of how correct the call site looks.
+**Fix:** write to Redis/Postgres at event time (from whichever process the
+event happens in), refresh the local `Gauge` from that at scrape time
+(inside `/metrics`'s handler, in the `api` process only). Full pattern +
+which metrics this applies to: `.claude/knowledge/architecture.md` →
+"Metrics: Cross-Process Emission Pattern". This is exactly how
+`proxy_source_healthy` was missed by the first round-25 audit pass (the
+Gauge existing and being called somewhere passed a naive check) and only
+caught via a live `/metrics` cross-check against real running containers.
+**Detection method that actually worked:** rebuild the real containers,
+hit the real `/metrics` endpoint, and grep the output for every metric name
+referenced in `monitoring/alerts/prometheus_rules.yml` — don't just confirm
+the Python code compiles and the call site exists.

@@ -318,17 +318,44 @@ def register_routes(app: FastAPI, cfg: AppConfig) -> None:
         async def metrics() -> Response:
             from prometheus_client import REGISTRY
 
-            from api.dependencies import _storage_pg
+            from api import dependencies
             from core.tenant import TenantId
-            from observability.metrics import count_validated_proxies, proxy_pool_validated_count
+            from observability.metrics import (
+                count_validated_proxies,
+                proxy_pool_validated_count,
+                refresh_capsolver_spend,
+                refresh_dlq_size,
+                refresh_proxy_source_health,
+                refresh_redis_backed_counters,
+            )
 
-            if _storage_pg is not None:
+            pg = dependencies._storage_pg
+            redis = dependencies._storage_redis
+            if pg is not None:
                 try:
                     tenant = TenantId("system")
-                    count = await count_validated_proxies(_storage_pg, tenant)
+                    count = await count_validated_proxies(pg, tenant)
                     proxy_pool_validated_count.set(count)
                 except Exception:
                     logger.warning("proxy_pool_validated_count gauge update failed", exc_info=True)
+                try:
+                    await refresh_dlq_size(pg)
+                except Exception:
+                    logger.warning("dlq_size gauge update failed", exc_info=True)
+                if redis is not None:
+                    try:
+                        await refresh_capsolver_spend(pg, redis)
+                    except Exception:
+                        logger.warning("capsolver spend gauge update failed", exc_info=True)
+            if redis is not None:
+                try:
+                    await refresh_redis_backed_counters(redis)
+                except Exception:
+                    logger.warning("redis-backed counter refresh failed", exc_info=True)
+                try:
+                    await refresh_proxy_source_health(redis)
+                except Exception:
+                    logger.warning("proxy_source_healthy gauge update failed", exc_info=True)
 
             return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 

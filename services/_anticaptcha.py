@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from core.budget import CAPSOLVER_CONCURRENCY
+import core.budget
 
 if TYPE_CHECKING:
     from core.budget import CapSolverBudget
@@ -56,7 +56,7 @@ async def solve_anticaptcha(
         )
         return str(val) if val else None
 
-    async with CAPSOLVER_CONCURRENCY:
+    async with core.budget.CAPSOLVER_CONCURRENCY:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 create = (
@@ -132,7 +132,7 @@ async def solve_image_to_text(
             return str(text[0]) if text else None
         return str(text) if text else None
 
-    async with CAPSOLVER_CONCURRENCY:
+    async with core.budget.CAPSOLVER_CONCURRENCY:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = (

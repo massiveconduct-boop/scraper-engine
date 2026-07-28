@@ -121,6 +121,12 @@ class CircuitBreaker:
         trip_raw = await self._get(self._key(domain, "trip_count"))
         trip_count = (int(trip_raw) if trip_raw else 0) + 1
         await self._set(self._key(domain, "trip_count"), str(trip_count))
+        # Global counter, not per-domain (round 25) — Redis has no cheap way to
+        # enumerate every domain this breaker has ever seen, so a per-domain
+        # scrape-time gauge isn't feasible. observability/metrics.py refreshes
+        # this into circuit_breaker_trips_total when /metrics is scraped, from
+        # the (separate, long-lived) API process.
+        await self._redis.incr("metrics:circuit_breaker_trips_total")
 
         cooldown = min(
             self._cooldown_seconds * (2 ** (trip_count - 1)),

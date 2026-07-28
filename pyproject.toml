@@ -28,6 +28,13 @@ dependencies = [
     "redis==8.0.1",
     "rq==2.10.0",
     "camoufox==0.5.4",
+    "botasaurus==4.0.97",
+    # Round 26: imported directly by services/botasaurus_requests_client.py
+    # for L1's JA3-matched client — was already a transitive dep of
+    # botasaurus itself, declared directly here per the same reasoning as
+    # every other direct-import dependency in this list (avoids the drift
+    # this list exists to prevent — see .claude/knowledge/operations.md #12).
+    "botasaurus-requests==4.0.38",
     "structlog==26.1.0",
     "prometheus-client==0.25.0",
     "pyyaml==6.0.3",

@@ -125,6 +125,20 @@ services:
       pgbouncer-init:
         condition: service_completed_successfully
 
+  # Round 25: config/schema.py::PgBouncerConfig's pool fields have no code path
+  # to affect the real pooler (it's configured entirely by pgbouncer.ini above);
+  # this exporter is the actual fix for PgBouncerPoolNearLimit's dead metric —
+  # it reads real pool state via SHOW POOLS/SHOW CONFIG (stats_users, added to
+  # pgbouncer.ini above) rather than anything this app process could report.
+  pgbouncer_exporter:
+    image: prometheuscommunity/pgbouncer-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: "postgres://scraper:${POSTGRES_PASSWORD:-scraper}@pgbouncer:6432/pgbouncer?sslmode=disable"
+    ports:
+      - "9127:9127"
+    depends_on:
+      - pgbouncer
+
   redis:
     image: redis:7-alpine
     ports:

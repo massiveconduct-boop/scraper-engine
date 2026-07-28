@@ -52,12 +52,393 @@ Index of all knowledge documents. Read this first to discover what exists before
 | `docs/round-20-evidence.md` | CAPTCHA solver wired into L2/L3 fetch path — `fetcher/_captcha.py` (DOM detect→solve→inject→re-poll), worker builds solver once, factory threads it, best-effort/null-safe, 15 tests | CAPTCHA fetch-path integration |
 | `docs/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
 | `docs/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
-| `.github/workflows/test.yml` | Live CI (lint incl. mypy-strict + fetcher-factory + force_engine grep-gates + challenge-mirror ruff baseline; unit/integration/chaos) | CI configuration reference |
+| `.github/workflows/test.yml` | Live CI — 5 jobs: lint (mypy-strict + fetcher-factory + force_engine grep-gates + challenge-mirror ruff baseline), unit, integration, chaos (real PgBouncer via `docker compose`, not GH `services:` — round 23), build-and-push (GHCR, `push` to `main` only — round 22) | CI configuration reference |
 | `tools/mypy-baseline.txt` | EMPTY since round 18 — mypy `--strict` clean; CI fails on any error | mypy strict gate |
 
-## Technical Debt / Open Threads (as of round 23)
+## Technical Debt / Open Threads (as of round 26)
 
-- **RESOLVED (round 23) — load test executed for the first time, found and
+- **RESOLVED (round 25) — all 5 round-24 gaps closed, plus 3 more of the same
+  class found by an independent fresh audit, plus 2 real bugs found while
+  tracing the wiring, plus Botasaurus restored for real per an explicit
+  follow-up ask.** Full round-25 story (what changed, why, tradeoffs) is
+  below this list in its own entry. The findings list immediately below is
+  kept as-is — it's the accurate historical record of what round 24's audit
+  found; only the resolution status changed.
+
+- **(Historical — round 24 findings, all resolved round 25).** Same class of
+  bug as round-24's earlier fixes (a config field or module that looks live
+  but silently does nothing) — found by grepping every `config/schema.py`
+  field for real usage outside config files. Ranked by impact:
+  1. **`browser/pool.py::BrowserPool` is entirely dead code.** Grepped every
+     `BrowserPool(` call site — zero outside its own file and tests. The
+     "hot-browser lease() pool" architecture documented in `CLAUDE.md`'s
+     module map and this file's own Architecture section (`## Browser Pool`,
+     below) does not exist in production: `fetcher/level_2.py:110` and
+     `fetcher/level_3.py:84` each construct a brand-new
+     `CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)` directly, per fetch.
+     Every L2/L3 fetch is a full cold-start Firefox launch — no reuse, no
+     prewarming. Real, measurable performance gap versus the documented
+     design, not just a config-wiring issue. See the correction note added
+     to `.claude/knowledge/architecture.md` → "Browser Pool".
+  2. **`CapSolverBudget`'s "per-tenant" framing is false.**
+     `orchestrator/worker.py:65` constructs `CapSolverBudget(self._redis)`
+     with no ceiling argument at all — always falls back to the hardcoded
+     `DEFAULT_DAILY_CEILING = 1.0` class constant in `core/budget.py`. The
+     per-tenant DB column `capsolver_daily_credit_ceiling` (written at
+     tenant creation, `migrations/versions/001_initial.py:130`) is never
+     read back by anything. Every tenant gets the identical global $1/day
+     ceiling regardless of what's stored for them.
+     `config/schema.py::CapSolverConfig.daily_credit_ceiling_default` and
+     `.max_concurrent_solves` are both dead too — concurrency IS enforced,
+     but via a separate hardcoded `CAPSOLVER_CONCURRENCY = Semaphore(10)`
+     in `core/budget.py`, not config.
+  3. **Camoufox config (`geoip`/`humanize`/`headless_mode`) is 100% ignored.**
+     `browser/camoufox_wrapper.py` hardcodes `geoip=True, humanize=1.5,
+     headless="virtual"` directly in the Camoufox constructor call.
+     `camoufox.max_total_instances: 8` is likewise dead — the real
+     concurrency cap is `core/budget.py`'s `BROWSER_SEMAPHORE =
+     Semaphore(8)`, a hardcoded constant that happens to match the config
+     default by coincidence, not by reading it. An operator changing any of
+     these four config values has zero effect.
+  4. **`fetcher/botasaurus_wrapper.py::BotasaurusWrapper` is orphaned.**
+     Never imported by anything, including tests. The `botasaurus` package
+     itself isn't even a declared dependency (not in `pyproject.toml`, not
+     installed). `config/schema.py`'s `level_2.engine: "botasaurus+camoufox"`
+     value is misleading — L2 is Camoufox-only in practice, matching L3.
+  5. **Minor/cosmetic:** `config/schema.py::PgBouncerConfig`
+     (`pool_mode`/`max_client_conn`/`default_pool_size`) is vestigial — the
+     real PgBouncer process is configured entirely by the static
+     `infra/pgbouncer/pgbouncer.ini` file plus docker-compose env vars, not
+     by this Python config at all. Editing `config/base.yaml`'s `pgbouncer:`
+     section has no effect on the actual pooler.
+
+  **Resolution (round 25):** #1-4 all fixed, #5 left cosmetic as planned. #4
+  was decided both ways in the same round — first deleted (matching the
+  "correct config to reality" option below), then restored for real per an
+  explicit follow-up ask. See the round-25 entry immediately below and
+  `.claude/knowledge/decisions.md` → "Botasaurus" for the full reversal
+  story, and `.claude/knowledge/architecture.md` → "Browser Pool" /
+  "Botasaurus Integration" for the current design.
+
+- **RESOLVED (round 25) — full story.** Before starting implementation, a
+  fresh independent audit (same grep-every-config-field method, run again to
+  make sure nothing else was missed) confirmed all 5 round-24 findings still
+  held, and found **3 more of the same class**:
+  1. `SessionRetentionConfig.browser_sessions_ttl_days` was a no-op — the
+     real TTL was hardcoded (`SessionStateManager.__init__(ttl_days=30)`),
+     and that class was never constructed in production anyway (fixed as
+     part of the BrowserPool wiring below, which is what finally gives
+     `SessionStateManager` a real construction site).
+  2. 7 of 12 Prometheus alert rules in `monitoring/alerts/prometheus_rules.yml`
+     referenced metrics nothing emitted.
+  3. `observability/middlewares/` was an empty orphaned package (no
+     `__init__.py`, no files) — exactly where an HTTP-metrics middleware
+     belonged.
+
+  Two more real bugs surfaced while tracing the fixes (not config-wiring
+  gaps — actual logic bugs):
+  - `core/budget.py::CapSolverBudget._spend_key()` ignored its own
+    `tenant_id` parameter — always returned the same literal string, so
+    every tenant's spend was pooled into one Redis key regardless of any
+    per-tenant ceiling being wired.
+  - `storage/session_manager.py` was a *second*, separate orphaned
+    session-save class (distinct from `browser/session_state.py`) with a
+    schema mismatch bug — it inserted `(session_id, state, updated_at)`,
+    columns that don't match the real `browser_sessions` migration
+    (`session_id, domain, storage_state, last_used_at, expires_at`). Deleted
+    as the root-cause fix, since `browser/session_state.py::SessionStateManager`
+    is the one real implementation and is now actually wired in.
+
+  **Fixes, phase by phase:**
+  1. **Camoufox config + CapSolver per-tenant ceiling.** `browser/
+     camoufox_wrapper.py` takes `geoip`/`humanize`/`headless_mode` as
+     constructor args now. `core.budget.BROWSER_SEMAPHORE`/
+     `CAPSOLVER_CONCURRENCY` are resized from config at process startup via
+     a new `configure_budget()` — this required switching the 2-3 consumer
+     modules from `from core.budget import X` to `import core.budget` +
+     `core.budget.X`, since a name bound at import time would never see a
+     later reassignment. `CapSolverBudget` now takes an optional `pg` client
+     and looks up `tenants.capsolver_daily_credit_ceiling` per tenant
+     (short-cached in-process), falling back to the old global default only
+     when no `pg` is given.
+  2. **`BrowserPool` wired into production.** `fetcher/factory.py`'s
+     `build_level2_fetcher`/`build_level3_fetcher` (the sole sanctioned
+     fetcher-construction path, CI-gated) now accept a `pool` param;
+     `Level2Fetcher`/`Level3Fetcher` lease from it instead of constructing
+     `CamoufoxWrapper` directly. One pool per rq job (not per process) —
+     rq forks a fresh "work horse" process per job that `os._exit()`s right
+     after (same fact that drove round 24's tracing fix), so a pool literally
+     cannot outlive one job; still a real win for multi-URL-same-domain jobs.
+     Found and fixed a proxy-identity bug while wiring this in: `acquire()`
+     used to reuse a pooled browser across different proxies as long as the
+     domain matched.
+  3. **Botasaurus orphan deleted, then restored for real (see decisions.md
+     for the full flip).** Initially deleted `fetcher/botasaurus_wrapper.py`
+     (never imported, package not a dependency) and corrected
+     `config/schema.py::LevelConfig.engine` to `Literal["scrapling",
+     "camoufox"]` — matching what L2 had always actually done. Per an
+     explicit follow-up ask, restored it for real instead: added
+     `botasaurus==4.0.97` as a genuine dependency, live-verified the real
+     package's API (headless Chrome via Xvfb launched and fetched
+     successfully in this sandbox), and found the *original* deleted file
+     would have crashed on its first real fetch anyway — it called
+     `driver.page_source`, an attribute that doesn't exist on botasaurus's
+     `Driver` (it's `page_html`). `Level2Fetcher` now tries Botasaurus first,
+     falling back to the existing Camoufox pipeline on exception or a
+     detected challenge page. `engine` Literal extended back to include
+     `"botasaurus+camoufox"`. Also found and fixed real dependency-declaration
+     drift while doing this: the Dockerfile and `.github/workflows/test.yml`
+     each hardcode their *own* separate dependency list (don't read
+     `pyproject.toml` at all) — added `botasaurus` to all of them and
+     rebuilt every container to confirm it actually imports, not just in the
+     local venv.
+  4. **7 dead alert metrics wired**, with an architecture correction found
+     mid-implementation: metrics set from code that runs inside the rq
+     worker process (circuit breaker, proxy exhaustion, job duration) can
+     never reach `/metrics` (a different, long-lived process) — fixed via
+     Redis/Postgres-backed counters written at event time, refreshed into
+     local gauges only when `/metrics` is scraped. Full pattern:
+     `.claude/knowledge/architecture.md` → "Metrics: Cross-Process Emission
+     Pattern". Dropped the `BrowserPoolExhausted` alert entirely (same
+     process-lifetime problem, no real fix available short of a persistent
+     worker pool). Added a `pgbouncer_exporter` sidecar to `docker-compose.yml`
+     for the PgBouncer alert rather than hand-rolling an admin-console client.
+  5. **`PgBouncerConfig`** documented informational-only, no code change
+     (genuinely cosmetic, as round 24 already concluded).
+
+  **Two more fixes from a user follow-up after the initial round-25 pass
+  landed** (user asked, after reviewing: implement Botasaurus for real per
+  spec, don't let `BrowserPool`'s prewarming get evicted, fix
+  `proxy_source_healthy`):
+  - **`BrowserPool.acquire()` correctness fix.** The pool's own docstring
+    always said tear-down should only happen "on unhealthy release, idle
+    timeout, or explicit shutdown" — but the actual code destroyed a live
+    browser on ANY mismatch (wrong domain or wrong proxy), which also meant
+    a prewarmed browser got evicted on its very first real use (its
+    `_last_domain` starts `None`, which was being treated as a mismatch
+    against any real domain). Fixed by keeping mismatched wrappers pooled as
+    spares instead of destroying them, and by treating an unclaimed
+    (`_last_domain is None`) wrapper as a domain match rather than a
+    mismatch. Proxy mismatch is deliberately NOT relaxed the same way — see
+    `.claude/knowledge/decisions.md` → "BrowserPool Mismatch Handling" for
+    why that asymmetry is correct, not an oversight.
+  - **`proxy_source_healthy` fixed** — same cross-process gap as the other
+    round-25 metrics, just missed by the original audit (the Gauge object
+    exists and is called somewhere, so a naive check doesn't catch it). It's
+    set inside the separate `proxy-harvester` container; now written to
+    Redis at harvest time and refreshed into the gauge from the `api`
+    process at scrape time.
+
+  **Verification (all of the above):** 315 unit/integration/chaos tests pass
+  (up from 301 — 7 new for Botasaurus wiring, 2 for the pool fix, 5 for
+  proxy_source_health), mypy `--strict` and ruff both clean, live
+  `BrowserPool` lifecycle test with real Camoufox, and — after rebuilding the
+  actual containers — a real `/metrics` scrape showing every new metric
+  populated with genuine data (real DLQ row count, real per-tenant CapSolver
+  spend/ceiling), `promtool` validating the edited alert rules file against
+  the real running Prometheus.
+
+- **RESOLVED (round 26) — Botasaurus capability-upgrade implemented, all 6
+  ranked findings below.** Plan drafted and executed in a fresh session per
+  the round-25 follow-up ask. Full story, including three real findings made
+  only during this round's own verification (not carried over from the
+  round-25 research — one of them a misdiagnosis caught and corrected in the
+  same session, not just a clean bug find): `.claude/knowledge/architecture.md`
+  → "Botasaurus Capability Upgrade".
+  1. `reuse_driver=True`'s internal `_driver_pool` (read directly from
+     `botasaurus/browser_decorator.py` during planning) turned out to be a
+     bare unkeyed module-level list — no proxy/profile/tenant matching at
+     all. Using it as originally proposed would have leaked one tenant's
+     proxy/profile onto another's fetch. Item 2 was redesigned around a new
+     `browser/botasaurus_pool.py::BotasaurusPool` that constructs and keys
+     raw `Driver` objects itself instead (same proxy+domain matching
+     `browser/pool.py::BrowserPool` already uses for Camoufox).
+  2. `tiny_profile=True` without a profile raises `ValueError` in the real
+     `botasaurus_driver.core.config.Config` — found live, during this
+     round's own smoke test, not in the original research. Fixed by gating
+     `tiny_profile` (and the paired `HASHED` fingerprint) on `session_id is
+     not None` in both `botasaurus_wrapper.py` and `botasaurus_pool.py`.
+  3. End-to-end live browser verification against the local
+     `challenge-mirror` container initially failed (`ChromeException:
+     Invalid parameters` on `Page.navigate`) and was first misdiagnosed as a
+     Chrome/CDP version mismatch (Chrome 149 vs. `botasaurus_driver`
+     4.0.93) — **that diagnosis was wrong, corrected same session.** The
+     real cause: botasaurus's `@browser` decorator always calls the wrapped
+     function positionally, `func(driver, data)` (`browser_decorator.py`'s
+     `run_task`), with `data=None` for a bare call. `botasaurus_wrapper.py`'s
+     inner `_fetch(driver, target_url: str = url)` used a keyword *default*
+     for the URL, which that positional `None` silently clobbered — every
+     fetch was navigating to `None`, not the real target. Confirmed by
+     comparing a raw `Driver().get()` call (worked) against the
+     `@browser`-decorated path (failed identically for both plain `get()`
+     and `google_get()`, proving it wasn't Chrome-version- or
+     bypass_cloudflare-specific). Fixed by reading `url` from the outer
+     closure directly. The mocked unit tests had missed this because the
+     test harness's fake decorator called `fn(_FakeDriver(), URL)` — the
+     real URL, positionally — instead of botasaurus's actual
+     `fn(driver, None)`; fixed to match. After the fix,
+     `BotasaurusWrapper.fetch_html()` and `BotasaurusPool.fetch()` are both
+     genuinely live-verified against `challenge-mirror`: real
+     `<h1>Verified Content</h1>` HTML returned, `google_get`/
+     `short_random_sleep` confirmed executing, and exactly one `Driver()`
+     construction across two same-domain `BotasaurusPool` fetches (the 2nd
+     used `driver.requests.get()`, no new browser launch).
+
+  Original round-25-follow-up research context, preserved for reference:
+  User asked what Botasaurus features are in use vs. available, requested
+  thorough research against the real repo before drafting an implementation
+  plan in a fresh session.
+  Research method: introspected the actual installed package
+  (`botasaurus`, `botasaurus_driver`, `botasaurus_requests`,
+  `botasaurus_humancursor`) plus fetched the real GitHub repo
+  (`omkarcloud/botasaurus`, 5.6k stars) README via `gh api` for the
+  maintainers' own production template and detection-avoidance checklist —
+  not from training-data assumptions.
+
+  **Currently used (round 25 minimal implementation):** `parallel=1`
+  (forced), `headless=False` + `enable_xvfb_virtual_display=True`,
+  `reuse_driver=False` (one-shot per fetch), `proxy=`, `profile=session_id`,
+  plain `driver.get()` → `driver.page_html`. A small fraction of what's
+  available.
+
+  **Findings, ranked by value (full detail already given to user, don't
+  re-research — implement from this list):**
+  1. **`google_get(url, bypass_cloudflare=True)` instead of plain `get(url)`
+     — biggest gap.** `google_get` fakes a Google-search-referrer arrival
+     (defeats Cloudflare's "connection challenge" tier, used on most
+     product/blog/search pages); `bypass_cloudflare=True` adds automatic
+     Turnstile-checkbox solving via human-like mouse movement (confirmed
+     live in `botasaurus_driver/solve_cloudflare_captcha.py`). Free — no
+     CapSolver spend. Our wrapper currently does neither.
+  2. **`driver.requests.get()` for multi-URL same-domain jobs.** After one
+     real navigation establishes session/cookies/TLS/proxy, subsequent pages
+     on the same domain fetch through the browser's own `fetch()` API
+     instead of a full page load — same fingerprint, far less bandwidth.
+     Maintainers cite a real case: 250GB→5GB proxy bandwidth for a 100k-page
+     job. Only pays off with `reuse_driver=True`, which is a real design
+     change (every fetch is currently one-shot) — worth its own short plan.
+  3. **`tiny_profile=True` alongside our existing `profile=session_id`.**
+     Without it, each persisted profile is a full ~100MB Chrome profile
+     directory; with it, ~1KB (cookies only). We generate one profile per
+     (tenant, domain) pair — real disk-growth risk in production as-is.
+  4. **Concrete anti-detection settings we don't set**, per the
+     maintainers' own "why am I getting detected" checklist:
+     `remove_default_browser_check_argument=True` (a specific flag Datadome
+     checks for), `close_on_crash=True`,
+     `driver.short_random_sleep()`/`long_random_sleep()` for pacing,
+     `UserAgent.HASHED`/`WindowSize.HASHED` paired with our existing profile
+     (consistent fingerprint per profile across repeat visits).
+  5. **`max_retry` on the decorator** — a single Botasaurus attempt
+     currently either works or falls straight to Camoufox, no internal
+     retry. Maintainers' own production template uses `max_retry=5`.
+  6. **`botasaurus_requests` (JA3 TLS-fingerprint spoofing HTTP client) for
+     L1.** Separate from the browser path — a `requests`-like client
+     (`chrome()`/`firefox()` impersonation). Our L1 (Scrapling, plain HTTP)
+     has no TLS-fingerprint defense at all; could reduce unnecessary
+     L1→L2 escalations for sites that only check TLS/JA3, not JS execution.
+
+  **Explicitly rejected, with reasoning (don't re-propose these):**
+  - Botasaurus's own `cache=True` — file-based, per-container, doesn't
+    survive restarts or work across worker replicas. We already have
+    `storage/dedup.py` as the real success-gated cache; a second, competing
+    one would be a net negative, not an addition.
+  - `capsolver_extension_python` (Chrome-extension-based captcha solving) —
+    would create two different captcha-solving mechanisms (extension for
+    Botasaurus, API+token-injection for Camoufox), with inconsistent budget
+    tracking against `CapSolverBudget`. Keep the existing service-based
+    integration as the single path.
+  - Fingerprint randomization (`UserAgent.RANDOM`/`WindowSize.RANDOM`) — the
+    maintainers explicitly recommend against this as a default (a mismatched
+    UA-vs-actual-fingerprint is itself a detection signal); only the
+    `HASHED` variant paired with a stable profile is worth adding.
+
+  **Status: all 6 implemented (round 26)** — see the RESOLVED entry above
+  for what changed vs. this original plan (item 2 was redesigned, a real
+  `tiny_profile` bug was found and fixed, live verification was blocked by
+  an environment issue and worked around).
+
+- **RESOLVED (round 24) — PR #7 merged (`c4a8f54`): 6 confirmed dead-wiring
+  gaps closed, real tracing deployed end-to-end.** Same investigation
+  method as the round-24 audit above (grep every config field for real
+  usage) turned up: `observability/logging.py::configure_logging()` had
+  zero call sites anywhere (production ran on Python's default unconfigured
+  logger, not the structlog/JSON setup that existed for it);
+  `observability/tracing.py::configure_tracing()` likewise never called;
+  `ObservabilityConfig.metrics_enabled` never read (`/metrics` always
+  mounted regardless); `SSRFGuardConfig.additional_denied_cidrs` had no
+  constructor path to reach (`SSRFGuard.__init__()` took zero arguments);
+  `SessionRetentionConfig`'s two TTL fields had no enforcement job at all;
+  CI never built or published an image. All six wired/fixed, plus (per an
+  explicit follow-up ask) full distributed tracing actually deployed, not
+  just non-crashing. Full narrative:
+  - `observability/bootstrap.py` (new) — single call wiring logging+tracing
+    into every process (api, cli, harvester daemon, rq worker).
+  - `observability/logging.py` rewritten to bridge stdlib logging through
+    structlog via `structlog.stdlib.ProcessorFormatter` — the previous
+    implementation only configured structlog's *native* processor pipeline,
+    which nothing in this codebase uses (every logger here is a plain
+    `logging.getLogger(__name__)`). Hit and fixed a second bug in the same
+    pass: `structlog.stdlib.filter_by_level` cannot be used inside a
+    `ProcessorFormatter` foreign-record chain — it expects a real
+    `logging.Logger` with `.disabled`, which foreign/stdlib records don't
+    provide the same way, and it crashed every single log call in the
+    codebase (caught live: `--- Logging error ---` spam). Root logger's own
+    level now does the filtering instead. See
+    `.claude/knowledge/troubleshooting.md` → "structlog + stdlib bridging".
+  - **Real tracing backend, not just a non-crashing TracerProvider.** Added
+    a `jaeger` service to `docker-compose.yml` (Jaeger's all-in-one image
+    speaks OTLP gRPC natively — no separate otel-collector needed). New
+    `observability.otlp_endpoint` config (default `http://jaeger:4317`) —
+    the OTel exporter's own default of `localhost:4317` resolves inside
+    whichever container is exporting, never reaching a separate service.
+    Instrumented httpx/asyncpg/redis process-wide
+    (`opentelemetry-instrumentation-{httpx,asyncpg,redis}`) plus FastAPI
+    request spans (already had `FastAPIInstrumentor`), a `scrape_job` root
+    span per rq job (`orchestrator/tasks.py`), and a `proxy_daemon_{name}`
+    root span per harvester cycle (`proxy/harvester_daemon.py::
+    _run_periodic`). Also fixed `configure_tracing()`'s `service_name` param
+    — accepted but never attached to the `TracerProvider`, would have shown
+    every trace as `unknown_service` in Jaeger.
+  - **Found and fixed the single most subtle bug of the whole session**:
+    rq's work-horse process exits via `os._exit()` (confirmed in rq's own
+    source, `rq/worker/base.py` — the comment literally says "os._exit() is
+    the way to exit from childs after a fork()"), which bypasses `atexit`
+    entirely, and `BatchSpanProcessor`'s background export thread doesn't
+    survive `fork()` at all (only the calling thread does) — so every job's
+    span was being silently dropped, with NO error anywhere, until an
+    explicit bounded `force_flush(timeout_millis=2000)` was added to
+    `_run_scrape_job`'s `finally` block (plus a matching `timeout=2` on the
+    `OTLPSpanExporter` itself — `force_flush`'s own timeout doesn't shorten
+    an export call already blocked on the exporter's longer default
+    deadline). Full diagnostic trail + the exact evidence that proved it
+    (identical code invoked directly vs. through a real forked work-horse
+    produced different results) in
+    `.claude/knowledge/troubleshooting.md` → "BatchSpanProcessor + fork()".
+  - `api/routes.py`'s `/metrics` gated by `metrics_enabled`; `core/
+    ssrf_guard.py::SSRFGuard` accepts `additional_denied_cidrs` directly,
+    wired through a new DI singleton (`api/dependencies.py::_ssrf_guard`)
+    for API routes and `fetcher/factory.py::_build_ssrf_guard` for
+    fetchers, instead of leaving every call site to silently default.
+  - `proxy/retention_reaper.py` (new) — enforces
+    `browser_sessions_ttl_days`/`domain_ban_history_retention_days`, wired
+    as a 4th periodic task in the harvester daemon plus a `cli reap`
+    one-shot. Isolates per-tenant failures (found live: a stale
+    pre-migration-002 dev tenant schema was silently blocking the *entire*
+    cycle, including unrelated `domain_ban_history` cleanup, before this
+    isolation was added).
+  - Live-verified end to end, not just unit-tested: real JSON logs from
+    every process; a real `/v1/scrape` job through a real forked rq
+    work-horse produced a `scrape_job` trace in Jaeger with 32 nested
+    Postgres/Redis child spans; `proxy_daemon_harvest/promotion/health/
+    retention` spans all confirmed in Jaeger; SSRF `additional_denied_cidrs`
+    blocks a configured range end to end; retention reaper deletes expired
+    rows and isolates a stale tenant's failure without blocking others.
+    301 tests pass (up from 292), ruff + mypy --strict clean, all CI checks
+    green on the real PR.
+  - **CD gap (GHCR build-and-push) shipped in PR #6, not #7** — see the
+    round-23 entry below; not repeated here.
+
+- **RESOLVED (round 23, shipped as PR #6 `d8cfc46`) — load test executed for the first time, found and
   fixed a real bug.** `tests/load/locustfile.py` had never actually been run
   (open item since round 21) and had no `X-API-Key` header, so every
   `/v1/scrape`/`/v1/jobs` request would have 401'd — fixed by setting the

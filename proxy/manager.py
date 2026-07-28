@@ -51,6 +51,7 @@ class ProxyManager:
         for attempt in range(self.MAX_ATTEMPTS):
             proxy = await self._select_candidate(tenant_id, domain, tier_min_score, seen)
             if proxy is None:
+                await self._redis.raw.incr(f"metrics:proxy_exhausted_total:{level}")
                 raise ProxyPoolExhaustedError(
                     domain=domain,
                     level=level,
@@ -65,6 +66,7 @@ class ProxyManager:
 
             return ProxyLease(proxy=proxy, tenant_id=tenant_id)
 
+        await self._redis.raw.incr(f"metrics:proxy_exhausted_total:{level}")
         raise ProxyPoolExhaustedError(domain=domain, level=level, attempts=self.MAX_ATTEMPTS)
 
     async def mark_success(self, tenant_id: TenantId, ip: str, port: int) -> None:

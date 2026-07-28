@@ -24,6 +24,8 @@ The `proxy_pool` table has `UNIQUE (ip, port, protocol)`. All INSERTs must use `
 ### Prometheus Gauges
 When adding a Prometheus gauge: define it in `observability/metrics.py`, update it in the relevant code path with `.set()`, create an alert rule in `monitoring/alerts/prometheus_rules.yml` that thresholds against the gauge metric (not row-level SQL). PromQL cannot evaluate SQL predicates.
 
+**Before wiring the `.set()` call, check which process runs that code.** `/metrics` is served only by the `api` process. A gauge set from an rq worker or the `proxy-harvester` daemon is invisible to it — `prometheus_client`'s `REGISTRY` is in-process state, and rq forks a fresh process per job that exits right after, so it's gone before the next scrape regardless. If the event isn't in the `api` process, write to Redis/Postgres at event time and refresh the gauge at scrape time instead (see every `refresh_*` function in `observability/metrics.py` for the pattern; full rationale in `.claude/knowledge/architecture.md` → "Metrics: Cross-Process Emission Pattern"). This bug class (metric exists, is called, never reaches `/metrics`) has occurred twice (round 25 — 7 alert metrics, then `proxy_source_healthy` separately).
+
 ---
 
 ## Test Patterns

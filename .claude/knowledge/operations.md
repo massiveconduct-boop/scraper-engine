@@ -21,6 +21,7 @@
 | Prometheus | prom/prometheus:latest | 9090 | Metrics collection + alert evaluation |
 | Alertmanager | prom/alertmanager:latest | 9093 | Alert routing to Slack (two-tier: default + paging-channel) |
 | PgBouncer init | postgres:16-alpine | — | SCRAM userlist auto-regeneration |
+| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | Distributed tracing backend — round 24 |
 
 ---
 
@@ -76,8 +77,33 @@ containers get service names. Symptom if missing:
 
 ### Alerts
 - `ProxyPoolCriticallyLow`: fires when `proxy_pool_validated_count < 5` for 5 minutes. Severity: critical.
-- `BrowserPoolExhausted`, `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined.
-- Rules in `monitoring/alerts/prometheus_rules.yml`.
+- `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined and all now backed by real metrics (round 25 — see below).
+- Rules in `monitoring/alerts/prometheus_rules.yml`. 11 rules as of round 25 (was 12 — `BrowserPoolExhausted` removed, see below), `promtool check rules` validated against a real Prometheus container.
+- **`BrowserPoolExhausted` REMOVED (round 25), not fixed.** Its expr was
+  `browser_pool_size{status="idle"} == 0`, but `BrowserPool` now lives inside
+  the rq work-horse process for one job's lifetime (see
+  `.claude/knowledge/architecture.md` → "Browser Pool") — that process never
+  serves `/metrics` and is gone before the next scrape could see it. A
+  `browser_pool_size` gauge set there would hit the exact cross-process
+  problem the other round-25 metric fixes exist to close, with no real fix
+  available short of a persistent (not per-job) worker pool. Revisit only if
+  `BrowserPool`'s lifetime changes.
+- **The other 7 were dead metrics too until round 25** — `circuit_state`
+  (now `circuit_breaker_trips_total`, global not per-domain — Redis can't
+  cheaply enumerate every domain), `dlq_size`, `capsolver_daily_spend`
+  (now divided by a real per-tenant `capsolver_daily_ceiling`, not a
+  hardcoded `1.0`), `proxy_exhausted_total` (labeled by `level`, not
+  `domain` — unbounded-cardinality label removed), `job_duration_seconds_count`/
+  `_sum`, `http_requests_total`. Mechanics: `.claude/knowledge/architecture.md`
+  → "Metrics: Cross-Process Emission Pattern".
+- **`PgBouncerPoolNearLimit`** now backed by a `pgbouncer_exporter` sidecar
+  (`docker-compose.yml`, `prometheuscommunity/pgbouncer-exporter` image,
+  reads real `SHOW POOLS`/`SHOW CONFIG` state — `stats_users = scraper`
+  added to `infra/pgbouncer/pgbouncer.ini` for this). Metric names in the
+  alert rule match that exporter's documented output but haven't been
+  confirmed against a live scrape of the exporter itself yet — verify with
+  `curl pgbouncer_exporter:9127/metrics` before trusting this alert in
+  production.
 
 ### Alertmanager
 - Two-tier Slack routing: `default` receiver → `#alerts` (repeat 4h), `paging-channel` receiver → `#alerts-critical` for severity=critical (repeat 30m).
@@ -85,25 +111,63 @@ containers get service names. Symptom if missing:
 - Webhook URL from `.env` (`SLACK_WEBHOOK_URL`), never committed. `docker-entrypoint.sh` substitutes via `sed` at container start.
 - Global `slack_api_url` required (Alertmanager v0.33.1 — per-receiver `api_url` silently ignored).
 
+### Distributed Tracing (round 24)
+- Jaeger UI at `:16686` — query `/api/traces?service=scraper-engine` (optionally
+  `&operation=<name>` or `&tag=job_id:<id>`) for programmatic verification
+  instead of eyeballing the UI.
+- Toggle: `observability.tracing_enabled`. Exporter target:
+  `observability.otlp_endpoint` (default `http://jaeger:4317`).
+- What's traced: every API request; one `scrape_job` span per rq job; one
+  `proxy_daemon_{harvest,promotion,health,retention}` span per harvester
+  cycle; every outbound httpx/Postgres/Redis call nested under whichever of
+  those is active. Full architecture: `.claude/knowledge/architecture.md` →
+  "Observability & Tracing".
+- **Operator note:** an unreachable Jaeger adds up to ~2s latency per rq job
+  (bounded `force_flush` + exporter timeout — see troubleshooting.md →
+  "BatchSpanProcessor + fork()") rather than failing the job. Structured
+  JSON logs (`observability.logging_level`) are independent of tracing and
+  keep working even if Jaeger is down.
+
 ---
 
 ## CI Pipeline (Live)
 
-**File:** `.github/workflows/test.yml` — 4-stage pipeline, GitHub Actions hosted, green as of round 11.
+**File:** `.github/workflows/test.yml` — 5 jobs, GitHub Actions hosted, green as of round 25.
 
-**Stages:**
+**Jobs (each `needs:` the previous):**
 - **lint (round 13-18):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across core/proxy/orchestrator/api/storage/fetcher/browser/observability) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + challenge-mirror ruff baseline + mypy-shrinkage advisory.
-- **unit:** 148 tests, explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently).
-- **integration:** Postgres 16 + Redis 7 as GitHub Actions services. Alembic upgrade head before tests. Excludes `test_promotion.py` (needs judge server subprocess) and Camoufox-dependent tests.
-- **chaos:** Same services. Excludes `test_pgbouncer_search_path_isolation.py` (no PgBouncer service in CI).
+- **unit:** explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently; also see "Known Operational Gaps" #12 on this list drifting from `pyproject.toml`); 315 tests as of round 25.
+- **integration:** Postgres 16 + Redis 7 as GitHub Actions `services:`. Alembic upgrade head before tests. Runs the *full* `tests/integration/` — `test_promotion.py` is no longer excluded (round 23; see below).
+- **chaos:** **Real PgBouncer, not GH Actions `services:`** (round 23) — a bare
+  `services:` container pair can't produce the SCRAM-auth-off-a-live-`pg_authid`
+  transaction pooling that G-05's test needs, so this job runs
+  `docker compose up -d postgres redis pgbouncer` instead (reusing the
+  project's own `pgbouncer-init` dependency chain from `docker-compose.yml`),
+  polls `:6432` for TCP readiness, then runs the *full* `tests/chaos/` —
+  `test_pgbouncer_search_path_isolation.py` is no longer excluded either.
+- **build-and-push (round 22):** builds the root `Dockerfile`, pushes to GHCR
+  (`ghcr.io/<owner>/<repo>:<sha>` and `:latest`) via the automatic
+  `GITHUB_TOKEN` — no new secret needed. Gated `if: github.event_name ==
+  'push' && github.ref == 'refs/heads/main'` — never runs on `pull_request`
+  (a fork PR must never get registry write access), so it correctly shows
+  `skipping` on every PR's checks and only actually runs after a merge to
+  `main`. Publishes an image; does not deploy anywhere — no deploy target
+  (k8s/systemd/cloud) exists in this repo yet.
 
 **Run URL:** https://github.com/massiveconduct-boop/scraper-engine/actions
 
-**Excluded from CI (by design):**
+**Still excluded from CI (by design, unchanged):**
 - 2 Camoufox-dependent unit tests (binary ~300MB, run locally)
 - L2/L3 live escalation tests (Camoufox + challenge mirror)
-- `test_promotion.py` (judge server subprocess)
-- `test_pgbouncer_search_path_isolation.py` (no PgBouncer service)
+
+**Historical note (superseded round 23):** `test_promotion.py` and
+`test_pgbouncer_search_path_isolation.py` used to be permanently `--ignore`'d
+in CI (`test_promotion.py` for a judge-server-subprocess concern that no
+longer applies now that it uses `sys.executable` instead of a hardcoded
+`"python"` binary; the PgBouncer test for lack of a real pooler in CI). Both
+pass locally and, as of round 23, in real CI too — see the chaos job above.
+Recorded here so a future reader doesn't waste time rediscovering why they
+were once excluded.
 
 ---
 
@@ -203,3 +267,63 @@ levels:
    `StorageConfig` source (DB through PgBouncer).
 6. **Stale Dockerfile Python pin (RESOLVED, round 14):** The committed Dockerfile text pinned `python:3.11-slim` from initial commit through round 12, but every *built* image (incl. the deployed `scraper_engine-api`) ran Python 3.12.13 — matching local venv (3.12.3) and CI (3.12). So the pin was documentation drift, never a runtime exposure; 3.11 was never deployed. Round 13 aligned the text to `python:3.12-slim`. Recorded here so the historical mismatch is explicit, not implicit in a diff.
 7. **AWS WAF captcha unverified (BACKLOG — needs a real target).** The solver supports AWS WAF (`solve_aws_waf`) but it has never been exercised against a live AWS-WAF-protected site (per-request runtime data can't be mocked faithfully). To verify when a target is available: point `tools/verify_captcha_live.py` at the target, confirm DOM detection extracts the AWS WAF challenge and that a solved token is accepted. Low priority.
+8. **`BrowserPool` unwired (RESOLVED round 25).** Was: every L2/L3 fetch a
+    cold-start browser launch, no prewarming, no reuse. Now wired — one pool
+    per rq job, leased by `Level2Fetcher`/`Level3Fetcher` via
+    `fetcher/factory.py`. Also fixed a real correctness bug found while
+    wiring it in (mismatch used to destroy live browsers instead of keeping
+    them pooled). Full story: `.claude/MEMORY.md` → Technical Debt (round
+    25); `.claude/knowledge/architecture.md` → "Browser Pool".
+9. **CapSolver budget was a single hardcoded global ceiling (RESOLVED round
+    25).** `CapSolverBudget` now reads the real per-tenant DB column
+    (`tenants.capsolver_daily_credit_ceiling`); `config.capsolver.
+    max_concurrent_solves` now sizes `CAPSOLVER_CONCURRENCY` for real.
+    (`daily_credit_ceiling_default` was removed from config — superseded by
+    the DB column, kept as the single source of truth.) Also fixed a real
+    bug found alongside it: `_spend_key()` ignored `tenant_id`, pooling every
+    tenant's spend into one Redis key regardless of ceiling. Full story:
+    `.claude/MEMORY.md` → Technical Debt (round 25).
+10. **Camoufox config entirely ignored (RESOLVED round 25).**
+    `geoip`/`humanize`/`headless_mode` now flow into `CamoufoxWrapper`'s
+    constructor from config; `max_total_instances` now sizes
+    `BROWSER_SEMAPHORE` via a new `configure_budget()` called once at rq
+    worker process startup. Full story: `.claude/MEMORY.md` → Technical Debt
+    (round 25).
+11. **`fetcher/botasaurus_wrapper.py` — deleted, then restored for real
+    (RESOLVED round 25).** Was orphaned (never imported, `botasaurus` not a
+    dependency). Deleted first as dead code, then restored and wired for
+    real per an explicit follow-up ask (the authoritative spec §3.6
+    designs a real implementation). `level_2.engine` config now genuinely
+    reflects what runs. Full story + the reversal reasoning:
+    `.claude/MEMORY.md` → Technical Debt (round 25);
+    `.claude/knowledge/decisions.md` → "Botasaurus".
+12. **Dependency declarations live in 5 separate places, none read from each
+    other (OPEN — known drift risk, not being fixed this round).**
+    `pyproject.toml`'s `dependencies` list, the Dockerfile's `deps` stage
+    (a hardcoded `RUN pip install ...` line, "mirrors .github/workflows/
+    test.yml" per its own comment — but only by convention, not by any
+    actual mechanism), and 3-4 separate hardcoded install lists inside
+    `.github/workflows/test.yml`'s different jobs. Adding a real dependency
+    to `pyproject.toml` alone does **not** make it reach the Docker image or
+    CI — found round 25 when `botasaurus` was added to `pyproject.toml` but
+    the built image didn't actually contain it until the Dockerfile and
+    every CI job's install list were separately updated too. No fix
+    attempted this round (would mean either templating the Dockerfile from
+    `pyproject.toml` or switching to `pip install -e .` in a way compatible
+    with the multi-stage build-cache design — see the Dockerfile's own
+    comment on why `-e .` was avoided). **Operator checklist when adding any
+    new Python dependency:** update `pyproject.toml`, `Dockerfile`'s
+    `deps` stage, and every `pip install` block in `.github/workflows/
+    test.yml`, then rebuild + `docker run --rm <image> python -c "import
+    <pkg>"` to actually confirm it landed — don't trust that editing
+    `pyproject.toml` alone did anything.
+13. **`proxy_source_healthy` had the same cross-process gap as the round-25
+    alert metrics (RESOLVED round 25 follow-up).** Set inside the
+    `proxy-harvester` container, invisible to the `api` process's
+    `/metrics`. Now written to Redis at harvest time, refreshed into the
+    gauge at scrape time. Missed by the original round-25 audit (the Gauge
+    object exists and is called somewhere, so a naive check doesn't catch
+    it) — found only via a live `/metrics` cross-check after the rest of
+    round 25 landed. Full story: `.claude/MEMORY.md` → Technical Debt
+    (round 25 follow-up).
+    Full finding: `.claude/MEMORY.md` → Technical Debt (round 24).

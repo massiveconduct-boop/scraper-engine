@@ -11,11 +11,25 @@ an ongoing watcher, not a one-time decision — these free sources go dark on
 their own schedule, independent of this project's release cycle. The
 ProxySourceWentDark alert (monitoring/alerts/prometheus_rules.yml) fires on
 sustained absence.
+
+Round 25: this used to only set an in-process Gauge. `record_source_health`
+is called from `ProxyHarvester._direct_scrape`, which runs inside the
+proxy-harvester container — a different process from the one serving
+/metrics (api). An in-process Gauge set there could never reach Prometheus;
+same cross-process gap already closed for the other round-25 metrics (see
+observability/metrics.py's module docstring). Fixed the same way: write to
+Redis at event time, refresh the Gauge from Redis only when /metrics is
+actually scraped, from the api process.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from prometheus_client import REGISTRY, Gauge
+
+if TYPE_CHECKING:
+    from storage.redis_client import RedisClient
 
 proxy_source_healthy = Gauge(
     "proxy_source_healthy",
@@ -24,12 +38,11 @@ proxy_source_healthy = Gauge(
     registry=REGISTRY,
 )
 
+REDIS_KEY_PREFIX = "metrics:proxy_source_healthy:"
 
-def record_source_health(source_name: str, proxy_count: int) -> None:
-    """Set the per-source health gauge from a single harvest cycle's result.
 
-    Called once per source inside ProxyHarvester._direct_scrape, using the
-    per-source count already being computed there — no extra work, no extra
-    query.
-    """
-    proxy_source_healthy.labels(source_name=source_name).set(1 if proxy_count > 0 else 0)
+async def record_source_health(redis: RedisClient, source_name: str, proxy_count: int) -> None:
+    """Write the per-source health signal to Redis from a single harvest
+    cycle's result — no extra work, no extra query, just a different sink
+    than the in-process Gauge (which nothing scrapes from this process)."""
+    await redis.raw.set(f"{REDIS_KEY_PREFIX}{source_name}", "1" if proxy_count > 0 else "0")

@@ -24,11 +24,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 
 from config.loader import load_config
+from core.budget import configure_budget
 from core.models import ConfigOverrides, FetchResult, JobStatus, JobStatusResponse, ScrapeRequest
 from core.tenant import TenantId
 from observability.bootstrap import bootstrap_observability
@@ -43,8 +45,14 @@ logger = logging.getLogger(__name__)
 
 # rq imports this module once per worker process before executing any job —
 # module-level code is the right place to bootstrap once, rather than
-# reconfiguring logging/tracing on every single job inside _run_scrape_job.
-bootstrap_observability(load_config().observability)
+# reconfiguring logging/tracing (or resizing the budget semaphores) on every
+# single job inside _run_scrape_job.
+_bootstrap_cfg = load_config()
+bootstrap_observability(_bootstrap_cfg.observability)
+configure_budget(
+    browser_max_total_instances=_bootstrap_cfg.camoufox.max_total_instances,
+    capsolver_max_concurrent_solves=_bootstrap_cfg.capsolver.max_concurrent_solves,
+)
 
 
 def run_scrape_job(tenant_id: str, job_id: str) -> None:
@@ -73,6 +81,7 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
     await redis.start()
     await s3.start()
     tracer = trace.get_tracer(__name__)
+    job_start = time.monotonic()
     try:
         with tracer.start_as_current_span(
             "scrape_job", attributes={"job_id": job_id, "tenant_id": tenant_id_raw}
@@ -125,6 +134,20 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
 
             if webhook_url:
                 await _dispatch_webhook(webhook_url, job_id, status, results, error)
+
+            # Redis-backed counter, refreshed into job_duration_seconds_count/_sum
+            # gauges only when /metrics is actually scraped (this rq work-horse
+            # process exits right after this job — see the force_flush comment
+            # below for why an in-process Histogram would never be scraped).
+            metric_status = "completed" if status == JobStatus.COMPLETED else "failed"
+            try:
+                await redis.raw.incr(f"metrics:job_duration:{metric_status}:count")
+                await redis.raw.incrbyfloat(
+                    f"metrics:job_duration:{metric_status}:sum",
+                    time.monotonic() - job_start,
+                )
+            except Exception:
+                logger.warning("job_duration metric update failed", exc_info=True)
     finally:
         await s3.stop()
         await redis.stop()
@@ -153,6 +176,9 @@ async def _run_scrape(
     pg: PostgresClient,
     cfg: AppConfig,
 ) -> JobStatusResponse:
+    from browser.botasaurus_pool import BotasaurusPool
+    from browser.pool import BrowserPool
+    from browser.session_state import SessionStateManager
     from orchestrator.circuit_breaker import CircuitBreaker
     from orchestrator.politeness import PolitenessController
     from orchestrator.worker import Worker
@@ -172,10 +198,44 @@ async def _run_scrape(
         slot_ttl_seconds=cfg.politeness.slot_ttl_seconds,
     )
     dlq = DeadLetterQueue(pg)
-    worker = Worker(
-        redis=redis, circuit_breaker=circuit_breaker, politeness=politeness, dlq=dlq, config=cfg
+
+    # One BrowserPool per job (round 25) — rq forks a fresh "work horse" process
+    # per job (see the force_flush comment below), so a pool can only ever live
+    # for the duration of one job; started/shut down here the same way pg/redis/s3
+    # bracket the whole job in _run_scrape_job. Still a real win for jobs with
+    # multiple URLs on the same domain (crawls), which now reuse one hot browser
+    # instead of cold-starting Camoufox per URL.
+    session_mgr = SessionStateManager(pg, ttl_days=cfg.session_retention.browser_sessions_ttl_days)
+    browser_pool = BrowserPool(
+        tenant_id=tenant_id,
+        session_mgr=session_mgr,
+        geoip=cfg.camoufox.geoip,
+        humanize=cfg.camoufox.humanize,
+        headless_mode=cfg.camoufox.headless_mode,
+        max_total_instances=cfg.camoufox.max_total_instances,
     )
-    return await worker.process_job(tenant_id, job_id, request)
+    await browser_pool.start()
+    # One BotasaurusPool per job too (round 26), same rationale and lifetime
+    # as browser_pool above — reuses one live Botasaurus driver across
+    # same-domain URLs in a crawl job instead of relaunching per URL. See
+    # browser/botasaurus_pool.py for why this doesn't use botasaurus's own
+    # reuse_driver=True.
+    botasaurus_pool = BotasaurusPool(tenant_id=tenant_id, config=cfg.botasaurus)
+    try:
+        worker = Worker(
+            redis=redis,
+            circuit_breaker=circuit_breaker,
+            politeness=politeness,
+            dlq=dlq,
+            config=cfg,
+            pg=pg,
+            browser_pool=browser_pool,
+            botasaurus_pool=botasaurus_pool,
+        )
+        return await worker.process_job(tenant_id, job_id, request)
+    finally:
+        await browser_pool.shutdown()
+        await botasaurus_pool.shutdown()
 
 
 async def _run_crawl_job(config_used: dict[str, Any]) -> list[FetchResult]:
