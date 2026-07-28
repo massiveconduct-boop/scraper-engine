@@ -93,8 +93,8 @@ class Worker:
                     errors.append(f"Circuit open for {domain}")
                     break
 
-                acquired = await self._politeness.acquire_slot(domain, tenant_id)
-                if not acquired:
+                slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
+                if slot_worker_id is None:
                     await asyncio.sleep(1)
                     continue
 
@@ -102,7 +102,7 @@ class Worker:
                     await self._politeness.wait_if_needed(domain, tenant_id)
                     result = await self._fetch_url(tenant_id, url_str, level)
                 finally:
-                    await self._politeness.release_slot(domain, tenant_id)
+                    await self._politeness.release_slot(domain, tenant_id, slot_worker_id)
 
                 if result is None:
                     continue

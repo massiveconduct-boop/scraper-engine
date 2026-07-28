@@ -7,6 +7,7 @@ asserts promotion from score 25 → 60.
 """
 
 import subprocess
+import sys
 import time
 
 import pytest
@@ -20,7 +21,7 @@ from storage.postgres_client import PostgresClient
 @pytest.fixture(scope="module")
 def judge_server():
     """Start the self-hosted judge server on port 8089 in the background."""
-    p = subprocess.Popen(["python", "judge_server.py"])
+    p = subprocess.Popen([sys.executable, "judge_server.py"])
     # Give the server a moment to bind and start listening
     time.sleep(1.0)
     yield

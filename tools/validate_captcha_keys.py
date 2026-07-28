@@ -48,6 +48,9 @@ async def main() -> int:
             status = "REJECTED"  # key not accepted at all (bad/expired/401)
         elif isinstance(balance, (int, float)) and balance <= 0:
             status = "NO FUNDS"  # authenticates, but $0 → solves will fail
+        elif r.get("has_active_plan") is False:
+            status = "NO PLAN"  # funded, but no worker-slot capacity — OCR-only
+            any_solve_capable = True  # ImageToText still works
         else:
             status = "WORKING"
             any_solve_capable = True
@@ -57,7 +60,10 @@ async def main() -> int:
     print(
         "note: WORKING means the key authenticates AND has a balance. It does not "
         "prove a specific captcha capability is active — confirm with "
-        "tools/verify_captcha_live.py."
+        "tools/verify_captcha_live.py. NO PLAN means NoCaptchaAI has real "
+        "balance but no subscription plan: ImageToText works, but worker-slot "
+        "types (reCAPTCHA/Turnstile/GeeTest/MTCaptcha) will accept tasks and "
+        "silently never solve them — fix at nocaptchaai.com/manage, not in code."
     )
     if any_solve_capable:
         print("PASS: at least one provider authenticates and has funds.")

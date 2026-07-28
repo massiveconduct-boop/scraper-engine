@@ -26,6 +26,14 @@ _JUDGE_URLS = [
 ]
 
 
+def _deleted_row_count(status: str) -> int:
+    """asyncpg's execute() returns a command tag like "DELETE 3" — parse the
+    row count so `removed` reflects reality (it was always 0 before: the
+    DELETE ran every cycle but its result was discarded, not counted)."""
+    parts = status.split()
+    return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+
+
 class HealthMonitor:
     """Periodically re-validate proxies in the pool against judge endpoints.
 
@@ -85,10 +93,22 @@ class HealthMonitor:
                 downgraded += 1
 
             # Remove proxies below minimum reliability
-            await self._pg.execute(
+            deleted = await self._pg.execute(
                 system_tenant,
                 "DELETE FROM proxy_pool WHERE reliability_score <= 0",
             )
+            removed += _deleted_row_count(deleted)
+
+        # api/health.py reads this key for GET /health's proxy_pool_size —
+        # it was being read but never written anywhere, so the field was
+        # permanently stuck at 0 regardless of the pool's real state.
+        pool_row = await self._pg.fetchrow(
+            system_tenant, "SELECT count(*) AS n FROM proxy_pool"
+        )
+        pool_size = pool_row["n"] if pool_row else 0
+        await self._redis.set(
+            system_tenant, "metrics:proxy_pool_size", str(pool_size), ttl=600
+        )
 
         return {"validated": validated, "removed": removed, "downgraded": downgraded}
 

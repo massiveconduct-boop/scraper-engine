@@ -62,8 +62,12 @@ class PolitenessController:
     def _last_fetch_key(self, domain: str, tenant_id: TenantId) -> str:
         return f"politeness:last:{tenant_id}:{domain}"
 
-    async def acquire_slot(self, domain: str, tenant_id: TenantId) -> bool:
-        """Atomically try to acquire a concurrency slot. Returns False if at capacity."""
+    async def acquire_slot(self, domain: str, tenant_id: TenantId) -> str | None:
+        """Atomically try to acquire a concurrency slot.
+
+        Returns the slot's worker_id on success (pass it to release_slot to
+        release exactly this slot), or None if at capacity.
+        """
         import uuid
 
         worker_id = str(uuid.uuid4())[:8]
@@ -77,13 +81,16 @@ class PolitenessController:
             self._concurrency,
             self._slot_ttl,
         )
-        return bool(result)
+        return worker_id if bool(result) else None
 
-    async def release_slot(self, domain: str, tenant_id: TenantId) -> None:
-        """Release all slots for this domain (worker identity tracked via the set)."""
-        # In practice, we need worker_id tracking. For now, use a simpler pattern:
-        # Decay the slot by reducing the set cardinality via SCARD/SREM.
-        # The TTL deadman's switch handles crash safety.
+    async def release_slot(self, domain: str, tenant_id: TenantId, worker_id: str) -> None:
+        """Release the specific slot identified by worker_id (from acquire_slot).
+
+        The TTL deadman's switch (set on acquire) remains the crash-safety
+        backstop for workers that die before releasing.
+        """
+        slot_key = self._slot_key(domain, tenant_id)
+        await self._redis.eval(RELEASE_SLOT_LUA, 1, slot_key, worker_id)
 
     async def wait_if_needed(self, domain: str, tenant_id: TenantId) -> None:
         """Enforce minimum inter-fetch delay if needed."""

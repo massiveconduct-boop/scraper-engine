@@ -122,11 +122,25 @@ class StorageConfig(BaseModel):
         return v
 
 
+class S3Config(BaseModel):
+    """Object storage for HTML snapshots (scrape_results.html_snapshot_url).
+
+    Defaults point at the docker-compose MinIO service. Override per
+    environment via the ``${S3_*}`` placeholders in base.yaml.
+    """
+
+    endpoint_url: str = "http://minio:9000"
+    access_key: str = "minioadmin"
+    secret_key: str = "minioadmin"
+    bucket: str = "scraper-snapshots"
+
+
 class AppConfig(BaseModel):
     """Root configuration schema matching config/base.yaml."""
 
     tenant_id: str | None = None  # only for log enrichment (ContextVar), never for routing
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    s3: S3Config = Field(default_factory=S3Config)
     levels: LevelsConfig = Field(default_factory=LevelsConfig)
     camoufox: CamoufoxConfig = Field(default_factory=CamoufoxConfig)
     proxy_harvester: ProxyHarvesterConfig = Field(default_factory=ProxyHarvesterConfig)

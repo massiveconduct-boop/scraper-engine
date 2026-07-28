@@ -144,33 +144,48 @@ levels:
 ## Known Operational Gaps
 
 1. **PgBouncer pg_hba.conf:** Requires `host all all 172.0.0.0/8 md5` rule added to Postgres. Without it, auth_type must be scram-sha-256 in both pgbouncer.ini and pg_hba.conf.
-2. **CAPTCHA solving (round 19 provider, round 20 wiring):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha live-accepted. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject unit-tested, not yet live-verified end to end (needs active reCAPTCHA entitlement + real target — round-19 account sat `idle`).
+2. **CAPTCHA solving (round 19 provider, round 20 wiring, round 22 root-caused):** NoCaptchaAI primary + CapSolver fallback (`services/`). ImageToText live-solved with real money; reCAPTCHA v2 / AntiTurnstileTask / GeeTest-v4(captchaId) / MTCaptcha are live-accepted (task created, no error) but never solved — root cause confirmed, see below. **Wired into the L2/L3 fetch path** (round 20): worker builds the solver once, `fetcher/_captcha.py` does DOM detect→solve→inject→re-poll, best-effort + null-safe (no key → solving skipped). DOM detect/inject live-verified end to end round 22 (real Camoufox, real DOM, real inject) — the one unproven step is a target accepting a solved token, blocked on the account gap below, not the mechanics.
 
-   **Provider-key health is now observable (post-round-20).** A present key is
-   NOT a working key — NoCaptchaAI can have an inactive reCAPTCHA capability and
-   CapSolver keys can 401. Two mechanisms surface this:
+   **Provider-key health is now observable (post-round-20, extended round-22).** A present key is
+   NOT a working key — NoCaptchaAI can have no active plan and CapSolver keys can 401 or have $0 balance.
+   Mechanisms that surface this:
    - `captcha_provider_configured{provider}` gauge — 1 if a key is present, 0 if
      absent (set at solver build, no network). Shows *missing* config in
      monitoring immediately.
    - `tools/validate_captcha_keys.py` — active preflight that calls each
-     provider's balance endpoint and reports WORKING / REJECTED / no-key (keys
-     masked). Exit 0 if any provider works, 1 if none.
+     provider's balance endpoint and reports WORKING / NO PLAN / NO FUNDS /
+     REJECTED / no-key (keys masked). Exit 0 if any provider works, 1 if none.
+     `NoCaptchaAIClient.has_active_plan()` (round 22) calls the current
+     `GET /balance` endpoint (richer than the legacy one `get_balance()` uses)
+     and is what makes `NO PLAN` detectable automatically instead of silently
+     reporting a misleading `WORKING`.
 
    **Operator runbook when captcha solving isn't producing tokens:**
    1. `set -a && . ./.env && set +a && .venv/bin/python tools/validate_captcha_keys.py`
-      — confirm which provider is REJECTED and why.
+      — confirm which provider is REJECTED/NO FUNDS/NO PLAN and why.
    2. `NO FUNDS` → top up that provider's balance. `REJECTED` → replace the key.
-      reCAPTCHA still `idle` despite a funded, authenticating key → activate the
-      reCAPTCHA capability on the account (plan/capability toggle).
+      `NO PLAN` (NoCaptchaAI) → **buy an actual package** at
+      nocaptchaai.com/manage (pay-as-you-go packages, $10/50K solves+) — ad-hoc
+      wallet top-ups do not grant worker-slot capacity, only a purchased
+      package does (round-22 finding, confirmed against the live pricing page
+      and the account's own `plan` object).
    3. Re-run the preflight (expect WORKING), then the full end-to-end check
-      `tools/verify_captcha_live.py`.
-   **Current state (last preflight):** both keys *authenticate* —
-   NoCaptchaAI balance ≈ $1.00 (funded; reCAPTCHA capability still to be
-   confirmed by a live solve — round-19 saw it `idle`), CapSolver balance
-   **$0.00** (authenticates but can't pay for solves — top up to enable the
-   fallback). `get_balance` proves the key/account, not the specific capability;
-   only `tools/verify_captcha_live.py` proves an end-to-end solve. All
-   account/billing actions, not code.
+      `tools/verify_captcha_live.py` — note that script targets Google's
+      official reCAPTCHA demo page and can hang for its full ~120s poll
+      ceiling even on a healthy account; prefer a real (non-demo) target when
+      confirming a fix.
+   **Current state (last preflight, round 22):** both keys *authenticate* —
+   NoCaptchaAI balance ≈ $1.00 but **`NO PLAN`** (`plan.planType`/`planId`
+   both empty, `is_default: 1` — wallet-only account, root-caused via raw
+   API probing across two different real sitekeys, not a demo-key artifact
+   and not outdated code — the request format matches NoCaptchaAI's current
+   docs exactly), CapSolver balance **$0.00** (authenticates but can't pay
+   for solves — top up to enable the fallback). `get_balance` proves the
+   key/account, not plan/capability; `has_active_plan()` proves the plan;
+   only a real solve proves the specific capability. All account/billing
+   actions, not code. Full evidence: `.claude/knowledge/decisions.md` →
+   "CAPTCHA Solver" round-22 follow-ups; `.claude/knowledge/troubleshooting.md`
+   → "stuck idle forever".
 3. **mypy `--strict` clean (RESOLVED, round 18):** was 23 baseline findings; all fixed. `strict = true` in pyproject, `mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/` → "Success: no issues found in 57 source files". `tools/mypy-baseline.txt` is now empty and the CI gate fails on ANY error (no tolerance). Fixes included a real bug (`api/main.py` called `redis.close()`, which doesn't exist — the method is `stop()`); the rest were type precision (Protocol for the ASN classifier, `Any` for duck-typed Playwright pages/contexts, optional/generic args, a justified `type: ignore[no-untyped-call]` on the untyped `AsyncCamoufox`).
 4. **Docker image ~4 GB:** Camoufox Firefox binary ~300 MB unavoidable (BD-02). Accepted as final for Oracle Cloud VPS (100 GB boot volume). Round 13 fixed the launch-lib chain (xvfb, libgtk-3-0, libx11-xcb1, camoufox[geoip]) — the image now actually launches a browser, not just ships one.
 5. **`proxy-harvester` daemon (RESOLVED, post-round-20).** The container

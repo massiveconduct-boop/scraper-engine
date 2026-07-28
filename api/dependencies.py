@@ -6,17 +6,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from orchestrator.worker import Worker
+    from rq import Queue
+
     from storage.postgres_client import PostgresClient
     from storage.redis_client import RedisClient
+    from storage.s3_client import S3Client
 
     from .auth import TenantResolver
 
-# Module-level singletons — initialized at startup
+# Module-level singletons — initialized at startup (api/main.py lifespan)
 _tenant_resolver: TenantResolver | None = None
 _storage_pg: PostgresClient | None = None
 _storage_redis: RedisClient | None = None
-_worker: Worker | None = None
+_storage_s3: S3Client | None = None
+_queue: Queue | None = None
 
 
 async def get_tenant_resolver() -> TenantResolver:
@@ -40,15 +43,15 @@ async def get_redis() -> RedisClient:
     return _storage_redis
 
 
-def init_dependencies(
-    tenant_resolver: TenantResolver,
-    pg: PostgresClient,
-    redis: RedisClient,
-    worker: Worker,
-) -> None:
-    """Initialize all module-level singletons at startup."""
-    global _tenant_resolver, _storage_pg, _storage_redis, _worker
-    _tenant_resolver = tenant_resolver
-    _storage_pg = pg
-    _storage_redis = redis
-    _worker = worker
+async def get_s3() -> S3Client:
+    """Dependency: return the S3Client singleton."""
+    if _storage_s3 is None:
+        raise RuntimeError("S3Client not initialized")
+    return _storage_s3
+
+
+async def get_queue() -> Queue:
+    """Dependency: return the rq Queue producer singleton."""
+    if _queue is None:
+        raise RuntimeError("Queue not initialized")
+    return _queue

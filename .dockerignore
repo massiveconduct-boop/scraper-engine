@@ -1,0 +1,32 @@
+# Docker build context exclusions.
+#
+# There was no .dockerignore before this — every `docker build` copied the
+# ENTIRE repo (via `COPY . .` in the Dockerfile's runtime stage) into the
+# image, including .venv/ (600MB+), .git/ (full history, incl. a redacted
+# pre-redact backup ref), and .env (real API keys — a secrets-in-image leak).
+# That bloat is also what exhausted the host's disk across repeated builds.
+
+.git/
+.venv/
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.github/
+.claude/
+.wolf/
+docs/
+specs/
+*.md
+
+challenge-mirror/.git/
+report-review-fix/.git/

@@ -108,6 +108,24 @@ class ScrapeRequest(BaseModel):
         return v
 
 
+class CrawlRequest(BaseModel):
+    """Bulk crawl request — for target sets too large for /v1/scrape's 500-URL
+    cap. Runs a named Scrapy spider (services/scrapy_adapter.py) instead of
+    the L1->L2->L3 escalation ladder; results land in scrape_results with
+    level_used=0 as the "bulk crawl" sentinel."""
+
+    spider_name: str
+    start_urls: list[HttpUrl]
+    webhook: HttpUrl | None = None
+
+    @field_validator("start_urls")
+    @classmethod
+    def non_empty(cls, v: list[HttpUrl]) -> list[HttpUrl]:
+        if not v:
+            raise ValueError("start_urls must contain at least one entry")
+        return v
+
+
 class JobStatus(str, Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"

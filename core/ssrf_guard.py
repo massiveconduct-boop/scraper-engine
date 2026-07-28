@@ -32,17 +32,20 @@ class SSRFGuard:
         self._denied = [ipaddress.ip_network(n) for n in self.DENIED_NETWORKS]
 
     async def validate(self, url: str) -> None:
-        """Raises SSRFBlockedError if the resolved host is in a denied range."""
-        host = await self._resolve_host(url)
-        addr = ipaddress.ip_address(host)
-
-        for net in self._denied:
-            if addr in net:
-                raise SSRFBlockedError(
-                    url=url,
-                    host=host,
-                    network=str(net),
-                )
+        """Raises SSRFBlockedError if ANY address the host resolves to is in a
+        denied range. Checking only the first `getaddrinfo` result would let a
+        multi-record DNS answer (public IP first, private IP second) slip past —
+        so every candidate address is checked, not just one."""
+        hosts = await self._resolve_hosts(url)
+        for host in hosts:
+            addr = ipaddress.ip_address(host)
+            for net in self._denied:
+                if addr in net:
+                    raise SSRFBlockedError(
+                        url=url,
+                        host=host,
+                        network=str(net),
+                    )
 
     async def validate_redirect_chain(self, response: object) -> None:
         """Called by every fetcher after following redirects; re-resolves final host."""
@@ -51,8 +54,9 @@ class SSRFGuard:
         await self.validate(final_url)
 
     @staticmethod
-    async def _resolve_host(url: str) -> str:
-        """Resolve host from URL via async DNS lookup using getaddrinfo in executor."""
+    async def _resolve_hosts(url: str) -> list[str]:
+        """Resolve every address a host resolves to via async DNS lookup using
+        getaddrinfo in an executor (not just the first record — see validate())."""
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
@@ -62,13 +66,13 @@ class SSRFGuard:
 
         loop = asyncio.get_running_loop()
 
-        def _resolve() -> str:
+        def _resolve() -> list[str]:
             info = socket.getaddrinfo(hostname, None)
-            # Return the first resolved IP
-            for _family, _, _, _, sockaddr in info:
-                return str(sockaddr[0])
-            raise SSRFBlockedError(
-                url=url, host=hostname, network="<unresolvable>"
-            )
+            addrs = {str(sockaddr[0]) for _family, _, _, _, sockaddr in info}
+            if not addrs:
+                raise SSRFBlockedError(
+                    url=url, host=hostname, network="<unresolvable>"
+                )
+            return list(addrs)
 
         return await loop.run_in_executor(None, _resolve)

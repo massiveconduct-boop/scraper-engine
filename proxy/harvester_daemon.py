@@ -30,6 +30,7 @@ from typing import Any
 
 from config.loader import load_config
 from config.schema import AppConfig
+from proxy.asn_classifier import build_asn_classifier
 from proxy.harvester import ProxyHarvester
 from proxy.health_monitor import HealthMonitor
 from proxy.promotion import ProxyPromotionJob
@@ -75,7 +76,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     redis = RedisClient(redis_url=cfg.storage.redis_url)
     await redis.start()
 
-    harvester = ProxyHarvester(pg, sources=ph.sources)
+    harvester = ProxyHarvester(pg, sources=ph.sources, asn_classifier=build_asn_classifier())
     # Promotion reuses the harvester's HTTP validator — no duplicated logic.
     promotion = ProxyPromotionJob(pg, ProxyHarvester._http_validate)
     health = HealthMonitor(pg, redis)

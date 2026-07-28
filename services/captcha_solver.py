@@ -213,7 +213,8 @@ async def validate_captcha_keys() -> dict[str, dict[str, object]]:
             # get_balance() proves the key AUTHENTICATES; it does not prove the
             # specific captcha capability is active. A funded, authenticating key
             # is the strongest signal we can get without spending on a real solve.
-            balance = await cls(key, null_budget).get_balance()
+            client = cls(key, null_budget)
+            balance = await client.get_balance()
             out[name] = {
                 "configured": True, "ok": True, "balance": float(balance),
                 "detail": f"balance={balance}",
@@ -223,4 +224,27 @@ async def validate_captcha_keys() -> dict[str, dict[str, object]]:
                 "configured": True, "ok": False, "balance": None,
                 "detail": str(exc)[:160],
             }
+            continue
+
+        # NoCaptchaAI-specific, isolated from the balance check above so a
+        # failure here (e.g. the plan endpoint being unreachable) can never
+        # clobber an already-successful balance result. A funded key with no
+        # active plan (wallet-only / pay-as-you-go) authenticates and shows
+        # real balance, but every worker-slot-based type (reCAPTCHA/
+        # Turnstile/GeeTest/MTCaptcha) silently never solves — round-22 root
+        # cause, see services/nocaptcha.py::has_active_plan docstring.
+        if name == "nocaptchaai":
+            has_plan = getattr(client, "has_active_plan", None)
+            if has_plan is not None:
+                try:
+                    active = await has_plan()
+                except Exception:
+                    active = None
+                if active is False:
+                    out[name]["has_active_plan"] = False
+                    out[name]["detail"] = (
+                        f"balance={balance} — NO ACTIVE PLAN: ImageToText will "
+                        f"work, but reCAPTCHA/Turnstile/GeeTest/MTCaptcha will "
+                        f"accept tasks and never solve them (no worker slot)"
+                    )
     return out

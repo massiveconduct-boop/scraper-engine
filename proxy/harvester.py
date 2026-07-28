@@ -42,20 +42,17 @@ class SupportsClassify(Protocol):
     async def classify(self, ip: str) -> str: ...
 
 
-class FakeClassifier:
-    async def classify(self, ip: str) -> str:
-        return "unknown"
-
-
 class ProxyHarvester:
     def __init__(
         self, pg: PostgresClient,
         sources: list[str] | None = None,
         asn_classifier: SupportsClassify | None = None,
     ) -> None:
+        from proxy.asn_classifier import NullAsnClassifier
+
         self._pg = pg
         self._sources = sources or []
-        self._classifier: SupportsClassify = asn_classifier or FakeClassifier()
+        self._classifier: SupportsClassify = asn_classifier or NullAsnClassifier()
 
     async def harvest_once(self, limit: int = 100) -> int:
         """Run one harvest cycle from both paths. Returns total proxies."""
@@ -75,7 +72,7 @@ class ProxyHarvester:
             validated = await self._count_validated(system_tenant)
             proxy_pool_validated_count.set(validated)
         except Exception:
-            pass
+            logger.warning("proxy_pool_validated_count gauge update failed", exc_info=True)
         return count
 
     async def _count_validated(self, tenant: TenantId) -> int:

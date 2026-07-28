@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
-from fetcher._content_utils import autoscroll, poll_until_solved, safe_content
+from core.ssrf_guard import SSRFGuard
+from fetcher._content_utils import (
+    SSRFRouteGuard,
+    autoscroll,
+    poll_until_solved,
+    safe_content,
+)
 from fetcher._failure import classify_fetch_exception
 from fetcher.challenge_detector import ChallengeDetector
 
@@ -41,6 +47,7 @@ class Level2Fetcher:
         scroll_wait_ms: int = 1500,
         challenge_detector: ChallengeDetector | None = None,
         captcha_solver: CaptchaSolver | None = None,
+        ssrf_guard: SSRFGuard | None = None,
         force_engine: str | None = None,  # TEST-ONLY. See guard below.
     ) -> None:
         """Level 2 fetcher with config-driven wait strategy + challenge-gated retry.
@@ -73,6 +80,7 @@ class Level2Fetcher:
         self._scroll_wait_ms = scroll_wait_ms
         self._challenge_detector = challenge_detector or ChallengeDetector()
         self._captcha_solver = captcha_solver
+        self._ssrf_guard = ssrf_guard or SSRFGuard()
 
     async def fetch(
         self,
@@ -102,7 +110,15 @@ class Level2Fetcher:
             wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
             async with wrapper as browser_context:
                 page = await browser_context.new_page()  # type: ignore[attr-defined]
-                await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
+                route_guard = SSRFRouteGuard(self._ssrf_guard)
+                await route_guard.install(page)
+                try:
+                    await page.goto(
+                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
+                    )
+                except Exception:
+                    route_guard.raise_if_blocked()
+                    raise
                 with contextlib.suppress(Exception):
                     await page.wait_for_load_state(
                         "networkidle", timeout=self._networkidle_timeout_ms

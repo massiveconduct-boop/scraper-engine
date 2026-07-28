@@ -8,47 +8,58 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+      S3_ENDPOINT: http://minio:9000
     depends_on:
       - postgres
       - redis
       - pgbouncer
       - minio
 
+  # worker-l1/l2/l3 are 3 replicas of the SAME worker pulling from ONE queue
+  # ("scraper-jobs"), not per-level queues — Worker.process_job already runs
+  # the full L1->L2->L3 escalation internally, per URL, in a single job. Three
+  # separate rq workers just gives 3x horizontal concurrency on that one queue.
   worker-l1:
     build: .
-    command: rq worker scraper-level1
+    command: rq worker scraper-jobs
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+      S3_ENDPOINT: http://minio:9000
     depends_on:
       - postgres
       - redis
       - pgbouncer
+      - minio
 
   worker-l2:
     build: .
-    command: rq worker scraper-level2
+    command: rq worker scraper-jobs
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+      S3_ENDPOINT: http://minio:9000
     depends_on:
       - postgres
       - redis
       - pgbouncer
+      - minio
 
   worker-l3:
     build: .
-    command: rq worker scraper-level3
+    command: rq worker scraper-jobs
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+      S3_ENDPOINT: http://minio:9000
     depends_on:
       - postgres
       - redis
       - pgbouncer
+      - minio
 
   proxy-harvester:
     build: .

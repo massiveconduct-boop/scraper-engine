@@ -20,8 +20,10 @@ def create_app() -> FastAPI:
         import api.dependencies as deps
         from api.auth import TenantResolver
         from config.loader import load_config
+        from orchestrator.job_queue import build_queue
         from storage.postgres_client import PostgresClient
         from storage.redis_client import RedisClient
+        from storage.s3_client import S3Client
 
         cfg = load_config()
 
@@ -38,12 +40,27 @@ def create_app() -> FastAPI:
             await redis.start()
             deps._storage_redis = redis
 
+        if deps._storage_s3 is None:
+            s3 = S3Client(
+                endpoint_url=cfg.s3.endpoint_url,
+                access_key=cfg.s3.access_key,
+                secret_key=cfg.s3.secret_key,
+                bucket=cfg.s3.bucket,
+            )
+            await s3.start()
+            deps._storage_s3 = s3
+
+        if deps._queue is None:
+            deps._queue = build_queue(cfg.storage.redis_url)
+
         yield
 
         if deps._storage_pg is not None:
             await deps._storage_pg.stop()
         if deps._storage_redis is not None:
             await deps._storage_redis.stop()
+        if deps._storage_s3 is not None:
+            await deps._storage_s3.stop()
 
     app = FastAPI(
         title="Scraper Engine",
