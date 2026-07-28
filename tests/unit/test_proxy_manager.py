@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.exceptions import ProxyPoolExhaustedError
-from core.models import Proxy, ProxyProtocol
-from core.tenant import TenantId
-from proxy.manager import ProxyManager
+from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.proxy.manager import ProxyManager
 
 
 @pytest.fixture

@@ -25,10 +25,10 @@ async def test_session_survives_pool_recycle():
     cookie_name = "session_persistence_probe"
     cookie_value = f"probe-{unique_id}"
 
-    from browser.pool import BrowserPool
-    from browser.session_state import SessionStateManager
-    from core.tenant import TenantId
-    from storage.postgres_client import PostgresClient
+    from scraper_engine.browser.pool import BrowserPool
+    from scraper_engine.browser.session_state import SessionStateManager
+    from scraper_engine.core.tenant import TenantId
+    from scraper_engine.storage.postgres_client import PostgresClient
 
     tenant = TenantId("system")
 

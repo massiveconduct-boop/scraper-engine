@@ -21,8 +21,8 @@ import os
 
 import pytest
 
-from core.tenant import TenantId
-from fetcher._content_utils import safe_content
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher._content_utils import safe_content
 
 MIRROR = os.environ.get("CHALLENGE_MIRROR_URL", "http://127.0.0.1:8090")
 
@@ -53,7 +53,7 @@ async def test_mid_poll_reload_with_delay() -> None:
     in-flight, _safe_content returns None.  If it already completed, the
     returned string length is printed.
     """
-    from browser.camoufox_wrapper import CamoufoxWrapper
+    from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 
     wrapper = CamoufoxWrapper(proxy=None, tenant_id=TenantId("chaostest"))
     async with wrapper as browser_context:
@@ -89,7 +89,7 @@ async def test_mid_poll_reload_aggressive_race() -> None:
     concurrently and content() is called without waiting, maximising the
     chance that the page is mid-navigation.
     """
-    from browser.camoufox_wrapper import CamoufoxWrapper
+    from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 
     wrapper = CamoufoxWrapper(proxy=None, tenant_id=TenantId("chaostest"))
     async with wrapper as browser_context:

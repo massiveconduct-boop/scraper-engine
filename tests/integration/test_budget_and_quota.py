@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.budget import CapSolverBudget
-from core.exceptions import QuotaExceededError
-from core.quota import QuotaManager
-from core.tenant import TenantId
+from scraper_engine.core.budget import CapSolverBudget
+from scraper_engine.core.exceptions import QuotaExceededError
+from scraper_engine.core.quota import QuotaManager
+from scraper_engine.core.tenant import TenantId
 
 
 @pytest.fixture

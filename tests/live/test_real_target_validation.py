@@ -32,9 +32,9 @@ import os
 
 import pytest
 
-from config.loader import load_config
-from core.tenant import TenantId
-from fetcher.factory import (
+from scraper_engine.config.loader import load_config
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher.factory import (
     build_level1_fetcher,
     build_level2_fetcher,
     build_level3_fetcher,

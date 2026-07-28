@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from core.tenant import TenantId
-from proxy.harvester import ProxyHarvester
-from proxy.promotion import ProxyPromotionJob
-from storage.postgres_client import PostgresClient
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.proxy.harvester import ProxyHarvester
+from scraper_engine.proxy.promotion import ProxyPromotionJob
+from scraper_engine.storage.postgres_client import PostgresClient
 
 JUDGE_SERVER = Path(__file__).resolve().parent.parent / "fixtures" / "judge_server.py"
 

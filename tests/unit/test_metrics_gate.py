@@ -6,8 +6,8 @@ register_routes() actually gates it now."""
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.routes import register_routes
-from config.schema import AppConfig
+from scraper_engine.api.routes import register_routes
+from scraper_engine.config.schema import AppConfig
 
 
 def test_metrics_enabled_mounts_route():

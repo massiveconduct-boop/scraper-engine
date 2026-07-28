@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from proxy.harvester import ProxyHarvester
+from scraper_engine.proxy.harvester import ProxyHarvester
 
 
 @pytest.fixture
@@ -90,14 +90,14 @@ class TestProxySourceHealthWiring:
 
     @pytest.mark.asyncio
     async def test_record_source_health_writes_healthy(self, redis):
-        from proxy.source_health import record_source_health
+        from scraper_engine.proxy.source_health import record_source_health
 
         await record_source_health(redis, "geonode", 5)
         redis.raw.set.assert_awaited_once_with("metrics:proxy_source_healthy:geonode", "1")
 
     @pytest.mark.asyncio
     async def test_record_source_health_writes_unhealthy_on_zero(self, redis):
-        from proxy.source_health import record_source_health
+        from scraper_engine.proxy.source_health import record_source_health
 
         await record_source_health(redis, "geonode", 0)
         redis.raw.set.assert_awaited_once_with("metrics:proxy_source_healthy:geonode", "0")
@@ -129,8 +129,8 @@ class TestProxySourceHealthWiring:
     async def test_refresh_reads_back_what_record_wrote(self, redis):
         """observability.metrics.refresh_proxy_source_health is the scrape-time
         half — reads back exactly the keys record_source_health writes."""
-        from observability.metrics import refresh_proxy_source_health
-        from proxy.source_health import proxy_source_healthy, record_source_health
+        from scraper_engine.observability.metrics import refresh_proxy_source_health
+        from scraper_engine.proxy.source_health import proxy_source_healthy, record_source_health
 
         healthy_source = ProxyHarvester.SOURCES[0][0]
         dark_source = ProxyHarvester.SOURCES[1][0]
@@ -160,8 +160,8 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_promotes_validating_proxy(self, pg, classifier):
         """Proxy that passes HTTP validation is promoted from 25→60."""
-        from core.models import AnonymityLevel
-        from core.tenant import TenantId
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": "1.2.3.4", "port": 3128, "protocol": "HTTP"},
         ]
@@ -178,8 +178,8 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_skips_non_validating_proxy(self, pg, classifier):
         """Proxy that fails HTTP validation is not promoted, but attempt IS tracked."""
-        from core.models import AnonymityLevel
-        from core.tenant import TenantId
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": "5.6.7.8", "port": 8080, "protocol": "HTTP"},
         ]
@@ -194,7 +194,7 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_empty_pool_returns_zero(self, pg, classifier):
         """Empty pool (no score<40 rows) returns 0 promoted."""
-        from core.tenant import TenantId
+        from scraper_engine.core.tenant import TenantId
         pg.fetch.return_value = []
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         promoted = await h.promote_tcp_only(limit=50, tenant=TenantId("system"))
@@ -204,8 +204,8 @@ class TestPromoteTcpOnly:
     @pytest.mark.asyncio
     async def test_limit_caps_rows_processed(self, pg, classifier):
         """limit= parameter caps how many rows are fetched for re-validation."""
-        from core.models import AnonymityLevel
-        from core.tenant import TenantId
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.core.tenant import TenantId
         pg.fetch.return_value = [
             {"ip": f"10.0.0.{i}", "port": 3128, "protocol": "HTTP"} for i in range(3)
         ]

@@ -11,10 +11,10 @@ import os
 
 import pytest
 
-from core.tenant import TenantId
-from fetcher.level_1 import Level1Fetcher
-from fetcher.level_2 import Level2Fetcher
-from fetcher.level_3 import Level3Fetcher
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher.level_1 import Level1Fetcher
+from scraper_engine.fetcher.level_2 import Level2Fetcher
+from scraper_engine.fetcher.level_3 import Level3Fetcher
 
 MIRROR = os.environ.get("CHALLENGE_MIRROR_URL", "http://127.0.0.1:8090")
 STANDARD_URL = f"{MIRROR}/?difficulty=standard"

@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from browser.pool import BrowserPool
-from browser.session_state import SessionStateManager
-from core.models import Proxy, ProxyProtocol
-from core.tenant import TenantId
+from scraper_engine.browser.pool import BrowserPool
+from scraper_engine.browser.session_state import SessionStateManager
+from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.tenant import TenantId
 
 
 class TestAcquireDoubleIssue:
@@ -38,7 +38,7 @@ class TestAcquireDoubleIssue:
 
         # Second acquire — pool should be empty, must NOT return same ctx
         with patch.object(pool, '_active_wrappers', []), \
-             patch('browser.pool.CamoufoxWrapper') as mock_cw:
+             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             def make_mock(*a, **kw):
                 inst = MagicMock()
                 inst.__aenter__ = AsyncMock(return_value=object())
@@ -65,7 +65,7 @@ class TestAcquireDoubleIssue:
         assert ctx1 is fake_ctx
 
         with patch.object(pool, '_active_wrappers', []), \
-             patch('browser.pool.CamoufoxWrapper') as mock_cw:
+             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             def make_mock(*a, **kw):
                 inst = MagicMock()
                 inst.__aenter__ = AsyncMock(return_value=object())
@@ -104,7 +104,7 @@ class TestBrowserPool:
     ))
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
         """Pool without warm instances creates a new wrapper on acquire."""
-        from browser.pool import BrowserPool
+        from scraper_engine.browser.pool import BrowserPool
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         wrapper = await pool.acquire(proxy=proxy)
@@ -112,8 +112,8 @@ class TestBrowserPool:
         assert wrapper.proxy == proxy
 
     async def test_release_healthy_returns_to_pool(self, tenant):
-        from browser.camoufox_wrapper import CamoufoxWrapper
-        from browser.pool import BrowserPool
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+        from scraper_engine.browser.pool import BrowserPool
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
@@ -124,7 +124,7 @@ class TestBrowserPool:
         assert pool._pool.qsize() == 0  # wrapper was put back but queue is lazy
 
     def test_shutdown_clears_pool(self, tenant):
-        from browser.pool import BrowserPool
+        from scraper_engine.browser.pool import BrowserPool
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         # shutdown on empty pool should not error
@@ -166,7 +166,7 @@ class TestBrowserPool:
 
         with (
             patch.object(pool, "_active_wrappers", [fake_wrapper]),
-            patch("browser.pool.CamoufoxWrapper") as mock_cw,
+            patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw,
         ):
             fresh_ctx = object()
             inst = MagicMock()
@@ -192,7 +192,7 @@ class TestSessionIsolation:
     @pytest.mark.asyncio
     async def test_storage_state_creates_isolated_context(self, tenant):
         """CamoufoxWrapper with storage_state creates BrowserContext via new_context()."""
-        from browser.camoufox_wrapper import CamoufoxWrapper
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 
         storage_state = {"cookies": [{"name": "sid", "value": "abc"}], "origins": []}
         fake_browser = MagicMock()
@@ -216,7 +216,7 @@ class TestSessionIsolation:
     @pytest.mark.asyncio
     async def test_no_storage_state_returns_browser_directly(self, tenant):
         """CamoufoxWrapper without storage_state: _isolated_ctx stays None."""
-        from browser.camoufox_wrapper import CamoufoxWrapper
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 
         wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, storage_state=None)
         assert wrapper._storage_state is None
@@ -240,13 +240,13 @@ class TestSessionIsolation:
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeAcquireCtx())
-        from browser.session_state import SessionStateManager
+        from scraper_engine.browser.session_state import SessionStateManager
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
         fake_ctx = object()
 
-        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper
@@ -273,7 +273,7 @@ class TestSessionIsolation:
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
-        from browser.session_state import SessionStateManager
+        from scraper_engine.browser.session_state import SessionStateManager
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
@@ -306,7 +306,7 @@ class TestSessionIsolation:
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
-        from browser.session_state import SessionStateManager
+        from scraper_engine.browser.session_state import SessionStateManager
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
@@ -350,7 +350,7 @@ class TestSessionIsolation:
         assert ctx1 is fake_ctx
 
         with patch.object(pool, '_active_wrappers', []), \
-             patch('browser.pool.CamoufoxWrapper') as mock_cw:
+             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
 
             def make_mock(*a, **kw):
                 inst = MagicMock()

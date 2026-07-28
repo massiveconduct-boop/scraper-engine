@@ -9,9 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import services.capsolver
-import services.nocaptcha
-from services.captcha_solver import validate_captcha_keys
+from scraper_engine.services import capsolver, nocaptcha
+from scraper_engine.services.captcha_solver import validate_captcha_keys
 
 
 @pytest.mark.asyncio
@@ -21,8 +20,8 @@ async def test_reports_working_and_rejected(monkeypatch):
 
     good = MagicMock(get_balance=AsyncMock(return_value=12.5))
     rejected = MagicMock(get_balance=AsyncMock(side_effect=RuntimeError("401 KEY_DENIED")))
-    monkeypatch.setattr(services.nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=good))
-    monkeypatch.setattr(services.capsolver, "CapSolverClient", MagicMock(return_value=rejected))
+    monkeypatch.setattr(nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=good))
+    monkeypatch.setattr(capsolver, "CapSolverClient", MagicMock(return_value=rejected))
 
     r = await validate_captcha_keys()
 
@@ -41,7 +40,7 @@ async def test_zero_balance_authenticates_but_is_not_solve_capable(monkeypatch):
     monkeypatch.setenv("NOCAPTCHA_AI_API_KEY", "nk")
     monkeypatch.delenv("CAPSOLVER_API_KEY", raising=False)
     broke = MagicMock(get_balance=AsyncMock(return_value=0.0))
-    monkeypatch.setattr(services.nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=broke))
+    monkeypatch.setattr(nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=broke))
 
     r = await validate_captcha_keys()
     assert r["nocaptchaai"]["ok"] is True
@@ -62,7 +61,7 @@ async def test_reports_no_active_plan_without_clobbering_balance(monkeypatch):
         has_active_plan=AsyncMock(return_value=False),
     )
     monkeypatch.setattr(
-        services.nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=no_plan)
+        nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=no_plan)
     )
 
     r = await validate_captcha_keys()

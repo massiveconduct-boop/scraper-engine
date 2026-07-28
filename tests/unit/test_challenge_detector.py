@@ -5,7 +5,7 @@ The detector gates escalation decisions (challenge pages, and round-15's
 JS-gated-shell escalation), so it warrants direct coverage.
 """
 
-from fetcher.challenge_detector import ChallengeDetector
+from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 CD = ChallengeDetector()
 

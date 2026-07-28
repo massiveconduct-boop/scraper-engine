@@ -1,8 +1,8 @@
 # tests/unit/test_scoring.py
 """Proxy scoring engine tests — spec §3.3."""
 
-from core.models import AnonymityLevel, AsnClass
-from proxy.scoring import ScoringEngine
+from scraper_engine.core.models import AnonymityLevel, AsnClass
+from scraper_engine.proxy.scoring import ScoringEngine
 
 
 class TestScoringEngine:

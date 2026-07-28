@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from core.tenant import TenantId
+from scraper_engine.core.tenant import TenantId
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ class TestPolitenessRace:
 
         At every sampled instant, SCARD must never exceed 2.
         """
-        from orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
+        from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
 
         domain = "racetest.internal"
         tenant = TenantId("g06test")

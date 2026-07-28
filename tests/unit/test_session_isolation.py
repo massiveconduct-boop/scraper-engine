@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from browser.pool import BrowserPool
-from core.tenant import TenantId
+from scraper_engine.browser.pool import BrowserPool
+from scraper_engine.core.tenant import TenantId
 
 
 @pytest.fixture
@@ -51,7 +51,7 @@ class TestDomainIsolation:
         fake_ctx_a = MagicMock()
         fake_ctx_a.storage_state = AsyncMock(return_value=storage_a)
 
-        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper._isolated_ctx = fake_ctx_a
             mock_wrapper._context = fake_ctx_a
@@ -76,7 +76,7 @@ class TestDomainIsolation:
         fake_ctx_b = MagicMock()
         fake_ctx_b.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
 
-        with patch('browser.pool.CamoufoxWrapper') as mock_cw_b:
+        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw_b:
             mock_wrapper_b = MagicMock()
             mock_wrapper_b._isolated_ctx = None  # no storage_state
             mock_wrapper_b._context = fake_ctx_b
@@ -108,7 +108,7 @@ class TestDomainIsolation:
         fake_ctx = MagicMock()
         fake_ctx.storage_state = AsyncMock(return_value=saved_state)
 
-        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper._isolated_ctx = fake_ctx
             mock_wrapper._context = fake_ctx
@@ -132,7 +132,7 @@ class TestDomainIsolation:
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=None)
 
         fake_ctx = object()
-        with patch('browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper

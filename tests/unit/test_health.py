@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api.health import HealthChecker, check_health
+from scraper_engine.api.health import HealthChecker, check_health
 
 
 @pytest.mark.asyncio

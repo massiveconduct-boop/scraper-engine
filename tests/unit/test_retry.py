@@ -3,8 +3,8 @@
 
 import pytest
 
-from core.models import FailureCategory
-from core.retry import (
+from scraper_engine.core.models import FailureCategory
+from scraper_engine.core.retry import (
     RETRY_MATRIX,
     RetryStrategy,
     backoff_delay,

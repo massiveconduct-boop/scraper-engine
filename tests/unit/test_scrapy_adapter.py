@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from services.scrapy_adapter import ScrapyAdapter
+from scraper_engine.services.scrapy_adapter import ScrapyAdapter
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from proxy.health_monitor import HealthMonitor
+from scraper_engine.proxy.health_monitor import HealthMonitor
 
 
 @pytest.fixture

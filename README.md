@@ -37,7 +37,7 @@ tenant creation, scaling, monitoring): `docs/guides/deployment.md`.
 docker compose up -d postgres redis pgbouncer   # integration/chaos tests need real infra
 pytest tests/unit/ tests/integration/ tests/chaos/ -q
 ruff check . --exclude 'tests/fixtures/challenge_mirror'
-mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ --strict --ignore-missing-imports
+mypy src/scraper_engine/core/ src/scraper_engine/proxy/ src/scraper_engine/orchestrator/ src/scraper_engine/api/ src/scraper_engine/storage/ src/scraper_engine/fetcher/ src/scraper_engine/browser/ src/scraper_engine/observability/ --strict --ignore-missing-imports
 ```
 
 ## Repository Layout

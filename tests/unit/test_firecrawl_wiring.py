@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.tenant import TenantId
-from fetcher.level_1 import Level1Fetcher
-from services.firecrawl_client import FirecrawlClient, build_firecrawl_client
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.fetcher.level_1 import Level1Fetcher
+from scraper_engine.services.firecrawl_client import FirecrawlClient, build_firecrawl_client
 
 
 def test_build_firecrawl_client_returns_none_when_key_unset(monkeypatch):

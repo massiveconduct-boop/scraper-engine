@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.tenant import TenantId
-from orchestrator.politeness import PolitenessController
+from scraper_engine.core.tenant import TenantId
+from scraper_engine.orchestrator.politeness import PolitenessController
 
 
 @pytest.fixture

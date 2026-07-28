@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import orchestrator.tasks as tasks_module
-from core.models import FetchResult, JobStatus, JobStatusResponse
+import scraper_engine.orchestrator.tasks as tasks_module
+from scraper_engine.core.models import FetchResult, JobStatus, JobStatusResponse
 
 
 @pytest.fixture
@@ -27,9 +27,15 @@ def fake_clients(monkeypatch):
     s3 = AsyncMock()
     s3.store_snapshot.return_value = "snapshots/system/job-1/key.html"
 
-    monkeypatch.setattr("storage.postgres_client.PostgresClient", MagicMock(return_value=pg))
-    monkeypatch.setattr("storage.redis_client.RedisClient", MagicMock(return_value=redis))
-    monkeypatch.setattr("storage.s3_client.S3Client", MagicMock(return_value=s3))
+    monkeypatch.setattr(
+        "scraper_engine.storage.postgres_client.PostgresClient", MagicMock(return_value=pg)
+    )
+    monkeypatch.setattr(
+        "scraper_engine.storage.redis_client.RedisClient", MagicMock(return_value=redis)
+    )
+    monkeypatch.setattr(
+        "scraper_engine.storage.s3_client.S3Client", MagicMock(return_value=s3)
+    )
 
     cfg = MagicMock()
     cfg.storage.database_url = "postgresql://x/db"
@@ -38,7 +44,7 @@ def fake_clients(monkeypatch):
     cfg.s3.access_key = "k"
     cfg.s3.secret_key = "s"
     cfg.s3.bucket = "b"
-    monkeypatch.setattr("config.loader.load_config", MagicMock(return_value=cfg))
+    monkeypatch.setattr("scraper_engine.config.loader.load_config", MagicMock(return_value=cfg))
 
     return pg, redis, s3, cfg
 
@@ -61,7 +67,9 @@ async def test_run_scrape_job_persists_results_and_dispatches_webhook(fake_clien
     monkeypatch.setattr(tasks_module, "_run_scrape", run_scrape_mock)
 
     deliver_mock = AsyncMock(return_value=True)
-    monkeypatch.setattr("orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock)
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
+    )
 
     await tasks_module._run_scrape_job("system", "job-1")
 
@@ -98,7 +106,9 @@ async def test_run_scrape_job_skips_webhook_when_not_set(fake_clients, monkeypat
         AsyncMock(return_value=JobStatusResponse(job_id="job-2", status=JobStatus.COMPLETED)),
     )
     deliver_mock = AsyncMock(return_value=True)
-    monkeypatch.setattr("orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock)
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
+    )
 
     await tasks_module._run_scrape_job("system", "job-2")
 
@@ -130,7 +140,9 @@ async def test_run_scrape_job_crawl_type_routes_to_scrapy_adapter(fake_clients, 
     }
 
     run_spider_mock = AsyncMock(return_value=[{"url": "http://example.com", "title": "Example"}])
-    monkeypatch.setattr("services.scrapy_adapter.ScrapyAdapter.run_spider", run_spider_mock)
+    monkeypatch.setattr(
+        "scraper_engine.services.scrapy_adapter.ScrapyAdapter.run_spider", run_spider_mock
+    )
     run_scrape_mock = AsyncMock()
     monkeypatch.setattr(tasks_module, "_run_scrape", run_scrape_mock)
 
@@ -165,7 +177,8 @@ async def test_run_scrape_job_creates_traced_span_with_job_attributes(fake_clien
         AsyncMock(return_value=JobStatusResponse(job_id="job-span", status=JobStatus.COMPLETED)),
     )
     monkeypatch.setattr(
-        "orchestrator.webhook.WebhookDispatcher.deliver", AsyncMock(return_value=True)
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver",
+        AsyncMock(return_value=True),
     )
 
     exporter = InMemorySpanExporter()

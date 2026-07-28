@@ -31,6 +31,10 @@ Async Python multi-level web scraping system. Levels: L1 (HTTP/Scrapling), L2 (B
 
 ## Module Map
 
+All packages below live under `src/scraper_engine/` (e.g. `core/` means
+`src/scraper_engine/core/`, imported as `scraper_engine.core`) — moved there
+from repo-root-level packages in the src-layout consolidation.
+
 | Package | Responsibility |
 |---|---|
 | `core/` | Domain models, TenantId, SSRF guard, retry, budget, quota |

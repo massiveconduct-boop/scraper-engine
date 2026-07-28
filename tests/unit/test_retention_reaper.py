@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from config.schema import SessionRetentionConfig
-from proxy.retention_reaper import RetentionReaper
+from scraper_engine.config.schema import SessionRetentionConfig
+from scraper_engine.proxy.retention_reaper import RetentionReaper
 
 
 @pytest.fixture
