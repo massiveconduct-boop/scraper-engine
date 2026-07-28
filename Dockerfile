@@ -46,7 +46,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir "camoufox[geoip]" \
     fastapi uvicorn pydantic pydantic-core httpx scrapling \
     asyncpg redis rq structlog prometheus-client \
-    pyyaml boto3 python-dotenv alembic sqlalchemy scrapy
+    pyyaml boto3 python-dotenv alembic sqlalchemy scrapy maxminddb
 
 # ── Stage 3: runtime — app code copied LAST ─────────────────────────────────
 FROM system-base AS runtime

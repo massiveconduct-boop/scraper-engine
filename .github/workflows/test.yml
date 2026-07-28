@@ -24,7 +24,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy
+            pyyaml boto3 python-dotenv scrapy maxminddb
       # challenge-mirror excluded here — linted separately against its own
       # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
       - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
@@ -91,7 +91,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy \
+            pyyaml boto3 python-dotenv scrapy maxminddb \
             pytest pytest-asyncio pytest-cov
           pip install -e . --no-deps
       - run: python -m pytest tests/unit/ -v --tb=short
@@ -133,7 +133,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy fakeredis \
+            pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
@@ -172,7 +172,7 @@ jobs:
           pip install \
             fastapi uvicorn pydantic pydantic-core httpx scrapling \
             asyncpg redis rq camoufox structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy fakeredis \
+            pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
             pytest pytest-asyncio pytest-cov alembic sqlalchemy
           pip install -e . --no-deps
       - run: alembic upgrade head
