@@ -53,22 +53,46 @@ class BrowserPool:
         prewarm_count: int = 2,
         max_idle_seconds: int = 300,
         session_mgr: SessionStateManager | None = None,
+        geoip: bool = True,
+        humanize: float = 1.5,
+        headless_mode: str = "virtual",
+        max_total_instances: int | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._prewarm_count = prewarm_count
         self._max_idle_seconds = max_idle_seconds
         self._session_mgr = session_mgr
+        self._geoip = geoip
+        self._humanize = humanize
+        self._headless_mode = headless_mode
+        # Validated in start(), not here — this is a ceiling on the shared
+        # core.budget.BROWSER_SEMAPHORE, not something this pool enforces
+        # itself, so a mismatch is only meaningful once we actually try to
+        # prewarm past it.
+        self._max_total_instances = max_total_instances
         self._pool: asyncio.Queue[Any] = asyncio.Queue()
         self._active_wrappers: list[CamoufoxWrapper] = []
         self._started = False
 
     async def start(self) -> None:
         """Launch prewarm_count browsers and store their live contexts."""
+        if (
+            self._max_total_instances is not None
+            and self._prewarm_count > self._max_total_instances
+        ):
+            raise ValueError(
+                f"prewarm_count ({self._prewarm_count}) exceeds "
+                f"max_total_instances ({self._max_total_instances}) — prewarming "
+                "would block waiting on core.budget.BROWSER_SEMAPHORE"
+            )
         for i in range(self._prewarm_count):
             wrapper = CamoufoxWrapper(
                 proxy=None,
                 tenant_id=self._tenant_id,
                 persistent_profile_id=f"prewarm-{i}",
+                geoip=self._geoip,
+                humanize=self._humanize,
+                headless_mode=self._headless_mode,
             )
             ctx = await wrapper.__aenter__()
             self._active_wrappers.append(wrapper)
@@ -89,18 +113,44 @@ class BrowserPool:
         keep = []
         for ctx, wrapper, idle_since in drained:
             if now - idle_since > self._max_idle_seconds:
+                # Genuinely stale — this is the one case that actually tears
+                # down the browser. idle timeout, not a mismatch, is what
+                # BrowserPool is meant to reclaim on (class docstring).
                 for w in self._active_wrappers:
                     if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
                 continue
-            if domain is not None and getattr(wrapper, '_last_domain', None) != domain:
-                for w in self._active_wrappers:
-                    if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
-                        self._active_wrappers.remove(w)
-                        await w.__aexit__()
-                        break
+
+            # A wrapper leased with proxy A must never be handed back out for a
+            # request that asked for proxy B — a domain match alone isn't
+            # enough (round 25). A caller that doesn't care about proxy
+            # (proxy=None) accepts any pooled wrapper, matching the domain=None
+            # behavior below.
+            proxy_mismatch = proxy is not None and getattr(wrapper, "proxy", None) != proxy
+            # domain=None on the wrapper means "never successfully leased yet"
+            # (prewarm(), or a wrapper that's never been through lease()'s
+            # success path) — not "leased for a different domain." Treating an
+            # unclaimed wrapper as a domain mismatch was evicting every
+            # prewarmed instance on its very first real acquire() call, making
+            # prewarming nearly useless (round 25 fix). A wrapper that HAS
+            # served a domain before still can't silently switch to another.
+            domain_mismatch = (
+                domain is not None
+                and getattr(wrapper, "_last_domain", None) is not None
+                and wrapper._last_domain != domain
+            )
+            if domain_mismatch or proxy_mismatch:
+                # Not a match for *this* request, but still a live, warm spare.
+                # BrowserPool's own docstring: "purely a latency optimization,
+                # not a concurrency control" — tearing a good instance down
+                # just because this particular request doesn't want it was
+                # pure waste; keep it pooled for a request that does match,
+                # and build a fresh one (below) for this one instead. Total
+                # concurrently-alive instances still can't exceed
+                # core.budget.BROWSER_SEMAPHORE either way.
+                keep.append((ctx, wrapper, idle_since))
                 continue
             if selected is None:
                 selected = (ctx, wrapper)
@@ -121,6 +171,9 @@ class BrowserPool:
             proxy=proxy,
             tenant_id=self._tenant_id,
             storage_state=session_state,
+            geoip=self._geoip,
+            humanize=self._humanize,
+            headless_mode=self._headless_mode,
         )
         self._active_wrappers.append(wrapper)
         ctx = await wrapper.__aenter__()

@@ -130,6 +130,54 @@ class TestBrowserPool:
         # shutdown on empty pool should not error
         asyncio.run(pool.shutdown())
 
+    async def test_prewarmed_wrapper_not_evicted_on_first_domain_mismatch(self, tenant):
+        """Round 25 regression: a never-yet-leased (prewarmed) wrapper has
+        _last_domain=None — it must be usable for the FIRST real request's
+        domain instead of being destroyed just because None != that domain
+        (this was making prewarming nearly useless before this fix)."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.start()
+        fake_ctx = object()
+        fake_wrapper = MagicMock()
+        fake_wrapper._last_domain = None
+        fake_wrapper.proxy = None
+        fake_wrapper.__aexit__ = AsyncMock()
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+
+        with patch.object(pool, "_active_wrappers", [fake_wrapper]):
+            ctx = await pool.acquire(domain="example.com")
+
+        assert ctx is fake_ctx
+        fake_wrapper.__aexit__.assert_not_awaited()
+
+    async def test_mismatched_wrapper_kept_in_pool_not_destroyed(self, tenant):
+        """A wrapper that already served a different domain must not be
+        reused for this request, but must stay pooled as a live spare — not
+        torn down. Only idle timeout (or unhealthy release/shutdown) may
+        destroy a live wrapper, per the module's own docstring."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.start()
+        fake_ctx = object()
+        fake_wrapper = MagicMock()
+        fake_wrapper._last_domain = "other.example"
+        fake_wrapper.proxy = None
+        fake_wrapper.__aexit__ = AsyncMock()
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+
+        with (
+            patch.object(pool, "_active_wrappers", [fake_wrapper]),
+            patch("browser.pool.CamoufoxWrapper") as mock_cw,
+        ):
+            fresh_ctx = object()
+            inst = MagicMock()
+            inst.__aenter__ = AsyncMock(return_value=fresh_ctx)
+            mock_cw.return_value = inst
+            ctx = await pool.acquire(domain="example.com")
+
+        assert ctx is fresh_ctx  # built fresh rather than reusing the mismatch
+        fake_wrapper.__aexit__.assert_not_awaited()  # NOT destroyed
+        assert pool._pool.qsize() == 1  # mismatched wrapper stayed pooled
+
 
 class TestSessionIsolation:
     """Session load/save wired into CamoufoxWrapper constructor + lease() boundary.

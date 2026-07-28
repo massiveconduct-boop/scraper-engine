@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from core.budget import BROWSER_SEMAPHORE
+import core.budget
 
 if TYPE_CHECKING:
     from core.models import Proxy
@@ -43,11 +43,17 @@ class CamoufoxWrapper:
         tenant_id: TenantId | None,
         persistent_profile_id: str | None = None,
         storage_state: dict[str, object] | None = None,
+        geoip: bool = True,
+        humanize: float = 1.5,
+        headless_mode: str = "virtual",
     ) -> None:
         self.proxy = proxy
         self.tenant_id = tenant_id
         self.persistent_profile_id = persistent_profile_id
         self._storage_state = storage_state
+        self._geoip = geoip
+        self._humanize = humanize
+        self._headless_mode = headless_mode
         self._browser: Any = None
         self._context: Any | None = None
         self._isolated_ctx: Any | None = None
@@ -65,7 +71,7 @@ class CamoufoxWrapper:
         Path A unavailable — AsyncCamoufox does not forward storage_state
         to Playwright context creation.
         """
-        await BROWSER_SEMAPHORE.acquire()
+        await core.budget.BROWSER_SEMAPHORE.acquire()
         try:
             from camoufox.async_api import AsyncCamoufox
 
@@ -74,9 +80,9 @@ class CamoufoxWrapper:
                 proxy_config = {"server": self.proxy.url()}
 
             self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
-                geoip=True,
-                humanize=1.5,
-                headless="virtual",
+                geoip=self._geoip,
+                humanize=self._humanize,
+                headless=self._headless_mode,
                 proxy=proxy_config,
             )
             self._context = await self._browser.__aenter__()
@@ -87,7 +93,7 @@ class CamoufoxWrapper:
             self._isolated_ctx = await self._context.new_context(**kwargs)
             return self._isolated_ctx
         except Exception:
-            BROWSER_SEMAPHORE.release()
+            core.budget.BROWSER_SEMAPHORE.release()
             raise
 
     async def __aexit__(self, *exc: object) -> None:
@@ -108,4 +114,4 @@ class CamoufoxWrapper:
             finally:
                 self._browser = None
                 self._context = None
-                BROWSER_SEMAPHORE.release()
+                core.budget.BROWSER_SEMAPHORE.release()

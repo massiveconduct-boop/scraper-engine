@@ -49,6 +49,19 @@ camoufox:
   headless_mode: virtual
   max_total_instances: 8  # measured per-instance RSS: ~80MB (Camoufox v152, virtual headless)
 
+# Round 26: Botasaurus capability upgrade — every field verified against the
+# real installed botasaurus/botasaurus_driver source (see config/schema.py's
+# BotasaurusConfig docstring and .claude/knowledge/architecture.md).
+botasaurus:
+  bypass_cloudflare: true
+  tiny_profile: true
+  remove_default_browser_check_argument: true
+  close_on_crash: true
+  random_sleep_enabled: true
+  hashed_fingerprint: true
+  max_retry: 0
+  l1_ja3_client_enabled: false
+
 proxy_harvester:
   sources:
     - proxifly
@@ -69,7 +82,8 @@ circuit_breaker:
   max_cooldown_seconds: 3600
 
 capsolver:
-  daily_credit_ceiling_default: 1.0   # [CONFIRMED — BD-03: $1.00/day]
+  # Per-tenant daily ceiling lives in the tenants.capsolver_daily_credit_ceiling
+  # DB column, not here (round 25) — see config/schema.py::CapSolverConfig.
   max_concurrent_solves: 10
 
 ssrf_guard:

@@ -8,7 +8,8 @@ Used only when L1 and L2 have both failed. Most expensive path.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING, Any, cast
 
 from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
@@ -25,6 +26,7 @@ from fetcher.challenge_detector import ChallengeDetector
 from .result import FetchResult
 
 if TYPE_CHECKING:
+    from browser.pool import BrowserPool
     from core.models import ConfigOverrides, Proxy
     from core.tenant import TenantId
     from services.captcha_solver import CaptchaSolver
@@ -47,6 +49,7 @@ class Level3Fetcher:
         challenge_detector: ChallengeDetector | None = None,
         captcha_solver: CaptchaSolver | None = None,
         ssrf_guard: SSRFGuard | None = None,
+        pool: BrowserPool | None = None,
     ) -> None:
         """Level 3 fetcher with config-driven bounded retry for CPU-bound challenges.
 
@@ -68,6 +71,7 @@ class Level3Fetcher:
         self._challenge_detector = challenge_detector or ChallengeDetector()
         self._captcha_solver = captcha_solver
         self._ssrf_guard = ssrf_guard or SSRFGuard()
+        self._pool = pool
 
     async def fetch(
         self,
@@ -81,9 +85,22 @@ class Level3Fetcher:
         timeout = overrides.timeout_seconds if overrides else self.TIMEOUT_SECONDS
 
         try:
-            wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
-            async with wrapper as browser_context:
-                page = await browser_context.new_page()  # type: ignore[attr-defined]
+            browser_ctx_mgr: AbstractAsyncContextManager[Any]
+            if self._pool is not None:
+                from urllib.parse import urlparse
+
+                domain = urlparse(url).hostname or "unknown"
+                browser_ctx_mgr = cast(
+                    "AbstractAsyncContextManager[Any]",
+                    self._pool.lease(proxy=proxy, domain=domain),
+                )
+            else:
+                browser_ctx_mgr = cast(
+                    "AbstractAsyncContextManager[Any]",
+                    CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id),
+                )
+            async with browser_ctx_mgr as browser_context:
+                page = await browser_context.new_page()
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:

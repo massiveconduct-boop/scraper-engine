@@ -20,6 +20,7 @@ from .result import FetchResult
 if TYPE_CHECKING:
     from core.models import ConfigOverrides, Proxy
     from core.tenant import TenantId
+    from services.botasaurus_requests_client import BotasaurusRequestsClient
     from services.firecrawl_client import FirecrawlClient
 
 MAX_REDIRECTS = 10
@@ -34,15 +35,24 @@ class Level1Fetcher:
         self,
         firecrawl_client: FirecrawlClient | None = None,
         ssrf_guard: SSRFGuard | None = None,
+        ja3_client: BotasaurusRequestsClient | None = None,
     ) -> None:
         """Level 1 fetcher. firecrawl_client is optional — the factory builds it
         once from FIRECRAWL_API_KEY; None disables markdown conversion (fetch
         still runs, FetchResult.markdown just stays unset). ssrf_guard defaults
         to a fresh SSRFGuard() — a submission-time check alone leaves a
         DNS-rebinding / redirect-to-internal-target gap between enqueue and the
-        worker actually connecting, so every hop is re-validated here too."""
+        worker actually connecting, so every hop is re-validated here too.
+
+        ja3_client is optional (round 26) — the factory builds it from
+        config.botasaurus.l1_ja3_client_enabled (default off, brand-new code
+        path). When set, every fetch tries the JA3-matched client first,
+        falling back to the plain httpx path below on any failure — same
+        first-attempt/fallback shape as Level2Fetcher's Botasaurus-then-
+        Camoufox pipeline."""
         self._firecrawl = firecrawl_client
         self._ssrf_guard = ssrf_guard or SSRFGuard()
+        self._ja3_client = ja3_client
 
     async def fetch(
         self,
@@ -62,6 +72,10 @@ class Level1Fetcher:
 
         try:
             await self._ssrf_guard.validate(url)
+            if self._ja3_client is not None:
+                ja3_result = await self._fetch_via_ja3(url, proxy, timeout, start)
+                if ja3_result is not None:
+                    return ja3_result
             async with httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=False,
@@ -120,3 +134,50 @@ class Level1Fetcher:
                 ),
                 error_message=str(exc),
             )
+
+    async def _fetch_via_ja3(
+        self, url: str, proxy: Proxy | None, timeout: int, start: float
+    ) -> FetchResult | None:
+        """Returns None (not a FetchResult) to signal "fall back to plain
+        httpx" — any exception here (network error, a TLS-fingerprint client
+        quirk, etc.) is swallowed, matching Level2Fetcher's
+        Botasaurus-first-attempt fallback shape. Redirects are followed
+        manually, same as the httpx path above, so every hop still gets
+        SSRF-revalidated (spec §1.1 #4) — the JA3 client itself is always
+        called with allow_redirects=False."""
+        assert self._ja3_client is not None
+        try:
+            proxy_url = proxy.url() if proxy else None
+            current_url = url
+            # One session for this fetch's entire redirect chain — not
+            # self._ja3_client.get() per hop, which would open a fresh
+            # session (and lose any cookies a redirect hop set) each time.
+            # Scoped to this call only, so no cross-tenant/cross-request
+            # cookie continuity — found during PR review, before merge.
+            session = await self._ja3_client.open_session()
+            response = await session.get(current_url, proxy=proxy_url)
+            for _ in range(MAX_REDIRECTS):
+                if response.status_code not in (301, 302, 303, 307, 308) or not response.location:
+                    break
+                next_url = str(httpx.URL(current_url).join(response.location))
+                await self._ssrf_guard.validate(next_url)
+                current_url = next_url
+                response = await session.get(current_url, proxy=proxy_url)
+
+            success = response.status_code < 400
+            markdown = None
+            if success and self._firecrawl is not None:
+                markdown = await self._firecrawl.convert_to_markdown(response.text, url)
+
+            return FetchResult(
+                url=url,
+                success=success,
+                http_status=response.status_code,
+                html=response.text,
+                markdown=markdown,
+                level_used=1,
+                proxy_used=proxy.key() if proxy else None,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+        except Exception:
+            return None

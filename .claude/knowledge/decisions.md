@@ -431,3 +431,355 @@ succeed (would raise `DuplicatePreparedStatement` without the fix).
 
 **Status:** Active, merged (PR #3, `48b4983`), deployed — api healthy through the
 pooler in production.
+
+---
+
+## Decision: SSRF `additional_denied_cidrs` — DI Singleton + Factory, Not 8 Call Sites
+
+**Date:** 2026-07-28 | **Round:** 24 (PR #7)
+
+**What:** `SSRFGuard.__init__` gained one optional param,
+`additional_denied_cidrs: list[str] | None = None`, appended to the hardcoded
+`DENIED_NETWORKS` list. Rather than threading `config.ssrf_guard.
+additional_denied_cidrs` through all 8 zero-arg `SSRFGuard()` construction
+sites, only two places actually needed to change: a new `api/dependencies.py::
+_ssrf_guard` module-level singleton (populated once in `api/main.py`'s
+lifespan, same pattern as `_storage_pg`/`_tenant_resolver`), read directly by
+`api/routes.py`'s two route handlers; and `fetcher/factory.py::
+_build_ssrf_guard(config)`, called once per fetcher build and passed
+explicitly into `Level1/2/3Fetcher`'s existing `ssrf_guard` param.
+
+**Why:** The config field existed (`SSRFGuardConfig.additional_denied_cidrs`)
+but had no path to reach any real `SSRFGuard` instance — the constructor took
+zero arguments. Two options: change every `SSRFGuard()` call site (8, across
+`api/routes.py` ×2, `fetcher/level_1/2/3.py`'s `ssrf_guard or SSRFGuard()`
+fallback, and test files), or build the config-aware guard in exactly the two
+places production code actually decides whether to build one at all (the API
+lifespan, and the fetcher factory that's already the sole DI point for
+fetchers per the round-13 factory decision above). The second was strictly
+less code and matches an existing pattern instead of inventing a new one.
+
+**Tradeoffs:** Test/live-test call sites (`tests/live/test_smoke.py`,
+`tests/integration/test_ssrf_redirect_chain.py`) intentionally keep
+zero-arg `SSRFGuard()` — they test default-denied-range behavior, not the
+config extension point.
+
+**Alternatives:** Thread the config value through every call site individually
+(rejected — 8 sites, most of which already had a working `or SSRFGuard()`
+fallback that just needed a config-aware default, not a signature change at
+every caller). Read config globally inside `SSRFGuard.__init__` itself via
+`load_config()` (rejected — hides a dependency inside a class that otherwise
+takes no I/O-touching state, and would silently change behavior for the
+existing zero-arg test call sites the moment `additional_denied_cidrs` is
+ever set in `config/base.yaml`).
+
+**Status:** Active. Live-verified two ways: a real HTTP POST to the running
+API blocked a default-denied range through the DI singleton; a direct
+factory-path test confirmed a custom-configured CIDR (`203.0.113.0/24`,
+TEST-NET-3) blocks while a normal public IP still passes.
+
+---
+
+## Decision: Real Tracing Backend (Jaeger), Not Just a Configured Exporter
+
+**Date:** 2026-07-28 | **Round:** 24 (PR #7)
+
+**What:** Added a `jaeger` service to `docker-compose.yml` (Jaeger's
+`all-in-one` image — native OTLP gRPC receiver on `:4317` plus a UI on
+`:16686`, no separate otel-collector needed) and a new
+`observability.otlp_endpoint` config field (default `http://jaeger:4317`),
+threaded into `configure_tracing()`'s `OTLPSpanExporter(endpoint=...)`.
+Auto-instrumented httpx/asyncpg/redis process-wide and added two manual root
+spans (job-level, cycle-level — see architecture.md → "Observability &
+Tracing"). `configure_tracing()`'s `service_name` param — present before this
+round but never used — is now attached via `Resource.create({SERVICE_NAME:
+service_name})`.
+
+**Why:** The immediate ask was "wire `configure_tracing()` so it's called" —
+doing only that produces a `TracerProvider` with the OTel default exporter
+target (`localhost:4317`), which resolves *inside whichever container is
+exporting* and therefore never reaches anywhere. A `TracerProvider` that
+successfully constructs but never delivers a trace anywhere observable is
+tracing in name only — the user explicitly asked for it to be "fully
+functional and deployed," which means a real backend has to exist and
+receive real data, provable by querying it, not just by the absence of an
+exception.
+
+**Tradeoffs:** Jaeger's all-in-one image is dev/single-node — fine for this
+project's current docker-compose deployment model, would need a real
+collector + persistent backend (Tempo, a hosted Jaeger, etc.) for a
+multi-node production deployment. Not attempted — no such deployment target
+exists in this repo yet (same reasoning as the GHCR build-and-push job:
+publish/wire what exists, don't invent infrastructure that isn't there).
+
+**Alternatives:** Ship only the `TracerProvider` + exporter and call it done
+once it didn't crash (rejected — this is exactly the "looks wired, does
+nothing" class of bug the whole round-24 audit exists to close; verified via
+Jaeger's own query API that traces were *actually* landing, not inferred from
+log silence — log silence turned out to be ambiguous evidence during this
+same investigation, see troubleshooting.md). A generic OTel Collector in
+front of Jaeger (rejected — extra moving part with no present benefit; add it
+if/when a second trace backend or sampling/processing pipeline is needed).
+
+**Status:** Active. Live-proven end to end, including through a real forked
+rq work-horse (see the next decision) — a real `/v1/scrape` job produced a
+`scrape_job` trace in Jaeger with 32 nested Postgres/Redis child spans;
+`proxy_daemon_harvest/promotion/health/retention` spans confirmed separately.
+
+---
+
+## Decision: `force_flush()` in the rq Job's `finally` Block, Not `atexit`
+
+**Date:** 2026-07-28 | **Round:** 24 (PR #7)
+
+**What:** `orchestrator/tasks.py::_run_scrape_job`'s `finally` block calls
+`trace.get_tracer_provider().force_flush(timeout_millis=2000)` (guarded by
+`hasattr` — the default no-op provider has no `force_flush` at all),
+alongside the existing `s3.stop()`/`redis.stop()`/`pg.stop()` cleanup. The
+`OTLPSpanExporter` itself is also constructed with an explicit `timeout=2`
+(seconds) — `force_flush`'s own timeout only bounds how long `force_flush`
+waits, not the underlying exporter's own default (10s) network-call deadline.
+
+**Why:** Confirmed live that a real rq worker processing a real job never
+produced a trace, while calling the exact same `_run_scrape_job` function
+directly (not via `rq worker`'s job-dispatch path) worked immediately — same
+code, same process type, different result. Root cause: rq's `Worker.
+perform_job()` runs inside a forked "work horse" child process
+(`rq/worker/base.py`'s own docstring: "Will/should only be called inside the
+work horse's process") that terminates via `os._exit()` — confirmed by
+grepping rq's actual installed source (`rq/worker/base.py:1619`: "os._exit()
+is the way to exit from childs after a fork()"). `os._exit()` skips `atexit`
+entirely (already registered by `configure_tracing()` for the *non*-forking
+processes — api, cli, harvester daemon) — and separately,
+`BatchSpanProcessor`'s background export thread doesn't survive `fork()` at
+all regardless (only the calling thread continues in a forked child), so the
+already-queued span from `configure_tracing()`'s original exporter setup
+would never be flushed by anything unless something explicit forces it
+before the process disappears.
+
+**Tradeoffs:** `force_flush()` is a best-effort synchronous export — if
+Jaeger is genuinely unreachable, every job now pays up to ~2s of latency
+before the ceiling gives up (previously: 0ms, because nothing flushed at
+all). Deliberately bounded short rather than trusting the SDK's default
+30s — an unreachable trace collector must never be able to stall the actual
+scrape/crawl pipeline. First attempt used no explicit timeout at all, which
+measurably slowed the local test suite (50s → 78s) — the two-part fix
+(`force_flush`'s own bound AND the exporter's own bound) was needed together;
+either alone left the other's default in control of worst-case latency.
+
+**Alternatives:** `atexit.register(provider.shutdown)` alone (tried first,
+insufficient — confirmed via live testing that `os._exit()` bypasses it;
+kept anyway for the non-forking processes where it's the correct mechanism).
+Switch `orchestrator/tasks.py`'s span export to `SimpleSpanProcessor`
+(synchronous export on every span end, no batching) instead of
+`BatchSpanProcessor` (rejected — `configure_tracing()` is shared by every
+process, including the API and harvester daemon where batching is the
+correct choice for a busy, long-running process; changing it globally to
+fix a fork-specific problem in one caller would trade one process's problem
+for another's).
+
+**Status:** Active. Regression test added:
+`tests/unit/test_tasks.py::test_run_scrape_job_creates_traced_span_with_job_attributes`
+uses `InMemorySpanExporter` (added to the real, already-configured
+`TracerProvider` via `add_span_processor` — `trace.set_tracer_provider()`
+can't be called twice) to assert the span exists with the right attributes,
+not just that nothing crashes. Live-proven separately through an actual
+forked rq work-horse, not just this in-process test.
+
+---
+
+## Decision: Redis-Backed Scrape-Time Metrics, Not In-Process Gauges
+
+**Date:** 2026-07-28 | **Round:** 25
+
+**What:** Every round-25 metric whose triggering event happens outside the
+`api` process (`dlq_size`, `capsolver_daily_spend`/`_ceiling`,
+`circuit_breaker_trips_total`, `proxy_exhausted_total`,
+`job_duration_seconds_count`/`_sum`, `proxy_source_healthy`) writes a plain
+value to Redis or queries Postgres directly at event time, then
+`observability/metrics.py`'s `refresh_*` functions read that back into a
+local `Gauge` only when `/metrics` is actually scraped by the `api` process.
+Full mechanics: `.claude/knowledge/architecture.md` → "Metrics: Cross-Process
+Emission Pattern".
+
+**Why:** `prometheus_client`'s `REGISTRY` is in-process global state. These
+6 metrics' triggering events happen in rq worker processes or the
+`proxy-harvester` daemon — different processes from the one serving
+`/metrics`. Worse for rq specifically: it forks a fresh "work horse" process
+per job that `os._exit()`s immediately after, so even a well-intentioned
+in-process `Counter.inc()` there is gone before the next scrape could ever
+see it. Setting an in-process Gauge from worker code would have looked
+wired (code compiles, tests could even pass if they don't check
+cross-process visibility) while being exactly as functionally dead as the
+config-wiring gaps this whole round exists to close.
+
+**Tradeoffs:** More Redis round-trips at scrape time (one extra `GET` per
+metric per `/metrics` hit) versus zero for a pure in-process gauge — judged
+acceptable since `/metrics` is scraped on a slow interval (typically 15-60s
+in Prometheus), not per-request. `job_duration_seconds` and `dlq_size` are
+Gauges reconstructed from a plain Redis counter/Postgres count, not native
+`Histogram`/`Counter` objects — this means no real histogram buckets for
+`job_duration_seconds` (just count + sum per status label), which is enough
+to satisfy the existing `HighJobFailureRate` alert's query but would need
+real bucketing added if a latency-distribution view is ever needed.
+
+**Alternatives considered:**
+- **Prometheus Pushgateway** — the standard solution for exactly this
+  class of problem (short-lived batch jobs pushing metrics). Rejected for
+  this round as new infrastructure beyond scope; worth reconsidering if the
+  Redis-round-trip-per-scrape approach doesn't scale.
+- **A dedicated metrics HTTP server per rq worker process** — rejected
+  outright: rq's per-job forking means a worker process typically lives for
+  the duration of one job, far shorter than a Prometheus scrape interval;
+  the server would usually be dead again before anything could reach it.
+- **True native `Histogram` for `job_duration_seconds`** — would require
+  the observe() call to happen in the same process serving `/metrics`,
+  which isn't possible given where jobs actually run. Rejected in favor of
+  the simpler count+sum-as-Gauges reconstruction, which is enough for the
+  one alert that currently needs it.
+
+**Status:** Active. Live-verified: rebuilt the `api` container, curled
+`/metrics` twice, confirmed real values (403 real DLQ rows, 3 real tenants'
+CapSolver spend/ceiling, `http_requests_total` incrementing across scrapes).
+`promtool check rules` (from the actual running Prometheus container)
+validated the edited `monitoring/alerts/prometheus_rules.yml` syntax.
+
+---
+
+## Decision: BrowserPool Mismatch Handling — Keep as Spare, Domain Relaxed, Proxy Not
+
+**Date:** 2026-07-28 | **Round:** 25 (user follow-up after initial round-25 pass)
+
+**What:** `browser/pool.py::acquire()` no longer tears down (`__aexit__`s) a
+pooled wrapper just because it doesn't match the current request's domain or
+proxy — it's kept in the pool as a live spare for a future request that does
+match, and a fresh wrapper is built for the current one instead (bounded by
+the same `core.budget.BROWSER_SEMAPHORE` either way). Separately, a wrapper
+whose `_last_domain` is still `None` (never successfully leased — this is
+every prewarmed instance) is now treated as an domain match for any request,
+not a mismatch. **Proxy mismatch does NOT get that same "unclaimed matches
+anything" treatment.**
+
+**Why:** The class's own docstring already said tear-down should only
+happen "on unhealthy release, idle timeout, or explicit shutdown" — the
+prior mismatch-destroys behavior contradicted its own documented contract,
+and (per the original design spec §3.5) the pool is meant to be "purely a
+latency optimization... not a concurrency control," which destroying good
+instances on every rotation defeats. The domain relaxation specifically
+closes a real regression: prewarmed browsers were being evicted on their
+very first real acquire() call (their `_last_domain` starts `None`, and
+`None != "example.com"` was being read as a mismatch), making prewarming
+close to useless. Domain relaxation is safe because a browser with no
+domain history has no functional reason it can't serve any domain.
+
+Proxy is different, and deliberately not relaxed the same way: a prewarmed
+`CamoufoxWrapper` is launched with `proxy=None` baked into the Camoufox
+constructor call at process-start — Playwright/Camoufox has no way to
+change a running browser's proxy after launch. If `wrapper.proxy is None`
+were treated as "matches any requested proxy," a proxy-scoped request could
+silently be served through a proxy-less browser — quietly dropping the
+proxy entirely, not just picking the wrong one. That's a real functional
+bug (defeats IP rotation/anti-detection for that fetch), not a cosmetic
+labeling issue like the domain case.
+
+**Tradeoffs:** A prewarmed browser genuinely cannot help the *first* fetch
+of any new (domain, proxy) combination it wasn't already scoped to — that
+fetch always pays a fresh Camoufox launch, no way around it without knowing
+the future proxy in advance (which isn't possible; proxies are assigned per
+request). What the domain relaxation actually buys is avoiding *destroying*
+the prewarmed instance for having failed one mismatched check — it stays
+available for a subsequent proxy-less request, or after `BrowserPool`'s
+`_last_domain` machinery would otherwise be forced to keep rebuilding.
+
+**Alternatives considered:**
+- **Prewarm each instance with a real proxy** — rejected, not possible in
+  general; proxies aren't known until a request arrives.
+- **Relax proxy the same way as domain** — rejected outright per the
+  functional-bug reasoning above; this was seriously considered and
+  discarded, not overlooked.
+- **"Upgrade" a mismatched wrapper's proxy in place** — rejected; no
+  Camoufox/Playwright API exists to reconfigure a running browser's proxy
+  after launch.
+
+**Status:** Active. Regression tests:
+`tests/unit/test_browser.py::TestBrowserPool::
+test_prewarmed_wrapper_not_evicted_on_first_domain_mismatch` and
+`::test_mismatched_wrapper_kept_in_pool_not_destroyed`. Live-verified via
+`tests/live/test_browser_pool_lifecycle.py` (real Camoufox processes) after
+the change.
+
+---
+
+## Decision: Botasaurus — Deleted as Dead Code, Then Restored For Real (Same Round)
+
+**Date:** 2026-07-28 | **Round:** 25
+
+**What:** `fetcher/botasaurus_wrapper.py` was deleted early in round 25 (as
+part of closing the round-24 "orphaned module" finding), then restored and
+wired for real later in the same round, per an explicit user follow-up ask
+("implement Botasaurus for real per spec"). Final state: `botasaurus==4.0.97`
+is a genuine dependency; `Level2Fetcher` tries a real `BotasaurusWrapper`
+fetch first, falling back to the existing Camoufox pipeline on failure or a
+detected challenge page. Full design: `.claude/knowledge/architecture.md` →
+"Botasaurus Integration".
+
+**Why deleted first:** `fetcher/botasaurus_wrapper.py` was never imported by
+anything in production, `botasaurus` wasn't a declared dependency anywhere
+(not `pyproject.toml`, Dockerfile, or CI), and `config/schema.py`'s
+`level_2.engine: "botasaurus+camoufox"` value was fiction nothing read — L2
+had always run as Camoufox-only in practice. Per the "remove broken code,
+don't leave it orphaned" operating rule, and because a Literal-typed
+`engine` field honestly reflecting reality (`"scrapling" | "camoufox"`)
+seemed better than a config value describing a feature that had never
+existed in production.
+
+**Why restored:** the authoritative spec (`specs/scraper-engine-blueprint-v2.md`
+§3.6) explicitly designs a real `BotasaurusWrapper` with a specific
+concurrency-coordination fix (F-32: force `parallel=1` since Botasaurus
+manages its own multiprocessing pool internally) — this was a deliberate,
+documented piece of the original architecture, not an accidental leftover.
+Deleting it without asking first was too large an architectural call to
+make unilaterally; user confirmed after being told the spec designed a real
+implementation.
+
+**What was found restoring it:** the *original* deleted file's
+`_botasaurus_fetch` called `driver.page_source` — an attribute that doesn't
+exist on botasaurus's real `Driver` class (confirmed against the installed
+package; it exposes `driver.page_html` instead). Even if the original file
+had been wired into the fetch path, it would have raised `AttributeError`
+on its first real fetch — it was never actually tested against a real
+install at any point in the project's history. The restored version fixes
+that, but is otherwise deliberately minimal: `parallel=1`, headless/xvfb,
+`proxy=`, `profile=`, plain `get()`→`page_html`, matching what the spec's
+own §3.6 code sample shows. `google_get`/`bypass_cloudflare` and the rest of
+Botasaurus's anti-detection surface were deliberately **not** added in this
+pass — that's the separate, already-researched-but-not-yet-implemented
+follow-up tracked in `.claude/MEMORY.md` → Technical Debt (round 25
+follow-up).
+
+**Tradeoffs:** `Level2Fetcher` now makes up to two fetch attempts
+(Botasaurus, then Camoufox) before escalating to L3 on failure — more
+latency on the failure path, in exchange for a real chance of a cheaper/
+different-fingerprint success on the happy path. Botasaurus fetches are
+one-shot (`reuse_driver=False`), not pooled like `CamoufoxWrapper` —
+consistent with the minimal-restoration scope above.
+
+**Alternatives considered:**
+- **Leave it deleted, correct the config value (the original round-25
+  decision)** — reasonable and defensible on its own; reversed only because
+  the user, once told the spec designed a real implementation, wanted it
+  built rather than the config just being made honest about its absence.
+- **Wire Botasaurus as the ONLY L2 engine (replacing Camoufox for L2
+  entirely)** — rejected; Botasaurus's Selenium-style driver can't run the
+  existing challenge-detection/captcha-solve/scroll pipeline, so an
+  unconditional replacement would have made L2 strictly less capable on
+  anything past a simple connection-level check. Fallback-not-replacement
+  keeps L2 at least as capable as before, with a chance of doing better/cheaper.
+
+**Status:** Active. `tests/unit/test_botasaurus_wrapper.py` (7 tests) covers
+the semaphore acquire/release, the forced `parallel=1`, and all 4
+fallback/pass-through branches of `Level2Fetcher.fetch()`. Live-verified:
+real headless-via-Xvfb Chrome launched and fetched a `data:` URL in the dev
+sandbox before the final implementation was written; every container
+(`api`, `worker-l1/l2/l3`, `proxy-harvester`) rebuilt and confirmed
+`import botasaurus` succeeds inside the actual image, not just the local venv.

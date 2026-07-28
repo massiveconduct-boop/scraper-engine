@@ -83,7 +83,9 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     redis = RedisClient(redis_url=cfg.storage.redis_url)
     await redis.start()
 
-    harvester = ProxyHarvester(pg, sources=ph.sources, asn_classifier=build_asn_classifier())
+    harvester = ProxyHarvester(
+        pg, sources=ph.sources, asn_classifier=build_asn_classifier(), redis=redis
+    )
     # Promotion reuses the harvester's HTTP validator — no duplicated logic.
     promotion = ProxyPromotionJob(pg, ProxyHarvester._http_validate)
     health = HealthMonitor(pg, redis)

@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from observability.middlewares.http_metrics import HTTPMetricsMiddleware
+
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     """Reject requests larger than max_size_bytes."""
@@ -84,9 +86,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 def configure_middleware(app: FastAPI) -> None:
     """Apply all hardening middleware to the FastAPI app.
 
-    Order: security headers → CORS → size limit → rate limit → routes.
+    Order: HTTP metrics → security headers → CORS → size limit → rate limit → routes.
     """
-    # Security headers (outermost)
+    # HTTP metrics (outermost — must see the final response even when a later
+    # middleware short-circuits with 413/429, so http_requests_total counts
+    # every response the client actually sees, not just ones that reach the route)
+    app.add_middleware(HTTPMetricsMiddleware)
+
+    # Security headers
     app.add_middleware(SecurityHeadersMiddleware)
 
     # CORS. allow_credentials=True combined with allow_origins=["*"] is a real

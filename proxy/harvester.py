@@ -27,6 +27,7 @@ from core.models import AnonymityLevel, AsnClass, ProxyProtocol
 if TYPE_CHECKING:
     from core.tenant import TenantId
     from storage.postgres_client import PostgresClient
+    from storage.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,16 @@ class ProxyHarvester:
         self, pg: PostgresClient,
         sources: list[str] | None = None,
         asn_classifier: SupportsClassify | None = None,
+        redis: RedisClient | None = None,
     ) -> None:
         from proxy.asn_classifier import NullAsnClassifier
 
         self._pg = pg
         self._sources = sources or []
         self._classifier: SupportsClassify = asn_classifier or NullAsnClassifier()
+        # None disables the per-source health signal (round 25) — tests and
+        # any other caller that doesn't need it can skip passing a redis client.
+        self._redis = redis
 
     async def harvest_once(self, limit: int = 100) -> int:
         """Run one harvest cycle from both paths. Returns total proxies."""
@@ -104,10 +109,13 @@ class ProxyHarvester:
             for name, url, fmt in self.SOURCES:
                 n = await self._scrape_one(name, url, fmt, limit - total, tenant, client)
                 counts[name] = n
-                # Per-source health gauge (round 13 D2) — a source going dark
-                # becomes a specific named signal, not just a drop in the aggregate.
-                from proxy.source_health import record_source_health
-                record_source_health(name, n)
+                # Per-source health signal (round 13 D2) — a source going dark
+                # becomes a specific named signal, not just a drop in the
+                # aggregate. Written to Redis, not an in-process gauge (round
+                # 25 — this process doesn't serve /metrics).
+                if self._redis is not None:
+                    from proxy.source_health import record_source_health
+                    await record_source_health(self._redis, name, n)
                 total += n
                 if total >= limit:
                     break

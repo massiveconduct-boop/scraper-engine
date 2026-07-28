@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import time
+from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlparse
 
 from browser.camoufox_wrapper import CamoufoxWrapper
 from core.models import FailureCategory
@@ -26,8 +28,11 @@ from fetcher.challenge_detector import ChallengeDetector
 from .result import FetchResult
 
 if TYPE_CHECKING:
+    from browser.botasaurus_pool import BotasaurusPool
+    from browser.pool import BrowserPool
     from core.models import ConfigOverrides, Proxy
     from core.tenant import TenantId
+    from fetcher.botasaurus_wrapper import BotasaurusWrapper
     from services.captcha_solver import CaptchaSolver
 
 
@@ -48,6 +53,9 @@ class Level2Fetcher:
         challenge_detector: ChallengeDetector | None = None,
         captcha_solver: CaptchaSolver | None = None,
         ssrf_guard: SSRFGuard | None = None,
+        pool: BrowserPool | None = None,
+        botasaurus: BotasaurusWrapper | None = None,
+        botasaurus_pool: BotasaurusPool | None = None,
         force_engine: str | None = None,  # TEST-ONLY. See guard below.
     ) -> None:
         """Level 2 fetcher with config-driven wait strategy + challenge-gated retry.
@@ -81,6 +89,20 @@ class Level2Fetcher:
         self._challenge_detector = challenge_detector or ChallengeDetector()
         self._captcha_solver = captcha_solver
         self._ssrf_guard = ssrf_guard or SSRFGuard()
+        # None keeps the pre-round-25 behavior: a fresh cold-start CamoufoxWrapper
+        # per fetch. When set, every fetch leases a hot browser instead (round 25).
+        self._pool = pool
+        # None disables Botasaurus entirely (falls straight to Camoufox, matching
+        # pre-round-25 behavior). When set, every fetch tries Botasaurus first
+        # (spec §3.6 — "Botasaurus + Camoufox"), falling back to the full
+        # Camoufox pipeline below on failure or a detected challenge page.
+        self._botasaurus = botasaurus
+        # None keeps every fetch one-shot (round 25 behavior). When set
+        # (round 26), a 2nd+ fetch for the same proxy+domain within this job
+        # reuses the live driver instead of relaunching Botasaurus — see
+        # browser/botasaurus_pool.py for why this isn't botasaurus's own
+        # reuse_driver=True.
+        self._botasaurus_pool = botasaurus_pool
 
     async def fetch(
         self,
@@ -89,11 +111,55 @@ class Level2Fetcher:
         proxy: Proxy | None = None,
         overrides: ConfigOverrides | None = None,
     ) -> FetchResult:
-        """Fetch a URL. Dispatches to Camoufox (production) or, only when the
-        test seam is armed, to raw undetected Playwright (negative control)."""
+        """Fetch a URL. Tries Botasaurus first when configured, falls back to
+        the full Camoufox pipeline (challenge-detection/captcha-solve/scroll)
+        on failure or a detected challenge page — Botasaurus's Selenium-style
+        Driver has no live page/context to run that pipeline against, so it
+        only ever gets one unaided attempt. Only when the test seam is armed,
+        dispatches to raw undetected Playwright (negative control) instead."""
         if self._force_engine == "raw_playwright":
             return await self._fetch_via_raw_playwright(url, proxy, overrides)
+        if self._botasaurus is not None and proxy is not None and tenant_id is not None:
+            result = await self._fetch_via_botasaurus(url, tenant_id, proxy)
+            if result is not None:
+                return result
         return await self._fetch_via_camoufox(url, tenant_id, proxy, overrides)
+
+    async def _fetch_via_botasaurus(
+        self, url: str, tenant_id: TenantId, proxy: Proxy
+    ) -> FetchResult | None:
+        """Returns None (not a FetchResult) to signal "fall back to Camoufox"
+        — either Botasaurus raised, or the HTML it got back looks like a
+        challenge/block page it has no way to solve on its own."""
+        start = time.monotonic()
+        domain = urlparse(url).hostname or "unknown"
+        assert self._botasaurus is not None
+        session_id = f"{tenant_id}:{domain}"
+        try:
+            if self._botasaurus_pool is not None:
+                html = await self._botasaurus_pool.fetch(
+                    url, proxy=proxy, domain=domain, session_id=session_id
+                )
+            else:
+                html = await self._botasaurus.fetch_html(
+                    url,
+                    proxy=proxy,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
+        except Exception:
+            return None
+        if self._challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False):
+            return None
+        return FetchResult(
+            url=url,
+            success=True,
+            http_status=200,
+            html=html,
+            level_used=2,
+            proxy_used=proxy.key(),
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
 
     async def _fetch_via_camoufox(
         self,
@@ -107,9 +173,20 @@ class Level2Fetcher:
         timeout = overrides.timeout_seconds if overrides else self.TIMEOUT_SECONDS
 
         try:
-            wrapper = CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id)
-            async with wrapper as browser_context:
-                page = await browser_context.new_page()  # type: ignore[attr-defined]
+            browser_ctx_mgr: AbstractAsyncContextManager[Any]
+            if self._pool is not None:
+                domain = urlparse(url).hostname or "unknown"
+                browser_ctx_mgr = cast(
+                    "AbstractAsyncContextManager[Any]",
+                    self._pool.lease(proxy=proxy, domain=domain),
+                )
+            else:
+                browser_ctx_mgr = cast(
+                    "AbstractAsyncContextManager[Any]",
+                    CamoufoxWrapper(proxy=proxy, tenant_id=tenant_id),
+                )
+            async with browser_ctx_mgr as browser_context:
+                page = await browser_context.new_page()
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
