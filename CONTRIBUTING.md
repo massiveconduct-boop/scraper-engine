@@ -13,6 +13,16 @@ docker compose up -d postgres redis pgbouncer
 alembic upgrade head
 ```
 
+`pip install -e ".[dev]"` registers every top-level package (`api`, `core`,
+`proxy`, etc.) via an editable-install finder, so imports resolve to their
+real path regardless of the process's current working directory — you don't
+need `PYTHONPATH` tricks or to run commands from the repo root specifically.
+
+**Import style:** absolute cross-package imports (`from core.tenant import
+TenantId`), single-dot same-package imports are fine (`from .schema import
+AppConfig` inside `config/`), no deep relative imports (`from ..x` /
+`from ...x`) — none exist in this codebase, keep it that way.
+
 ## Before opening a PR
 
 ```bash
