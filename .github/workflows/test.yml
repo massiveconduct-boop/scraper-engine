@@ -28,19 +28,19 @@ jobs:
             opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
             opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
             opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis
-      # challenge-mirror excluded here — linted separately against its own
+      # challenge_mirror excluded here — linted separately against its own
       # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
-      - run: ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
-      - name: challenge-mirror ruff baseline (diff against committed baseline, fail on NEW)
+      - run: ruff check . --exclude 'tests/fixtures/challenge_mirror'
+      - name: challenge_mirror ruff baseline (diff against committed baseline, fail on NEW)
         run: |
-          ruff check challenge-mirror/ --output-format=concise 2>&1 | grep "^challenge-mirror/" | sort >/tmp/mirror-current.txt || true
-          sort challenge-mirror/.ruff-baseline.txt >/tmp/mirror-baseline.txt
+          ruff check tests/fixtures/challenge_mirror/ --output-format=concise 2>&1 | grep "^tests/fixtures/challenge_mirror/" | sort >/tmp/mirror-current.txt || true
+          sort tests/fixtures/challenge_mirror/.ruff-baseline.txt >/tmp/mirror-baseline.txt
           NEW=$(comm -13 /tmp/mirror-baseline.txt /tmp/mirror-current.txt)
           if [ -n "$NEW" ]; then
-            echo "=== NEW challenge-mirror ruff findings (failing build) ===" && echo "$NEW"
+            echo "=== NEW challenge_mirror ruff findings (failing build) ===" && echo "$NEW"
             exit 1
           fi
-          echo "challenge-mirror ruff baseline OK — no new findings"
+          echo "challenge_mirror ruff baseline OK — no new findings"
       - name: no direct fetcher construction outside factory
         run: |
           HITS=$(grep -rn "Level1Fetcher(\|Level2Fetcher(\|Level3Fetcher(" --include="*.py" . \

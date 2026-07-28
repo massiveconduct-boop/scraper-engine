@@ -8,7 +8,7 @@ Index of all knowledge documents. Read this first to discover what exists before
 |---|---|---|
 | `.claude/knowledge/architecture.md` | System design, invariants, module interactions, data flow | Understanding how components connect; adding new modules |
 | `.claude/knowledge/decisions.md` | Design decisions with rationale, tradeoffs, rejected alternatives | Understanding WHY something was built a certain way; considering changes |
-| `specs/scraper-engine-blueprint-v2.md` | Authoritative specification v2.0 | Source of truth for requirements and invariants |
+| `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git) | Authoritative specification v2.0 | Source of truth for requirements and invariants |
 
 ## Implementation
 

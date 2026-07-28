@@ -24,9 +24,8 @@ htmlcov/
 .github/
 .claude/
 .wolf/
+.local/
 docs/
-specs/
 *.md
 
-challenge-mirror/.git/
-report-review-fix/.git/
+tests/fixtures/challenge_mirror/.git/

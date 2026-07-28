@@ -17,7 +17,7 @@ alembic upgrade head
 
 ```bash
 pytest tests/unit/ tests/integration/ tests/chaos/ -q
-ruff check . --exclude 'challenge-mirror' --exclude 'report-review-fix'
+ruff check . --exclude 'tests/fixtures/challenge_mirror'
 mypy core/ proxy/ orchestrator/ api/ storage/ fetcher/ browser/ observability/ --strict --ignore-missing-imports
 ```
 
@@ -46,5 +46,6 @@ suppressions to work around it — fix the type issue.
   operations (living documents, kept current)
 - `.claude/MEMORY.md` — full round-by-round project history and technical
   debt log
-- `specs/scraper-engine-blueprint-v2.md` — authoritative design spec,
-  including the 7 non-negotiable design invariants (§1.1)
+
+The design spec (7 non-negotiable design invariants and the full module
+blueprint) isn't part of this repo — ask a maintainer if you need it.

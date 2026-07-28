@@ -20,3 +20,4 @@ profiles/
 !.claude/knowledge/
 !.claude/MEMORY.md
 .archive/
+.local/
