@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import httpx
 
 
@@ -31,3 +33,16 @@ class FirecrawlClient:
         except Exception:
             # Fallback: return raw HTML if Firecrawl is unavailable
             return html
+
+
+def build_firecrawl_client() -> FirecrawlClient | None:
+    """Select the Firecrawl client for production use.
+
+    Returns None when FIRECRAWL_API_KEY is unset — markdown conversion is
+    simply skipped (FetchResult.markdown stays None), same env-gated,
+    gracefully-inert pattern as services/captcha_solver.build_captcha_solver.
+    """
+    api_key = os.environ.get("FIRECRAWL_API_KEY")
+    if not api_key:
+        return None
+    return FirecrawlClient(api_key)

@@ -89,13 +89,21 @@ def configure_middleware(app: FastAPI) -> None:
     # Security headers (outermost)
     app.add_middleware(SecurityHeadersMiddleware)
 
-    # CORS — restrict to known origins in production
+    # CORS. allow_credentials=True combined with allow_origins=["*"] is a real
+    # misconfiguration, not just a spec nit: Starlette's CORSMiddleware works
+    # around the browser-side rejection of that combo by reflecting the
+    # request's actual Origin header back verbatim, which — for a browser
+    # that has stored credentials for this API — defeats origin restriction
+    # entirely. This API authenticates via X-API-Key (a header the calling
+    # JS sets explicitly), never cookies/TLS-client-certs/HTTP auth, so there
+    # is nothing for allow_credentials to protect; it stays False so the
+    # wildcard origin can't be paired with credentialed reflection.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # tighten in production
-        allow_credentials=True,
+        allow_origins=["*"],
+        allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
     # Request size limit

@@ -49,6 +49,31 @@ async def test_zero_balance_authenticates_but_is_not_solve_capable(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reports_no_active_plan_without_clobbering_balance(monkeypatch):
+    """A NoCaptchaAI key that authenticates with real balance but has no
+    subscription plan (round-22 root cause: worker-slot types accept tasks
+    and silently never solve them) must surface has_active_plan=False
+    without losing the already-successful ok/balance fields."""
+    monkeypatch.setenv("NOCAPTCHA_AI_API_KEY", "nk-present")
+    monkeypatch.delenv("CAPSOLVER_API_KEY", raising=False)
+
+    no_plan = MagicMock(
+        get_balance=AsyncMock(return_value=0.9982),
+        has_active_plan=AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        services.nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=no_plan)
+    )
+
+    r = await validate_captcha_keys()
+
+    assert r["nocaptchaai"]["ok"] is True
+    assert r["nocaptchaai"]["balance"] == 0.9982
+    assert r["nocaptchaai"]["has_active_plan"] is False
+    assert "NO ACTIVE PLAN" in r["nocaptchaai"]["detail"]
+
+
+@pytest.mark.asyncio
 async def test_absent_keys_report_not_configured(monkeypatch):
     monkeypatch.delenv("NOCAPTCHA_AI_API_KEY", raising=False)
     monkeypatch.delenv("CAPSOLVER_API_KEY", raising=False)

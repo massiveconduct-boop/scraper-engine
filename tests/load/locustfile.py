@@ -10,6 +10,7 @@ Or headless:
         --headless --users 50 --spawn-rate 10 --run-time 60s
 """
 
+import os
 import random
 
 from locust import HttpUser, between, task
@@ -22,6 +23,13 @@ class ScraperEngineUser(HttpUser):
 
     def on_start(self):
         self.job_ids: list[str] = []
+        # /v1/scrape and /v1/jobs require X-API-Key (api/routes.py) — without
+        # it every submit/poll call 401s and the test only measures the auth
+        # rejection path, not the real pipeline. LOAD_TEST_API_KEY lets CI/prod
+        # point this at a real provisioned tenant key.
+        self.client.headers["X-API-Key"] = os.environ.get(
+            "LOAD_TEST_API_KEY", "sk-admin"
+        )
 
     @task(3)
     def submit_scrape_job(self):

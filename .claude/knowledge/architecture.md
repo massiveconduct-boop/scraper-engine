@@ -101,6 +101,40 @@ All routes enforce 4 invariants per blueprint:
 
 ---
 
+## SSRF Enforcement — Two Checkpoints, Not One (Round 22 — closes invariant #4 TOCTOU gap)
+
+Invariant #4 ("every outbound fetch SSRF-checked before enqueue and after every
+redirect") was only half-true through round 21: `SSRFGuard.validate()` ran
+once in `api/routes.py` at job-submission time and never again. The actual
+fetch happens later, in a different process (the worker), after a queue wait
+of unknown length — a DNS-rebind or same-request redirect to a private/
+metadata address in that window bypassed the guard completely.
+`validate_redirect_chain()` existed but had zero production call sites
+(grep-verified) despite docs claiming it was wired.
+
+Now enforced at both checkpoints:
+1. **Submit time** (unchanged) — `api/routes.py`, before enqueue.
+2. **Fetch time** (new, round 22) — every fetcher re-validates immediately
+   before connecting, and again per redirect hop:
+   - `Level1Fetcher` (httpx): `follow_redirects=True` replaced with a manual
+     redirect loop, validating each hop before following it.
+   - `Level2Fetcher`/`Level3Fetcher` (Camoufox/Playwright): a `page.route()`
+     handler (`fetcher/_content_utils.py::SSRFRouteGuard`) validates every
+     request/redirect at the browser layer, aborting blocked ones and
+     surfacing the real `SSRFBlockedError` (Playwright itself only reports a
+     generic aborted-request error).
+
+Also fixed in `core/ssrf_guard.py`: `_resolve_host` checked only the first
+`getaddrinfo()` result, so a multi-record DNS answer (public IP first,
+private second) could slip through — renamed to `_resolve_hosts`, checks
+every resolved address.
+
+Live-proven inside the real `worker-l2` container: a genuine private-network
+navigation attempt (docker-network IP, `172.18.0.13`) was correctly blocked.
+Full evidence: `.claude/knowledge/decisions.md`.
+
+---
+
 ## Fetcher Construction & Shared Content Helpers (Round 13-16)
 
 - **DI factory:** `fetcher/factory.py::build_level1/2/3_fetcher(config)` is the ONLY
@@ -152,8 +186,13 @@ Best-effort: returns False (never raises) on no widget / no sitekey / no token /
 inject failure → degrades to "still a challenge", never a false positive. Null-safe:
 no provider key → solver is None → fetch runs with solving skipped. Observable via
 `captcha_solve_attempts_total{kind}` / `captcha_solved_total{kind}`. DOM detect/inject
-is unit-tested with a fake page; not yet live-verified end to end (see
-`docs/round-20-evidence.md`).
+is unit-tested with a fake page; live-verified end to end round 22 (real Camoufox
++ real DOM detect + real inject — see `docs/round-20-evidence.md` for the
+mechanics). The one thing NOT proven live is a target actually *accepting* a
+solved token, because no NoCaptchaAI solve has produced a token yet on this
+account — root-caused round 22 as an account-side gap (no subscription plan,
+not a code bug); see `.claude/knowledge/troubleshooting.md` → "Captcha task
+accepted but stuck idle forever" and `decisions.md` for the full evidence.
 
 ---
 

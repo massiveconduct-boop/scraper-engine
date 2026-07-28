@@ -10,6 +10,7 @@ for the browser levels).
 
 from __future__ import annotations
 
+from core.exceptions import SSRFBlockedError
 from core.models import FailureCategory
 
 # Substrings that unambiguously indicate the host could not be resolved, across
@@ -29,7 +30,10 @@ _HOST_UNREACHABLE_MARKERS: tuple[str, ...] = (
 def classify_fetch_exception(
     exc: BaseException, default: FailureCategory
 ) -> FailureCategory:
-    """Return HOST_UNREACHABLE for DNS/unknown-host errors, else `default`."""
+    """Return HOST_UNREACHABLE for DNS/unknown-host errors, SSRF_BLOCKED for a
+    guard rejection (initial request or a redirect hop), else `default`."""
+    if isinstance(exc, SSRFBlockedError):
+        return FailureCategory.SSRF_BLOCKED
     msg = str(exc)
     if any(marker in msg for marker in _HOST_UNREACHABLE_MARKERS):
         return FailureCategory.HOST_UNREACHABLE

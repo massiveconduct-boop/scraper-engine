@@ -21,15 +21,29 @@ class TestPoliteness:
         redis.eval.return_value = 1  # slot acquired
         pc = PolitenessController(redis=redis, default_concurrency=2)
         result = await pc.acquire_slot("example.com", tenant)
-        assert result is True
+        assert result is not None
+        assert isinstance(result, str)
 
     @pytest.mark.asyncio
     async def test_acquire_slot_fails_at_limit(self, tenant):
         redis = AsyncMock()
         redis.eval.side_effect = [1, 0]  # first succeeds, second fails
         pc = PolitenessController(redis=redis, default_concurrency=1)
-        assert await pc.acquire_slot("busy.com", tenant) is True
-        assert await pc.acquire_slot("busy.com", tenant) is False
+        assert await pc.acquire_slot("busy.com", tenant) is not None
+        assert await pc.acquire_slot("busy.com", tenant) is None
+
+    @pytest.mark.asyncio
+    async def test_release_slot_releases_the_acquired_worker_id(self, tenant):
+        redis = AsyncMock()
+        redis.eval.return_value = 1
+        pc = PolitenessController(redis=redis, default_concurrency=2)
+        worker_id = await pc.acquire_slot("example.com", tenant)
+        assert worker_id is not None
+
+        await pc.release_slot("example.com", tenant, worker_id)
+
+        release_call = redis.eval.call_args
+        assert worker_id in release_call.args
 
     @pytest.mark.asyncio
     async def test_wait_if_needed_no_delay_first_time(self, tenant):

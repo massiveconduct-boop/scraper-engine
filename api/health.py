@@ -61,10 +61,13 @@ class HealthChecker:
 
         if self._s3 is not None:
             try:
+                await self._s3.ping()
                 status.s3_reachable = True
             except Exception as e:
                 status.checks["s3"] = str(e)
                 healthy = False
+        else:
+            status.s3_reachable = True  # not configured for this check — don't fail on it
 
         try:
             from core.tenant import TenantId
@@ -77,6 +80,10 @@ class HealthChecker:
         return status
 
 
-async def check_health() -> dict[str, str]:
-    """Convenience function for FastAPI — returns {status: ok} without dependencies."""
-    return {"status": "ok"}
+async def check_health(
+    pg: PostgresClient,
+    redis: RedisClient,
+    s3: S3Client | None = None,
+) -> HealthStatus:
+    """Convenience function for FastAPI/CLI — runs the real composite health check."""
+    return await HealthChecker(pg, redis, s3).check()

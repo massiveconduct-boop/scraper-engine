@@ -24,6 +24,17 @@ if TYPE_CHECKING:
 CREATE_TASK_URL = "https://api.nocaptchaai.com/createTask"
 GET_RESULT_URL = "https://api.nocaptchaai.com/getTaskResult"
 GET_BALANCE_URL = "https://api.nocaptchaai.com/getBalance"
+# Separate from GET_BALANCE_URL (the legacy anti-captcha-protocol endpoint,
+# which only returns a bare number): this is the current API's richer
+# `GET /balance` that also reports plan status. A funded key with no active
+# plan (planType/planId empty) authenticates and shows a real balance, but
+# every worker-slot-based task type (reCAPTCHA/Turnstile/GeeTest/MTCaptcha —
+# anything needing a live browser to render+solve, unlike ImageToText's pure
+# ML inference) silently sits at status "idle" forever with errorId 0 — no
+# error is ever raised, so balance alone can't tell you this is broken
+# (round 22 — root-caused after reCAPTCHA v2 solves hung against two
+# different real sitekeys while ImageToText solved fine on the same key).
+PLAN_URL = "https://api.nocaptchaai.com/balance"
 
 PROVIDER = "nocaptchaai"
 
@@ -143,3 +154,21 @@ class NoCaptchaAIClient:
     async def get_balance(self) -> float:
         """Return current NoCaptchaAI account balance."""
         return await _get_balance(api_key=self._api_key, balance_url=GET_BALANCE_URL)
+
+    async def has_active_plan(self) -> bool | None:
+        """Whether this key has an actual subscription plan (not just wallet
+        balance). False means worker-slot-based types (reCAPTCHA/Turnstile/
+        GeeTest/MTCaptcha) will accept tasks but never solve them — see
+        PLAN_URL's docstring. Returns None if the plan endpoint itself
+        couldn't be reached (distinct from a confirmed no-plan account)."""
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                data = (
+                    await client.get(PLAN_URL, params={"apiKey": self._api_key})
+                ).json()
+        except Exception:
+            return None
+        plan = data.get("plan") or {}
+        return bool(plan.get("planType") or plan.get("planId"))

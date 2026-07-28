@@ -141,17 +141,59 @@ correct forms (createTask accepted, HTTP 200 errorId 0):
 - **MTCaptcha:** `MTCaptchaTask` accepted.
 - **AWS WAF:** `AWSWAFTask` needs per-request runtime data (awsKey/awsIv/awsContext/awsChallengeJS) extracted from the live page — no static site key. Synthetic input → "Payload not valid".
 
-### Captcha task accepted but stuck `status:"idle"` forever
-Two causes seen: (1) account's "use wallet balance for solving" toggle OFF — tasks
-accepted+queued but never funded/solved; (2) the target is unsolvable (Google's
-reCAPTCHA demo key never routes to a solver). Diagnose: check `getBalance` (`packages`,
-balance) and try a known-solvable task (ImageToText with a generated text image).
-Demo/test sitekeys generally do NOT route to solvers — test with real production
-sitekeys or ImageToText.
+### Captcha task accepted but stuck `status:"idle"` forever (root-caused round 22)
+Round 19's "wrong casing → idle forever" (line above) is real but incomplete —
+round 22 proved the **correct** `ReCaptchaV2TaskProxyLess` casing/format also
+sits at `idle` forever, so a right-looking request is not proof the task will
+ever solve. Confirmed via raw `createTask`/`getTaskResult` calls (bypassing
+this repo's wrapper) against two different real sitekeys — Google's demo AND
+2captcha's demo, ruling out "one specific test key is filtered" — both gave
+`errorId: 0` + a real `taskId`, then `status: "idle"` on every poll for 45+
+seconds straight, no error ever raised. Root cause: `GET
+https://api.nocaptchaai.com/balance?apiKey=...` (the *current* balance
+endpoint — richer than the legacy `POST /getBalance` this repo's
+`get_balance()` calls) returns `plan: {planType: "", planId: "", ...}` and
+`is_default: 1` — **no subscription plan, wallet-balance-only account**.
+NoCaptchaAI's pricing page confirms only pay-as-you-go *packages* ($10/50K
+solves+) grant "REST API access" + worker slots; a plan-less account has none,
+even with real wallet balance. Interactive/browser-rendered types (reCAPTCHA
+v2, Turnstile, GeeTest, MTCaptcha) need a worker slot to render+solve the
+widget; ImageToText doesn't (pure ML inference on a submitted image) — which
+is exactly why ImageToText solves for real money on this same key while
+everything else sits idle forever. Not a demo-sitekey artifact, not a code
+bug — verified the request format is byte-for-byte what NoCaptchaAI's current
+docs show. Fix: buy a package at nocaptchaai.com/manage. Diagnostic:
+`services/nocaptcha.py::NoCaptchaAIClient.has_active_plan()` (added round 22)
+calls the current `/balance` endpoint and is wired into
+`tools/validate_captcha_keys.py`, which now reports `NO PLAN` instead of a
+misleading `WORKING` for this exact situation. Full evidence trail:
+`.claude/knowledge/decisions.md` → "CAPTCHA Solver" round-22 follow-ups #2/#3.
 
-### CapSolver key rejected — HTTP 401 ERROR_KEY_DENIED_ACCESS
-The current `.env` CAPSOLVER_API_KEY is invalid (fallback non-functional until
-replaced). Not a code issue — the same shared code path talks to NoCaptchaAI fine.
+### CapSolver fallback non-functional — key check (superseded round 21, re-confirmed round 22)
+Round 19 saw HTTP 401 `ERROR_KEY_DENIED_ACCESS`. **Round-21 re-check
+(`tools/validate_captcha_keys.py`) corrected this:** the current
+`CAPSOLVER_API_KEY` now AUTHENTICATES — `getBalance` returns `0.0`. So the key is
+valid; the fallback is non-functional because the account has **$0.00 balance**
+(can't pay for solves), not because the key is rejected. Fix = top up, not
+replace. Lesson: `getBalance` succeeding proves the key/account, NOT that solving
+will work (needs funds + active capability) — grade on balance, and confirm a
+real solve with `tools/verify_captcha_live.py`. Not a code issue. Round 22: a
+live reCAPTCHA v2 solve attempt (NoCaptchaAI returning `None` → falling
+through to CapSolver) surfaced `ERROR_KEY_DENIED_ACCESS` again at actual
+task-creation time even though `getBalance` authenticates — consistent with
+$0 balance being rejected earlier at createTask than at the balance check;
+does not change the fix (top up), just confirms it end to end.
+
+### Fetcher `fetch()` argument order — url FIRST, tenant SECOND
+`Level1Fetcher.fetch(url, tenant_id, proxy=None, overrides=None)` takes the URL
+first (`fetcher/level_1.py:32`). Calling `fetch(tenant_id, url)` (tenant-first, the
+intuitive order) passes the tenant slug as the URL → httpx raises
+`"Request URL is missing an 'http://' or 'https://' protocol"`, classified as
+`NETWORK_TIMEOUT`. This looks like a broken/proxy-less engine but is a caller bug.
+Verified the engine works with the correct order: L1 fetch of a real site →
+`success=True, http_status=200`, full HTML. Note the Worker uses
+`_fetch_url(tenant_id, url_str, level)` internally (tenant-first) — do not confuse
+the two signatures.
 
 ---
 

@@ -298,6 +298,136 @@ real target.
 
 **Alternatives:** Single provider (rejected — no resilience, coverage gaps).
 
-**Status:** Active but NOT YET WIRED into the L2/L3 fetch path — see technical debt.
-Solver exists, is tested, and is live-verified; fetchers detect challenges but do
-not yet call it.
+**Status:** Active and WIRED into the L2/L3 fetch path (round 20 — `fetcher/_captcha.py`
+DOM detect→solve→inject→re-poll; worker builds the solver once, factory threads it).
+Provider-key health is observable (post-round-20): `captcha_provider_configured`
+gauge + `services.captcha_solver.validate_captcha_keys()` + `tools/validate_captcha_keys.py`.
+Last preflight: both keys AUTHENTICATE — NoCaptchaAI ~$1 funded, CapSolver $0.00
+(top up to enable fallback — external account action, not a code issue).
+
+**Round 22 follow-up — NoCaptchaAI primary live-solve CONFIRMED with real spend.**
+`tools/verify_captcha_live.py` targets Google's official reCAPTCHA demo page,
+which per this doc's own troubleshooting notes never routes to a solver (demo
+sitekeys are unsolvable by design) — that script will hang/fail regardless of
+provider health and is the wrong target for a quick confirmation. Used
+ImageToText instead (same underlying create-task/poll plumbing as the token
+solvers, and known synchronous): a real distorted-text image ("8k4wZ2") sent
+to the real NoCaptchaAI API round-tripped an exact match, with real balance
+deducted ($0.9984 → $0.9982). Confirms the full pipeline — auth, task
+submission, solve, budget deduction — genuinely works end to end on the
+funded primary. CapSolver fallback remains unfunded; still needs the account
+topped up by whoever holds it, not something fixable from this codebase.
+
+**Round 22 follow-up #2 — reCAPTCHA v2 root-caused with raw API evidence (user
+asked to verify independently, not trust the doc above at face value).**
+Called `createTask`/`getTaskResult` directly (bypassing this repo's wrapper)
+against TWO different real reCAPTCHA v2 sitekeys — Google's own demo page AND
+2captcha's demo page (a different, real, non-Google sitekey, ruling out
+"Google's specific test key is filtered" as the explanation). Both produced
+the identical raw signature: `createTask` returns `errorId: 0` with a real
+`taskId` (request genuinely accepted, no rejection), then `getTaskResult`
+reports `status: "idle"` on every poll for 45+ seconds straight — never
+"processing", never "ready", never an error. The code's own polling loop
+(`services/_anticaptcha.py::solve_anticaptcha`) correctly submits, correctly
+polls, and correctly gives up after its ceiling — there is no bug in this
+repo's CAPTCHA code. `status: "idle"` forever, across two independent real
+targets, means the account itself is not routing reCAPTCHA v2 tasks to any
+solver — an account-side capability/config gap on NoCaptchaAI's dashboard
+(the same "use wallet balance for solving" toggle or per-capability
+entitlement troubleshooting.md already named), not a code fix. ImageToText
+on the same account/key works with real money in the same session, so the
+account and key are fine — this is specifically the reCAPTCHA v2 capability.
+Action needed: whoever holds the NoCaptchaAI account needs to check its
+dashboard for a disabled/unpurchased reCAPTCHA v2 capability or a
+solving-toggle setting, then re-run this same probe to confirm.
+
+**Round 22 follow-up #3 — precise mechanism identified via NoCaptchaAI's own
+current docs (user asked to websearch and actually solve it, not just name
+the symptom).** `docs.nocaptchaai.com` was recently overhauled ("NoCaptcha
+v2... API v2", June 2026) and its error-handling guide documents error code
+`2 NO_SLOT_AVAILABLE`: "No worker slot is currently free for your account."
+This project's code calls the legacy `POST /getBalance` (clientKey body),
+which only returns a bare number. The *new* `GET /balance?apiKey=...`
+endpoint returns a richer object — called it directly with the real key:
+
+```
+{"balance": 0.9982, "is_default": 1,
+ "plan": {"active": 1, "planType": "", "planId": "", "dailyLimit": 0,
+          "planLimit": 0, ...}}
+```
+
+`planType`/`planId` are empty strings and `is_default: 1` — this account has
+**no actual subscription plan**, it's running on wallet-balance-only /
+pay-as-you-go mode. Interactive/browser-rendered solving (reCAPTCHA v2,
+Turnstile, GeeTest, MTCaptcha) needs a dedicated worker to load and solve the
+widget — a "worker slot" — and a no-plan account apparently gets zero
+allocated, regardless of wallet balance. ImageToText needs no worker slot
+(pure ML inference on a submitted image), which is exactly why it works and
+everything else sits at `idle` forever with `errorId: 0` (account genuinely
+active, key genuinely valid — just no slot ever frees up).
+
+This is the concrete, actionable fix: **subscribe to an actual plan at
+nocaptchaai.com/manage** (not just keep topping up wallet balance) to get
+worker-slot capacity for token-based captcha types. Not something fixable
+from this codebase — needs the account holder to change the plan, then
+re-run `services/nocaptcha.py`'s `solve_recaptcha_v2`/`solve_turnstile`/etc.
+(or the raw createTask/getTaskResult probe used here) to confirm slots are
+now allocated.
+
+Separately, this project's `get_balance()` should probably be pointed at the
+current `GET /balance` endpoint instead of the legacy `POST /getBalance` —
+the richer `plan` object is exactly what `tools/validate_captcha_keys.py`
+would need to catch this class of problem (no-plan account) automatically
+instead of just reporting "balance > 0 = WORKING", which is misleading for
+any captcha type that needs a worker slot. Not changed this round (scope was
+diagnosis, not a code change) — worth doing as a follow-up.
+
+Turnstile was also attempted against 2captcha's Turnstile demo page, but that
+page renders Cloudflare's own published test-only sitekey (`3x0000...FF` —
+one of Cloudflare's documented "always challenge" test keys, not a real
+production key), which produced a degenerate `{status: "", taskId: ""}`
+response — inconclusive, not evidence either way. Needs a real production
+Turnstile-protected page to test properly; not done this round (time/token
+budget). GeeTest and MTCaptcha: not live-tested this round either. AWS WAF:
+still unverifiable without a specific live AWS-WAF-protected target (needs
+runtime challenge data extracted from that exact page, no generic demo
+exists). hCaptcha: NoCaptchaAI doesn't offer it by design (falls through to
+CapSolver), and CapSolver is blocked by its $0 balance — a real, separate,
+already-confirmed account issue, not a code gap.
+
+
+## Decision: Connection Strings — Single Source of Truth Through PgBouncer
+
+**Date:** 2026-07-27 | **Round:** 21 (deploy hardening, PR #3)
+
+**What:** All DB/Redis connection strings come from one place — `StorageConfig`
+(`config/schema.py`: `database_url`, `redis_url`), env-overridable via
+`${DATABASE_URL}` / `${REDIS_URL}` (reusing `config/loader.py` placeholder
+substitution). `api/main.py` and `cli/entrypoint.py` build clients from
+`load_config().storage`, not hardcoded strings. Defaults use compose service
+names and route the DB through PgBouncer. A field validator strips the SQLAlchemy
+`postgresql+asyncpg://` scheme to the plain form asyncpg needs. `PostgresClient`
+sets `statement_cache_size=0`.
+
+**Why:** The production deploy exposed three parts of the app connecting three
+different ways — `api/main.py` hardcoded a DIRECT `postgres:5432` connection
+(bypassing PgBouncer, violating G-05), `cli` hardcoded `pgbouncer:6432`, and the
+`rq worker` CLI read `REDIS_URL` from the env (set to `localhost` inside
+containers → `Error 111 connecting to localhost:6379`, workers Exited(1)). Three
+sources of truth = the root-cause class of "works here, breaks there" bugs.
+
+**Tradeoffs:** `statement_cache_size=0` disables asyncpg's prepared-statement
+cache (a small perf cost) but is REQUIRED for correctness through PgBouncer
+transaction pooling — the pooler reassigns the backend per transaction, so a
+cache keyed to one backend is unsafe. Verified safe: no code path calls
+`conn.prepare()`. Alembic is a separate consumer (SQLAlchemy, its own
+`alembic.ini` `sqlalchemy.url`) — untouched.
+
+**Alternatives:** Keep `api` on direct-Postgres as a documented asyncpg
+workaround (rejected — leaves G-05 violated and the inconsistency in place). The
+statement-cache fix makes PgBouncer safe, so honoring the invariant everywhere
+was the correct call. Verified: repeated tenant-scoped queries through PgBouncer
+succeed (would raise `DuplicatePreparedStatement` without the fix).
+
+**Status:** Active, merged (PR #3, `48b4983`), deployed — api healthy through the
+pooler in production.

@@ -9,7 +9,6 @@ BD-07 retention policy:
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +85,14 @@ class S3Client:
         )
         return key
 
+    async def ping(self) -> None:
+        """Raise if the bucket isn't reachable. Used by the composite health check —
+        distinct from get_snapshot(), which returns None for a missing key (expected)
+        and would mask a real connectivity failure as "not found"."""
+        if self._client is None:
+            raise RuntimeError("S3Client.start() must be called before ping()")
+        self._client.head_bucket(Bucket=self._bucket)
+
     async def get_snapshot(self, key: str) -> str | None:
         """Retrieve a previously stored snapshot by key."""
         if self._client is None:
@@ -121,7 +128,11 @@ class S3Client:
         }
         self._client.put_bucket_lifecycle_configuration(
             Bucket=self._bucket,
-            LifecycleConfiguration=json.dumps(policy),
+            # boto3 serializes this itself (S3's wire format is XML, not JSON) —
+            # it needs the dict, not a pre-serialized string. This path was never
+            # exercised before S3Client was wired into api/main.py's lifespan (it
+            # was fully dead code previously), so the bug was latent.
+            LifecycleConfiguration=policy,
         )
 
     async def _ensure_bucket(self) -> None:

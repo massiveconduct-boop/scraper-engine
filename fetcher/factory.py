@@ -30,8 +30,13 @@ if TYPE_CHECKING:
 
 def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     """Construct the L1 (HTTP/Scrapling) fetcher. Takes no wait-strategy config
-    today, but centralised here so every production call site has one path."""
-    return Level1Fetcher()
+    today, but centralised here so every production call site has one path.
+
+    Threads an optional FirecrawlClient (env-gated on FIRECRAWL_API_KEY, same
+    pattern as captcha_solver) for markdown conversion — None disables it."""
+    from services.firecrawl_client import build_firecrawl_client
+
+    return Level1Fetcher(firecrawl_client=build_firecrawl_client())
 
 
 def build_level2_fetcher(
@@ -53,7 +58,7 @@ def build_level2_fetcher(
         scroll_passes=lvl.scroll_passes,
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
-        captcha_solver=captcha_solver,
+        captcha_solver=captcha_solver if lvl.capsolver_enabled else None,
     )
 
 
@@ -74,5 +79,5 @@ def build_level3_fetcher(
         scroll_passes=lvl.scroll_passes,
         scroll_wait_ms=lvl.scroll_wait_ms,
         challenge_detector=challenge_detector or ChallengeDetector(),
-        captcha_solver=captcha_solver,
+        captcha_solver=captcha_solver if lvl.capsolver_enabled else None,
     )

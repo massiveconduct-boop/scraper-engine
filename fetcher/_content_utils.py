@@ -17,8 +17,53 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from core.exceptions import SSRFBlockedError
+
 if TYPE_CHECKING:
+    from core.ssrf_guard import SSRFGuard
     from fetcher.challenge_detector import ChallengeDetector
+
+
+class SSRFRouteGuard:
+    """Installs a Playwright/Camoufox request-interception route that
+    re-validates every request URL — including redirects and sub-resource
+    fetches — against SSRFGuard before letting it proceed.
+
+    A submission-time-only SSRF check (validated once in api/routes.py
+    before enqueue) leaves two real gaps for the browser fetchers: a
+    DNS-rebind between enqueue and the worker actually navigating, and a
+    same-request redirect to a private/metadata address, which Camoufox
+    would otherwise follow inside the browser with no re-check at all.
+    Blocking at the request layer closes both.
+
+    Playwright surfaces an aborted request to the caller as a generic
+    navigation error, not the original SSRFBlockedError — so the guard
+    records the real exception on `.blocked` for the fetcher to re-raise
+    after `page.goto()` fails, giving an accurate failure_category instead
+    of a misleading BROWSER_CRASH.
+    """
+
+    def __init__(self, ssrf_guard: SSRFGuard) -> None:
+        self._ssrf_guard = ssrf_guard
+        self.blocked: SSRFBlockedError | None = None
+
+    async def install(self, page: Any) -> None:
+        await page.route("**/*", self._handle)
+
+    async def _handle(self, route: Any) -> None:
+        try:
+            await self._ssrf_guard.validate(route.request.url)
+        except SSRFBlockedError as exc:
+            self.blocked = exc
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
+
+    def raise_if_blocked(self) -> None:
+        """Call from the fetcher's except-block: re-raises the real SSRF
+        rejection in place of whatever generic error Playwright reported."""
+        if self.blocked is not None:
+            raise self.blocked
 
 # `page` is a Playwright/Camoufox Page — duck-typed as Any here so these shared
 # helpers don't take a hard dependency on the Playwright types (which aren't
