@@ -3,7 +3,7 @@
 **Purpose:** Infrastructure, deployment, CI, monitoring, alerts.
 **Scope:** How to run, deploy, monitor, and debug this system in production.
 **When to read:** Deploying; setting up CI; configuring alerts; production incidents.
-**Related:** `docs/deployment.md`, `.claude/knowledge/architecture.md`
+**Related:** `docs/guides/deployment.md`, `.claude/knowledge/architecture.md`
 
 ---
 

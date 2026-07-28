@@ -7,7 +7,7 @@ name = "scraper-engine"
 version = "0.1.0"
 description = "Search & Scraper Engine — multi-level web scraping with anti-detection"
 requires-python = ">=3.11"
-license = {text = "Proprietary"}
+license = {text = "Apache-2.0"}
 
 [tool.setuptools.packages.find]
 include = ["core*", "proxy*", "browser*", "fetcher*", "services*", "storage*", "orchestrator*", "api*", "cli*", "config*", "observability*", "scrapy_project*", "monitoring*"]
