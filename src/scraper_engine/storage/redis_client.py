@@ -20,7 +20,7 @@ class RedisClient:
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0") -> None:
         self._redis_url = redis_url
-        self._client: aioredis.Redis[str] | None = None
+        self._client: aioredis.Redis | None = None
 
     async def start(self) -> None:
         """Connect to Redis."""
@@ -29,7 +29,7 @@ class RedisClient:
         )
 
     @property
-    def raw(self) -> aioredis.Redis[str]:
+    def raw(self) -> aioredis.Redis:
         """Return the underlying Redis client for system-level (non-tenant) operations.
 
         Circuit breaker, politeness controller, and other system-level components
@@ -42,10 +42,7 @@ class RedisClient:
     async def stop(self) -> None:
         """Close the Redis connection."""
         if self._client:
-            # types-redis' stub doesn't know about aclose() (added in redis-py
-            # 5.0.1, replacing the now-deprecated close()) — real runtime has
-            # it, this is a third-party stub gap, not our code.
-            await self._client.aclose()  # type: ignore[attr-defined]
+            await self._client.aclose()
 
     def _prefix(self, tenant_id: TenantId, key: str) -> str:
         return f"{tenant_id}:{key}"
@@ -108,6 +105,4 @@ class RedisClient:
         """Execute a Lua script (not tenant-scoped — caller provides keys)."""
         if self._client is None:
             raise RuntimeError("RedisClient.start() must be called before eval()")
-        # types-redis' stub leaves eval() untyped — real redis-py has it, this
-        # is a third-party stub gap, not our code.
-        return await self._client.eval(script, num_keys, *args)  # type: ignore[no-untyped-call]
+        return await self._client.eval(script, num_keys, *args)
