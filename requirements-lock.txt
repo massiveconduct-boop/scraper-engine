@@ -120,7 +120,7 @@ editor==1.8.0
     # via inquirer
 et-xmlfile==2.0.0
     # via openpyxl
-fastapi==0.139.2
+fastapi==0.140.13
     # via scraper-engine (pyproject.toml)
 filelock==3.32.0
     # via tldextract

@@ -149,7 +149,7 @@ execnet==2.1.2
     # via pytest-xdist
 fakeredis==2.36.2
     # via scraper-engine (pyproject.toml)
-fastapi==0.139.2
+fastapi==0.140.13
     # via scraper-engine (pyproject.toml)
 filelock==3.32.0
     # via
