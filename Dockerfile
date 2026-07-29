@@ -12,7 +12,7 @@
 # image-size win. See docs/round-13-evidence.md for the honest before/after.
 
 # ── Stage 1: system deps shared by builder and runtime ──────────────────────
-FROM python:3.12-slim AS system-base
+FROM python:3.14-slim AS system-base
 # xvfb is REQUIRED: production config uses camoufox headless_mode=virtual, which
 # launches Firefox inside a virtual X display. Without it, every L2/L3 browser
 # fetch dies at runtime with `camoufox.exceptions.CannotFindXvfb`. (This was a
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # On plain python:3.12-slim (NOT system-base) so that changing apt packages
 # (e.g. adding xvfb) never invalidates this 300MB Firefox fetch. This is the
 # single most expensive, least-frequently-changing layer.
-FROM python:3.12-slim AS camoufox-fetch
+FROM python:3.14-slim AS camoufox-fetch
 # camoufox[geoip] — production config sets camoufox.geoip=true; the plain
 # `camoufox` package raises NotInstalledGeoIPExtra at launch without the extra.
 RUN pip install --no-cache-dir "camoufox[geoip]" && \
