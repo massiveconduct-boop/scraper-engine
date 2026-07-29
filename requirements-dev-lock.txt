@@ -520,7 +520,7 @@ runs==1.3.0
     # via editor
 s3transfer==0.19.2
     # via boto3
-scrapling==0.4.11
+scrapling==0.4.12
     # via scraper-engine (pyproject.toml)
 scrapy==2.17.0
     # via scraper-engine (pyproject.toml)

@@ -14,7 +14,7 @@ dependencies = [
     "pydantic==2.13.4",
     "pydantic-core==2.46.4",
     "httpx==0.28.1",
-    "scrapling==0.4.11",
+    "scrapling==0.4.12",
     # scrapling.fetchers.AsyncFetcher/Fetcher (fetcher/scrapling_wrapper.py)
     # import curl_cffi directly at module scope — without it,
     # scrapling.fetchers is entirely unimportable (round 28: found while
