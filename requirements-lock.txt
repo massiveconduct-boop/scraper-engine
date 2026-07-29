@@ -57,7 +57,7 @@ botasaurus-requests==4.0.38
     # via
     #   scraper-engine (pyproject.toml)
     #   botasaurus
-boto3==1.43.52
+boto3==1.43.58
     # via scraper-engine (pyproject.toml)
 botocore==1.43.58
     # via
