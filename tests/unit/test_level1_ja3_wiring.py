@@ -21,9 +21,14 @@ class _FakeResponse:
 
 class _FakeAsyncClient:
     def __init__(self, *a, **kw): ...
-    async def __aenter__(self): return self
-    async def __aexit__(self, *a): return False
-    async def get(self, url): return _FakeResponse()
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        return _FakeResponse()
 
 
 def _fake_ja3_client(session: AsyncMock) -> AsyncMock:
@@ -40,6 +45,7 @@ async def test_uses_ja3_result_when_it_succeeds(monkeypatch):
     fetcher = Level1Fetcher(ja3_client=ja3)
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
     result = await fetcher.fetch("http://example.com", TenantId("system"))
@@ -78,6 +84,7 @@ async def test_falls_back_to_httpx_when_ja3_raises(monkeypatch):
     fetcher = Level1Fetcher(ja3_client=ja3)
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
     result = await fetcher.fetch("http://example.com", TenantId("system"))
@@ -91,6 +98,7 @@ async def test_no_ja3_client_skips_straight_to_httpx(monkeypatch):
     fetcher = Level1Fetcher(ja3_client=None)
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
     result = await fetcher.fetch("http://example.com", TenantId("system"))

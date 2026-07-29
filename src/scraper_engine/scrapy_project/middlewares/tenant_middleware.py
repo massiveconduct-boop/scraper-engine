@@ -35,8 +35,6 @@ class TenantMiddleware:
         if tenant_id:
             request.meta["tenant_id"] = str(tenant_id)
 
-    def process_response(
-        self, request: Request, response: Response, spider: Spider
-    ) -> Response:
+    def process_response(self, request: Request, response: Response, spider: Spider) -> Response:
         """Ensure tenant context flows through responses."""
         return response

@@ -41,9 +41,7 @@ class TestSSRFGuard:
     @pytest.mark.asyncio
     async def test_validate_rejects_private(self) -> None:
         guard = SSRFGuard()
-        with patch.object(
-            SSRFGuard, "_resolve_hosts", new_callable=AsyncMock
-        ) as mock_resolve:
+        with patch.object(SSRFGuard, "_resolve_hosts", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = ["127.0.0.1"]
             with pytest.raises(SSRFBlockedError):
                 await guard.validate("http://127.0.0.1:8080/admin")
@@ -51,9 +49,7 @@ class TestSSRFGuard:
     @pytest.mark.asyncio
     async def test_validate_rejects_internal(self) -> None:
         guard = SSRFGuard()
-        with patch.object(
-            SSRFGuard, "_resolve_hosts", new_callable=AsyncMock
-        ) as mock_resolve:
+        with patch.object(SSRFGuard, "_resolve_hosts", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = ["10.0.0.1"]
             with pytest.raises(SSRFBlockedError):
                 await guard.validate("http://10.0.0.1/api")
@@ -64,9 +60,7 @@ class TestSSRFGuard:
         second must still be blocked — checking only the first record would
         let this slip through (the bug this test guards against)."""
         guard = SSRFGuard()
-        with patch.object(
-            SSRFGuard, "_resolve_hosts", new_callable=AsyncMock
-        ) as mock_resolve:
+        with patch.object(SSRFGuard, "_resolve_hosts", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = ["93.184.216.34", "169.254.169.254"]
             with pytest.raises(SSRFBlockedError):
                 await guard.validate("http://multi-record.example.com/")
@@ -74,9 +68,7 @@ class TestSSRFGuard:
     @pytest.mark.asyncio
     async def test_validate_allows_public(self) -> None:
         guard = SSRFGuard()
-        with patch.object(
-            SSRFGuard, "_resolve_hosts", new_callable=AsyncMock
-        ) as mock_resolve:
+        with patch.object(SSRFGuard, "_resolve_hosts", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = ["93.184.216.34"]
             await guard.validate("https://example.com/")
 
@@ -87,9 +79,7 @@ class TestSSRFGuard:
         class MockResponse:
             url = "https://final.example.com/page"
 
-        with patch.object(
-            SSRFGuard, "_resolve_hosts", new_callable=AsyncMock
-        ) as mock_resolve:
+        with patch.object(SSRFGuard, "_resolve_hosts", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = ["93.184.216.34"]
             await guard.validate_redirect_chain(MockResponse())
 
@@ -103,9 +93,20 @@ class TestSSRFGuard:
             assert hosts == ["93.184.216.34"]
 
     @pytest.mark.asyncio
+    async def test_resolve_hosts_raises_when_no_addresses_returned(self):
+        """getaddrinfo succeeding with an empty result set (edge case some
+        resolvers can produce) must be treated as unresolvable, not as a
+        pass-through with an empty host list."""
+        guard = SSRFGuard()
+        with patch("socket.getaddrinfo") as mock_getaddrinfo:
+            mock_getaddrinfo.return_value = []
+            with pytest.raises(SSRFBlockedError) as exc_info:
+                await guard._resolve_hosts("https://unresolvable.example.com/")
+            assert exc_info.value.network == "<unresolvable>"
+
+    @pytest.mark.asyncio
     async def test_resolve_hosts_no_hostname(self):
         """Test _resolve_hosts raises ValueError for malformed URL."""
         guard = SSRFGuard()
         with pytest.raises(ValueError):
             await guard._resolve_hosts("not-a-valid-url://")
-

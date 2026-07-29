@@ -1,6 +1,7 @@
 # tests/unit/test_promotion.py
 """ProxyPromotionJob unit tests — attempt tracking, bounded concurrency, cooldown."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,6 +19,7 @@ def _make_pg_mock(*, fetch_rows=None):
     class _FakeAcquireCtx:
         async def __aenter__(self):
             return conn
+
         async def __aexit__(self, *args):
             pass
 
@@ -50,9 +52,17 @@ class TestProxyPromotionJob:
         """Valid HTTP response → score promoted to 60."""
         from scraper_engine.core.models import AnonymityLevel
 
-        pg = _make_pg_mock(fetch_rows=[
-            {"id": 1, "ip": "10.0.0.1", "port": 3128, "protocol": "HTTP", "promotion_attempts": 0},
-        ])
+        pg = _make_pg_mock(
+            fetch_rows=[
+                {
+                    "id": 1,
+                    "ip": "10.0.0.1",
+                    "port": 3128,
+                    "protocol": "HTTP",
+                    "promotion_attempts": 0,
+                },
+            ]
+        )
         validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
@@ -66,9 +76,17 @@ class TestProxyPromotionJob:
         """Failed validation → attempt counter incremented, not promoted."""
         from scraper_engine.core.models import AnonymityLevel
 
-        pg = _make_pg_mock(fetch_rows=[
-            {"id": 2, "ip": "10.0.0.2", "port": 8080, "protocol": "HTTP", "promotion_attempts": 2},
-        ])
+        pg = _make_pg_mock(
+            fetch_rows=[
+                {
+                    "id": 2,
+                    "ip": "10.0.0.2",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "promotion_attempts": 2,
+                },
+            ]
+        )
         validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
@@ -82,9 +100,17 @@ class TestProxyPromotionJob:
         """Proxy with 4 attempts, 5th fails → exhausted."""
         from scraper_engine.core.models import AnonymityLevel
 
-        pg = _make_pg_mock(fetch_rows=[
-            {"id": 3, "ip": "10.0.0.3", "port": 3128, "protocol": "HTTP", "promotion_attempts": 4},
-        ])
+        pg = _make_pg_mock(
+            fetch_rows=[
+                {
+                    "id": 3,
+                    "ip": "10.0.0.3",
+                    "port": 3128,
+                    "protocol": "HTTP",
+                    "promotion_attempts": 4,
+                },
+            ]
+        )
         validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
@@ -99,14 +125,25 @@ class TestProxyPromotionJob:
         from scraper_engine.core.models import AnonymityLevel
 
         conn = AsyncMock()
-        conn.fetch = AsyncMock(return_value=[
-            {"id": 4, "ip": "10.0.0.4", "port": 3128, "protocol": "HTTP", "promotion_attempts": 0},
-        ])
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": 4,
+                    "ip": "10.0.0.4",
+                    "port": 3128,
+                    "protocol": "HTTP",
+                    "promotion_attempts": 0,
+                },
+            ]
+        )
         conn.execute = AsyncMock()
 
         class _FakeCtx:
-            async def __aenter__(self): return conn
-            async def __aexit__(self, *a): pass
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                pass
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
@@ -128,11 +165,39 @@ class TestProxyPromotionJob:
     async def test_semaphore_bounds_concurrency(self, tenant):
         """Verify semaphore is created with PROMOTION_CONCURRENCY=5."""
         from scraper_engine.core.models import AnonymityLevel
+
         validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
         job = ProxyPromotionJob(pg=_make_pg_mock(), http_validate_fn=validate, system_tenant=tenant)
 
         # Semaphore should exist and have value of 5 (plan §4.2: PROMOTION_CONCURRENCY=5)
         assert job._sem is not None
-        assert job._sem._value == 5, (
-            f"Expected PROMOTION_CONCURRENCY=5, got {job._sem._value}"
-        )
+        assert job._sem._value == 5, f"Expected PROMOTION_CONCURRENCY=5, got {job._sem._value}"
+
+    @pytest.mark.asyncio
+    async def test_run_forever_runs_cycle_then_loops(self, tenant, monkeypatch):
+        pg = _make_pg_mock(fetch_rows=[])
+        validate = AsyncMock()
+        job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
+
+        async def fake_sleep(_):  # break the infinite loop after one cycle
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("scraper_engine.proxy.promotion.asyncio.sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await job.run_forever(interval_seconds=1)
+
+    @pytest.mark.asyncio
+    async def test_run_forever_swallows_run_once_error_and_keeps_looping(self, tenant, monkeypatch):
+        """A single failed cycle must not take the promotion loop offline —
+        per the module docstring's self-DOS-avoidance contract."""
+        pg = _make_pg_mock(fetch_rows=[])
+        validate = AsyncMock()
+        job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
+        monkeypatch.setattr(job, "run_once", AsyncMock(side_effect=RuntimeError("boom")))
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("scraper_engine.proxy.promotion.asyncio.sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await job.run_forever(interval_seconds=1)

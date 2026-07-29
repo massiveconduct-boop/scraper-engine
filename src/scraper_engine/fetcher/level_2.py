@@ -76,9 +76,7 @@ class Level2Fetcher:
                 and by fetcher/factory.py never setting it.
         """
         if force_engine is not None and force_engine not in ("raw_playwright",):
-            raise ValueError(
-                f"force_engine must be None or 'raw_playwright', got {force_engine!r}"
-            )
+            raise ValueError(f"force_engine must be None or 'raw_playwright', got {force_engine!r}")
         self._force_engine = force_engine
         self._goto_wait_until = goto_wait_until
         self._networkidle_timeout_ms = networkidle_timeout_ms
@@ -190,9 +188,7 @@ class Level2Fetcher:
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
-                    await page.goto(
-                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
-                    )
+                    await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
@@ -245,9 +241,7 @@ class Level2Fetcher:
                 success=False,
                 level_used=2,
                 duration_ms=int((time.monotonic() - start) * 1000),
-                failure_category=classify_fetch_exception(
-                    exc, FailureCategory.BROWSER_CRASH
-                ),
+                failure_category=classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH),
                 error_message=str(exc),
                 proxy_used=proxy.key() if proxy else "none",
             )
@@ -336,9 +330,7 @@ class Level2Fetcher:
                 success=False,
                 level_used=2,
                 duration_ms=int((time.monotonic() - start) * 1000),
-                failure_category=classify_fetch_exception(
-                    exc, FailureCategory.BROWSER_CRASH
-                ),
+                failure_category=classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH),
                 error_message=str(exc),
                 proxy_used="none",
             )

@@ -81,13 +81,17 @@ class ScoringEngine:
         score.recency_penalty = recency_penalty
 
         # Composite: weighted average with bonuses
-        score.total = max(0.0, min(100.0,
-            score.latency_score * 0.25 +
-            score.success_rate * 0.45 +
-            score.anonymity_bonus * 0.15 +
-            asn_bonus * 0.10 +
-            (100.0 - recency_penalty) * 0.05
-        ))
+        score.total = max(
+            0.0,
+            min(
+                100.0,
+                score.latency_score * 0.25
+                + score.success_rate * 0.45
+                + score.anonymity_bonus * 0.15
+                + asn_bonus * 0.10
+                + (100.0 - recency_penalty) * 0.05,
+            ),
+        )
 
         score.breakdown = {
             "latency": score.latency_score,

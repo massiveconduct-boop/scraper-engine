@@ -19,6 +19,7 @@ established below for proxy_pool_validated_count). http_requests_total is
 the one exception — HTTP requests and /metrics scrapes both happen in the
 same long-lived API process, so it can be a normal in-process Counter.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -211,9 +212,5 @@ async def refresh_redis_backed_counters(redis: RedisClient) -> None:
     for status in _JOB_STATUSES:
         count_raw = await redis.raw.get(f"metrics:job_duration:{status}:count")
         sum_raw = await redis.raw.get(f"metrics:job_duration:{status}:sum")
-        job_duration_seconds_count.labels(status=status).set(
-            float(count_raw) if count_raw else 0.0
-        )
-        job_duration_seconds_sum.labels(status=status).set(
-            float(sum_raw) if sum_raw else 0.0
-        )
+        job_duration_seconds_count.labels(status=status).set(float(count_raw) if count_raw else 0.0)
+        job_duration_seconds_sum.labels(status=status).set(float(sum_raw) if sum_raw else 0.0)

@@ -44,7 +44,10 @@ class CaptchaProvider(Protocol):
     ) -> str | None: ...
 
     async def solve_geetest(
-        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        self,
+        tenant_id: TenantId,
+        captcha_id: str,
+        page_url: str,
         challenge: str | None = ...,
     ) -> str | None: ...
 
@@ -54,9 +57,7 @@ class CaptchaProvider(Protocol):
 class CaptchaSolver:
     """Primary-with-fallback CAPTCHA solver covering the common real-world types."""
 
-    def __init__(
-        self, primary: CaptchaProvider, fallback: CaptchaProvider | None = None
-    ) -> None:
+    def __init__(self, primary: CaptchaProvider, fallback: CaptchaProvider | None = None) -> None:
         self._primary = primary
         self._fallback = fallback
 
@@ -64,16 +65,12 @@ class CaptchaSolver:
         self, method: str, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
         """Try primary.<method>(tenant, site_key, page_url), then fallback."""
-        token: str | None = await getattr(self._primary, method)(
-            tenant_id, site_key, page_url
-        )
+        token: str | None = await getattr(self._primary, method)(tenant_id, site_key, page_url)
         if token is not None:
             return token
         if self._fallback is not None:
             logger.info("captcha_primary_miss %s — trying fallback", method)
-            fb: str | None = await getattr(self._fallback, method)(
-                tenant_id, site_key, page_url
-            )
+            fb: str | None = await getattr(self._fallback, method)(tenant_id, site_key, page_url)
             return fb
         return None
 
@@ -82,9 +79,7 @@ class CaptchaSolver:
     ) -> str | None:
         return await self._key_url("solve_recaptcha_v2", tenant_id, site_key, page_url)
 
-    async def solve_hcaptcha(
-        self, tenant_id: TenantId, site_key: str, page_url: str
-    ) -> str | None:
+    async def solve_hcaptcha(self, tenant_id: TenantId, site_key: str, page_url: str) -> str | None:
         return await self._key_url("solve_hcaptcha", tenant_id, site_key, page_url)
 
     async def solve_turnstile(
@@ -109,7 +104,10 @@ class CaptchaSolver:
         return None
 
     async def solve_geetest(
-        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        self,
+        tenant_id: TenantId,
+        captcha_id: str,
+        page_url: str,
         challenge: str | None = None,
     ) -> str | None:
         token = await self._primary.solve_geetest(tenant_id, captcha_id, page_url, challenge)
@@ -117,9 +115,7 @@ class CaptchaSolver:
             return token
         if self._fallback is not None:
             logger.info("captcha_primary_miss solve_geetest — trying fallback")
-            return await self._fallback.solve_geetest(
-                tenant_id, captcha_id, page_url, challenge
-            )
+            return await self._fallback.solve_geetest(tenant_id, captcha_id, page_url, challenge)
         return None
 
 
@@ -144,12 +140,8 @@ def build_captcha_solver(budget: CapSolverBudget) -> CaptchaSolver | None:
     try:
         from scraper_engine.observability.metrics import captcha_provider_configured
 
-        captcha_provider_configured.labels(provider="nocaptchaai").set(
-            1 if nocaptcha_key else 0
-        )
-        captcha_provider_configured.labels(provider="capsolver").set(
-            1 if capsolver_key else 0
-        )
+        captcha_provider_configured.labels(provider="nocaptchaai").set(1 if nocaptcha_key else 0)
+        captcha_provider_configured.labels(provider="capsolver").set(1 if capsolver_key else 0)
     except Exception:  # pragma: no cover - metrics must never break startup
         pass
 
@@ -206,7 +198,10 @@ async def validate_captcha_keys() -> dict[str, dict[str, object]]:
         key = os.environ.get(env_var)
         if not key:
             out[name] = {
-                "configured": False, "ok": False, "balance": None, "detail": "no key set",
+                "configured": False,
+                "ok": False,
+                "balance": None,
+                "detail": "no key set",
             }
             continue
         try:
@@ -216,12 +211,16 @@ async def validate_captcha_keys() -> dict[str, dict[str, object]]:
             client = cls(key, null_budget)
             balance = await client.get_balance()
             out[name] = {
-                "configured": True, "ok": True, "balance": float(balance),
+                "configured": True,
+                "ok": True,
+                "balance": float(balance),
                 "detail": f"balance={balance}",
             }
         except Exception as exc:
             out[name] = {
-                "configured": True, "ok": False, "balance": None,
+                "configured": True,
+                "ok": False,
+                "balance": None,
                 "detail": str(exc)[:160],
             }
             continue

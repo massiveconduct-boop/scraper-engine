@@ -28,34 +28,270 @@ Index of all knowledge documents. Read this first to discover what exists before
 
 | Document | Purpose | When to read |
 |---|---|---|
-| `docs/ROUND-6-DEFINITIVE.md` | Consolidated round 6 evidence — all 6 items, 10 bugs fixed | Auditing claims; understanding what was resolved |
-| `docs/round-6-double-issue-fix.md` | `acquire()` double-issue bug — root cause, fix, regression tests | Understanding pool safety; similar concurrency bugs |
-| `docs/round-6-exit-144-closure.md` | Exit 144 investigation — Bash tool timeout, production timeout answer | Understanding signal 144 in CI; timeout debugging |
-| `docs/round-6-broker-diagnostic.md` | Broker subprocess diagnostic — works, exit 0, 3 proxies | Debugging proxybroker2; harvest pipeline issues |
-| `docs/round-6-critical-fixes.md` | ON CONFLICT restore, hot-browser pool, Prometheus gauge | Understanding the three critical fixes from final review round |
-| `docs/round-6-lease-fix.md` | `lease()` async context manager — invariant §1.1.6 restoration | Understanding pool safety contract |
-| `docs/final-production-readiness-report.md` | Comprehensive production readiness (round 5) | Overall project status |
-| `docs/round-7-evidence-report.md` | Session isolation (Postgres), proxy promotion (attempt tracking), alert wiring (Slack) | Round 7 deliverables + evidence |
-| `docs/round-8-deliverables.md` | Debug endpoint deletion, pool.py full trace, cookie persistence, deps pinned, api/routes.py wired, per-tenant quota | Round 8 deliverables |
-| `docs/round-8-closure-evidence.md` | Quota enforcement fix — exception-based, per-tenant limits, three-curl evidence | Quota implementation details |
-| `docs/per-tenant-quota-enforcement.md` | Per-tenant quota curl evidence (system=2, other=5) | Two-tenant isolation verification |
-| `docs/round-9-evidence-report.md` | Camoufox binary confirmed, CI pipeline (4-stage green), L2/L3 page.content() race fix, mypy --strict findings | Round 9 deliverables |
-| `docs/round-10.03-ratchet-proven.md` | mypy ratchet gate proven on real CI (probe file caught, exit 1, reverted) | Ratchet mechanism verification |
-| `docs/round-11-evidence.md` | Force-push recovery, all 6 bugs fixed, 209 collected/203 passed/6 skipped/0 failed, config-driven timeouts | Final round closure |
-| `docs/round-12-final.md` | Force-push root cause (`git reset --hard`), branch protection, `v1.0.0-rc1` tag, ChallengeDetector + `_safe_content` guard | Rounds 12–12.4 consolidated |
-| `docs/round-13-evidence.md` | Config DI factory + CI gate, `force_engine` negative-control seam, monitoring dashboard/alerts (Slack-proven), per-source health gauge, ruff 45→0, mirror ruff baseline, Docker multi-stage + launch-lib chain fix | Round 13 deliverables |
-| `docs/round-14-evidence.md` | L2 flakiness fixed (shared `poll_until_solved` retry loop, deterministic A/B), host-vs-container 202/201 reconciled (pgbouncer test), Python 3.11 never-deployed (stale pin) | Round 14 deliverables |
-| `docs/round-15-evidence.md` | Real-target validation (books/quotes/scrapethissite/webscraper/nowsecure/sannysoft/scrapecups) — Cloudflare passed, no webdriver leak; `HOST_UNREACHABLE` non-retryable DNS category added | Round 15 real-site validation + DNS taxonomy fix |
-| `docs/round-16-evidence.md` | Infinite-scroll/lazy-load `autoscroll` (consecutive-stable stop; live-proven 10→30 quotes) | Scroll handling |
-| `docs/round-17-evidence.md` | Full-stack e2e smoke (auth/SSRF/quota/persist/retrieve); GET /v1/jobs 500 fix (asyncpg UUID→str) | Live API pipeline + UUID bug |
-| `docs/round-19-evidence.md` | CAPTCHA solver — NoCaptchaAI primary/CapSolver fallback; ImageToText solved live; provider-specific task-type corrections (docs stale) | CAPTCHA solving subsystem |
-| `docs/round-20-evidence.md` | CAPTCHA solver wired into L2/L3 fetch path — `fetcher/_captcha.py` (DOM detect→solve→inject→re-poll), worker builds solver once, factory threads it, best-effort/null-safe, 15 tests | CAPTCHA fetch-path integration |
-| `docs/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
-| `docs/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
+| `.archive/closure/ROUND-6-DEFINITIVE.md` | Consolidated round 6 evidence — all 6 items, 10 bugs fixed | Auditing claims; understanding what was resolved |
+| `.archive/other/round-6-double-issue-fix.md` | `acquire()` double-issue bug — root cause, fix, regression tests | Understanding pool safety; similar concurrency bugs |
+| `.archive/closure/round-6-exit-144-closure.md` | Exit 144 investigation — Bash tool timeout, production timeout answer | Understanding signal 144 in CI; timeout debugging |
+| `.archive/evidence/round-6-broker-diagnostic.md` | Broker subprocess diagnostic — works, exit 0, 3 proxies | Debugging proxybroker2; harvest pipeline issues |
+| `.archive/other/round-6-critical-fixes.md` | ON CONFLICT restore, hot-browser pool, Prometheus gauge | Understanding the three critical fixes from final review round |
+| `.archive/other/round-6-lease-fix.md` | `lease()` async context manager — invariant §1.1.6 restoration | Understanding pool safety contract |
+| `.archive/closure/final-production-readiness-report.md` | Comprehensive production readiness (round 5) | Overall project status |
+| `.archive/evidence/round-7-evidence-report.md` | Session isolation (Postgres), proxy promotion (attempt tracking), alert wiring (Slack) | Round 7 deliverables + evidence |
+| `.archive/closure/round-8-deliverables.md` | Debug endpoint deletion, pool.py full trace, cookie persistence, deps pinned, api/routes.py wired, per-tenant quota | Round 8 deliverables |
+| `.archive/closure/round-8-closure-evidence.md` | Quota enforcement fix — exception-based, per-tenant limits, three-curl evidence | Quota implementation details |
+| `.archive/other/per-tenant-quota-enforcement.md` | Per-tenant quota curl evidence (system=2, other=5) | Two-tenant isolation verification |
+| `.archive/evidence/round-9-evidence-report.md` | Camoufox binary confirmed, CI pipeline (4-stage green), L2/L3 page.content() race fix, mypy --strict findings | Round 9 deliverables |
+| `.archive/evidence/round-10.03-ratchet-proven.md` | mypy ratchet gate proven on real CI (probe file caught, exit 1, reverted) | Ratchet mechanism verification |
+| `.archive/evidence/round-11-evidence.md` | Force-push recovery, all 6 bugs fixed, 209 collected/203 passed/6 skipped/0 failed, config-driven timeouts | Final round closure |
+| `.archive/closure/round-12-final.md` | Force-push root cause (`git reset --hard`), branch protection, `v1.0.0-rc1` tag, ChallengeDetector + `_safe_content` guard | Rounds 12–12.4 consolidated |
+| `.archive/evidence/round-13-evidence.md` | Config DI factory + CI gate, `force_engine` negative-control seam, monitoring dashboard/alerts (Slack-proven), per-source health gauge, ruff 45→0, mirror ruff baseline, Docker multi-stage + launch-lib chain fix | Round 13 deliverables |
+| `.archive/evidence/round-14-evidence.md` | L2 flakiness fixed (shared `poll_until_solved` retry loop, deterministic A/B), host-vs-container 202/201 reconciled (pgbouncer test), Python 3.11 never-deployed (stale pin) | Round 14 deliverables |
+| `.archive/evidence/round-15-evidence.md` | Real-target validation (books/quotes/scrapethissite/webscraper/nowsecure/sannysoft/scrapecups) — Cloudflare passed, no webdriver leak; `HOST_UNREACHABLE` non-retryable DNS category added | Round 15 real-site validation + DNS taxonomy fix |
+| `.archive/evidence/round-16-evidence.md` | Infinite-scroll/lazy-load `autoscroll` (consecutive-stable stop; live-proven 10→30 quotes) | Scroll handling |
+| `.archive/evidence/round-17-evidence.md` | Full-stack e2e smoke (auth/SSRF/quota/persist/retrieve); GET /v1/jobs 500 fix (asyncpg UUID→str) | Live API pipeline + UUID bug |
+| `.archive/evidence/round-19-evidence.md` | CAPTCHA solver — NoCaptchaAI primary/CapSolver fallback; ImageToText solved live; provider-specific task-type corrections (docs stale) | CAPTCHA solving subsystem |
+| `.archive/evidence/round-20-evidence.md` | CAPTCHA solver wired into L2/L3 fetch path — `fetcher/_captcha.py` (DOM detect→solve→inject→re-poll), worker builds solver once, factory threads it, best-effort/null-safe, 15 tests | CAPTCHA fetch-path integration |
+| `.archive/closure/comprehensive-phase-report.md` | Challenge mirror + chaos tests (9/9 pass), CI pipeline setup | Infrastructure phase |
+| `.archive/evidence/ci-pipeline-evidence.md` | CI pipeline run URL + job statuses | CI verification |
 | `.github/workflows/test.yml` | Live CI — 5 jobs: lint (mypy-strict + fetcher-factory + force_engine grep-gates + challenge-mirror ruff baseline), unit, integration, chaos (real PgBouncer via `docker compose`, not GH `services:` — round 23), build-and-push (GHCR, `push` to `main` only — round 22) | CI configuration reference |
 | `tools/mypy-baseline.txt` | EMPTY since round 18 — mypy `--strict` clean; CI fails on any error | mypy strict gate |
 
-## Technical Debt / Open Threads (as of round 26)
+## Technical Debt / Open Threads (as of round 28)
+
+- **RESOLVED (round 28 follow-up) — scrapling_wrapper.py and
+  adaptive_selector.py wired into production for real, live-verified.**
+  User-requested follow-up to the coverage round below: both modules were
+  fully tested but had zero production callers. `fetcher/factory.py` was
+  already silently ignoring `base.yaml`'s `levels.level_1.engine:
+  scrapling` (L1's own declared "HTTP/Scrapling" identity) — same
+  "config exists, nothing reads it" bug class as the rest of this round.
+  Wired: `ScraplingWrapper.fetch()` now returns a `ScraplingResponse`
+  (status/text/location) instead of a bare string, so
+  `Level1Fetcher._fetch_via_scrapling` can drive its own manual
+  redirect loop with per-hop SSRF revalidation (spec §1.1 #4), mirroring
+  the existing JA3-client path exactly — no invariant weakened.
+  `AdaptiveSelector` wired once, centrally, into `Worker.process_job`
+  right after any level's fetch succeeds, populating
+  `FetchResult.extracted` (declared on the model and already persisted by
+  `orchestrator/tasks.py`, but never populated) using
+  `ConfigOverrides.extraction_schema` (also declared, also never read)
+  when the caller provides one.
+
+  Real bug found live-testing (not just unit-testing) this: `scrapling==
+  0.4.11` alone doesn't install `curl_cffi`, so `scrapling.fetchers.
+  AsyncFetcher` — the only thing the wrapper uses — was entirely
+  unimportable. `scrapling[fetchers]` would fix that but pins
+  `playwright==1.61.0` exactly, conflicting with `camoufox==0.5.4`'s
+  `playwright<1.61` (real, unresolvable version conflict). Fixed by
+  declaring `curl_cffi>=0.15.0` directly instead of the extra — same
+  "declare exactly what's imported" pattern as every other direct-import
+  dependency in this project.
+
+  Live-verified for real against real network traffic (`tests/live/
+  test_scrapling_engine_wiring.py`, 6/6 passing, `httpbin.org`/
+  `example.com`, not mocks): factory constructs the real client by
+  default, plain GET works, a real 2-hop redirect chain is followed
+  correctly, a real 404 doesn't crash anything, and AdaptiveSelector
+  correctly extracts title+content from real HTML — the live run itself
+  caught a test-assertion bug (assumed every page has a `<title>`;
+  `httpbin.org/html` genuinely doesn't, extractor correctly omits the
+  key) before it became a false-confidence pass.
+
+  Also ran the full existing `tests/live/test_escalation_ladder.py`
+  against the local `challenge-mirror` — initially misdiagnosed the
+  result. `127.0.0.1`/docker-bridge addresses are genuinely SSRF-denied,
+  but wrongly concluded from that that a *separate* external VPS was
+  needed (echoing the file's own "requires... a real VPS" framing) — user
+  corrected this: this host's own **Tailscale interface**
+  (`100.64.0.0/10`, CGNAT space) is *not* in `SSRFGuard.DENIED_NETWORKS`
+  at all, and is a real, directly-bound interface (unlike the box's NAT'd
+  egress-only public IP, which times out on self-connect — hairpin NAT,
+  confirmed separately, not an app bug). Re-ran via the Tailscale IP: all
+  three levels genuinely work — L1 correctly rejected, L2 solved in
+  ~5.1s, L3 in ~13.8s, matching this file's own recorded historical
+  timings almost exactly. Fixed `test_escalation_ladder.py` for real:
+  added a `_skip_if_ssrf_blocked` helper (skip with a clear reason
+  instead of a confusing bare assertion failure when pointed at a denied
+  address) and corrected the module docstring to name the Tailscale-IP
+  path explicitly, instead of implying external infra is required.
+
+  623 tests (was 611), still 100% CI-gated coverage, ruff/mypy/pre-commit
+  clean. `browser/` package's real (non-gated, per its documented CI
+  exclusion) coverage checked out of user-requested caution: 84%,
+  `browser/pool.py` the largest gap at 70%, entirely in real-Firefox-only
+  code paths — informational only, not added to CI per explicit
+  instruction.
+
+- **RESOLVED (round 28) — all 8 senior-dev review findings from round 27,
+  #1 (coverage) done first and alone per user priority.**
+  1. **Coverage gate wired for real, brought to 100%.** `.github/
+     workflows/test.yml`'s `chaos` job (last job, full docker-compose infra
+     up) now runs the combined `tests/unit/ tests/integration/ tests/chaos/`
+     suite with `--cov=src/scraper_engine --cov-fail-under=100`; the other
+     two jobs run without `--cov` (redundant, since chaos re-runs
+     everything). `pyproject.toml`'s `[tool.coverage.report] fail_under`
+     90→100, `include` expanded to match `[tool.coverage.run] source`'s 8
+     packages (was silently only gating 3). Went from 72% real (measured at
+     round-27-end, worse than the previously-recorded 82% once `include`
+     covered all 8 declared packages, not 3) to **100%**, ~370 missing
+     lines closed across ~20 files — done directly (no subagents, per
+     explicit user correction after 8 of 9 background coverage agents died
+     mid-task from an unrelated API session limit; their one surviving
+     success, `storage/`, was kept). Two real bugs found and fixed writing
+     these tests, not just chased for coverage: `fetcher/
+     scrapling_wrapper.py` called a nonexistent `scrapling.get()` (dead
+     code, zero callers, never previously tested — real API is
+     `scrapling.fetchers.AsyncFetcher.get()` returning `.html_content`,
+     confirmed via Context7 docs, not guessed) and `pyproject.toml`'s
+     `dependencies = [...]` list was textually misplaced after
+     `[tool.setuptools.package-data]`, so TOML parsed it as nested under
+     that table — `pip install -e .` installed **zero** runtime
+     dependencies, masked because CI/Dockerfile hand-listed everything
+     separately (see #4 below — same root drift this closes). Also found:
+     the `integration` CI job (GH Actions `services:` postgres+redis only)
+     had no `minio`, so the round's new `test_s3_client.py`/
+     `test_api_main.py` would have failed there — GH Actions service
+     containers can't override a container's CMD (minio's image needs
+     `server /data`), so `minio` is brought up via the project's own
+     docker-compose in that job instead, same pattern already used for
+     pgbouncer in `chaos`.
+  2. **Version + release process.** `pyproject.toml` `0.1.0` → `1.0.0`.
+     `CHANGELOG.md` `[Unreleased]` entry added for round 28 plus the
+     previously-undocumented PRs #11-#14; a "Release process" section
+     added to `CONTRIBUTING.md` (rename `[Unreleased]` → `[X.Y.Z] -
+     date`, bump `pyproject.toml`, tag the merge commit — version/tag/
+     changelog move together from now on).
+  3. **CI Python matrix.** `unit`/`integration`/`chaos` jobs now
+     `strategy.matrix.python-version: ["3.11", "3.12"]`; `lint` stays
+     3.12-only (mypy/ruff don't need matrix coverage). No 3.11
+     incompatibilities surfaced.
+  4. **Lockfile + CI/Dockerfile de-duplication.** `requirements-lock.txt`
+     (runtime) / `requirements-dev-lock.txt` (+dev extras) generated via
+     `uv pip compile --no-header` (the `--no-header` flag matters — without
+     it, the autogenerated header echoes the literal `-o <filename>` arg,
+     so a drift-check comparing against a differently-named temp file
+     always spuriously fails). CI's three hand-listed `pip install <40
+     packages>` blocks and `Dockerfile`'s hand-written deps stage replaced
+     with `pip install -r requirements-dev-lock.txt`; a `lint`-job step
+     regenerates both lockfiles into `/tmp` and diffs against committed,
+     failing the build on drift. This closes Known Operational Gaps #12
+     below at the mechanism level, not just the one symptom round 27
+     patched (`types-redis`).
+  5. **Dependency vulnerability scanning.** `.github/dependabot.yml`
+     (`pip`/`github-actions`/`docker`, weekly). `pip-audit -r
+     requirements-lock.txt` step added to the `lint` job (blocking).
+  6. **`py.typed`.** Added at `src/scraper_engine/py.typed`, wired into
+     `[tool.setuptools.package-data]`.
+  7. **Governance files.** `SECURITY.md`, `CODEOWNERS`,
+     `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.md`,
+     `.github/PULL_REQUEST_TEMPLATE.md` — standard, not padded.
+  8. **Pre-commit hooks.** `.pre-commit-config.yaml` (ruff check+format,
+     local `mypy --strict` scoped identically to CI). First real run
+     reformatted 87 files (repo had never had `ruff format` enforced before
+     — pure formatting, verified via a full test+coverage re-run
+     afterward, still 100%/611 passed). `pre-commit install` documented as
+     one-time setup in `CONTRIBUTING.md`.
+
+  Full verification: `pytest tests/unit tests/integration tests/chaos
+  --cov=src/scraper_engine --cov-fail-under=100` → 611 passed, 1 skipped,
+  100% (0 lines missing, every included package). `ruff check .` clean.
+  `mypy --strict` clean on all 8 scoped packages. Both lockfiles verified
+  drift-free against `pyproject.toml`. `pre-commit run --all-files` clean.
+
+- **RESOLVED (round 27) — repo professionalization + src/ layout
+  consolidation (PRs #9-#14).** Multi-part session, in order:
+  1. **`alembic.ini` cwd-dependency (PR #9).** `script_location = migrations`
+     resolved relative to process cwd, not the ini file's own location —
+     the documented production command (`docker compose exec api alembic
+     upgrade head`) silently failed inside the `api` container (worked
+     only when run from repo root, which CI happened to always do,
+     masking it). Fixed via Alembic's own `%(here)s` token
+     (`script_location = %(here)s/migrations`) — Alembic's sanctioned
+     mechanism for exactly this, added in 1.11 (1.18.5 is installed).
+     Live-verified by running `alembic -c <abs path> current` from `/tmp`.
+  2. **Docs/root reorg (PRs #10/#11).** First pass (PR #10) moved ~60
+     historical per-round evidence/directive/closure reports into a
+     tracked `docs/archive/` — user rejected this as still "not what a
+     professional repo looks like." Redone (PR #11) per explicit
+     clarification: categorized by type into
+     `.archive/{evidence,directive,closure,other}/`, **gitignored**
+     (kept on disk, off GitHub) rather than tracked — user's own framing:
+     "I don't see this kind of file in other developers' GitHub repos."
+     Root `README.md` turned out to be byte-identical to
+     `challenge-mirror/README.md` (describing the wrong subproject
+     entirely) — replaced with a real one. Added `LICENSE` (Apache 2.0 —
+     explicit user choice over MIT/Apache-2.0/proprietary, since
+     `pyproject.toml` previously said "Proprietary"), `NOTICE`,
+     `CONTRIBUTING.md`, `CHANGELOG.md` (Keep a Changelog format, entries
+     per real merged PR, matched against the one real git tag rather than
+     inventing version numbers).
+  3. **Test fixture relocation (PR #12).** User pushed back again: even
+     the reorganized layout still had `challenge-mirror/` and
+     `judge_server.py` — real, actively-used test infrastructure, not
+     scratch — sitting at repo root next to real source packages, unlike
+     "other developers' repos" where test-only fake servers live under
+     `tests/`. Moved both to `tests/fixtures/`. Separately, `specs/` (the
+     design spec, not imported by any code), a confirmed exact duplicate
+     directory (`report-review-fix/`, byte-identical to
+     `challenge-mirror/`), and 2 unused manual debug scripts moved to
+     `.local/` — a **separate** gitignored dir from `.archive/`, per the
+     user's explicit correction that non-doc files (specs, scripts)
+     shouldn't share a bucket named after doc categories
+     (evidence/directive/closure).
+  4. **Import path-independence audit (PR #13).** User asked for a
+     refactor to make imports "path-independent regardless of execution
+     location" (root-relative absolute imports, dynamic path resolution,
+     editable package setup, `__init__.py` everywhere). Audited before
+     changing anything: the codebase already did almost all of it — zero
+     deep relative imports (`from ..x`) anywhere, 175 already-absolute
+     cross-package imports as the dominant pattern, `config/loader.py`
+     already `Path(__file__)`-anchored, every package already had
+     `__init__.py`, and the already-documented `pip install -e ".[dev]"`
+     already made imports resolve regardless of cwd (confirmed live via
+     the installed editable-install finder). Only 2 real gaps existed:
+     the alembic.ini one above, and one test's hardcoded subprocess path
+     (`tests/integration/test_promotion.py`, fixed via `Path(__file__)`).
+     Added a permanent test (`test_import_location_invariance.py`) that
+     spawns a subprocess with cwd set to a tempdir, proving imports
+     resolve from anywhere — turns a one-off manual check into a
+     CI-enforced guarantee.
+  5. **src/ layout consolidation (PR #14, the largest change of the
+     round).** The 12 top-level packages sitting loose at repo root
+     (flagged separately as a stylistic gap while reviewing the layout)
+     were moved under one `src/scraper_engine/` package. Sized before
+     touching anything: 167 `.py` files, 455 import statements. Mechanics:
+     `git mv` for history; a scripted regex bulk-rewrote all safe
+     `from X import Y` forms (436 substitutions, 108 files); bare
+     `import X.sub[.as alias]` forms (9 lines) were deliberately hand-fixed
+     instead, because a blind prefix rewrite silently changes which name
+     Python binds for that form (`import a.b` binds `a`; `import a.b as x`
+     binds `b`) — caught one real near-miss this way:
+     `services/_anticaptcha.py` had a function parameter also named
+     `budget`, which would have shadowed the module-level import bound to
+     the same name inside every function using it. A live pytest run then
+     surfaced import forms genuinely invisible to static regex auditing:
+     `mock.patch()`/`monkeypatch.setattr()` calls referencing a module by
+     dotted **string** (both quote styles, including multi-line calls),
+     and — the highest-risk one — rq's own job queue
+     (`api/routes.py`'s `queue.enqueue("orchestrator.tasks.
+     run_scrape_job", ...)`, which would have silently broken every real
+     scrape/crawl job in production had it shipped unfixed), plus Scrapy's
+     own `scrapy.cfg`/`settings.py` module-path strings. `Dockerfile`
+     fixed properly (`pip install --no-deps .` after `COPY .`, registering
+     the package into site-packages so it resolves regardless of cwd,
+     rather than a `PYTHONPATH` patch — same reasoning as the alembic
+     fix). Along the way, CI failed on a real but **unrelated,
+     pre-existing** issue exposed by re-running mypy: `types-redis`
+     (stale, targets a redis-py version 4 majors behind the installed
+     8.0.1) was shadowing real redis-py's own inline `py.typed` types
+     locally; CI (which never installed `types-redis`) saw the correct
+     types all along — confirmed via `git stash` that the conflict
+     predated this round's changes. Fixed by removing the stale
+     dependency, not by chasing the wrong stub. Verified beyond static
+     analysis: full `docker compose build` + boot + migrations via the
+     real documented command + a **real job submitted through the live
+     rebuilt API**, confirmed `PENDING → COMPLETED` with real fetched
+     content, proving the rq job-queue string fix actually works end to
+     end. 341 tests pass (up from 340), ruff/mypy --strict clean.
 
 - **RESOLVED (round 25) — all 5 round-24 gaps closed, plus 3 more of the same
   class found by an independent fresh audit, plus 2 real bugs found while
@@ -354,8 +590,9 @@ Index of all knowledge documents. Read this first to discover what exists before
 
   **Status: all 6 implemented (round 26)** — see the RESOLVED entry above
   for what changed vs. this original plan (item 2 was redesigned, a real
-  `tiny_profile` bug was found and fixed, live verification was blocked by
-  an environment issue and worked around).
+  `tiny_profile` bug was found and fixed, and live verification — after an
+  initial misdiagnosis was caught and corrected — succeeded for real
+  against `challenge-mirror`, not blocked by environment).
 
 - **RESOLVED (round 24) — PR #7 merged (`c4a8f54`): 6 confirmed dead-wiring
   gaps closed, real tracing deployed end-to-end.** Same investigation
@@ -552,7 +789,7 @@ Index of all knowledge documents. Read this first to discover what exists before
      `api/routes.py` at job-submission time, never again when the worker
      actually connected (seconds-to-minutes later, different process). A
      DNS-rebind between those two points bypassed it completely. Docs
-     (`docs/production-readiness-report.md`, `docs/round-12-evidence.md`)
+     (`.archive/closure/production-readiness-report.md`, `.archive/evidence/round-12-evidence.md`)
      claimed `validate_redirect_chain()` was "called after redirects" —
      false; grep confirmed zero production call sites, only tests/docs.
      Fixed: every fetcher now re-validates immediately before connecting.
@@ -611,7 +848,7 @@ Index of all knowledge documents. Read this first to discover what exists before
   All fixes: 291 tests pass (0 fail, up from 290), ruff + mypy --strict
   clean.
 - **Round 22 also closed three spec-documented-but-orphaned features**
-  (verified against `specs/scraper-engine-blueprint-v2.md`, not scope creep):
+  (verified against `.local/specs/scraper-engine-blueprint-v2.md`, local-only, not scope creep):
   real ASN classification (`proxy/asn_classifier.py`, `MaxMindAsnClassifier`
   using the already-installed `maxminddb` dep against `GEOIP_ASN_DB_PATH`,
   auto-selected over the renamed `NullAsnClassifier` — was `FakeClassifier`,
@@ -640,7 +877,7 @@ Index of all knowledge documents. Read this first to discover what exists before
   corrected the stale "CapSolver 401" claim — keys authenticate, CapSolver just $0.
 - **CAPTCHA solver wired into the fetch path (round 20 — RESOLVED).** L2/L3 now
   detect a widget → solve → inject → re-poll via `fetcher/_captcha.py`; worker
-  builds the solver once, factory threads it. See `docs/round-20-evidence.md`.
+  builds the solver once, factory threads it. See `.archive/evidence/round-20-evidence.md`.
   **Live-verified (round 20, `tools/verify_captcha_live.py`)**: real Camoufox +
   Google reCAPTCHA demo — DOM detection PASS (extracted real sitekey), token
   injection PASS (marker read back from `#g-recaptcha-response`). The only
@@ -674,7 +911,7 @@ Index of all knowledge documents. Read this first to discover what exists before
   smoke-tested in-image). Supersedes `scraper-engine:round18`.
 
 ### Operator security follow-ups (not code — surfaced round 20)
-- **Rotate the Slack webhook** once committed to `docs/round-7-evidence-report.md`
+- **Rotate the Slack webhook** once committed to `.archive/evidence/round-7-evidence-report.md`
   and now purged from git history (GitHub push-protection caught it; redacted via
   `filter-branch`). Treat as compromised. Local backup ref of pre-redact history:
   `backup-rounds-12-17-pre-redact`.
@@ -688,7 +925,7 @@ Index of all knowledge documents. Read this first to discover what exists before
 | Document | Purpose | When to read |
 |---|---|---|
 | `docs/reference/api-reference.md` | API endpoint reference (scrape, jobs, health, admin) | Integrating with the API |
-| `docs/auditable-verification-report.md` | Auditable report from round 4 | Historical reference |
+| `.archive/evidence/auditable-verification-report.md` | Auditable report from round 4 | Historical reference |
 
 ## Update Policy
 

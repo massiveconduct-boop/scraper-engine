@@ -44,9 +44,7 @@ class TestRetryMatrix:
 
 class TestBackoffDelay:
     def test_exponential_growth(self) -> None:
-        strategy = RetryStrategy(
-            max_attempts=3, base_delay_seconds=2.0, max_delay_seconds=60.0
-        )
+        strategy = RetryStrategy(max_attempts=3, base_delay_seconds=2.0, max_delay_seconds=60.0)
         # Run 10 times to smooth out jitter randomness
         for _ in range(10):
             if backoff_delay(strategy, 0) < backoff_delay(strategy, 1) < backoff_delay(strategy, 2):
@@ -54,9 +52,7 @@ class TestBackoffDelay:
         pytest.fail("Exponential growth not observed in 10 attempts")
 
     def test_max_capped(self) -> None:
-        strategy = RetryStrategy(
-            max_attempts=10, base_delay_seconds=20.0, max_delay_seconds=30.0
-        )
+        strategy = RetryStrategy(max_attempts=10, base_delay_seconds=20.0, max_delay_seconds=30.0)
         for attempt in range(10):
             delay = backoff_delay(strategy, attempt)
             assert delay <= 30.0 * 1.5  # jitter can add up to 50%
@@ -110,6 +106,28 @@ class TestRetryWithBackoff:
         with pytest.raises(ConnectionError):
             await retry_with_backoff(fn, FailureCategory.NETWORK_TIMEOUT)
         assert call_count == 3  # max_attempts=3 for NETWORK_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_on_retry_callback_invoked_before_each_retry(self) -> None:
+        call_count = 0
+        seen: list[tuple[FailureCategory, int, Exception]] = []
+
+        async def fn():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise ConnectionError("fail")
+            return "ok"
+
+        async def on_retry(category, attempt, exc):
+            seen.append((category, attempt, exc))
+
+        result = await retry_with_backoff(fn, FailureCategory.NETWORK_TIMEOUT, on_retry=on_retry)
+        assert result == "ok"
+        assert len(seen) == 1
+        assert seen[0][0] == FailureCategory.NETWORK_TIMEOUT
+        assert seen[0][1] == 0
+        assert isinstance(seen[0][2], ConnectionError)
 
     @pytest.mark.asyncio
     async def test_no_retry_for_non_retryable(self) -> None:

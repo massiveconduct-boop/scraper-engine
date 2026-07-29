@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.0
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exclude", "tests/fixtures/challenge_mirror"]
+      - id: ruff-format
+        exclude: ^tests/fixtures/challenge_mirror/
+
+  - repo: local
+    hooks:
+      - id: mypy-strict
+        name: mypy --strict (scoped, matches CI)
+        entry: mypy
+        args:
+          - src/scraper_engine/core
+          - src/scraper_engine/proxy
+          - src/scraper_engine/orchestrator
+          - src/scraper_engine/api
+          - src/scraper_engine/storage
+          - src/scraper_engine/fetcher
+          - src/scraper_engine/browser
+          - src/scraper_engine/observability
+          - --ignore-missing-imports
+        language: system
+        pass_filenames: false
+        types: [python]

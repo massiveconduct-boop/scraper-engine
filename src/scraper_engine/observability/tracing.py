@@ -63,6 +63,5 @@ def configure_tracing(
 
     except ImportError:
         import logging
-        logging.getLogger(__name__).warning(
-            "OpenTelemetry not installed — tracing disabled"
-        )
+
+        logging.getLogger(__name__).warning("OpenTelemetry not installed — tracing disabled")

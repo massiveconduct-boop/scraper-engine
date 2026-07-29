@@ -1,7 +1,6 @@
 # tests/unit/test_exceptions.py
 """Exception hierarchy tests — all custom exceptions."""
 
-
 from scraper_engine.core.exceptions import (
     AuthenticationError,
     CapSolverBudgetExceededError,

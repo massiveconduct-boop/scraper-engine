@@ -104,6 +104,7 @@ class CamoufoxWrapper:
         try:
             if self._isolated_ctx is not None:
                 import contextlib
+
                 with contextlib.suppress(Exception):
                     await self._isolated_ctx.close()
                 self._isolated_ctx = None

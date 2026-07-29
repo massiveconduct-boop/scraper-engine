@@ -9,7 +9,6 @@ With a valid API key (CAPSOLVER_API_KEY env var), this test exercises
 the full solve flow against CapSolver's sandbox test keys.
 """
 
-
 import pytest
 
 from scraper_engine.core.budget import CapSolverBudget
@@ -24,6 +23,7 @@ def tenant():
 @pytest.fixture
 def budget():
     from unittest.mock import AsyncMock
+
     redis = AsyncMock()
     redis.eval.return_value = 1  # budget OK
     redis.get.return_value = "0.0"
@@ -35,6 +35,7 @@ class TestCapSolverClient:
 
     def test_client_init(self, budget):
         from scraper_engine.services.capsolver import CapSolverClient
+
         client = CapSolverClient(api_key="test-key", budget=budget)
         assert client._api_key == "test-key"
 
@@ -42,6 +43,7 @@ class TestCapSolverClient:
     async def test_get_balance_without_valid_key(self, budget):
         """G-08: get_balance returns 0.0 on API error (no crash)."""
         from scraper_engine.services.capsolver import CapSolverClient
+
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         balance = await client.get_balance()
         assert isinstance(balance, (int, float))
@@ -51,6 +53,7 @@ class TestCapSolverClient:
     async def test_solve_recaptcha_without_valid_key(self, tenant, budget):
         """G-08: solve returns None on auth error (no crash)."""
         from scraper_engine.services.capsolver import CapSolverClient
+
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         result = await client.solve_recaptcha_v2(
             tenant, site_key="test-site-key", page_url="http://example.com"
@@ -61,8 +64,67 @@ class TestCapSolverClient:
     async def test_solve_hcaptcha_without_valid_key(self, tenant, budget):
         """G-08: solve returns None on auth error (no crash)."""
         from scraper_engine.services.capsolver import CapSolverClient
+
         client = CapSolverClient(api_key="invalid-key", budget=budget)
         result = await client.solve_hcaptcha(
+            tenant, site_key="test-site-key", page_url="http://example.com"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_solve_turnstile_without_valid_key(self, tenant, budget):
+        """G-08: solve returns None on auth error (no crash)."""
+        from scraper_engine.services.capsolver import CapSolverClient
+
+        client = CapSolverClient(api_key="invalid-key", budget=budget)
+        result = await client.solve_turnstile(
+            tenant, site_key="test-site-key", page_url="http://example.com"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_solve_aws_waf_without_valid_key(self, tenant, budget):
+        """G-08: solve returns None on auth error (no crash)."""
+        from scraper_engine.services.capsolver import CapSolverClient
+
+        client = CapSolverClient(api_key="invalid-key", budget=budget)
+        result = await client.solve_aws_waf(
+            tenant, page_url="http://example.com", context="abc", iv="def"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_solve_geetest_without_valid_key_and_no_challenge(self, tenant, budget):
+        """G-08: solve returns None on auth error (no crash); challenge omitted."""
+        from scraper_engine.services.capsolver import CapSolverClient
+
+        client = CapSolverClient(api_key="invalid-key", budget=budget)
+        result = await client.solve_geetest(
+            tenant, captcha_id="test-captcha-id", page_url="http://example.com"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_solve_geetest_without_valid_key_and_with_challenge(self, tenant, budget):
+        """Covers the `if challenge is not None` branch that sets task["challenge"]."""
+        from scraper_engine.services.capsolver import CapSolverClient
+
+        client = CapSolverClient(api_key="invalid-key", budget=budget)
+        result = await client.solve_geetest(
+            tenant,
+            captcha_id="test-captcha-id",
+            page_url="http://example.com",
+            challenge="test-challenge",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_solve_mtcaptcha_without_valid_key(self, tenant, budget):
+        """G-08: solve returns None on auth error (no crash)."""
+        from scraper_engine.services.capsolver import CapSolverClient
+
+        client = CapSolverClient(api_key="invalid-key", budget=budget)
+        result = await client.solve_mtcaptcha(
             tenant, site_key="test-site-key", page_url="http://example.com"
         )
         assert result is None
@@ -78,6 +140,7 @@ class TestCapSolverClient:
         exhausted_budget = CapSolverBudget(redis=redis, daily_ceiling_credits=0.01)
 
         from scraper_engine.services.capsolver import CapSolverClient
+
         client = CapSolverClient(api_key="test-key", budget=exhausted_budget)
         result = await client.solve_recaptcha_v2(
             tenant, site_key="test", page_url="http://example.com"

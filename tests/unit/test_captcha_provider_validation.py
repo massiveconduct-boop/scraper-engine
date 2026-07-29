@@ -60,9 +60,7 @@ async def test_reports_no_active_plan_without_clobbering_balance(monkeypatch):
         get_balance=AsyncMock(return_value=0.9982),
         has_active_plan=AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(
-        nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=no_plan)
-    )
+    monkeypatch.setattr(nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=no_plan))
 
     r = await validate_captcha_keys()
 
@@ -80,8 +78,14 @@ async def test_absent_keys_report_not_configured(monkeypatch):
     r = await validate_captcha_keys()
 
     assert r["nocaptchaai"] == {
-        "configured": False, "ok": False, "balance": None, "detail": "no key set",
+        "configured": False,
+        "ok": False,
+        "balance": None,
+        "detail": "no key set",
     }
     assert r["capsolver"] == {
-        "configured": False, "ok": False, "balance": None, "detail": "no key set",
+        "configured": False,
+        "ok": False,
+        "balance": None,
+        "detail": "no key set",
     }

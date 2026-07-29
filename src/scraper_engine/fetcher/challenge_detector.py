@@ -52,8 +52,7 @@ class ChallengeDetector:
 
     def __init__(self) -> None:
         self._signatures_compiled = [
-            re.compile(re.escape(sig), re.IGNORECASE)
-            for sig in self.CHALLENGE_SIGNATURES
+            re.compile(re.escape(sig), re.IGNORECASE) for sig in self.CHALLENGE_SIGNATURES
         ]
 
     def is_challenge_page(
@@ -134,6 +133,7 @@ class ChallengeDetector:
     def _strip_html(html: str) -> str:
         """Remove HTML tags to get visible text content."""
         import re as _re
+
         text = _re.sub(r"<[^>]+>", "", html)
         text = _re.sub(r"\s+", " ", text)
         return text.strip()

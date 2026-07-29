@@ -45,6 +45,7 @@ class HealthChecker:
 
         try:
             from scraper_engine.core.tenant import TenantId
+
             await self._pg.fetchrow(TenantId("system"), "SELECT 1")
             status.pgbouncer_reachable = True
         except Exception as e:
@@ -53,6 +54,7 @@ class HealthChecker:
 
         try:
             from scraper_engine.core.tenant import TenantId
+
             await self._redis.get(TenantId("system"), "health:ping")
             status.redis_reachable = True
         except Exception as e:
@@ -71,6 +73,7 @@ class HealthChecker:
 
         try:
             from scraper_engine.core.tenant import TenantId
+
             raw = await self._redis.get(TenantId("system"), "metrics:proxy_pool_size")
             status.proxy_pool_size = int(raw) if raw else 0
         except Exception:

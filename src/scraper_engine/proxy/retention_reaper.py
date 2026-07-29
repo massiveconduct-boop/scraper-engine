@@ -49,9 +49,7 @@ class RetentionReaper:
         """
         sessions_deleted = 0
         tenants_failed = 0
-        rows = await self._pg.fetch(
-            _SYSTEM_TENANT, "SELECT tenant_id FROM public.tenants"
-        )
+        rows = await self._pg.fetch(_SYSTEM_TENANT, "SELECT tenant_id FROM public.tenants")
         for row in rows:
             tenant = TenantId(row["tenant_id"])
             try:

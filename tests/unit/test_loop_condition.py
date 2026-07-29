@@ -24,8 +24,8 @@ from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 UNSOLVED_HTML = (
     "<html><head><title>Verifying your browser…</title></head>"
-    "<body><p id=\"status\">Checking your browser before continuing…</p>"
-    "<script>const challengeId=\"abc\";</script></body></html>"
+    '<body><p id="status">Checking your browser before continuing…</p>'
+    '<script>const challengeId="abc";</script></body></html>'
 )
 
 SOLVED_HTML = (
@@ -38,17 +38,13 @@ SOLVED_HTML = (
 def _loop_condition(html: str | None) -> bool:
     """Replicate the exact loop condition from Level3Fetcher.fetch()."""
     cd = ChallengeDetector()
-    return (
-        html is None
-        or cd.is_challenge_page(html, 200, short_page_is_suspect=False)
-    )
+    return html is None or cd.is_challenge_page(html, 200, short_page_is_suspect=False)
 
 
 def test_none_continues_loop() -> None:
     """html=None (failed page.content() read) → keep polling."""
     assert _loop_condition(None) is True, (
-        "FAIL: html=None should continue the loop "
-        "(treat failed read as 'still unsolved')"
+        "FAIL: html=None should continue the loop (treat failed read as 'still unsolved')"
     )
 
 
@@ -61,9 +57,7 @@ def test_unsolved_continues_loop() -> None:
 
 def test_solved_exits_loop() -> None:
     """html=real content → exit loop."""
-    assert _loop_condition(SOLVED_HTML) is False, (
-        "FAIL: solved/marker page should exit the loop"
-    )
+    assert _loop_condition(SOLVED_HTML) is False, "FAIL: solved/marker page should exit the loop"
 
 
 if __name__ == "__main__":

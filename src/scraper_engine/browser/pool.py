@@ -197,9 +197,11 @@ class BrowserPool:
                     await self._session_mgr.save(self._tenant_id, domain, state)
                 except Exception:
                     import logging
+
                     logging.getLogger(__name__).warning(
                         "Failed to persist session state for domain=%s — "
-                        "session will be lost on next pool recycle", domain,
+                        "session will be lost on next pool recycle",
+                        domain,
                         exc_info=True,
                     )
 

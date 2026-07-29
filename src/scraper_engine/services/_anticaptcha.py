@@ -91,9 +91,7 @@ async def solve_anticaptcha(
                         return _token(result_data.get("solution", {}))
 
                     if result_data.get("errorId") not in (0, None):
-                        logger.warning(
-                            "%s_solve_error: %s", provider, result_data.get("errorCode")
-                        )
+                        logger.warning("%s_solve_error: %s", provider, result_data.get("errorCode"))
                         return None
 
                 return None

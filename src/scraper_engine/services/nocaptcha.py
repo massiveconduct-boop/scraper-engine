@@ -50,9 +50,7 @@ class NoCaptchaAIClient:
         self._api_key = api_key
         self._budget = budget
 
-    async def _solve_token(
-        self, tenant_id: TenantId, task: dict[str, object]
-    ) -> str | None:
+    async def _solve_token(self, tenant_id: TenantId, task: dict[str, object]) -> str | None:
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -70,11 +68,14 @@ class NoCaptchaAIClient:
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
         """Solve reCAPTCHA v2. Returns token or None."""
-        return await self._solve_token(tenant_id, {
-            "type": "ReCaptchaV2TaskProxyLess",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "ReCaptchaV2TaskProxyLess",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
     async def solve_turnstile(
         self, tenant_id: TenantId, site_key: str, page_url: str
@@ -83,11 +84,14 @@ class NoCaptchaAIClient:
 
         NoCaptchaAI's accepted type is AntiTurnstileTask (live-verified; the docs'
         TurnstileTaskProxyLess is rejected 'Payload not valid')."""
-        return await self._solve_token(tenant_id, {
-            "type": "AntiTurnstileTask",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "AntiTurnstileTask",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
     async def solve_aws_waf(
         self, tenant_id: TenantId, page_url: str, **aws_fields: str
@@ -95,14 +99,20 @@ class NoCaptchaAIClient:
         """Solve AWS WAF. Requires runtime challenge data extracted from the live
         page (awsKey/awsIv/awsContext/awsChallengeJS) — passed as **aws_fields —
         since AWS WAF has no static site key."""
-        return await self._solve_token(tenant_id, {
-            "type": "AWSWAFTask",
-            "websiteURL": page_url,
-            **aws_fields,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "AWSWAFTask",
+                "websiteURL": page_url,
+                **aws_fields,
+            },
+        )
 
     async def solve_geetest(
-        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        self,
+        tenant_id: TenantId,
+        captcha_id: str,
+        page_url: str,
         challenge: str | None = None,
     ) -> str | None:
         """Solve GeeTest v4. Uses captchaId (live-verified accepted; the v3 gt/
@@ -120,22 +130,21 @@ class NoCaptchaAIClient:
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
         """Solve MTCaptcha. Returns token or None."""
-        return await self._solve_token(tenant_id, {
-            "type": "MTCaptchaTask",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "MTCaptchaTask",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
-    async def solve_hcaptcha(
-        self, tenant_id: TenantId, site_key: str, page_url: str
-    ) -> str | None:
+    async def solve_hcaptcha(self, tenant_id: TenantId, site_key: str, page_url: str) -> str | None:
         """hCaptcha is NOT offered by NoCaptchaAI's API — always returns None so
         the orchestrator falls through to the CapSolver fallback (which supports it)."""
         return None
 
-    async def solve_image_to_text(
-        self, tenant_id: TenantId, image_b64: str
-    ) -> str | None:
+    async def solve_image_to_text(self, tenant_id: TenantId, image_b64: str) -> str | None:
         """Solve an image-to-text (OCR) CAPTCHA. Recognized text or None.
 
         Cheapest task type; solves synchronously. Live-verified round 19.
@@ -165,9 +174,7 @@ class NoCaptchaAIClient:
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                data = (
-                    await client.get(PLAN_URL, params={"apiKey": self._api_key})
-                ).json()
+                data = (await client.get(PLAN_URL, params={"apiKey": self._api_key})).json()
         except Exception:
             return None
         plan = data.get("plan") or {}

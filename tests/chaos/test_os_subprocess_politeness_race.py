@@ -25,6 +25,7 @@ from scraper_engine.core.tenant import TenantId
 @pytest.fixture
 async def redis():
     from redis.asyncio import Redis
+
     r = Redis(host="localhost", port=6379, decode_responses=True)
     yield r
     await r.aclose()
@@ -47,7 +48,7 @@ async def test_os_subprocess_politeness_holds_across_real_processes(redis):
     # Worker script: logs timestamps to stdout for the parent to parse.
     # Work duration is 80-250ms (was 10-50ms) — enough for 3 processes,
     # 10 iterations each, against a 2-slot limit, to produce real overlap.
-    worker_script = '''
+    worker_script = """
 import asyncio, os, random, sys, time
 from redis.asyncio import Redis
 async def worker():
@@ -69,9 +70,9 @@ async def worker():
         await asyncio.sleep(0.02)
     await r.aclose()
 asyncio.run(worker())
-'''
+"""
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(worker_script)
         script_path = f.name
 
@@ -79,7 +80,8 @@ asyncio.run(worker())
         procs = [
             subprocess.Popen(
                 [sys.executable, script_path],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
             )
             for _ in range(3)
@@ -151,11 +153,11 @@ asyncio.run(worker())
             for a, b in overlapping_pairs:
                 print(f"    {a} overlapped with {b}")
 
-        assert max_observed <= 2, (
-            f"G-06 OS SUBPROCESS RACE: {max_observed} concurrent > 2 max"
+        assert max_observed <= 2, f"G-06 OS SUBPROCESS RACE: {max_observed} concurrent > 2 max"
+        print(
+            f"  OS subprocess politeness: max_observed={max_observed}, max_allowed=2, "
+            f"peak_concurrent_holders={peak}, had_overlap={had_overlap}"
         )
-        print(f"  OS subprocess politeness: max_observed={max_observed}, max_allowed=2, "
-              f"peak_concurrent_holders={peak}, had_overlap={had_overlap}")
 
     finally:
         os.unlink(script_path)

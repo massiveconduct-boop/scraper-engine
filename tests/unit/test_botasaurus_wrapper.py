@@ -29,9 +29,7 @@ class TestBotasaurusWrapper:
     @pytest.mark.asyncio
     async def test_fetch_html_acquires_shared_browser_semaphore(self):
         wrapper = BotasaurusWrapper()
-        with patch.object(
-            wrapper, "_botasaurus_fetch", return_value="<html>ok</html>"
-        ) as fetch:
+        with patch.object(wrapper, "_botasaurus_fetch", return_value="<html>ok</html>") as fetch:
             assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"

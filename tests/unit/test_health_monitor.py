@@ -1,6 +1,7 @@
 # tests/unit/test_health_monitor.py
 """HealthMonitor tests — proxy validation with mocked DB + Redis."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -71,3 +72,33 @@ class TestHealthMonitor:
         with patch("httpx.AsyncClient.get", side_effect=OSError("refused")):
             result = await hm.check_one("1.2.3.4", 8080)
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_run_forever_logs_and_loops(self, pg, redis, monkeypatch):
+        hm = HealthMonitor(pg=pg, redis=redis)
+
+        async def fake_sleep(_):  # break the infinite loop after one cycle
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("scraper_engine.proxy.health_monitor.asyncio.sleep", fake_sleep)
+        with (
+            patch.object(hm, "check_one", return_value=True),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await hm.run_forever(interval_seconds=1)
+
+    @pytest.mark.asyncio
+    async def test_run_forever_swallows_cycle_error_and_keeps_looping(self, pg, redis, monkeypatch):
+        """A single failed check_all() cycle must not take run_forever offline —
+        matches the daemon supervisor's own isolate-failures contract."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("scraper_engine.proxy.health_monitor.asyncio.sleep", fake_sleep)
+        with (
+            patch.object(hm, "check_all", side_effect=RuntimeError("transient boom")),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await hm.run_forever(interval_seconds=1)

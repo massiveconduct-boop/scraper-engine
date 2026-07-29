@@ -67,10 +67,13 @@ class TestSolveCaptchaOnPage:
         assert page.evaluate_calls[1][1] == ("tok-123",)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("kind,attr", [
-        ("hcaptcha", "solve_hcaptcha"),
-        ("turnstile", "solve_turnstile"),
-    ])
+    @pytest.mark.parametrize(
+        "kind,attr",
+        [
+            ("hcaptcha", "solve_hcaptcha"),
+            ("turnstile", "solve_turnstile"),
+        ],
+    )
     async def test_kind_routes_to_correct_method(self, kind, attr):
         page = FakePage({"kind": kind, "sitekey": "SK"})
         solver = _solver(**{kind: "tok"})
@@ -115,6 +118,7 @@ class TestSolveCaptchaOnPage:
         class Boom:
             async def evaluate(self, *a):
                 raise RuntimeError("page gone")
+
         solver = _solver(recaptcha_v2="tok")
         out = await solve_captcha_on_page(Boom(), solver=solver, tenant_id=TENANT, url=URL)
         assert out is False

@@ -25,9 +25,7 @@ class HTTPMetricsMiddleware(BaseHTTPMiddleware):
     unbounded-cardinality metric that would grow forever.
     """
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         route = request.scope.get("route")
         route_template = getattr(route, "path_format", None) or request.url.path

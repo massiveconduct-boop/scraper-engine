@@ -85,3 +85,47 @@ async def test_maxmind_classifier_returns_unknown_on_no_record():
         classifier = MaxMindAsnClassifier("/fake/path.mmdb")
     classifier._reader.get.return_value = None
     assert await classifier.classify("6.6.6.6") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_maxmind_classifier_returns_unknown_on_lookup_value_error():
+    """mmdb lookups raise ValueError for malformed IPs — must not crash the caller."""
+    with patch("maxminddb.open_database", return_value=MagicMock()):
+        classifier = MaxMindAsnClassifier("/fake/path.mmdb")
+    classifier._reader.get.side_effect = ValueError("invalid IP address")
+    assert await classifier.classify("not-an-ip") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_maxmind_classifier_returns_unknown_on_lookup_os_error():
+    with patch("maxminddb.open_database", return_value=MagicMock()):
+        classifier = MaxMindAsnClassifier("/fake/path.mmdb")
+    classifier._reader.get.side_effect = OSError("db closed")
+    assert await classifier.classify("7.7.7.7") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_maxmind_classifier_returns_unknown_when_org_field_missing():
+    with patch("maxminddb.open_database", return_value=MagicMock()):
+        classifier = MaxMindAsnClassifier("/fake/path.mmdb")
+    classifier._reader.get.return_value = {"autonomous_system_number": 12345}
+    assert await classifier.classify("8.8.8.8") == "unknown"
+
+
+def test_maxmind_classifier_close_closes_reader():
+    with patch("maxminddb.open_database", return_value=MagicMock()) as mock_open:
+        classifier = MaxMindAsnClassifier("/fake/path.mmdb")
+    classifier.close()
+    mock_open.return_value.close.assert_called_once()
+
+
+def test_build_asn_classifier_falls_back_to_null_on_open_failure(monkeypatch, tmp_path):
+    """A present-but-corrupt .mmdb must not crash the harvester — degrade to null."""
+    db_path = tmp_path / "GeoLite2-ASN.mmdb"
+    db_path.write_bytes(b"corrupt, open_database is mocked to fail")
+    monkeypatch.setenv("GEOIP_ASN_DB_PATH", str(db_path))
+
+    with patch("maxminddb.open_database", side_effect=OSError("corrupt database")):
+        classifier = build_asn_classifier()
+
+    assert isinstance(classifier, NullAsnClassifier)

@@ -8,11 +8,9 @@ from typing import Protocol
 class Clock(Protocol):
     """Injectable time source for testability."""
 
-    def now(self) -> datetime:
-        ...
+    def now(self) -> datetime: ...
 
-    def timestamp_ms(self) -> int:
-        ...
+    def timestamp_ms(self) -> int: ...
 
 
 class SystemClock:

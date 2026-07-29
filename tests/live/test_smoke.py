@@ -19,6 +19,7 @@ class TestPublicEndpoints:
         import asyncio
 
         import httpx
+
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=15) as client:

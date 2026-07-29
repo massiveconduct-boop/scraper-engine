@@ -28,8 +28,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_PROMOTION_ATTEMPTS = 5
-PROMOTION_BATCH_SIZE = 20       # don't re-validate entire tcp-only tier at once
-PROMOTION_CONCURRENCY = 5       # bounded parallel HTTP validations
+PROMOTION_BATCH_SIZE = 20  # don't re-validate entire tcp-only tier at once
+PROMOTION_CONCURRENCY = 5  # bounded parallel HTTP validations
 PROMOTION_COOLDOWN_SECONDS = 900  # 15 minutes between attempts per proxy
 
 ValidateFn = Callable[
@@ -86,7 +86,9 @@ class ProxyPromotionJob:
             nonlocal promoted, failed, exhausted
             async with self._sem:
                 is_valid, anonymity = await self._http_validate(
-                    row["ip"], row["port"], row["protocol"],
+                    row["ip"],
+                    row["port"],
+                    row["protocol"],
                 )
             async with self._pg.acquire(self._tenant) as conn:
                 new_attempts = row["promotion_attempts"] + 1
@@ -119,7 +121,10 @@ class ProxyPromotionJob:
 
         logger.info(
             "promotion cycle: %d candidates, %d promoted, %d failed, %d exhausted",
-            len(candidates), promoted, failed, exhausted,
+            len(candidates),
+            promoted,
+            failed,
+            exhausted,
         )
         return {
             "candidates": len(candidates),

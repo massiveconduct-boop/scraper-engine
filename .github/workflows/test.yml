@@ -16,18 +16,24 @@ jobs:
       # mypy --strict needs the real runtime deps installed to resolve types —
       # without pydantic/fastapi/redis, BaseModel/decorators/returns collapse to
       # Any and mypy emits spurious subclass/untyped-decorator/no-any-return
-      # errors. Mirror the unit job's install list so CI type-checks against the
-      # same real types the local venv does (the remaining stub-only libs are
-      # covered by --ignore-missing-imports in the mypy step).
-      - run: |
-          pip install ruff mypy
-          pip install \
-            fastapi uvicorn pydantic pydantic-core httpx scrapling \
-            asyncpg redis rq camoufox botasaurus botasaurus-requests structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy maxminddb \
-            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
-            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
-            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis
+      # errors. requirements-dev-lock.txt is the single source of pinned
+      # versions (round 28) — every job installs from it instead of
+      # hand-listing packages, closing the 3-way-duplication drift that
+      # caused the round-27 types-redis mismatch (operations.md #12).
+      - run: pip install -r requirements-dev-lock.txt
+      - name: requirements-lock.txt / requirements-dev-lock.txt match pyproject.toml (fail on drift)
+        run: |
+          pip install -q uv
+          # --python-version 3.11 matches requires-python's floor (unit/integration/chaos
+          # run a 3.11+3.12 matrix) — without it, uv resolves against whatever
+          # interpreter compiled the lockfile and can pick a package version that
+          # doesn't support the floor (numpy==2.5.1 requires >=3.12, broke the 3.11 job).
+          uv pip compile pyproject.toml --python-version 3.11 --emit-index-url --no-header -o /tmp/check-lock.txt
+          uv pip compile pyproject.toml --extra dev --python-version 3.11 --emit-index-url --no-header -o /tmp/check-dev-lock.txt
+          diff requirements-lock.txt /tmp/check-lock.txt
+          diff requirements-dev-lock.txt /tmp/check-dev-lock.txt
+      - name: pip-audit (fail on known vulnerabilities)
+        run: pip-audit -r requirements-lock.txt
       # challenge_mirror excluded here — linted separately against its own
       # committed baseline in the next step (same pattern as tools/mypy-baseline.txt).
       - run: ruff check . --exclude 'tests/fixtures/challenge_mirror'
@@ -85,26 +91,25 @@ jobs:
   unit:
     runs-on: ubuntu-24.04
     needs: lint
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ matrix.python-version }}" }
       - name: Install dependencies
         run: |
-          pip install \
-            fastapi uvicorn pydantic pydantic-core httpx scrapling \
-            asyncpg redis rq camoufox botasaurus botasaurus-requests structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy maxminddb \
-            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
-            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
-            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
-            pytest pytest-asyncio pytest-cov
+          pip install -r requirements-dev-lock.txt
           pip install -e . --no-deps
       - run: python -m pytest tests/unit/ -v --tb=short
 
   integration:
     runs-on: ubuntu-24.04
     needs: unit
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     services:
       postgres:
         image: postgres:16-alpine
@@ -133,17 +138,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ matrix.python-version }}" }
+      # postgres/redis run as GH Actions `services:` above; minio has no
+      # equivalent here (tests/integration/test_s3_client.py and
+      # test_api_main.py, round 28, need a real S3-compatible endpoint) —
+      # GH Actions service containers can't override a container's CMD, and
+      # minio's image requires `server /data`, so it's brought up via the
+      # project's own docker-compose instead, same reasoning as the chaos
+      # job's pgbouncer.
+      - name: Start minio
+        run: docker compose up -d minio
+      - name: Wait for minio to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/9000) >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "minio never came up on :9000"
+          docker compose logs minio
+          exit 1
       - name: Install dependencies
         run: |
-          pip install \
-            fastapi uvicorn pydantic pydantic-core httpx scrapling \
-            asyncpg redis rq camoufox botasaurus botasaurus-requests structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
-            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
-            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
-            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
-            pytest pytest-asyncio pytest-cov alembic sqlalchemy
+          pip install -r requirements-dev-lock.txt
           pip install -e . --no-deps
       - run: alembic upgrade head
       - run: python -m pytest tests/integration/ -v --tb=short
@@ -151,6 +167,9 @@ jobs:
   chaos:
     runs-on: ubuntu-24.04
     needs: integration
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     env:
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@localhost:5432/scraper_engine
       REDIS_URL: redis://localhost:6379/0
@@ -158,15 +177,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ matrix.python-version }}" }
       # G-05 needs the *real* PgBouncer (transaction pooling, SCRAM auth off
       # a live pg_authid) — a bare postgres/redis service-container pair can't
       # produce that, so this job brings up the project's own docker-compose
       # infra instead of GH Actions `services:`. pgbouncer's `depends_on:
       # pgbouncer-init: condition: service_completed_successfully` means the
       # SCRAM userlist is already generated by the time this command returns.
-      - name: Start postgres, redis, pgbouncer (real transaction-pooling infra for G-05)
-        run: docker compose up -d postgres redis pgbouncer
+      # minio is included because tests/integration/test_s3_client.py (round
+      # 28) needs a real S3-compatible endpoint at localhost:9000.
+      - name: Start postgres, redis, pgbouncer, minio (real infra for G-05 + S3Client)
+        run: docker compose up -d postgres redis pgbouncer minio
       - name: Wait for pgbouncer to accept connections
         run: |
           for i in $(seq 1 30); do
@@ -178,17 +199,15 @@ jobs:
           exit 1
       - name: Install dependencies
         run: |
-          pip install \
-            fastapi uvicorn pydantic pydantic-core httpx scrapling \
-            asyncpg redis rq camoufox botasaurus botasaurus-requests structlog prometheus-client \
-            pyyaml boto3 python-dotenv scrapy fakeredis maxminddb \
-            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
-            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
-            opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis \
-            pytest pytest-asyncio pytest-cov alembic sqlalchemy
+          pip install -r requirements-dev-lock.txt
           pip install -e . --no-deps
       - run: alembic upgrade head
-      - run: python -m pytest tests/chaos/ -v --tb=short
+      # Real coverage gate (round 28): this job runs last with full infra up
+      # (postgres/redis/pgbouncer), so it's where the combined unit+
+      # integration+chaos suite is actually run with --cov and enforced —
+      # fail_under=100 in pyproject.toml was previously dead config that no
+      # `pytest` invocation in this file ever passed --cov to.
+      - run: python -m pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=short --cov=src/scraper_engine --cov-report=term-missing --cov-report=xml --cov-fail-under=100
 
   # Builds and publishes the image CI has been proving works — only on a real
   # merge to main (never on pull_request, so a fork PR never gets registry

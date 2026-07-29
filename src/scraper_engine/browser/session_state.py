@@ -48,9 +48,7 @@ class SessionStateManager:
                 expires_at,
             )
 
-    async def load(
-        self, tenant_id: TenantId, domain: str
-    ) -> dict[str, object] | None:
+    async def load(self, tenant_id: TenantId, domain: str) -> dict[str, object] | None:
         """Load a previously persisted storage_state, or None if not found/expired."""
         async with self._pg.acquire(tenant_id) as conn:
             row = await conn.fetchrow(
@@ -74,6 +72,4 @@ class SessionStateManager:
         got logged out) — don't keep reloading a poisoned session.
         """
         async with self._pg.acquire(tenant_id) as conn:
-            await conn.execute(
-                "DELETE FROM browser_sessions WHERE domain = $1", domain
-            )
+            await conn.execute("DELETE FROM browser_sessions WHERE domain = $1", domain)

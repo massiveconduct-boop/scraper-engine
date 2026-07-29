@@ -42,9 +42,7 @@ class ProxyMiddleware:
         if "proxy" not in request.meta:
             request.meta["proxy"] = None
 
-    def process_response(
-        self, request: Request, response: Response, spider: Spider
-    ) -> Response:
+    def process_response(self, request: Request, response: Response, spider: Spider) -> Response:
         """Check response for proxy failure signals."""
         if response.status in (403, 429, 503):
             if self._stats:
@@ -52,9 +50,7 @@ class ProxyMiddleware:
             logger.warning("proxy_blocked: %s status=%s", request.url, response.status)
         return response
 
-    def process_exception(
-        self, request: Request, exception: Exception, spider: Spider
-    ) -> None:
+    def process_exception(self, request: Request, exception: Exception, spider: Spider) -> None:
         """Mark proxy as failed on connection errors."""
         if self._stats:
             self._stats.inc_value("proxy/errors")

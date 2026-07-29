@@ -92,15 +92,11 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     reaper = RetentionReaper(pg, cfg.session_retention)
 
     tasks = [
-        asyncio.create_task(
-            _run_periodic("harvest", harvester.harvest_once, ph.interval_seconds)
-        ),
+        asyncio.create_task(_run_periodic("harvest", harvester.harvest_once, ph.interval_seconds)),
         asyncio.create_task(
             _run_periodic("promotion", promotion.run_once, ph.promotion_interval_seconds)
         ),
-        asyncio.create_task(
-            _run_periodic("health", health.check_all, ph.health_interval_seconds)
-        ),
+        asyncio.create_task(_run_periodic("health", health.check_all, ph.health_interval_seconds)),
         asyncio.create_task(
             _run_periodic(
                 "retention", reaper.run_once, cfg.session_retention.cleanup_interval_seconds
@@ -141,5 +137,5 @@ def main() -> None:
     asyncio.run(run())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover — only true under `python -m`, not tests
     main()

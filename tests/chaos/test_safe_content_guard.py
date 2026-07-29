@@ -58,9 +58,7 @@ async def test_mid_poll_reload_with_delay() -> None:
     wrapper = CamoufoxWrapper(proxy=None, tenant_id=TenantId("chaostest"))
     async with wrapper as browser_context:
         page = await browser_context.new_page()
-        await page.goto(
-            f"{MIRROR}/?difficulty=strict", wait_until="load", timeout=60000
-        )
+        await page.goto(f"{MIRROR}/?difficulty=strict", wait_until="load", timeout=60000)
         await page.wait_for_timeout(3000)
 
         # Fire reload mid-PoW-solve, then race _safe_content
@@ -94,9 +92,7 @@ async def test_mid_poll_reload_aggressive_race() -> None:
     wrapper = CamoufoxWrapper(proxy=None, tenant_id=TenantId("chaostest"))
     async with wrapper as browser_context:
         page = await browser_context.new_page()
-        await page.goto(
-            f"{MIRROR}/?difficulty=strict", wait_until="load", timeout=60000
-        )
+        await page.goto(f"{MIRROR}/?difficulty=strict", wait_until="load", timeout=60000)
         await page.wait_for_timeout(5000)
 
         # Fire reload then IMMEDIATELY read content
@@ -104,10 +100,7 @@ async def test_mid_poll_reload_aggressive_race() -> None:
         result = await safe_content(page)
 
         if result is None:
-            print(
-                "AGGRESSIVE RACE: GUARD HELD — _safe_content returned None "
-                "(page mid-navigation)"
-            )
+            print("AGGRESSIVE RACE: GUARD HELD — _safe_content returned None (page mid-navigation)")
         else:
             print(
                 f"AGGRESSIVE RACE: _safe_content returned {len(result)} chars "
