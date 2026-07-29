@@ -421,7 +421,7 @@ pydantic==2.13.4
     # via
     #   scraper-engine (pyproject.toml)
     #   fastapi
-pydantic-core==2.46.4
+pydantic-core==2.47.0
     # via
     #   scraper-engine (pyproject.toml)
     #   pydantic
