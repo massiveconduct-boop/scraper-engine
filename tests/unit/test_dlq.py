@@ -30,6 +30,7 @@ class TestDeadLetterQueue:
     @pytest.fixture
     def dlq(self, pg):
         from scraper_engine.storage.dlq import DeadLetterQueue
+
         return DeadLetterQueue(pg)
 
     @pytest.mark.asyncio

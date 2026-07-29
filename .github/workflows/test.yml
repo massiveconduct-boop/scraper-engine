@@ -24,8 +24,12 @@ jobs:
       - name: requirements-lock.txt / requirements-dev-lock.txt match pyproject.toml (fail on drift)
         run: |
           pip install -q uv
-          uv pip compile pyproject.toml --emit-index-url --no-header -o /tmp/check-lock.txt
-          uv pip compile pyproject.toml --extra dev --emit-index-url --no-header -o /tmp/check-dev-lock.txt
+          # --python-version 3.11 matches requires-python's floor (unit/integration/chaos
+          # run a 3.11+3.12 matrix) — without it, uv resolves against whatever
+          # interpreter compiled the lockfile and can pick a package version that
+          # doesn't support the floor (numpy==2.5.1 requires >=3.12, broke the 3.11 job).
+          uv pip compile pyproject.toml --python-version 3.11 --emit-index-url --no-header -o /tmp/check-lock.txt
+          uv pip compile pyproject.toml --extra dev --python-version 3.11 --emit-index-url --no-header -o /tmp/check-dev-lock.txt
           diff requirements-lock.txt /tmp/check-lock.txt
           diff requirements-dev-lock.txt /tmp/check-dev-lock.txt
       - name: pip-audit (fail on known vulnerabilities)

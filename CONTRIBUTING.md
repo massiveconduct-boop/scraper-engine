@@ -48,11 +48,14 @@ unreachable in-process.
 
 If you changed `pyproject.toml`'s dependencies, regenerate both lockfiles
 (`uv` must be installed — `pip install uv` or see astral.sh/uv) so CI's
-drift check doesn't fail:
+drift check doesn't fail. `--python-version 3.11` matches
+`requires-python`'s floor — compiling without it resolves against whatever
+interpreter you're running locally and can silently pick a package version
+that doesn't support 3.11 (numpy==2.5.1 broke the 3.11 CI job this way):
 
 ```bash
-uv pip compile pyproject.toml --emit-index-url --no-header -o requirements-lock.txt
-uv pip compile pyproject.toml --extra dev --emit-index-url --no-header -o requirements-dev-lock.txt
+uv pip compile pyproject.toml --python-version 3.11 --emit-index-url --no-header -o requirements-lock.txt
+uv pip compile pyproject.toml --extra dev --python-version 3.11 --emit-index-url --no-header -o requirements-dev-lock.txt
 ```
 
 ## Workflow

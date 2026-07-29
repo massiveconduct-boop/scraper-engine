@@ -45,8 +45,10 @@ class _TimeoutClient:
     def __init__(self, *a, **kw): ...
     async def __aenter__(self):
         return self
+
     async def __aexit__(self, *a):
         return False
+
     async def get(self, url):
         raise httpx.TimeoutException("timed out")
 
@@ -55,8 +57,10 @@ class _BoomClient:
     def __init__(self, *a, **kw): ...
     async def __aenter__(self):
         return self
+
     async def __aexit__(self, *a):
         return False
+
     async def get(self, url):
         raise ValueError("unexpected boom")
 
@@ -83,7 +87,9 @@ class TestPlainHttpxRedirects:
         result = await fetcher.fetch("http://example.com", TenantId("system"))
 
         assert result.markdown == "# final"
-        firecrawl.convert_to_markdown.assert_awaited_once_with("<html>final</html>", "http://example.com")
+        firecrawl.convert_to_markdown.assert_awaited_once_with(
+            "<html>final</html>", "http://example.com"
+        )
 
 
 class TestPlainHttpxExceptions:
@@ -127,7 +133,9 @@ class TestJa3MarkdownConversion:
 
         assert result.success is True
         assert result.markdown == "# ja3"
-        firecrawl.convert_to_markdown.assert_awaited_once_with("<html>ja3</html>", "http://example.com")
+        firecrawl.convert_to_markdown.assert_awaited_once_with(
+            "<html>ja3</html>", "http://example.com"
+        )
 
 
 class TestScraplingWiring:

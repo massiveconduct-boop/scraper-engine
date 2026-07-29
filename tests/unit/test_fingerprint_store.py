@@ -34,6 +34,7 @@ class TestFingerprintStore:
     @pytest.fixture
     def store(self, pg):
         from scraper_engine.storage.fingerprint_store import FingerprintStore
+
         return FingerprintStore(pg)
 
     @pytest.mark.asyncio

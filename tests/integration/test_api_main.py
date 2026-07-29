@@ -28,9 +28,7 @@ class TestCreateApp:
         monkeypatch.setattr(deps, "_queue", None)
         monkeypatch.setattr(deps, "_tenant_resolver", None)
 
-        monkeypatch.setattr(
-            "scraper_engine.config.loader.load_config", lambda: _local_config()
-        )
+        monkeypatch.setattr("scraper_engine.config.loader.load_config", lambda: _local_config())
 
         from scraper_engine.api.main import create_app
 

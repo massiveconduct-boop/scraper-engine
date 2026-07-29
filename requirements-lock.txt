@@ -21,6 +21,8 @@ apify-fingerprint-datapoints==0.13.0
     # via browserforge
 asgiref==3.12.1
     # via opentelemetry-instrumentation-asgi
+async-timeout==5.0.1
+    # via redis
 asyncpg==0.31.0
     # via scraper-engine (pyproject.toml)
 attrs==22.2.0
@@ -207,7 +209,7 @@ multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
-numpy==2.5.1
+numpy==2.4.6
     # via
     #   botasaurus-humancursor
     #   camoufox

@@ -25,6 +25,8 @@ asgiref==3.12.1
     # via opentelemetry-instrumentation-asgi
 ast-serialize==0.6.0
     # via mypy
+async-timeout==5.0.1
+    # via redis
 asyncpg==0.31.0
     # via scraper-engine (pyproject.toml)
 attrs==22.2.0
@@ -286,7 +288,7 @@ mypy-extensions==1.1.0
     # via mypy
 nodeenv==1.10.0
     # via pre-commit
-numpy==2.5.1
+numpy==2.4.6
     # via
     #   botasaurus-humancursor
     #   camoufox
@@ -549,7 +551,9 @@ tld==0.13.2
 tldextract==5.3.1
     # via scrapy
 tomli==2.4.1
-    # via pip-audit
+    # via
+    #   coverage
+    #   pip-audit
 tomli-w==1.2.0
     # via pip-audit
 twisted==26.4.0
@@ -567,6 +571,7 @@ typing-extensions==4.16.0
     #   cyclonedx-python-lib
     #   fastapi
     #   grpcio
+    #   locust
     #   mypy
     #   opentelemetry-api
     #   opentelemetry-exporter-otlp-proto-grpc

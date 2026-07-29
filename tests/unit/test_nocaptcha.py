@@ -72,9 +72,14 @@ class TestGetBalance:
 
         class _Client:
             def __init__(self, *a, **k): ...
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): return False
-            async def post(self, *a, **k): return _Resp()
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _Resp()
 
         monkeypatch.setattr(ac.httpx, "AsyncClient", _Client)
         client = nc.NoCaptchaAIClient("k", _budget())
@@ -93,6 +98,7 @@ class TestHasActivePlan:
         http_client.__aexit__.return_value = False
 
         import httpx
+
         monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=http_client))
 
         client = nc.NoCaptchaAIClient("k", _budget())
@@ -108,6 +114,7 @@ class TestHasActivePlan:
         http_client.__aexit__.return_value = False
 
         import httpx
+
         monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=http_client))
 
         client = nc.NoCaptchaAIClient("k", _budget())
@@ -119,6 +126,7 @@ class TestHasActivePlan:
         http_client.__aenter__.side_effect = RuntimeError("connection refused")
 
         import httpx
+
         monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=http_client))
 
         client = nc.NoCaptchaAIClient("k", _budget())

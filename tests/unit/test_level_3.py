@@ -82,12 +82,8 @@ class TestFetch:
     @pytest.mark.asyncio
     async def test_cold_start_success_path(self, monkeypatch):
         page = FakePage()
-        fake_wrapper_cls = MagicMock(
-            return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))
-        )
-        monkeypatch.setattr(
-            "scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls
-        )
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
         fetcher = Level3Fetcher()
 
         result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
@@ -111,12 +107,8 @@ class TestFetch:
     @pytest.mark.asyncio
     async def test_scroll_passes_triggers_autoscroll_and_recapture(self, monkeypatch):
         page = FakePage()
-        fake_wrapper_cls = MagicMock(
-            return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))
-        )
-        monkeypatch.setattr(
-            "scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls
-        )
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
         fetcher = Level3Fetcher(scroll_passes=2, scroll_wait_ms=1)
 
         result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
@@ -127,12 +119,8 @@ class TestFetch:
     @pytest.mark.asyncio
     async def test_goto_exception_without_ssrf_block_reraises_original(self, monkeypatch):
         page = FakePage(goto_exc=TimeoutError("navigation timed out"))
-        fake_wrapper_cls = MagicMock(
-            return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))
-        )
-        monkeypatch.setattr(
-            "scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls
-        )
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
         fetcher = Level3Fetcher()
 
         result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
@@ -147,12 +135,8 @@ class TestFetch:
             url="http://169.254.169.254/", host="169.254.169.254", network="169.254.0.0/16"
         )
         page = FakePage(goto_exc=RuntimeError("net::ERR_FAILED"), trigger_route_block=True)
-        fake_wrapper_cls = MagicMock(
-            return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))
-        )
-        monkeypatch.setattr(
-            "scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls
-        )
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
         fetcher = Level3Fetcher(ssrf_guard=ssrf_guard)
 
         result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
@@ -168,9 +152,7 @@ class TestMaybeSolveCaptcha:
             "scraper_engine.fetcher._captcha.solve_captcha_on_page",
             AsyncMock(return_value=False),
         )
-        fetcher = Level3Fetcher(
-            captcha_solver=MagicMock(), challenge_detector=ChallengeDetector()
-        )
+        fetcher = Level3Fetcher(captcha_solver=MagicMock(), challenge_detector=ChallengeDetector())
         page = FakePage()
 
         result = await fetcher._maybe_solve_captcha(

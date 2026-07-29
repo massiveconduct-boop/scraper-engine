@@ -64,9 +64,7 @@ class TestS3ClientUnstarted:
 
     async def test_get_snapshot_before_start_raises(self) -> None:
         client = S3Client(_ENDPOINT, _ACCESS_KEY, _SECRET_KEY, _BUCKET)
-        with pytest.raises(
-            RuntimeError, match=r"start\(\) must be called before get_snapshot\(\)"
-        ):
+        with pytest.raises(RuntimeError, match=r"start\(\) must be called before get_snapshot\(\)"):
             await client.get_snapshot("some/key.html")
 
     async def test_apply_lifecycle_policy_before_start_is_noop(self) -> None:
