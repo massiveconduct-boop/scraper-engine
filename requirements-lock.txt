@@ -306,7 +306,7 @@ psutil==7.2.2
     # via
     #   botasaurus
     #   botasaurus-driver
-pycares==4.11.0
+pycares==5.0.1
     # via aiodns
 pycparser==3.0
     # via cffi
