@@ -10,7 +10,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       # mypy --strict needs the real runtime deps installed to resolve types —
@@ -95,7 +95,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python-version }}" }
       - name: Install dependencies
@@ -136,7 +136,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       PGBOUNCER_DSN: postgresql://scraper:scraper@localhost:5432/scraper_engine
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python-version }}" }
       # postgres/redis run as GH Actions `services:` above; minio has no
@@ -175,7 +175,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       PGBOUNCER_DSN: postgresql://scraper:scraper@localhost:6432/scraper_engine
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python-version }}" }
       # G-05 needs the *real* PgBouncer (transaction pooling, SCRAM auth off
@@ -222,7 +222,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
