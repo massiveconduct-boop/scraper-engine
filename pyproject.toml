@@ -45,7 +45,7 @@ dependencies = [
     # this round; see .claude/knowledge/operations.md #12.
     "proxybroker2==2.0.0a4",
     "structlog==26.1.0",
-    "prometheus-client==0.25.0",
+    "prometheus-client==0.26.0",
     "pyyaml==6.0.3",
     "boto3==1.43.52",
     "python-dotenv==1.2.2",

@@ -392,7 +392,7 @@ pluggy==1.6.0
     #   pytest-cov
 pre-commit==4.6.1
     # via scraper-engine (pyproject.toml)
-prometheus-client==0.25.0
+prometheus-client==0.26.0
     # via scraper-engine (pyproject.toml)
 propcache==0.5.2
     # via
