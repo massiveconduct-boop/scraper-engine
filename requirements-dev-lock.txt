@@ -170,7 +170,7 @@ frozenlist==1.8.0
     # via
     #   aiohttp
     #   aiosignal
-gevent==25.9.1
+gevent==26.7.0
     # via
     #   botasaurus-requests
     #   geventhttpclient
