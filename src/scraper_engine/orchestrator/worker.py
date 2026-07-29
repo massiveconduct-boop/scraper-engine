@@ -62,11 +62,13 @@ class Worker:
         # bare constructor defaults.
         if config is None:
             from scraper_engine.config.loader import load_config
+
             config = load_config()
         self._config = config
         # One ChallengeDetector for escalation decisions (challenge pages and
         # JS-gated shells) — same single source of truth the fetchers use.
         from scraper_engine.fetcher.challenge_detector import ChallengeDetector
+
         self._challenge_detector = ChallengeDetector()
         # Build the CAPTCHA solver once (env keys + per-tenant budget on Redis)
         # and thread it into the browser fetchers via the factory. None when no
@@ -75,12 +77,11 @@ class Worker:
         # construction site (round 20 — wires services/captcha_solver in).
         from scraper_engine.core.budget import CapSolverBudget
         from scraper_engine.services.captcha_solver import build_captcha_solver
-        self._captcha_solver = build_captcha_solver(
-            CapSolverBudget(self._redis, pg=self._pg)
-        )
+
+        self._captcha_solver = build_captcha_solver(CapSolverBudget(self._redis, pg=self._pg))
         # Circuit breaker and politeness use raw Redis (not tenant-scoped),
         # so pass the underlying client for system-level key operations
-        if hasattr(circuit_breaker, '_redis'):
+        if hasattr(circuit_breaker, "_redis"):
             pass  # already set by caller
 
     async def process_job(
@@ -100,7 +101,9 @@ class Worker:
             for level in LEVELS:
                 if not await self._circuit_breaker.allow_request(domain):
                     await self._dlq.enqueue(
-                        tenant_id, job_id, url_str,
+                        tenant_id,
+                        job_id,
+                        url_str,
                         FailureCategory.CIRCUIT_OPEN,
                         f"Circuit open for {domain}",
                         level,
@@ -134,6 +137,23 @@ class Worker:
                         result.html or ""
                     ):
                         continue
+                    if result.html:
+                        # FetchResult.extracted was declared on the model and
+                        # persisted by orchestrator/tasks.py, but nothing ever
+                        # populated it — AdaptiveSelector existed, fully
+                        # tested, with zero callers (round 28). Wired here,
+                        # once, so it applies uniformly regardless of which
+                        # level actually succeeded.
+                        from scraper_engine.fetcher.adaptive_selector import AdaptiveSelector
+
+                        schema = (
+                            request.config_overrides.extraction_schema
+                            if request.config_overrides
+                            else None
+                        )
+                        result.extracted = await AdaptiveSelector().extract(
+                            result.html, schema=schema
+                        )
                     results.append(result)
                     break
                 else:
@@ -147,7 +167,9 @@ class Worker:
                         FailureCategory.HOST_UNREACHABLE,
                     ):
                         await self._dlq.enqueue(
-                            tenant_id, job_id, url_str,
+                            tenant_id,
+                            job_id,
+                            url_str,
                             result.failure_category,
                             result.error_message or "",
                             level,
@@ -156,15 +178,19 @@ class Worker:
                         break
             else:
                 await self._dlq.enqueue(
-                    tenant_id, job_id, url_str,
+                    tenant_id,
+                    job_id,
+                    url_str,
                     FailureCategory.PROXY_EXHAUSTED,
                     "All fetch levels exhausted",
                     3,
                 )
                 errors.append("All levels exhausted")
 
-        status = JobStatus.COMPLETED if not errors else (
-            JobStatus.FAILED if len(results) == 0 else JobStatus.COMPLETED
+        status = (
+            JobStatus.COMPLETED
+            if not errors
+            else (JobStatus.FAILED if len(results) == 0 else JobStatus.COMPLETED)
         )
         return JobStatusResponse(
             job_id=job_id,
@@ -174,12 +200,11 @@ class Worker:
             error="; ".join(errors) if errors else None,
         )
 
-    async def _fetch_url(
-        self, tenant_id: TenantId, url: str, level: int
-    ) -> FetchResult | None:
+    async def _fetch_url(self, tenant_id: TenantId, url: str, level: int) -> FetchResult | None:
         """Dispatch fetch to the appropriate level fetcher."""
         if level == 1:
             from scraper_engine.fetcher.factory import build_level1_fetcher
+
             l1_fetcher = build_level1_fetcher(self._config)
             return await l1_fetcher.fetch(url, tenant_id)
         elif level == 2:
@@ -188,6 +213,7 @@ class Worker:
 
             pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
             from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+
             try:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
                 async with lease:
@@ -213,6 +239,7 @@ class Worker:
 
             pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
             from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+
             try:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))
                 async with lease:

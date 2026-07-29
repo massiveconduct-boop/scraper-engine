@@ -733,8 +733,8 @@ don't leave it orphaned" operating rule, and because a Literal-typed
 seemed better than a config value describing a feature that had never
 existed in production.
 
-**Why restored:** the authoritative spec (`specs/scraper-engine-blueprint-v2.md`
-§3.6) explicitly designs a real `BotasaurusWrapper` with a specific
+**Why restored:** the authoritative spec (`.local/specs/scraper-engine-blueprint-v2.md`,
+local-only, not tracked in git — §3.6) explicitly designs a real `BotasaurusWrapper` with a specific
 concurrency-coordination fix (F-32: force `parallel=1` since Botasaurus
 manages its own multiprocessing pool internally) — this was a deliberate,
 documented piece of the original architecture, not an accidental leftover.
@@ -783,3 +783,115 @@ real headless-via-Xvfb Chrome launched and fetched a `data:` URL in the dev
 sandbox before the final implementation was written; every container
 (`api`, `worker-l1/l2/l3`, `proxy-harvester`) rebuilt and confirmed
 `import botasaurus` succeeds inside the actual image, not just the local venv.
+
+## Decision: src/ Layout Over Flat Top-Level Packages
+
+**Date:** 2026-07-29 | **Round:** 27
+
+**What:** Consolidated 12 previously-separate top-level Python packages
+(`api/`, `browser/`, `cli/`, `config/`, `core/`, `fetcher/`,
+`observability/`, `orchestrator/`, `proxy/`, `services/`, `storage/`,
+`scrapy_project/`) under a single `src/scraper_engine/` package. Imports
+changed from `from core.tenant import TenantId` to `from
+scraper_engine.core.tenant import TenantId`. `tests/` and `migrations/`
+stay at repo root, unmoved.
+
+**Why:** Flagged unprompted while reviewing the root layout like a senior
+developer — 12 sibling top-level packages with no umbrella package is a
+flatter, older-style layout; the modern convention for anything meant to be
+installed as one library is a single `src/<package>/`. User asked for a
+formal plan, then approved it.
+
+**Alternatives considered:**
+- **Leave it flat.** Rejected — not wrong, but not what "professional repo"
+  means to the user, and was explicitly the item flagged for this change.
+- **Only partially consolidate** (e.g. wrap just the packages with the most
+  cross-references). Rejected — a partial umbrella package is a worse
+  mental model than either extreme; either everything is `scraper_engine.X`
+  or nothing is.
+
+**Tradeoffs:**
+- Real, one-time cost: 455 import statements needed rewriting, and the
+  rewrite surfaced import forms invisible to static regex tooling (bare
+  dotted imports with rebinding semantics, quoted-string module references
+  in `mock.patch`/`monkeypatch.setattr`/rq's job queue/Scrapy's own config)
+  — see `.claude/knowledge/troubleshooting.md` → the three round-27 entries
+  for the exact gotchas hit.
+- The Dockerfile needed a real fix (`pip install --no-deps .` after
+  `COPY .`, not a `PYTHONPATH` patch) since the container previously relied
+  on the flat packages landing directly in `WORKDIR /app`.
+- `pyproject.toml`'s packaging/coverage/isort config, and every hardcoded
+  package-path argument in CI/`CONTRIBUTING.md`/`README.md` (`mypy core/
+  proxy/ ...` style commands) needed updating in lockstep — this is the
+  exact same "N places that don't read from each other" class of drift as
+  Known Operational Gaps #12, just for paths instead of dependency
+  versions.
+
+**Verification standard used:** static analysis (ruff/mypy) was not
+sufficient by itself — the real proof was submitting a live job through the
+rebuilt container stack and confirming `PENDING → COMPLETED` with real
+fetched content, since the single highest-risk fix (rq's dotted-string job
+reference) is invisible to any import-checker.
+
+## Decision: `.archive/` and `.local/` as Two Separate Gitignored Directories
+
+**Date:** 2026-07-29 | **Round:** 27
+
+**What:** Historical per-round evidence/directive/closure reports live in
+`.archive/{evidence,directive,closure,other}/`. The design spec, a
+confirmed-duplicate directory, and unused manual scripts live in a
+**separate** `.local/` directory. Both are gitignored — kept on disk,
+absent from GitHub.
+
+**Why two directories instead of one:** First pass used a single
+`docs/archive/` (tracked in git). User rejected this twice: first for still
+being tracked at all ("I don't see this kind of file in other developers'
+GitHub repos"), then — after `.archive/` was made gitignored and
+categorized by report type — for having non-report files (`specs/`, a
+duplicate directory, scripts) dumped into the same categorized bucket
+("these files are not docs"). The user's own correction was specific: a
+folder whose subdirectories are named after document categories
+(evidence/directive/closure) is the wrong home for a Python script or a
+whole spec file, even if both end up gitignored for the same reason.
+
+**Alternatives considered:**
+- One folder, mixed content, `other/` catch-all for everything non-doc
+  (the first attempt at reconciling). Rejected by the user directly.
+- Delete the non-doc items instead of relocating them. Not chosen — nothing
+  in this repo gets deleted outright when it can instead be archived/moved;
+  git history plus a local, findable copy is preferred over relying on
+  `git log` archaeology to recover something later.
+
+**Status:** Active. `.gitignore` has two separate entries (`.archive/`,
+`.local/`); do not merge them back into one directory without the same
+user correction applying in reverse.
+
+## Decision: `types-redis` Removed, Not Version-Pinned Differently
+
+**Date:** 2026-07-29 | **Round:** 27
+
+**What:** Removed `types-redis>=4.6.0` from `pyproject.toml`'s dev
+optional-dependencies entirely, rather than trying to pin it to a version
+compatible with the installed `redis==8.0.1`.
+
+**Why:** Real `redis` (since some version well before 8.0.1) ships its own
+inline types (`py.typed` marker present in the installed package). A
+third-party stub package for a library that now types itself is redundant
+at best; at worst — confirmed here — it's actively wrong when it targets
+an old version of that library and gets resolved instead of the real types.
+CI never installed `types-redis` in the first place and was checking
+against the correct types the whole time; removing the stub makes local
+match CI instead of the reverse.
+
+**Alternatives considered:**
+- Pin `types-redis` to a version matching installed `redis`. Rejected —
+  checked, no such version exists; `types-redis` is a legacy, unmaintained
+  stub for redis-py versions that predate its own `py.typed` types, not an
+  actively-updated companion package.
+- Add `# type: ignore` comments to satisfy whichever mypy result showed up
+  locally. Rejected as the first attempt, then reverted — this would have
+  masked real, correctly-typed methods (`aclose()`, `eval()`) behind
+  unnecessary ignores, treating a stub gap as if it were a real gap in
+  redis-py's own types.
+
+**Status:** Active. Do not re-add `types-redis` to dev dependencies.

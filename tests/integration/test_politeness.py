@@ -52,6 +52,7 @@ class TestPoliteness:
         redis.set.return_value = True
         pc = PolitenessController(redis=redis, default_delay_seconds=999.0)
         import time
+
         start = time.monotonic()
         await pc.wait_if_needed("first.com", tenant)
         elapsed = time.monotonic() - start
@@ -62,6 +63,7 @@ class TestPoliteness:
         redis = AsyncMock()
         # Set last fetch to just now, so the next call must wait
         import time
+
         redis.get.return_value = str(time.monotonic())
         redis.set.return_value = True
         pc = PolitenessController(redis=redis, default_delay_seconds=0.05)

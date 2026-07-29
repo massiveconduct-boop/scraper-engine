@@ -72,9 +72,12 @@ async def two_tenants_distinct_limits(pg: PostgresClient):
 
 @pytest.mark.integration
 async def test_two_tenants_enforce_independent_limits(
-    pg: PostgresClient, redis: RedisClient, two_tenants_distinct_limits: None,
+    pg: PostgresClient,
+    redis: RedisClient,
+    two_tenants_distinct_limits: None,
 ) -> None:
     """qtest_a gets 2 requests then 429. qtest_b gets 5 then 429. Independent."""
+
     async def resolve_limit(tenant_id: TenantId) -> int:
         row = await pg.fetchrow(
             TenantId("system"),

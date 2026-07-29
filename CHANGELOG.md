@@ -7,6 +7,43 @@ bug found, every design decision and why) lives in `.claude/MEMORY.md` and
 
 ## [Unreleased]
 
+- **Round 28 — chore: coverage gate wired for real + 7 senior-dev-review
+  findings closed.** `pyproject.toml`'s `[tool.coverage.report] fail_under`
+  was declared but no CI `pytest` invocation ever passed `--cov` — the gate
+  never actually ran (real measured coverage was 72%, not the declared
+  90%). Now wired into the `chaos` CI job (`--cov-fail-under=100`, run last
+  once full docker-compose infra is up) and coverage brought to 100% across
+  every package in `[tool.coverage.run] source` except `browser/` (real
+  Firefox needed, not available in CI). Also: version bumped `0.1.0` →
+  `1.0.0`; CI test matrix now covers Python 3.11 and 3.12 (previously
+  3.12-only despite `requires-python = ">=3.11"`); `requirements-lock.txt` /
+  `requirements-dev-lock.txt` added (`uv pip compile`) and CI/Dockerfile's
+  three hand-duplicated dependency lists replaced with `pip install -r`
+  against the lockfile, with a CI drift check; `pip-audit` step added to
+  the lint job; Dependabot configured for `pip`/`github-actions`/`docker`;
+  `py.typed` marker added (PEP 561); `SECURITY.md`, `CODEOWNERS`, issue/PR
+  templates added; `.pre-commit-config.yaml` added (ruff + scoped
+  `mypy --strict`, matching CI exactly) and verified via
+  `pre-commit run --all-files`. Found and fixed two real bugs along the
+  way: `pyproject.toml`'s `dependencies = [...]` list was textually
+  misplaced after `[tool.setuptools.package-data]`, so TOML parsed it as
+  nested under that table — `pip install -e .` installed zero runtime
+  dependencies, silently masked because CI/Dockerfile hand-listed every
+  dependency separately; and `fetcher/scrapling_wrapper.py` called a
+  nonexistent `scrapling.get()` (dead code, zero callers, never covered by
+  a test) — fixed to the real `scrapling.fetchers.AsyncFetcher.get()` API.
+- **PR #14 — refactor: consolidate 12 top-level packages under
+  `src/scraper_engine/`.** 455 import statements rewritten to the new
+  `scraper_engine.<package>` namespace; a stale `types-redis` stub had been
+  masking real `redis-py` types, found and removed as a follow-up fix.
+- **PR #13 — fix: import-path independence.** `alembic.ini`'s
+  `script_location` made cwd-independent (`%(here)s` token) — the
+  documented production migration command was silently broken when run
+  from inside a container.
+- **PR #12 — chore: relocate test fixtures, gitignore build-time-only
+  files.** `challenge-mirror/` and `judge_server.py` (real, actively-used
+  test infrastructure) moved under `tests/fixtures/`; design spec and
+  unused scripts moved to a gitignored `.local/`.
 - **PR #10 — chore: repo layout cleanup.** Archived 63 historical per-round
   evidence/directive/closure reports out of `docs/` (categorized, gitignored
   locally rather than tracked); restructured `docs/` into `reference/` and

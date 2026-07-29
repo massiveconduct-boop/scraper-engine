@@ -58,8 +58,6 @@ class TestPgBouncerIsolation:
                 )
                 return True
 
-        results = await asyncio.gather(*[
-            probe(random.choice(tenants)) for _ in range(50)
-        ])
+        results = await asyncio.gather(*[probe(random.choice(tenants)) for _ in range(50)])
         assert all(results), "All 50 probes must pass tenant isolation"
         assert len(results) == 50

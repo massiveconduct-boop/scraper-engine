@@ -5,6 +5,7 @@ import pytest
 from pydantic import HttpUrl, ValidationError
 
 from scraper_engine.core.models import (
+    CrawlRequest,
     FailureCategory,
     FetchResult,
     JobStatus,
@@ -50,6 +51,16 @@ class TestScrapeRequest:
         urls = [HttpUrl(f"http://example.com/{i}") for i in range(501)]
         with pytest.raises(ValidationError, match="max 500 urls"):
             ScrapeRequest(urls=urls)
+
+
+class TestCrawlRequest:
+    def test_valid_request(self) -> None:
+        cr = CrawlRequest(spider_name="titles", start_urls=[HttpUrl("http://example.com")])
+        assert len(cr.start_urls) == 1
+
+    def test_empty_start_urls_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="start_urls must contain at least one entry"):
+            CrawlRequest(spider_name="titles", start_urls=[])
 
 
 class TestFetchResult:

@@ -40,7 +40,7 @@ class WebhookDispatcher:
                 continue
 
             if attempt < retries - 1:
-                backoff = 2 ** attempt
+                backoff = 2**attempt
                 await asyncio.sleep(backoff)
 
         return False

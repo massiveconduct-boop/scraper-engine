@@ -30,7 +30,7 @@ class TestFallbackChain:
 
     @pytest.mark.asyncio
     async def test_primary_miss_uses_fallback(self):
-        primary = _provider(recaptcha=None)          # primary fails
+        primary = _provider(recaptcha=None)  # primary fails
         fallback = _provider(recaptcha="tok-fallback")
         solver = CaptchaSolver(primary, fallback)
 
@@ -48,6 +48,67 @@ class TestFallbackChain:
         solver = CaptchaSolver(_provider(hcaptcha=None))  # fallback=None
         assert await solver.solve_hcaptcha(TENANT, "sk", "http://x") is None
 
+    @pytest.mark.asyncio
+    async def test_solve_mtcaptcha_primary_hit(self):
+        primary = AsyncMock()
+        primary.solve_mtcaptcha.return_value = "mt-tok"
+        solver = CaptchaSolver(primary)
+        assert await solver.solve_mtcaptcha(TENANT, "sk", "http://x") == "mt-tok"
+
+    @pytest.mark.asyncio
+    async def test_solve_aws_waf_primary_hit_no_fallback_call(self):
+        primary = AsyncMock()
+        primary.solve_aws_waf.return_value = "aws-tok"
+        fallback = AsyncMock()
+        solver = CaptchaSolver(primary, fallback)
+        result = await solver.solve_aws_waf(TENANT, "http://x", awsKey="k", awsIv="iv")
+        assert result == "aws-tok"
+        fallback.solve_aws_waf.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_solve_aws_waf_falls_back(self):
+        primary = AsyncMock()
+        primary.solve_aws_waf.return_value = None
+        fallback = AsyncMock()
+        fallback.solve_aws_waf.return_value = "aws-fallback-tok"
+        solver = CaptchaSolver(primary, fallback)
+        result = await solver.solve_aws_waf(TENANT, "http://x", awsKey="k")
+        assert result == "aws-fallback-tok"
+
+    @pytest.mark.asyncio
+    async def test_solve_aws_waf_no_fallback_configured(self):
+        primary = AsyncMock()
+        primary.solve_aws_waf.return_value = None
+        solver = CaptchaSolver(primary)
+        assert await solver.solve_aws_waf(TENANT, "http://x") is None
+
+    @pytest.mark.asyncio
+    async def test_solve_geetest_primary_hit_no_fallback_call(self):
+        primary = AsyncMock()
+        primary.solve_geetest.return_value = "gt-tok"
+        fallback = AsyncMock()
+        solver = CaptchaSolver(primary, fallback)
+        result = await solver.solve_geetest(TENANT, "cid", "http://x", challenge="ch")
+        assert result == "gt-tok"
+        fallback.solve_geetest.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_solve_geetest_falls_back(self):
+        primary = AsyncMock()
+        primary.solve_geetest.return_value = None
+        fallback = AsyncMock()
+        fallback.solve_geetest.return_value = "gt-fallback-tok"
+        solver = CaptchaSolver(primary, fallback)
+        result = await solver.solve_geetest(TENANT, "cid", "http://x")
+        assert result == "gt-fallback-tok"
+
+    @pytest.mark.asyncio
+    async def test_solve_geetest_no_fallback_configured(self):
+        primary = AsyncMock()
+        primary.solve_geetest.return_value = None
+        solver = CaptchaSolver(primary)
+        assert await solver.solve_geetest(TENANT, "cid", "http://x") is None
+
 
 class TestFactory:
     def test_nocaptcha_primary_capsolver_fallback(self, monkeypatch):
@@ -57,6 +118,7 @@ class TestFactory:
         assert solver is not None
         from scraper_engine.services.capsolver import CapSolverClient
         from scraper_engine.services.nocaptcha import NoCaptchaAIClient
+
         assert isinstance(solver._primary, NoCaptchaAIClient)
         assert isinstance(solver._fallback, CapSolverClient)
 
@@ -66,6 +128,7 @@ class TestFactory:
         solver = build_captcha_solver(AsyncMock())
         assert solver is not None
         from scraper_engine.services.capsolver import CapSolverClient
+
         assert isinstance(solver._primary, CapSolverClient)
         assert solver._fallback is None
 
@@ -88,13 +151,19 @@ class TestImageToText:
 
         class _Client:
             def __init__(self, *a, **k): ...
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): return False
-            async def post(self, *a, **k): return _Resp()
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _Resp()
 
         monkeypatch.setattr(ac.httpx, "AsyncClient", _Client)
 
         from scraper_engine.services.nocaptcha import NoCaptchaAIClient
+
         budget = AsyncMock()
         budget.check_and_reserve.return_value = True
         client = NoCaptchaAIClient("k", budget)
@@ -103,6 +172,7 @@ class TestImageToText:
     @pytest.mark.asyncio
     async def test_ocr_budget_gate_blocks(self):
         from scraper_engine.services.nocaptcha import NoCaptchaAIClient
+
         budget = AsyncMock()
         budget.check_and_reserve.return_value = False
         client = NoCaptchaAIClient("k", budget)
@@ -115,14 +185,18 @@ class TestProviderTaskTypes:
     the solve pipeline itself is live-proven end-to-end via image-to-text."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("method,expected_type", [
-        # live-verified NoCaptchaAI-accepted task types
-        ("solve_recaptcha_v2", "ReCaptchaV2TaskProxyLess"),
-        ("solve_turnstile", "AntiTurnstileTask"),
-        ("solve_mtcaptcha", "MTCaptchaTask"),
-    ])
+    @pytest.mark.parametrize(
+        "method,expected_type",
+        [
+            # live-verified NoCaptchaAI-accepted task types
+            ("solve_recaptcha_v2", "ReCaptchaV2TaskProxyLess"),
+            ("solve_turnstile", "AntiTurnstileTask"),
+            ("solve_mtcaptcha", "MTCaptchaTask"),
+        ],
+    )
     async def test_nocaptcha_sends_correct_type(self, monkeypatch, method, expected_type):
         import scraper_engine.services.nocaptcha as nc
+
         captured = {}
 
         async def fake_solve(**kw):
@@ -141,6 +215,7 @@ class TestProviderTaskTypes:
     @pytest.mark.asyncio
     async def test_nocaptcha_geetest_captcha_id_field(self, monkeypatch):
         import scraper_engine.services.nocaptcha as nc
+
         captured = {}
 
         async def fake_solve(**kw):
@@ -159,6 +234,7 @@ class TestProviderTaskTypes:
     async def test_nocaptcha_hcaptcha_defers_to_fallback(self):
         # NoCaptchaAI has no hCaptcha — returns None so orchestrator falls through
         from scraper_engine.services.nocaptcha import NoCaptchaAIClient
+
         budget = AsyncMock()
         client = NoCaptchaAIClient("k", budget)
         assert await client.solve_hcaptcha(TENANT, "sk", "http://x") is None

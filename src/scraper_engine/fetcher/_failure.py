@@ -27,9 +27,7 @@ _HOST_UNREACHABLE_MARKERS: tuple[str, ...] = (
 )
 
 
-def classify_fetch_exception(
-    exc: BaseException, default: FailureCategory
-) -> FailureCategory:
+def classify_fetch_exception(exc: BaseException, default: FailureCategory) -> FailureCategory:
     """Return HOST_UNREACHABLE for DNS/unknown-host errors, SSRF_BLOCKED for a
     guard rejection (initial request or a redirect hop), else `default`."""
     if isinstance(exc, SSRFBlockedError):

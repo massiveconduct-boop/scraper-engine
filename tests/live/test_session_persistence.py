@@ -38,7 +38,9 @@ async def test_session_survives_pool_recycle():
     )
     await pg.start()
 
-    await pg.execute(tenant, """
+    await pg.execute(
+        tenant,
+        """
         CREATE TABLE IF NOT EXISTS browser_sessions (
             session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             domain VARCHAR(255) NOT NULL,
@@ -47,7 +49,8 @@ async def test_session_survives_pool_recycle():
             expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
             UNIQUE (domain)
         )
-    """)
+    """,
+    )
 
     session_mgr = SessionStateManager(pg=pg, ttl_days=30)
 
@@ -62,18 +65,18 @@ async def test_session_survives_pool_recycle():
     try:
         # ── Phase 1: acquire, set cookie, release healthy ──
         async with pool.lease(domain=domain) as ctx:
-            await ctx.add_cookies([
-                {
-                    "name": cookie_name,
-                    "value": cookie_value,
-                    "domain": ".example.com",
-                    "path": "/",
-                }
-            ])
-            state = await ctx.storage_state()
-            cookie_written = next(
-                (c for c in state["cookies"] if c["name"] == cookie_name), None
+            await ctx.add_cookies(
+                [
+                    {
+                        "name": cookie_name,
+                        "value": cookie_value,
+                        "domain": ".example.com",
+                        "path": "/",
+                    }
+                ]
             )
+            state = await ctx.storage_state()
+            cookie_written = next((c for c in state["cookies"] if c["name"] == cookie_name), None)
             print(f"STEP 1 - cookie written to live context: {cookie_written}")
             assert cookie_written is not None and cookie_written["value"] == cookie_value
 
@@ -88,9 +91,7 @@ async def test_session_survives_pool_recycle():
         # SessionStateManager must load the persisted state from Postgres.
         async with pool.lease(domain=domain) as ctx2:
             cookies = await ctx2.cookies()
-            reloaded = next(
-                (c for c in cookies if c["name"] == cookie_name), None
-            )
+            reloaded = next((c for c in cookies if c["name"] == cookie_name), None)
             print(f"STEP 2 - cookie reloaded from persisted session: {reloaded}")
             assert reloaded is not None, "session did not persist across pool recycle"
             assert reloaded["value"] == cookie_value, (

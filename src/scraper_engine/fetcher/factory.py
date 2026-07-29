@@ -48,17 +48,26 @@ def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     Threads an optional BotasaurusRequestsClient (round 26), gated on
     config.botasaurus.l1_ja3_client_enabled (default off — a brand-new code
     path with no live-traffic validation yet). None disables it, same
-    build-or-None pattern as the firecrawl client above."""
+    build-or-None pattern as the firecrawl client above.
+
+    Threads an optional ScraplingWrapper (round 28), gated on
+    config.levels.level_1.engine == "scrapling" (base.yaml's default) — L1's
+    own "HTTP/Scrapling" identity, previously declared in config but never
+    actually read here. None (any other engine value) skips the Scrapling
+    attempt entirely, same as L2/L3's engine-gated Botasaurus construction."""
+    from scraper_engine.fetcher.scrapling_wrapper import ScraplingWrapper
     from scraper_engine.services.botasaurus_requests_client import build_ja3_client
     from scraper_engine.services.firecrawl_client import build_firecrawl_client
 
+    lvl = config.levels.level_1
     return Level1Fetcher(
         firecrawl_client=build_firecrawl_client(),
         ssrf_guard=_build_ssrf_guard(config),
         ja3_client=build_ja3_client(
             config.botasaurus.l1_ja3_client_enabled,
-            timeout_seconds=float(config.levels.level_1.timeout_seconds),
+            timeout_seconds=float(lvl.timeout_seconds),
         ),
+        scrapling_client=ScraplingWrapper() if lvl.engine == "scrapling" else None,
     )
 
 

@@ -1,7 +1,6 @@
 # tests/unit/test_dedup.py
 """Deduplication engine tests — spec §3.9, design invariant §1.1.5."""
 
-
 import pytest
 
 
@@ -31,11 +30,13 @@ class TestDeduplicationEngine:
     @pytest.fixture
     def engine(self, redis):
         from scraper_engine.storage.dedup import DeduplicationEngine
+
         return DeduplicationEngine(redis)
 
     @pytest.mark.asyncio
     async def test_get_returns_none_for_miss(self, engine) -> None:
         from scraper_engine.core.tenant import TenantId
+
         result = await engine.get("http://example.com/page", TenantId("test"))
         assert result is None
 
@@ -158,3 +159,47 @@ class TestDeduplicationEngine:
         await engine.store(result, tenant)
         changed = await engine.has_changed(result, tenant)
         assert changed is False
+
+    @pytest.mark.asyncio
+    async def test_has_changed_true_when_never_cached(self, engine) -> None:
+        """No prior store() call — cached is None, so has_changed short-circuits True."""
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
+
+        tenant = TenantId("test")
+        result = FetchResult(
+            url="http://example.com/never-cached",
+            success=True,
+            html="<html>fresh</html>",
+            level_used=1,
+            duration_ms=42,
+        )
+
+        changed = await engine.has_changed(result, tenant)
+        assert changed is True
+
+    @pytest.mark.asyncio
+    async def test_content_hash_includes_markdown(self, engine) -> None:
+        """_content_hash must fold in markdown, not just html (line 47 branch)."""
+        from scraper_engine.core.models import FetchResult
+        from scraper_engine.core.tenant import TenantId
+
+        tenant = TenantId("test")
+        old = FetchResult(
+            url="http://example.com/md",
+            success=True,
+            markdown="old markdown",
+            level_used=1,
+            duration_ms=42,
+        )
+        new = FetchResult(
+            url="http://example.com/md",
+            success=True,
+            markdown="new markdown",
+            level_used=1,
+            duration_ms=42,
+        )
+
+        await engine.store(old, tenant)
+        changed = await engine.has_changed(new, tenant)
+        assert changed is True

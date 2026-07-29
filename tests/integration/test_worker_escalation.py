@@ -41,25 +41,45 @@ def success_l1(url):
 
 
 def fail_l1_timeout(url):
-    return FetchResult(url=url, success=False, level_used=1, duration_ms=10,
-                       failure_category=FailureCategory.NETWORK_TIMEOUT)
+    return FetchResult(
+        url=url,
+        success=False,
+        level_used=1,
+        duration_ms=10,
+        failure_category=FailureCategory.NETWORK_TIMEOUT,
+    )
 
 
 def fail_l2_detection(url):
-    return FetchResult(url=url, success=False, level_used=2, duration_ms=50,
-                       failure_category=FailureCategory.DETECTION_BLOCK)
+    return FetchResult(
+        url=url,
+        success=False,
+        level_used=2,
+        duration_ms=50,
+        failure_category=FailureCategory.DETECTION_BLOCK,
+    )
 
 
 def fail_ssrf(url):
-    return FetchResult(url=url, success=False, level_used=1, duration_ms=10,
-                       failure_category=FailureCategory.SSRF_BLOCKED,
-                       error_message="SSRF blocked")
+    return FetchResult(
+        url=url,
+        success=False,
+        level_used=1,
+        duration_ms=10,
+        failure_category=FailureCategory.SSRF_BLOCKED,
+        error_message="SSRF blocked",
+    )
 
 
 def fail_proxy_exhausted(url):
-    return FetchResult(url=url, success=False, level_used=2, duration_ms=50,
-                       failure_category=FailureCategory.PROXY_EXHAUSTED,
-                       error_message="No proxies available")
+    return FetchResult(
+        url=url,
+        success=False,
+        level_used=2,
+        duration_ms=50,
+        failure_category=FailureCategory.PROXY_EXHAUSTED,
+        error_message="No proxies available",
+    )
 
 
 class TestWorkerEscalation:
@@ -77,10 +97,12 @@ class TestWorkerEscalation:
     @pytest.mark.asyncio
     async def test_l1_timeout_escalates_to_l2_success(self, tenant, worker):
         """FETCHING_L1 failure → ESCALATING_L2 → FETCHING_L2 → PARSING_L2 (success)."""
-        worker._fetch_url = AsyncMock(side_effect=[
-            fail_l1_timeout("http://example.com"),
-            success_l1("http://example.com"),  # L2 success (uses same mock)
-        ])
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                fail_l1_timeout("http://example.com"),
+                success_l1("http://example.com"),  # L2 success (uses same mock)
+            ]
+        )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         resp = await worker.process_job(tenant, "job-2", request)
         assert resp.status == JobStatus.COMPLETED
@@ -88,11 +110,13 @@ class TestWorkerEscalation:
     @pytest.mark.asyncio
     async def test_l2_detection_escalates_to_l3_success(self, tenant, worker):
         """L1 fails → L2 detection block → L3 succeeds."""
-        worker._fetch_url = AsyncMock(side_effect=[
-            fail_l1_timeout("http://example.com"),
-            fail_l2_detection("http://example.com"),
-            success_l1("http://example.com"),  # L3 success
-        ])
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                fail_l1_timeout("http://example.com"),
+                fail_l2_detection("http://example.com"),
+                success_l1("http://example.com"),  # L3 success
+            ]
+        )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         resp = await worker.process_job(tenant, "job-3", request)
         assert resp.status == JobStatus.COMPLETED
@@ -100,11 +124,13 @@ class TestWorkerEscalation:
     @pytest.mark.asyncio
     async def test_all_levels_exhausted_goes_to_dead_letter(self, tenant, worker):
         """L1 fails → L2 fails → L3 fails → DEAD_LETTER."""
-        worker._fetch_url = AsyncMock(side_effect=[
-            fail_l1_timeout("http://example.com"),
-            fail_l2_detection("http://example.com"),
-            fail_l1_timeout("http://example.com"),  # L3 also fails
-        ])
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                fail_l1_timeout("http://example.com"),
+                fail_l2_detection("http://example.com"),
+                fail_l1_timeout("http://example.com"),  # L3 also fails
+            ]
+        )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         resp = await worker.process_job(tenant, "job-4", request)
         assert resp.status == JobStatus.FAILED
@@ -144,13 +170,21 @@ class TestWorkerEscalation:
 
         Covers the PARSING_RETRY_L1 → ESCALATING_L2 path from §4.1 state table.
         """
-        null_l1 = FetchResult(url="http://example.com", success=True, level_used=1,
-                               duration_ms=10, html="", extracted=None)
-        worker._fetch_url = AsyncMock(side_effect=[
-            null_l1,
-            null_l1,  # retry — still null
-            success_l1("http://example.com"),  # L2 success
-        ])
+        null_l1 = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=10,
+            html="",
+            extracted=None,
+        )
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                null_l1,
+                null_l1,  # retry — still null
+                success_l1("http://example.com"),  # L2 success
+            ]
+        )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         resp = await worker.process_job(tenant, "job-8", request)
         assert resp.status == JobStatus.COMPLETED

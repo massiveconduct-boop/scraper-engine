@@ -17,11 +17,13 @@ _ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
 def _resolve_env_vars(value: Any) -> Any:
     """Recursively resolve ${ENV_VAR} and ${ENV_VAR:default} placeholders in config values."""
     if isinstance(value, str):
+
         def _replace(m: re.Match[str]) -> str:
             var_name = m.group(1)
             default = m.group(2)
             result = os.environ.get(var_name, default if default is not None else m.group(0))
             return result if result is not None else m.group(0)
+
         return _ENV_VAR_RE.sub(_replace, value)
     elif isinstance(value, dict):
         return {k: _resolve_env_vars(v) for k, v in value.items()}

@@ -65,6 +65,7 @@ class SSRFRouteGuard:
         if self.blocked is not None:
             raise self.blocked
 
+
 # `page` is a Playwright/Camoufox Page — duck-typed as Any here so these shared
 # helpers don't take a hard dependency on the Playwright types (which aren't
 # consistently importable across the Camoufox stack). The concrete methods
@@ -115,14 +116,8 @@ async def poll_until_solved(
     """
     html = await safe_content(page)
     while (
-        (
-            html is None
-            or challenge_detector.is_challenge_page(
-                html, 200, short_page_is_suspect=False
-            )
-        )
-        and waited_ms < max_total_wait_ms
-    ):
+        html is None or challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False)
+    ) and waited_ms < max_total_wait_ms:
         await page.wait_for_timeout(retry_wait_increment_ms)
         waited_ms += retry_wait_increment_ms
         html = await safe_content(page)

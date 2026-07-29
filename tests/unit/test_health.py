@@ -65,3 +65,20 @@ async def test_check_health_pg_unreachable_marks_unhealthy():
 
     assert status.pgbouncer_reachable is False
     assert status.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_check_health_redis_unreachable_marks_unhealthy_and_pool_size_unknown():
+    """redis.get() backs both the health:ping check and the
+    metrics:proxy_pool_size read — a single Redis outage must fail both
+    independent try/except blocks, not just the first one reached."""
+    pg = AsyncMock()
+    redis = AsyncMock()
+    redis.get.side_effect = Exception("connection refused")
+
+    status = await check_health(pg, redis)
+
+    assert status.redis_reachable is False
+    assert status.healthy is False
+    assert "redis" in status.checks
+    assert status.proxy_pool_size == -1

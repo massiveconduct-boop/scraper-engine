@@ -79,9 +79,7 @@ async def main() -> None:
 
         # STAGE 2+3 — full production path: real solve + real inject
         print("\n[2+3] solve_captcha_on_page (real provider + real inject)…")
-        solved = await solve_captcha_on_page(
-            page, solver=solver, tenant_id=TENANT, url=DEMO_URL
-        )
+        solved = await solve_captcha_on_page(page, solver=solver, tenant_id=TENANT, url=DEMO_URL)
         textarea = await page.evaluate(
             "() => (document.getElementById('g-recaptcha-response')||{}).value || ''"
         )

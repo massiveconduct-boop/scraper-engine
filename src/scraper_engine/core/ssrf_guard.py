@@ -71,9 +71,7 @@ class SSRFGuard:
             info = socket.getaddrinfo(hostname, None)
             addrs = {str(sockaddr[0]) for _family, _, _, _, sockaddr in info}
             if not addrs:
-                raise SSRFBlockedError(
-                    url=url, host=hostname, network="<unresolvable>"
-                )
+                raise SSRFBlockedError(url=url, host=hostname, network="<unresolvable>")
             return list(addrs)
 
         return await loop.run_in_executor(None, _resolve)

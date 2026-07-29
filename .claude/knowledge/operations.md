@@ -135,8 +135,8 @@ containers get service names. Symptom if missing:
 **File:** `.github/workflows/test.yml` — 5 jobs, GitHub Actions hosted, green as of round 25.
 
 **Jobs (each `needs:` the previous):**
-- **lint (round 13-18):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across core/proxy/orchestrator/api/storage/fetcher/browser/observability) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + challenge-mirror ruff baseline + mypy-shrinkage advisory.
-- **unit:** explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently; also see "Known Operational Gaps" #12 on this list drifting from `pyproject.toml`); 315 tests as of round 25.
+- **lint (round 13-18, paths updated round 27 for the src/ layout):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across `src/scraper_engine/{core,proxy,orchestrator,api,storage,fetcher,browser,observability}`) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + `tests/fixtures/challenge_mirror` ruff baseline + mypy-shrinkage advisory. **Coverage gate is NOT run here or anywhere** — see Known Operational Gaps below, round-27 finding, OPEN for next session.
+- **unit:** explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently; also see "Known Operational Gaps" #12 on this list drifting from `pyproject.toml` — this exact drift caused a real round-27 mypy failure, see below); 341 tests as of round 27. Note: `types-redis` was removed from `pyproject.toml`'s dev extras in round 27 (stale stub shadowing real redis-py 8.0.1's own inline types) — do not re-add it.
 - **integration:** Postgres 16 + Redis 7 as GitHub Actions `services:`. Alembic upgrade head before tests. Runs the *full* `tests/integration/` — `test_promotion.py` is no longer excluded (round 23; see below).
 - **chaos:** **Real PgBouncer, not GH Actions `services:`** (round 23) — a bare
   `services:` container pair can't produce the SCRAM-auth-off-a-live-`pg_authid`
@@ -298,7 +298,7 @@ levels:
     `.claude/MEMORY.md` → Technical Debt (round 25);
     `.claude/knowledge/decisions.md` → "Botasaurus".
 12. **Dependency declarations live in 5 separate places, none read from each
-    other (OPEN — known drift risk, not being fixed this round).**
+    other (OPEN — known drift risk, structural fix planned for round 28).**
     `pyproject.toml`'s `dependencies` list, the Dockerfile's `deps` stage
     (a hardcoded `RUN pip install ...` line, "mirrors .github/workflows/
     test.yml" per its own comment — but only by convention, not by any
@@ -307,16 +307,25 @@ levels:
     to `pyproject.toml` alone does **not** make it reach the Docker image or
     CI — found round 25 when `botasaurus` was added to `pyproject.toml` but
     the built image didn't actually contain it until the Dockerfile and
-    every CI job's install list were separately updated too. No fix
-    attempted this round (would mean either templating the Dockerfile from
-    `pyproject.toml` or switching to `pip install -e .` in a way compatible
-    with the multi-stage build-cache design — see the Dockerfile's own
-    comment on why `-e .` was avoided). **Operator checklist when adding any
-    new Python dependency:** update `pyproject.toml`, `Dockerfile`'s
-    `deps` stage, and every `pip install` block in `.github/workflows/
-    test.yml`, then rebuild + `docker run --rm <image> python -c "import
-    <pkg>"` to actually confirm it landed — don't trust that editing
-    `pyproject.toml` alone did anything.
+    every CI job's install list were separately updated too.
+    **Round 27: this exact drift class caused a real CI failure.** CI's
+    lint job installs `mypy` unpinned and never installs `types-redis` at
+    all, while local dev extras pinned `mypy==2.3.0` + `types-redis>=4.6.0`
+    (a stub package targeting a redis-py version 4 majors behind the
+    installed 8.0.1). With both present, local mypy resolved `redis.
+    asyncio.Redis` via the stale third-party stub instead of the real
+    package's own `py.typed` inline types — demanding a generic type
+    argument CI's mypy (correctly, using the real types) rejected. Fixed by
+    removing `types-redis` from `pyproject.toml`'s dev extras (confirmed via
+    `git stash` that the underlying conflict predated the round-27 change
+    that exposed it) — but this only patches the one symptom. The
+    structural fix (round 28, see `.claude/MEMORY.md` → Technical Debt,
+    round 27 "NEXT QUEST", item 4) is still open. **Operator checklist when
+    adding any new Python dependency:** update `pyproject.toml`,
+    `Dockerfile`'s `deps` stage, and every `pip install` block in
+    `.github/workflows/test.yml`, then rebuild + `docker run --rm <image>
+    python -c "import <pkg>"` to actually confirm it landed — don't trust
+    that editing `pyproject.toml` alone did anything.
 13. **`proxy_source_healthy` had the same cross-process gap as the round-25
     alert metrics (RESOLVED round 25 follow-up).** Set inside the
     `proxy-harvester` container, invisible to the `api` process's
@@ -327,3 +336,14 @@ levels:
     round 25 landed. Full story: `.claude/MEMORY.md` → Technical Debt
     (round 25 follow-up).
     Full finding: `.claude/MEMORY.md` → Technical Debt (round 24).
+14. **Coverage gate is dead config (OPEN — round 27 finding, NEXT QUEST,
+    priority item for round 28).** `[tool.coverage.report] fail_under = 90`
+    in `pyproject.toml` is declared but never enforced — none of the three
+    pytest invocations in `.github/workflows/test.yml` (`unit`/
+    `integration`/`chaos`) pass `--cov`. Real measured coverage: 82%, not
+    90%. `orchestrator/job_queue.py` 0% (untested), `proxy/harvester.py`
+    47%, `orchestrator/worker.py` 67%. Same bug class as #8-11 above
+    (config/gate declared, nothing actually calls it) — the sixth
+    occurrence of this exact pattern in this codebase's history. Full
+    finding + full 8-item list: `.claude/MEMORY.md` → Technical Debt
+    (round 27, "Senior-dev review findings").

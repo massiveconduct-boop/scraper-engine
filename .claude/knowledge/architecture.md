@@ -5,6 +5,11 @@
 **When to read:** Understanding how components connect; adding new modules; debugging cross-cutting concerns.
 **Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`
 
+**Path note (round 27):** every bare package path below (`core/`, `proxy/`,
+`browser/pool.py`, etc.) means `src/scraper_engine/<that path>` — all
+application code was consolidated under `src/scraper_engine/` this round.
+See "Repository Layout" near the end of this file for the full picture.
+
 ---
 
 ## Design Invariants (from spec §1.1 — non-negotiable)
@@ -233,8 +238,8 @@ inject failure → degrades to "still a challenge", never a false positive. Null
 no provider key → solver is None → fetch runs with solving skipped. Observable via
 `captcha_solve_attempts_total{kind}` / `captcha_solved_total{kind}`. DOM detect/inject
 is unit-tested with a fake page; live-verified end to end round 22 (real Camoufox
-+ real DOM detect + real inject — see `docs/round-20-evidence.md` for the
-mechanics). The one thing NOT proven live is a target actually *accepting* a
++ real DOM detect + real inject — see `.archive/evidence/round-20-evidence.md`
+(local-only, not tracked in git) for the mechanics). The one thing NOT proven live is a target actually *accepting* a
 solved token, because no NoCaptchaAI solve has produced a token yet on this
 account — root-caused round 22 as an account-side gap (no subscription plan,
 not a code bug); see `.claude/knowledge/troubleshooting.md` → "Captcha task
@@ -507,3 +512,43 @@ API Client → FastAPI (/v1/scrape) → TenantResolver → SSRFGuard → QuotaMa
                                                 ├─ Level1/2/3Fetcher.fetch() → FetchResult
                                                 └─ DedupEngine → PostgresClient → proxy_pool
 ```
+
+---
+
+## Repository Layout (Round 27)
+
+All application code lives under one installable package,
+`src/scraper_engine/` — a consolidation of what were previously 12 separate
+top-level packages (`api/`, `browser/`, `cli/`, `config/`, `core/`,
+`fetcher/`, `observability/`, `orchestrator/`, `proxy/`, `services/`,
+`storage/`, `scrapy_project/`). Import as `scraper_engine.core`,
+`scraper_engine.proxy`, etc. Full rationale, alternatives considered, and
+the real bugs found doing the move: `.claude/knowledge/decisions.md` →
+"src/ Layout Over Flat Top-Level Packages"; the specific gotchas (bare
+dotted-import rebinding, string-based module references, stub/real-type
+drift): `.claude/knowledge/troubleshooting.md`, round-27 entries.
+
+`tests/` and `migrations/` are project-level, not part of the installable
+package — they stay at repo root, unmoved, per standard src-layout
+convention. `tests/fixtures/` holds real, actively-used test
+infrastructure: `challenge_mirror/` (self-hosted Cloudflare-like test
+target, BD-05) and `judge_server.py` (self-hosted proxy judge, used by the
+promotion integration test) — both genuine working components, not scratch,
+which is why they live under `tests/` rather than being archived.
+
+Two directories exist purely as local, gitignored scratch space — never
+pushed to GitHub, but not deleted either:
+- **`.archive/{evidence,directive,closure,other}/`** — 60+ historical
+  per-round evidence/directive/closure reports, categorized by type.
+  Point-in-time snapshots, not living documentation; `.claude/MEMORY.md` and
+  this knowledge base are the living record.
+- **`.local/`** — the authoritative design spec
+  (`.local/specs/scraper-engine-blueprint-v2.md`), a confirmed-duplicate directory,
+  and unused manual scripts. Deliberately kept separate from `.archive/`
+  (see the decisions.md entry above for why the split, not a single
+  merged folder).
+
+`docs/` (tracked, real) now holds only living reference material:
+`docs/reference/api-reference.md`, `docs/guides/deployment.md`. Root-level
+`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE` (Apache 2.0),
+`NOTICE` are standard OSS hygiene files, added round 27.

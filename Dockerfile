@@ -39,17 +39,17 @@ RUN pip install --no-cache-dir "camoufox[geoip]" && \
 # ── Stage 2b: Python deps (cache-stable) ────────────────────────────────────
 FROM system-base AS deps
 WORKDIR /app
-# Explicit runtime dependency list (mirrors .github/workflows/test.yml) rather
-# than `pip install -e .` — an editable install needs the source tree present,
-# which would defeat the whole point of installing deps before copying source.
-# A container never needs the editable install; the app runs from COPY . . below.
-RUN pip install --no-cache-dir "camoufox[geoip]" \
-    fastapi uvicorn pydantic pydantic-core httpx scrapling \
-    asyncpg redis rq botasaurus botasaurus-requests structlog prometheus-client \
-    pyyaml boto3 python-dotenv alembic sqlalchemy scrapy maxminddb \
-    opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc \
-    opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx \
-    opentelemetry-instrumentation-asyncpg opentelemetry-instrumentation-redis
+# requirements-dev-lock.txt (round 28) is the single source of pinned
+# versions, shared with CI — rather than `pip install -e .` (needs the
+# source tree present, defeating the point of installing deps before
+# copying source) or a 3rd hand-duplicated package list (the drift class
+# that caused the round-27 types-redis mismatch, operations.md #12).
+# dev-lock (not the runtime-only lock) because this image also runs
+# `alembic upgrade head` against migrations/, which needs alembic+sqlalchemy
+# — those are dev-extras, not src/ runtime deps, but this container ships
+# migrations/ too (COPY . . below) and is the thing that applies them.
+COPY requirements-dev-lock.txt .
+RUN pip install --no-cache-dir "camoufox[geoip]" -r requirements-dev-lock.txt
 
 # ── Stage 3: runtime — app code copied LAST ─────────────────────────────────
 FROM system-base AS runtime

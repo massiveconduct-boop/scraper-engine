@@ -54,10 +54,7 @@ class GenericSpider(Spider):
             "success": response.status < 400,
             "http_status": response.status,
             "title": response.css("title::text").get(),
-            "links": [
-                link.attrib.get("href", "")
-                for link in response.css("a[href]")[:50]
-            ],
+            "links": [link.attrib.get("href", "") for link in response.css("a[href]")[:50]],
         }
 
         # Apply extraction schema if configured

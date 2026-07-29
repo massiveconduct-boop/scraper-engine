@@ -19,6 +19,7 @@ from scraper_engine.core.tenant import TenantId
 @pytest.fixture
 async def redis():
     from redis.asyncio import Redis
+
     r = Redis(host="localhost", port=6379, decode_responses=True)
     yield r
     await r.aclose()
@@ -52,18 +53,19 @@ class TestPolitenessRace:
             for _ in range(5):
                 # Try to acquire
                 result = await redis.eval(
-                    ACQUIRE_SLOT_LUA, 1,
-                    slot_key, worker_id,
-                    max_concurrent, 300,
+                    ACQUIRE_SLOT_LUA,
+                    1,
+                    slot_key,
+                    worker_id,
+                    max_concurrent,
+                    300,
                 )
                 if result == 1:
                     await asyncio.sleep(0.01)
                     card = await redis.scard(slot_key)
                     if card > max_observed:
                         max_observed = card
-                    await redis.eval(
-                        RELEASE_SLOT_LUA, 1, slot_key, worker_id
-                    )
+                    await redis.eval(RELEASE_SLOT_LUA, 1, slot_key, worker_id)
                 await asyncio.sleep(0.005)
 
         await asyncio.gather(*[worker_task(i) for i in range(10)])

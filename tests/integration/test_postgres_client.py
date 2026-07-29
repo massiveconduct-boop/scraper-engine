@@ -57,15 +57,32 @@ class TestPostgresClient:
         assert row["one"] == 1
 
     @pytest.mark.asyncio
+    async def test_acquire_before_start_raises(self):
+        """acquire() must fail loudly, not hang, if start() was never called."""
+        client = PostgresClient(
+            pgbouncer_dsn="postgresql://scraper:scraper@localhost:5432/scraper_engine",
+            pool_size=5,
+        )
+        with pytest.raises(RuntimeError, match=r"start\(\) must be called before acquire\(\)"):
+            async with client.acquire(TenantId("system")):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_acquire_rejects_invalid_tenant_id_at_storage_boundary(self, pg):
+        """Defense-in-depth re-validation (§1.1.7): a raw string that bypasses
+        TenantId.__new__'s front-door check must still be rejected here."""
+        with pytest.raises(ValueError, match="Invalid tenant_id rejected at storage boundary"):
+            async with pg.acquire("Bad; DROP TABLE tenants;--"):
+                pass
+
+    @pytest.mark.asyncio
     async def test_tenant_isolation(self, pg):
         """Verify that SET search_path prevents cross-tenant access."""
         system = TenantId("system")
         # Create a second tenant schema
         new_tenant = TenantId("teststore")
         async with pg.acquire(system) as conn:
-            await conn.execute(
-                "SELECT public.create_tenant_schema($1)", str(new_tenant)
-            )
+            await conn.execute("SELECT public.create_tenant_schema($1)", str(new_tenant))
 
         # Verify teststore has its own tables
         async with pg.acquire(new_tenant) as conn:

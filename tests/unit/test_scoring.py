@@ -77,3 +77,16 @@ class TestScoringEngine:
         s1 = engine.compute_score(latency_ms=50, success_rate=80.0)
         s2 = engine.compute_score(latency_ms=50, success_rate=80.0)
         assert s1.total == s2.total
+
+    def test_apply_success_trims_history_to_last_50_samples(self) -> None:
+        engine = ScoringEngine()
+        for i in range(60):
+            engine.apply_success("9.9.9.9", 80, i)
+        history = engine._latency_history["9.9.9.9:80"]
+        assert len(history) == 50
+        assert history[0] == 10.0  # oldest 10 samples (0..9) trimmed away
+        assert history[-1] == 59.0
+
+    def test_average_latency_returns_none_when_no_data(self) -> None:
+        engine = ScoringEngine()
+        assert engine.average_latency("1.1.1.1", 9999) is None

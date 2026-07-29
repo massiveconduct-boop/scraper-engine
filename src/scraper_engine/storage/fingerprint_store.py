@@ -45,9 +45,7 @@ class FingerprintStore:
             now,
         )
 
-    async def get_profile(
-        self, tenant_id: TenantId, profile_id: str
-    ) -> dict[str, object] | None:
+    async def get_profile(self, tenant_id: TenantId, profile_id: str) -> dict[str, object] | None:
         """Retrieve a profile's storage_state and config references."""
         row = await self._pg.fetchrow(
             tenant_id,

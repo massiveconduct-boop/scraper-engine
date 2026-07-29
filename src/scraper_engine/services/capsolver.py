@@ -35,9 +35,7 @@ class CapSolverClient:
         self._api_key = api_key
         self._budget = budget
 
-    async def _solve_token(
-        self, tenant_id: TenantId, task: dict[str, object]
-    ) -> str | None:
+    async def _solve_token(self, tenant_id: TenantId, task: dict[str, object]) -> str | None:
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -52,41 +50,54 @@ class CapSolverClient:
     async def solve_recaptcha_v2(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        return await self._solve_token(tenant_id, {
-            "type": "RecaptchaV2TaskProxyless",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "RecaptchaV2TaskProxyless",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
-    async def solve_hcaptcha(
-        self, tenant_id: TenantId, site_key: str, page_url: str
-    ) -> str | None:
-        return await self._solve_token(tenant_id, {
-            "type": "HCaptchaTaskProxyless",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+    async def solve_hcaptcha(self, tenant_id: TenantId, site_key: str, page_url: str) -> str | None:
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "HCaptchaTaskProxyless",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
     async def solve_turnstile(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        return await self._solve_token(tenant_id, {
-            "type": "AntiTurnstileTaskProxyLess",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "AntiTurnstileTaskProxyLess",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
     async def solve_aws_waf(
         self, tenant_id: TenantId, page_url: str, **aws_fields: str
     ) -> str | None:
-        return await self._solve_token(tenant_id, {
-            "type": "AntiAwsWafTaskProxyLess",
-            "websiteURL": page_url,
-            **aws_fields,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "AntiAwsWafTaskProxyLess",
+                "websiteURL": page_url,
+                **aws_fields,
+            },
+        )
 
     async def solve_geetest(
-        self, tenant_id: TenantId, captcha_id: str, page_url: str,
+        self,
+        tenant_id: TenantId,
+        captcha_id: str,
+        page_url: str,
         challenge: str | None = None,
     ) -> str | None:
         task: dict[str, object] = {
@@ -101,11 +112,14 @@ class CapSolverClient:
     async def solve_mtcaptcha(
         self, tenant_id: TenantId, site_key: str, page_url: str
     ) -> str | None:
-        return await self._solve_token(tenant_id, {
-            "type": "MtCaptchaTaskProxyless",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-        })
+        return await self._solve_token(
+            tenant_id,
+            {
+                "type": "MtCaptchaTaskProxyless",
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            },
+        )
 
     async def get_balance(self) -> float:
         """Return current CapSolver account balance."""

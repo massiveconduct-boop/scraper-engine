@@ -1,0 +1,16 @@
+# Default owner for everything not matched below.
+* @massiveconduct-boop
+
+/src/scraper_engine/core/          @massiveconduct-boop
+/src/scraper_engine/proxy/         @massiveconduct-boop
+/src/scraper_engine/browser/       @massiveconduct-boop
+/src/scraper_engine/fetcher/       @massiveconduct-boop
+/src/scraper_engine/orchestrator/  @massiveconduct-boop
+/src/scraper_engine/api/           @massiveconduct-boop
+/src/scraper_engine/storage/       @massiveconduct-boop
+/src/scraper_engine/config/        @massiveconduct-boop
+/src/scraper_engine/observability/ @massiveconduct-boop
+/src/scraper_engine/services/      @massiveconduct-boop
+/migrations/                       @massiveconduct-boop
+/.github/                          @massiveconduct-boop
+/SECURITY.md                       @massiveconduct-boop

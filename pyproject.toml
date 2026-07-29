@@ -4,20 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scraper-engine"
-version = "0.1.0"
+version = "1.0.0"
 description = "Search & Scraper Engine — multi-level web scraping with anti-detection"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["scraper_engine*"]
-
-[tool.setuptools.package-data]
-"scraper_engine.config" = ["*.yaml"]
-infra = ["pgbouncer/*.ini"]
-monitoring = ["alerts/*.yml", "dashboards/*.json"]
-
 dependencies = [
     "fastapi==0.139.2",
     "uvicorn[standard]==0.51.0",
@@ -25,6 +15,18 @@ dependencies = [
     "pydantic-core==2.46.4",
     "httpx==0.28.1",
     "scrapling==0.4.11",
+    # scrapling.fetchers.AsyncFetcher/Fetcher (fetcher/scrapling_wrapper.py)
+    # import curl_cffi directly at module scope — without it,
+    # scrapling.fetchers is entirely unimportable (round 28: found while
+    # live-testing scrapling_wrapper.py's real production wiring; not caught
+    # earlier since bs4-based selector code never touches scrapling.fetchers).
+    # scrapling's own "fetchers" extra also pulls this in, but bundled with
+    # playwright==1.61.0 (exact), which conflicts with camoufox==0.5.4's
+    # playwright<1.61 — declared directly instead, same as every other
+    # direct-import dependency in this list, to get exactly what's needed
+    # without the extra's browser-automation stack (StealthyFetcher/
+    # DynamicFetcher, unused here) or its playwright pin conflict.
+    "curl_cffi>=0.15.0",
     "asyncpg==0.31.0",
     "redis==8.0.1",
     "rq==2.10.0",
@@ -36,6 +38,12 @@ dependencies = [
     # every other direct-import dependency in this list (avoids the drift
     # this list exists to prevent — see .claude/knowledge/operations.md #12).
     "botasaurus-requests==4.0.38",
+    # Round 28: imported by proxy/harvester.py's subprocess-broker fallback
+    # (`from proxybroker2 import Broker`) but was undeclared here — only
+    # worked because it happened to already be pip-installed in this venv.
+    # Same "config exists, nothing enforces it" bug class as the rest of
+    # this round; see .claude/knowledge/operations.md #12.
+    "proxybroker2==2.0.0a4",
     "structlog==26.1.0",
     "prometheus-client==0.25.0",
     "pyyaml==6.0.3",
@@ -52,6 +60,16 @@ dependencies = [
     "opentelemetry-instrumentation-redis==0.65b0",
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["scraper_engine*"]
+
+[tool.setuptools.package-data]
+scraper_engine = ["py.typed"]
+"scraper_engine.config" = ["*.yaml"]
+infra = ["pgbouncer/*.ini"]
+monitoring = ["alerts/*.yml", "dashboards/*.json"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
@@ -60,7 +78,17 @@ dev = [
     "pytest-xdist>=3.5.0",
     "ruff>=0.3.0",
     "mypy==2.3.0",
+    "pre-commit>=3.6.0",
     "types-pyyaml>=6.0.0",
+    # Migration tooling + test-only fakes — never imported from src/, only
+    # from migrations/ and tests/ (round 28: previously hand-listed a 3rd
+    # time per CI job instead of declared here, see operations.md #12).
+    "alembic==1.18.5",
+    "sqlalchemy==2.0.51",
+    "fakeredis==2.36.2",
+    "pip-audit>=2.7.0",
+    # tests/load/locustfile.py only.
+    "locust==2.46.0",
 ]
 
 [tool.ruff]
@@ -120,11 +148,9 @@ markers = [
 source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_engine/browser", "src/scraper_engine/fetcher", "src/scraper_engine/services", "src/scraper_engine/storage", "src/scraper_engine/orchestrator", "src/scraper_engine/api"]
 
 [tool.coverage.report]
-# Per-spec §10: CI gate fails if core/, proxy/, orchestrator/ combined < 90%.
-# browser/ excluded from fail_under because CamoufoxWrapper requires a real
-# Firefox process (~80MB RSS, not available in CI runners). Browser logic is
-# tested in session_state (3 tests, 100%) and pool init (1 test, 100%).
-# G-02 closure: browser/ measured where possible.
-# G-10 closure: line-level justification provided per file below.
-fail_under = 90
-include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*"]
+# Per-spec §10, round 28: CI gate enforces 100% across every package in
+# [tool.coverage.run] source except browser/, which needs a real Firefox
+# process (~80MB RSS, not available in CI runners) and is measured only
+# where possible (session_state, pool init) without being gated.
+fail_under = 100
+include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*", "src/scraper_engine/fetcher/*", "src/scraper_engine/services/*", "src/scraper_engine/storage/*", "src/scraper_engine/api/*"]

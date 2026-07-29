@@ -24,9 +24,7 @@ class RedisClient:
 
     async def start(self) -> None:
         """Connect to Redis."""
-        self._client = aioredis.from_url(
-            self._redis_url, encoding="utf-8", decode_responses=True
-        )
+        self._client = aioredis.from_url(self._redis_url, encoding="utf-8", decode_responses=True)
 
     @property
     def raw(self) -> aioredis.Redis:

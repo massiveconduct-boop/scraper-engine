@@ -104,9 +104,7 @@ class Level3Fetcher:
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
-                    await page.goto(
-                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
-                    )
+                    await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
@@ -155,9 +153,7 @@ class Level3Fetcher:
                 success=False,
                 level_used=3,
                 duration_ms=int((time.monotonic() - start) * 1000),
-                failure_category=classify_fetch_exception(
-                    exc, FailureCategory.BROWSER_CRASH
-                ),
+                failure_category=classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH),
                 error_message=str(exc),
                 proxy_used=proxy.key() if proxy else "none",
             )

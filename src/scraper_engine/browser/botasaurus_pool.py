@@ -83,11 +83,7 @@ class BotasaurusPool:
         loop = asyncio.get_running_loop()
         async with self._lock:
             entry = self._entry
-            if (
-                entry is not None
-                and entry.proxy_key == proxy.key()
-                and entry.domain == domain
-            ):
+            if entry is not None and entry.proxy_key == proxy.key() and entry.domain == domain:
                 return await loop.run_in_executor(None, self._reuse_fetch, entry.driver, url)
 
             if entry is not None:
@@ -100,9 +96,7 @@ class BotasaurusPool:
             self._entry = _PooledDriver(driver, proxy.key(), domain)
             return html
 
-    def _new_driver_fetch(
-        self, url: str, proxy: Proxy, session_id: str | None
-    ) -> tuple[Any, str]:
+    def _new_driver_fetch(self, url: str, proxy: Proxy, session_id: str | None) -> tuple[Any, str]:
         """Synchronous — constructs and navigates a fresh Driver, run in the
         executor same as BotasaurusWrapper._botasaurus_fetch (Selenium-style
         driver management has no native asyncio API to await on)."""

@@ -44,6 +44,7 @@ class TestAtomicLua:
     def test_acquire_slot_lua_exists(self):
         """Verify the ACQUIRE_SLOT_LUA script is defined and well-formed."""
         from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA
+
         assert "SCARD" in ACQUIRE_SLOT_LUA
         assert "SADD" in ACQUIRE_SLOT_LUA
         assert "EXPIRE" in ACQUIRE_SLOT_LUA

@@ -91,9 +91,7 @@ class PostgresClient:
             rows: list[asyncpg.Record] = await conn.fetch(query, *args)
             return rows
 
-    async def fetchrow(
-        self, tenant_id: TenantId, query: str, *args: Any
-    ) -> asyncpg.Record | None:
+    async def fetchrow(self, tenant_id: TenantId, query: str, *args: Any) -> asyncpg.Record | None:
         """Fetch a single row within a tenant scope."""
         async with self.acquire(tenant_id) as conn:
             return await conn.fetchrow(query, *args)

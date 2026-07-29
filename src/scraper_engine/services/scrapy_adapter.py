@@ -73,9 +73,7 @@ class ScrapyAdapter:
             self._available = False
             logger.warning("scrapy not installed — bulk crawl disabled")
 
-    async def run_spider(
-        self, spider_name: str, start_urls: list[str]
-    ) -> list[dict[str, object]]:
+    async def run_spider(self, spider_name: str, start_urls: list[str]) -> list[dict[str, object]]:
         """Run a Scrapy spider in an isolated subprocess and return extracted items."""
         if not self._available:
             return []

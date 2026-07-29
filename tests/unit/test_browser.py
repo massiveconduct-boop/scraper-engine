@@ -37,12 +37,16 @@ class TestAcquireDoubleIssue:
         assert ctx1 is fake_ctx, "first acquire should return the queued context"
 
         # Second acquire — pool should be empty, must NOT return same ctx
-        with patch.object(pool, '_active_wrappers', []), \
-             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with (
+            patch.object(pool, "_active_wrappers", []),
+            patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw,
+        ):
+
             def make_mock(*a, **kw):
                 inst = MagicMock()
                 inst.__aenter__ = AsyncMock(return_value=object())
                 return inst
+
             mock_cw.side_effect = make_mock
             ctx2 = await pool.acquire()
             assert ctx2 is not fake_ctx, (
@@ -64,12 +68,16 @@ class TestAcquireDoubleIssue:
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
 
-        with patch.object(pool, '_active_wrappers', []), \
-             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with (
+            patch.object(pool, "_active_wrappers", []),
+            patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw,
+        ):
+
             def make_mock(*a, **kw):
                 inst = MagicMock()
                 inst.__aenter__ = AsyncMock(return_value=object())
                 return inst
+
             mock_cw.side_effect = make_mock
 
             ctx2 = await pool.acquire()
@@ -98,10 +106,12 @@ class TestBrowserPool:
         assert pool._prewarm_count == 5
         assert pool._max_idle_seconds == 600
 
-    @pytest.mark.skip(reason=(
-        "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
-        "— runs on host, not CI"
-    ))
+    @pytest.mark.skip(
+        reason=(
+            "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
+            "— runs on host, not CI"
+        )
+    )
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
         """Pool without warm instances creates a new wrapper on acquire."""
         from scraper_engine.browser.pool import BrowserPool
@@ -235,18 +245,20 @@ class TestSessionIsolation:
         class _FakeAcquireCtx:
             async def __aenter__(self):
                 return conn
+
             async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeAcquireCtx())
         from scraper_engine.browser.session_state import SessionStateManager
+
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
         fake_ctx = object()
 
-        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper
@@ -255,7 +267,8 @@ class TestSessionIsolation:
             call_kwargs = mock_cw.call_args[1]
             assert "storage_state" in call_kwargs
             assert call_kwargs["storage_state"] == {
-                "cookies": [{"name": "x", "value": "y"}], "origins": [],
+                "cookies": [{"name": "x", "value": "y"}],
+                "origins": [],
             }
 
     @pytest.mark.asyncio
@@ -268,12 +281,14 @@ class TestSessionIsolation:
         class _FakeCtx:
             async def __aenter__(self):
                 return conn
+
             async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
         from scraper_engine.browser.session_state import SessionStateManager
+
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
@@ -285,8 +300,10 @@ class TestSessionIsolation:
         fake_wrapper.__aexit__ = AsyncMock()
         pool._active_wrappers = [fake_wrapper]
 
-        with patch.object(pool, 'acquire', new_callable=AsyncMock, return_value=fake_ctx), \
-             patch.object(pool, 'release', new_callable=AsyncMock):
+        with (
+            patch.object(pool, "acquire", new_callable=AsyncMock, return_value=fake_ctx),
+            patch.object(pool, "release", new_callable=AsyncMock),
+        ):
             async with pool.lease(domain="example.com"):
                 pass
         fake_ctx.storage_state.assert_called_once()
@@ -301,12 +318,14 @@ class TestSessionIsolation:
         class _FakeCtx:
             async def __aenter__(self):
                 return conn
+
             async def __aexit__(self, *a):
                 pass
 
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
         from scraper_engine.browser.session_state import SessionStateManager
+
         mgr = SessionStateManager(pg=pg)
 
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=mgr)
@@ -318,8 +337,11 @@ class TestSessionIsolation:
         fake_wrapper.__aexit__ = AsyncMock()
         pool._active_wrappers = [fake_wrapper]
 
-        with patch.object(pool, 'acquire', new_callable=AsyncMock, return_value=fake_ctx), \
-             patch.object(pool, 'release', new_callable=AsyncMock), pytest.raises(RuntimeError):
+        with (
+            patch.object(pool, "acquire", new_callable=AsyncMock, return_value=fake_ctx),
+            patch.object(pool, "release", new_callable=AsyncMock),
+            pytest.raises(RuntimeError),
+        ):
             async with pool.lease(domain="example.com"):
                 raise RuntimeError("simulated failure")
         fake_ctx.storage_state.assert_not_called()
@@ -330,8 +352,10 @@ class TestSessionIsolation:
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=None)
         fake_ctx = object()
 
-        with patch.object(pool, 'acquire', new_callable=AsyncMock, return_value=fake_ctx), \
-             patch.object(pool, 'release', new_callable=AsyncMock):
+        with (
+            patch.object(pool, "acquire", new_callable=AsyncMock, return_value=fake_ctx),
+            patch.object(pool, "release", new_callable=AsyncMock),
+        ):
             async with pool.lease(domain="example.com") as ctx:
                 assert ctx is fake_ctx
 
@@ -349,13 +373,16 @@ class TestSessionIsolation:
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
 
-        with patch.object(pool, '_active_wrappers', []), \
-             patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with (
+            patch.object(pool, "_active_wrappers", []),
+            patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw,
+        ):
 
             def make_mock(*a, **kw):
                 inst = MagicMock()
                 inst.__aenter__ = AsyncMock(return_value=object())
                 return inst
+
             mock_cw.side_effect = make_mock
             ctx2 = await pool.acquire()
             assert ctx2 is not fake_ctx
@@ -374,6 +401,7 @@ class TestSessionState:
         class _FakeAcquireCtx:
             async def __aenter__(self):
                 return conn
+
             async def __aexit__(self, *args):
                 pass
 

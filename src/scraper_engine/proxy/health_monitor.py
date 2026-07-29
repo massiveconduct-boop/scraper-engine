@@ -102,13 +102,9 @@ class HealthMonitor:
         # api/health.py reads this key for GET /health's proxy_pool_size —
         # it was being read but never written anywhere, so the field was
         # permanently stuck at 0 regardless of the pool's real state.
-        pool_row = await self._pg.fetchrow(
-            system_tenant, "SELECT count(*) AS n FROM proxy_pool"
-        )
+        pool_row = await self._pg.fetchrow(system_tenant, "SELECT count(*) AS n FROM proxy_pool")
         pool_size = pool_row["n"] if pool_row else 0
-        await self._redis.set(
-            system_tenant, "metrics:proxy_pool_size", str(pool_size), ttl=600
-        )
+        await self._redis.set(system_tenant, "metrics:proxy_pool_size", str(pool_size), ttl=600)
 
         return {"validated": validated, "removed": removed, "downgraded": downgraded}
 
@@ -116,9 +112,7 @@ class HealthMonitor:
         """Validate a single proxy. Returns True if still working."""
         proxy_url = f"http://{ip}:{port}"
         try:
-            async with httpx.AsyncClient(
-                proxy=proxy_url, timeout=10.0
-            ) as client:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=10.0) as client:
                 response = await client.get(_JUDGE_URLS[0])
                 ok: bool = response.status_code == 200
                 return ok

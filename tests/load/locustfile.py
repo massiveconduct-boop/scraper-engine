@@ -27,9 +27,7 @@ class ScraperEngineUser(HttpUser):
         # it every submit/poll call 401s and the test only measures the auth
         # rejection path, not the real pipeline. LOAD_TEST_API_KEY lets CI/prod
         # point this at a real provisioned tenant key.
-        self.client.headers["X-API-Key"] = os.environ.get(
-            "LOAD_TEST_API_KEY", "sk-admin"
-        )
+        self.client.headers["X-API-Key"] = os.environ.get("LOAD_TEST_API_KEY", "sk-admin")
 
     @task(3)
     def submit_scrape_job(self):

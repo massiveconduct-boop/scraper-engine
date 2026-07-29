@@ -47,9 +47,7 @@ class DeduplicationEngine:
             hasher.update(result.markdown.encode())
         return hasher.hexdigest()
 
-    async def get(
-        self, url: str, tenant_id: TenantId
-    ) -> FetchResult | None:
+    async def get(self, url: str, tenant_id: TenantId) -> FetchResult | None:
         """Return cached successful FetchResult, or None if not cached/stale.
 
         Keyed on (tenant_id, url) → last successful content hash.

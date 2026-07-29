@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scraper_engine.services import scrapy_adapter as sa
 from scraper_engine.services.scrapy_adapter import ScrapyAdapter
 
 
@@ -85,3 +86,65 @@ async def test_run_spider_terminates_process_on_timeout():
 
     assert result == []
     fake_process.terminate.assert_called_once()
+
+
+class TestAvailabilityDetection:
+    def test_available_false_when_scrapy_not_importable(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "scrapy":
+                raise ImportError("no scrapy")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        adapter = ScrapyAdapter()
+        assert adapter._available is False
+
+
+class TestRunSpiderSubprocess:
+    """Exercises the real subprocess entry point in-process, with
+    scrapy.crawler.CrawlerProcess faked so no real Twisted reactor starts —
+    same "mock the subprocess boundary" approach the module docstring
+    describes, one level deeper (the function itself, not multiprocessing)."""
+
+    def test_collects_items_from_parsed_responses(self, monkeypatch):
+        captured = {}
+
+        class FakeCrawlerProcess:
+            def __init__(self, settings):
+                captured["settings"] = settings
+
+            def crawl(self, spider_cls):
+                captured["spider_cls"] = spider_cls
+
+            def start(self):
+                spider = captured["spider_cls"]()
+                fake_response = MagicMock()
+                fake_response.url = "http://example.com"
+                fake_response.css.return_value.get.return_value = "Example Title"
+                list(spider.parse(fake_response))
+
+        monkeypatch.setattr("scrapy.crawler.CrawlerProcess", FakeCrawlerProcess)
+        monkeypatch.setattr("scrapy.utils.project.get_project_settings", lambda: {})
+
+        queue = MagicMock()
+        sa._run_spider_subprocess("titles", ["http://example.com"], queue)
+
+        queue.put.assert_called_once_with([{"url": "http://example.com", "title": "Example Title"}])
+
+    def test_puts_exception_on_queue_when_crawl_fails(self, monkeypatch):
+        monkeypatch.setattr(
+            "scrapy.utils.project.get_project_settings",
+            MagicMock(side_effect=RuntimeError("settings boom")),
+        )
+
+        queue = MagicMock()
+        sa._run_spider_subprocess("titles", ["http://example.com"], queue)
+
+        queue.put.assert_called_once()
+        put_arg = queue.put.call_args[0][0]
+        assert isinstance(put_arg, RuntimeError)
+        assert str(put_arg) == "settings boom"

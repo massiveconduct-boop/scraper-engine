@@ -13,9 +13,9 @@ from scraper_engine.core.tenant import TenantId
 
 def camoufox_process_count():
     return sum(
-        1 for p in psutil.process_iter(["name"])
-        if (name := (p.info["name"] or "").lower())
-        and ("camoufox" in name or "firefox" in name)
+        1
+        for p in psutil.process_iter(["name"])
+        if (name := (p.info["name"] or "").lower()) and ("camoufox" in name or "firefox" in name)
     )
 
 

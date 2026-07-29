@@ -86,6 +86,7 @@ async def scrape(
     if _storage_redis is not None and _storage_pg is not None:
         from scraper_engine.core.exceptions import QuotaExceededError
         from scraper_engine.core.quota import QuotaManager
+
         daily_limit = None
         row = await _storage_pg.fetchrow(
             tenant_id,
@@ -96,7 +97,8 @@ async def scrape(
             daily_limit = row["quota_daily_limit"]
         try:
             await QuotaManager(
-                redis=_storage_redis, daily_limit=daily_limit,
+                redis=_storage_redis,
+                daily_limit=daily_limit,
             ).check_and_increment(tenant_id, count=len(request.urls))
         except QuotaExceededError:
             raise HTTPException(status_code=429, detail="Daily quota exceeded") from None
@@ -105,8 +107,7 @@ async def scrape(
     job_id = str(uuid.uuid4())
     if _storage_pg is not None:
         config_json = json.dumps(
-            request.config_overrides.model_dump()
-            if request.config_overrides else {}
+            request.config_overrides.model_dump() if request.config_overrides else {}
         )
         await _storage_pg.execute(
             tenant_id,
@@ -171,6 +172,7 @@ async def crawl(
     if _storage_redis is not None and _storage_pg is not None:
         from scraper_engine.core.exceptions import QuotaExceededError
         from scraper_engine.core.quota import QuotaManager
+
         daily_limit = None
         row = await _storage_pg.fetchrow(
             tenant_id,
@@ -181,18 +183,21 @@ async def crawl(
             daily_limit = row["quota_daily_limit"]
         try:
             await QuotaManager(
-                redis=_storage_redis, daily_limit=daily_limit,
+                redis=_storage_redis,
+                daily_limit=daily_limit,
             ).check_and_increment(tenant_id, count=len(request.start_urls))
         except QuotaExceededError:
             raise HTTPException(status_code=429, detail="Daily quota exceeded") from None
 
     job_id = str(uuid.uuid4())
     if _storage_pg is not None:
-        config_json = json.dumps({
-            "_job_type": "crawl",
-            "spider_name": request.spider_name,
-            "start_urls": [str(u) for u in request.start_urls],
-        })
+        config_json = json.dumps(
+            {
+                "_job_type": "crawl",
+                "spider_name": request.spider_name,
+                "start_urls": [str(u) for u in request.start_urls],
+            }
+        )
         await _storage_pg.execute(
             tenant_id,
             """INSERT INTO scrape_jobs (job_id, urls, config_used, status, webhook_url)
@@ -282,8 +287,7 @@ async def get_job(
     errors = [r.error_message for r in results if not r.success and r.error_message]
 
     progress = (
-        1.0 if status in _TERMINAL_STATUSES
-        else (0.5 if status == JobStatus.PROCESSING else 0.0)
+        1.0 if status in _TERMINAL_STATUSES else (0.5 if status == JobStatus.PROCESSING else 0.0)
     )
 
     return JobStatusResponse(

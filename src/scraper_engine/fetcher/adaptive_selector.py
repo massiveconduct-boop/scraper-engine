@@ -22,6 +22,7 @@ class AdaptiveSelector:
     def __init__(self) -> None:
         try:
             from bs4 import BeautifulSoup  # noqa: F401
+
             self._bs4_available = True
         except ImportError:
             self._bs4_available = False

@@ -20,6 +20,7 @@ from .result import FetchResult
 if TYPE_CHECKING:
     from scraper_engine.core.models import ConfigOverrides, Proxy
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.fetcher.scrapling_wrapper import ScraplingWrapper
     from scraper_engine.services.botasaurus_requests_client import BotasaurusRequestsClient
     from scraper_engine.services.firecrawl_client import FirecrawlClient
 
@@ -36,6 +37,7 @@ class Level1Fetcher:
         firecrawl_client: FirecrawlClient | None = None,
         ssrf_guard: SSRFGuard | None = None,
         ja3_client: BotasaurusRequestsClient | None = None,
+        scrapling_client: ScraplingWrapper | None = None,
     ) -> None:
         """Level 1 fetcher. firecrawl_client is optional — the factory builds it
         once from FIRECRAWL_API_KEY; None disables markdown conversion (fetch
@@ -49,10 +51,18 @@ class Level1Fetcher:
         path). When set, every fetch tries the JA3-matched client first,
         falling back to the plain httpx path below on any failure — same
         first-attempt/fallback shape as Level2Fetcher's Botasaurus-then-
-        Camoufox pipeline."""
+        Camoufox pipeline.
+
+        scrapling_client is optional (round 28) — the factory builds it when
+        config.levels.level_1.engine == "scrapling" (base.yaml's default,
+        matching this level's "HTTP/Scrapling" identity, previously never
+        actually wired). Tried after the JA3 client (if configured) and
+        before the plain httpx fallback — same shape, one more link in the
+        chain."""
         self._firecrawl = firecrawl_client
         self._ssrf_guard = ssrf_guard or SSRFGuard()
         self._ja3_client = ja3_client
+        self._scrapling_client = scrapling_client
 
     async def fetch(
         self,
@@ -76,6 +86,10 @@ class Level1Fetcher:
                 ja3_result = await self._fetch_via_ja3(url, proxy, timeout, start)
                 if ja3_result is not None:
                     return ja3_result
+            if self._scrapling_client is not None:
+                scrapling_result = await self._fetch_via_scrapling(url, proxy, timeout, start)
+                if scrapling_result is not None:
+                    return scrapling_result
             async with httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=False,
@@ -86,9 +100,7 @@ class Level1Fetcher:
                 for _ in range(MAX_REDIRECTS):
                     if not response.is_redirect:
                         break
-                    next_url = str(
-                        response.headers.get("location") or response.url
-                    )
+                    next_url = str(response.headers.get("location") or response.url)
                     next_url = str(httpx.URL(current_url).join(next_url))
                     await self._ssrf_guard.validate(next_url)
                     current_url = next_url
@@ -124,14 +136,13 @@ class Level1Fetcher:
             )
         except Exception as exc:
             from scraper_engine.fetcher._failure import classify_fetch_exception
+
             return FetchResult(
                 url=url,
                 success=False,
                 level_used=1,
                 duration_ms=int((time.monotonic() - start) * 1000),
-                failure_category=classify_fetch_exception(
-                    exc, FailureCategory.NETWORK_TIMEOUT
-                ),
+                failure_category=classify_fetch_exception(exc, FailureCategory.NETWORK_TIMEOUT),
                 error_message=str(exc),
             )
 
@@ -163,6 +174,50 @@ class Level1Fetcher:
                 await self._ssrf_guard.validate(next_url)
                 current_url = next_url
                 response = await session.get(current_url, proxy=proxy_url)
+
+            success = response.status_code < 400
+            markdown = None
+            if success and self._firecrawl is not None:
+                markdown = await self._firecrawl.convert_to_markdown(response.text, url)
+
+            return FetchResult(
+                url=url,
+                success=success,
+                http_status=response.status_code,
+                html=response.text,
+                markdown=markdown,
+                level_used=1,
+                proxy_used=proxy.key() if proxy else None,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+        except Exception:
+            return None
+
+    async def _fetch_via_scrapling(
+        self, url: str, proxy: Proxy | None, timeout: int, start: float
+    ) -> FetchResult | None:
+        """Returns None (not a FetchResult) to signal "fall back to plain
+        httpx" — scrapling not installed, or any error mid-fetch, matching
+        `_fetch_via_ja3`'s fallback shape. Redirects are followed manually,
+        same as the httpx and JA3 paths, so every hop still gets
+        SSRF-revalidated (spec §1.1 #4) — ScraplingWrapper.fetch() is always
+        called with follow_redirects=False."""
+        assert self._scrapling_client is not None
+        try:
+            proxy_url = proxy.url() if proxy else None
+            current_url = url
+            response = await self._scrapling_client.fetch(current_url, timeout, proxy=proxy_url)
+            if response is None:
+                return None
+            for _ in range(MAX_REDIRECTS):
+                if response.location is None:
+                    break
+                next_url = str(httpx.URL(current_url).join(response.location))
+                await self._ssrf_guard.validate(next_url)
+                current_url = next_url
+                response = await self._scrapling_client.fetch(current_url, timeout, proxy=proxy_url)
+                if response is None:
+                    return None
 
             success = response.status_code < 400
             markdown = None

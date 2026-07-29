@@ -28,14 +28,41 @@ logger = logging.getLogger(__name__)
 # GeoLite2-ASN doesn't label "datacenter vs residential" directly — this is
 # the same category of heuristic MaxMind's own docs point integrators at.
 _DATACENTER_KEYWORDS = (
-    "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
-    "linode", "vultr", "ovh", "hetzner", "oracle", "cloudflare", "akamai",
-    "fastly", "alibaba", "tencent", "scaleway", "contabo", "leaseweb",
-    "hosting", "datacenter", "data center", "colocation", "server",
+    "amazon",
+    "aws",
+    "google",
+    "microsoft",
+    "azure",
+    "digitalocean",
+    "linode",
+    "vultr",
+    "ovh",
+    "hetzner",
+    "oracle",
+    "cloudflare",
+    "akamai",
+    "fastly",
+    "alibaba",
+    "tencent",
+    "scaleway",
+    "contabo",
+    "leaseweb",
+    "hosting",
+    "datacenter",
+    "data center",
+    "colocation",
+    "server",
 )
 _MOBILE_KEYWORDS = (
-    "mobile", "wireless", "cellular", "t-mobile", "verizon wireless",
-    "vodafone", "airtel", "jio", "cellco",
+    "mobile",
+    "wireless",
+    "cellular",
+    "t-mobile",
+    "verizon wireless",
+    "vodafone",
+    "airtel",
+    "jio",
+    "cellco",
 )
 
 

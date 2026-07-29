@@ -3,7 +3,7 @@
 **Purpose:** Diagnostic patterns, known failure modes, and their fixes.
 **Scope:** Bugs encountered during 7 rounds of audit. Recurring failure patterns.
 **When to read:** Debugging failures; encountering familiar error patterns.
-**Related:** `.claude/knowledge/decisions.md`, `docs/round-6-*.md`
+**Related:** `.claude/knowledge/decisions.md`, `.archive/{evidence,directive,closure}/round-6-*.md` (local-only, not tracked in git)
 
 ---
 
@@ -25,6 +25,114 @@
 **Symptom:** Ruff E501 on f-strings containing Python subprocess scripts.
 **Fix:** Add `# ruff: noqa: E501` at file top with comment explaining why.
 **Notable locations:** `proxy/harvester.py` (broker subprocess script strings).
+
+### Round 27: Bare Dotted Import Rebinding on Package Rename/Move
+**Symptom:** After renaming/moving a package, a bulk import-rewrite looks
+complete (ruff/grep for `from X import Y` shows nothing left) but a specific
+function silently uses the wrong object at runtime — no error, just wrong
+behavior, or in the worst case an `AttributeError` deep in a rarely-hit path.
+**Root cause:** `import a.b` binds the name `a` in the local namespace (not
+`a.b`), so callers reference it as `a.b.thing`. `import a.b as x` binds `x`
+to `a.b` itself (the deepest component), not to `a`. A blind regex that
+prepends a new prefix to a bare dotted import (`import a.b` →
+`import new_prefix.a.b`) silently changes which name gets bound — any code
+still saying `a.b.thing` afterward breaks, but with NO import error, since
+`new_prefix` still resolves as a name, just not the one being used later.
+**Real near-miss (round 27, src/ layout consolidation):**
+`services/_anticaptcha.py` had `import core.budget` at module level (used as
+`core.budget.CAPSOLVER_CONCURRENCY`), and the function's own parameter was
+also named `budget: CapSolverBudget` — rewriting the import to bind the name
+`budget` directly (`from scraper_engine.core import budget`) would have let
+the function parameter silently shadow the module-level import inside every
+function using it, since Python resolves the innermost binding. Caught by
+manually checking every bare dotted import's actual usage site before
+touching it, not by any tool.
+**Fix:** Never blindly regex-rewrite bare `import X.sub[ as alias]` forms.
+For each one: (1) check what name it binds (`X` for `import X.sub`, the
+alias for `import X.sub as alias`), (2) check that name isn't already used
+as a local variable/parameter name in the same scope, (3) if there's a
+naming collision, bind the rewritten import to a **distinct** alias
+(`import new.X.sub as sub_module`) rather than reusing the original name.
+`from X.sub import Y` (named-symbol imports) don't have this problem — they
+never rebind a package name, so those ARE safe to bulk-rewrite.
+**Detection:** `grep -rn "^\s*import <pkg>\b"` (note: `^\s*`, not just `^` —
+inline imports inside function bodies are indented and a `^import` anchor
+misses them) — every hit needs manual review, not automated rewrite.
+
+### Round 27: Dotted-String Module References Invisible to Import Audits
+**Symptom:** After renaming/moving a package, all tests pass locally in a
+quick spot-check, but a full `pytest` run (or worse, production) fails with
+`ModuleNotFoundError` for the OLD package name — even though every `import`/
+`from` statement was already updated.
+**Root cause:** Several real mechanisms reference a module by a dotted
+**string**, not a Python import statement, so grepping for `from X import`/
+`import X` never finds them: `unittest.mock.patch("old.module.path")` and
+`monkeypatch.setattr("old.module.path", ...)` (both single- and
+double-quoted, and split across multiple lines); `rq`'s own job queue
+(`queue.enqueue("old.module.task_function", ...)` — the worker process
+resolves this string via `importlib` at execution time, with no static
+check at all); Scrapy's own `scrapy.cfg` (`default = old.module.settings`)
+and `settings.py`'s own `SPIDER_MODULES`/`DOWNLOADER_MIDDLEWARES`/
+`ITEM_PIPELINES` string keys.
+**Real occurrence (round 27, src/ layout consolidation):** all of the above
+were found only because the full test suite was run and failed after the
+import-statement rewrite looked complete — most seriously,
+`api/routes.py`'s `queue.enqueue("orchestrator.tasks.run_scrape_job", ...)`,
+which would have silently broken every real scrape/crawl job in production
+had it shipped unfixed (confirmed fixed by submitting a real job through the
+rebuilt live API and watching it go `PENDING → COMPLETED`, not just by
+re-running tests).
+**Fix:** After any package rename/move, run the FULL test suite (not a
+subset) before considering the rewrite done — that's what actually surfaces
+these. Also worth a targeted grep pass for quoted dotted-path strings
+matching the old package names, in both quote styles, across `.py`, `.cfg`,
+and any framework-specific settings files.
+
+### Round 27: Stale Third-Party Type Stub Shadowing a Package's Own Inline Types
+**Symptom:** Local `mypy --strict` and CI's `mypy --strict` disagree about
+the SAME line of code — one says a type needs a generic argument, the other
+says it accepts none. Both can't be right; the actual cause is that they're
+checking against two different sources of type information.
+**Root cause:** A third-party stub package (e.g. `types-redis`) pinned in
+local dev dependencies but not installed in CI's environment. Once the real
+package ships its own inline types (a `py.typed` marker, e.g. real `redis`
+since some version), the third-party stub becomes not just redundant but
+actively wrong if it targets an old version of that package — and when both
+are installed, mypy can resolve via the stale stub instead of the real
+package's own types.
+**Real occurrence (round 27):** `types-redis==4.6.0.20241004` (stub target:
+redis-py 4.6) vs. real installed `redis==8.0.1` (ships its own `py.typed`).
+CI's lint job never installed `types-redis` at all — so CI was always
+checking against the correct, real types; the local dev environment was
+wrong. Confirmed via `git stash` (reproduced CI's exact errors on the
+pre-refactor code too, proving this predated round 27's changes) and via
+`pip uninstall types-redis` locally (immediately reproduced CI's errors).
+**Fix:** When local and CI mypy disagree, check whether a third-party stub
+package is installed in one environment but not the other before assuming
+either environment's code is wrong — `pip show <stub-package>`,
+`ls .venv/lib/*/site-packages/<real-package>/py.typed` to check if the real
+package now ships its own types, and if so, remove the stub rather than
+patching code to satisfy it.
+
+### Round 27: cwd-Dependent Config Path Only Breaks Inside a Container
+**Symptom:** A documented command (`docker compose exec api alembic upgrade
+head`) fails with a connection error inside a container, but the exact same
+tool works fine when run from a developer's shell or in CI.
+**Root cause:** A config file (`alembic.ini`'s `script_location`) used a
+bare relative path, which Alembic resolves against the **process's current
+working directory**, not the ini file's own location. Locally and in CI,
+the tool always happens to be invoked with cwd = repo root (matching the
+ini file's directory), so it silently works by coincidence. Inside a
+container built with `WORKDIR /app` and the ini file also at `/app`, it
+still happens to work — but `docker compose exec api alembic ...` doesn't
+guarantee the exec session's cwd matches `WORKDIR` in every Docker/compose
+version, and more generally, any invocation from a different directory
+breaks it.
+**Fix:** Alembic supports `%(here)s` token interpolation (since 1.11) that
+resolves relative to the ini file's own directory instead of cwd:
+`script_location = %(here)s/migrations`. Prefer a tool's own built-in
+location-independence mechanism over hand-rolled `Path(__file__)` tricks
+when one exists.
 
 ---
 

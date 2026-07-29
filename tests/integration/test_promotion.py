@@ -88,9 +88,7 @@ async def test_promote_tcp_only_promotes_seeded_proxy(pg, judge_server):
 
     # Plan §4.4: do NOT require nonzero promoted count as pass condition
     # for wild-proxy tests. For this controlled judge test, assert promotion.
-    assert result["promoted"] >= 1, (
-        f"Expected at least 1 promoted proxy, got {result}"
-    )
+    assert result["promoted"] >= 1, f"Expected at least 1 promoted proxy, got {result}"
 
     # Fetch updated score
     rows = await pg.fetch(

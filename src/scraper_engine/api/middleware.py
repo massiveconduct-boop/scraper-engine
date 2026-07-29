@@ -18,9 +18,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 
     MAX_BODY_BYTES = 1_048_576  # 1 MB
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > self.MAX_BODY_BYTES:
             return JSONResponse(
@@ -43,9 +41,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._window_seconds = window_seconds
         self._store: dict[str, list[float]] = {}
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
         key = f"rate:{client_ip}"
@@ -70,9 +66,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add security headers to every response."""
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"

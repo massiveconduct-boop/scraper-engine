@@ -8,6 +8,8 @@ cycle so the loop survives, and shuts down cleanly. Mirrors the fake-client
 style in test_captcha_inpage.py."""
 
 import asyncio
+import os
+import signal as signal_module
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -45,6 +47,17 @@ class TestRunPeriodic:
             await mod._run_periodic("harvest", cycle, 600)
         assert calls["n"] == 1  # ran despite raising; error was swallowed
 
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_cycle_itself_propagates(self):
+        """Cancellation raised by cycle() (not by asyncio.sleep) must also
+        re-raise, not be swallowed by the bare `except Exception` below it."""
+
+        async def cycle():
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_periodic("harvest", cycle, 600)
+
 
 class TestRun:
     @pytest.mark.asyncio
@@ -79,3 +92,51 @@ class TestRun:
         assert pg_cls.call_args.args[0] == AppConfig().storage.database_url
         # Harvester built with the configured source list.
         assert harv_cls.call_args.kwargs["sources"] == AppConfig().proxy_harvester.sources
+
+    @pytest.mark.asyncio
+    async def test_installs_real_signal_handlers_when_stop_not_supplied(self, monkeypatch):
+        """When `stop` is omitted, run() must install its own SIGTERM/SIGINT
+        handlers (docker compose stop needs a graceful shutdown path) instead
+        of relying on a caller-supplied Event, as the external_stop=True tests
+        above do."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        monkeypatch.setattr(mod, "PostgresClient", MagicMock(return_value=pg))
+        monkeypatch.setattr(mod, "RedisClient", MagicMock(return_value=redis))
+        monkeypatch.setattr(
+            mod,
+            "ProxyHarvester",
+            MagicMock(return_value=MagicMock(harvest_once=AsyncMock(return_value=0))),
+        )
+        monkeypatch.setattr(
+            mod,
+            "ProxyPromotionJob",
+            MagicMock(return_value=MagicMock(run_once=AsyncMock(return_value={}))),
+        )
+        monkeypatch.setattr(
+            mod,
+            "HealthMonitor",
+            MagicMock(return_value=MagicMock(check_all=AsyncMock(return_value={}))),
+        )
+
+        from scraper_engine.config.schema import AppConfig
+
+        task = asyncio.create_task(mod.run(config=AppConfig()))
+        await asyncio.sleep(0.1)  # let run() reach add_signal_handler before we fire one
+        os.kill(os.getpid(), signal_module.SIGTERM)
+        await asyncio.wait_for(task, timeout=5)
+
+        pg.stop.assert_awaited_once()
+        redis.stop.assert_awaited_once()
+
+
+class TestMain:
+    def test_main_drives_run_via_asyncio_run(self, monkeypatch):
+        calls = {"n": 0}
+
+        async def fake_run():
+            calls["n"] += 1
+
+        monkeypatch.setattr(mod, "run", fake_run)
+        mod.main()
+        assert calls["n"] == 1

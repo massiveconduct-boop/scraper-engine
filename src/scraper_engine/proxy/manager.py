@@ -82,9 +82,7 @@ class ProxyManager:
             port,
         )
 
-    async def mark_failure(
-        self, tenant_id: TenantId, ip: str, port: int, domain: str
-    ) -> None:
+    async def mark_failure(self, tenant_id: TenantId, ip: str, port: int, domain: str) -> None:
         """Ban proxy for domain (TTL 1h) and decay global reliability score."""
         ban_key = f"proxy_ban:{tenant_id}:{domain}:{ip}:{port}"
         await self._redis.set(tenant_id, ban_key, "1", ttl=3600)
@@ -132,9 +130,7 @@ class ProxyManager:
                 return proxy
         return None
 
-    async def _is_banned(
-        self, tenant_id: TenantId, proxy: Proxy, domain: str
-    ) -> bool:
+    async def _is_banned(self, tenant_id: TenantId, proxy: Proxy, domain: str) -> bool:
         """Check if proxy is domain-banned."""
         ban_key = f"proxy_ban:{tenant_id}:{domain}:{proxy.ip}:{proxy.port}"
         return await self._redis.get(tenant_id, ban_key) is not None

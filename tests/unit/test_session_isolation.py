@@ -51,14 +51,14 @@ class TestDomainIsolation:
         fake_ctx_a = MagicMock()
         fake_ctx_a.storage_state = AsyncMock(return_value=storage_a)
 
-        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper._isolated_ctx = fake_ctx_a
             mock_wrapper._context = fake_ctx_a
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx_a)
             mock_cw.return_value = mock_wrapper
 
-            with patch.object(pool, 'release', new_callable=AsyncMock):
+            with patch.object(pool, "release", new_callable=AsyncMock):
                 async with pool.lease(domain="a.example.com") as ctx_a:
                     assert ctx_a is fake_ctx_a
 
@@ -76,22 +76,21 @@ class TestDomainIsolation:
         fake_ctx_b = MagicMock()
         fake_ctx_b.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
 
-        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw_b:
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw_b:
             mock_wrapper_b = MagicMock()
             mock_wrapper_b._isolated_ctx = None  # no storage_state
             mock_wrapper_b._context = fake_ctx_b
             mock_wrapper_b.__aenter__ = AsyncMock(return_value=fake_ctx_b)
             mock_cw_b.return_value = mock_wrapper_b
 
-            with patch.object(pool, 'release', new_callable=AsyncMock):
+            with patch.object(pool, "release", new_callable=AsyncMock):
                 async with pool.lease(domain="b.example.com") as ctx_b:
                     assert ctx_b is fake_ctx_b
 
             # Domain B: storage_state=None passed to constructor (no loaded state)
             b_kwargs = mock_cw_b.call_args[1]
             assert b_kwargs.get("storage_state") is None, (
-                "ISOLATION LEAK: domain B received storage_state — "
-                "A's session bled into B"
+                "ISOLATION LEAK: domain B received storage_state — A's session bled into B"
             )
 
     @pytest.mark.asyncio
@@ -108,14 +107,14 @@ class TestDomainIsolation:
         fake_ctx = MagicMock()
         fake_ctx.storage_state = AsyncMock(return_value=saved_state)
 
-        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper._isolated_ctx = fake_ctx
             mock_wrapper._context = fake_ctx
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper
 
-            with patch.object(pool, 'release', new_callable=AsyncMock):
+            with patch.object(pool, "release", new_callable=AsyncMock):
                 async with pool.lease(domain="a.example.com") as ctx:
                     assert ctx is fake_ctx
 
@@ -132,12 +131,12 @@ class TestDomainIsolation:
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, session_mgr=None)
 
         fake_ctx = object()
-        with patch('scraper_engine.browser.pool.CamoufoxWrapper') as mock_cw:
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
             mock_wrapper = MagicMock()
             mock_wrapper.__aenter__ = AsyncMock(return_value=fake_ctx)
             mock_cw.return_value = mock_wrapper
 
-            with patch.object(pool, 'release', new_callable=AsyncMock):
+            with patch.object(pool, "release", new_callable=AsyncMock):
                 async with pool.lease(domain="example.com") as ctx:
                     assert ctx is fake_ctx
 
