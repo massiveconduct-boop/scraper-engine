@@ -67,7 +67,7 @@ brotli==1.2.0
     # via geventhttpclient
 browserforge==1.2.4
     # via camoufox
-cachetools==5.5.2
+cachetools==7.1.6
     # via proxybroker2
 camoufox==0.5.4
     # via scraper-engine (pyproject.toml)
