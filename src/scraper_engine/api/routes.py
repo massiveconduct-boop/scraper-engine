@@ -2,10 +2,12 @@
 """API route definitions — fully wired with auth, SSRF guard, and quota.
 
 Endpoints:
-  POST /v1/scrape      — single/multi-URL scrape (SSRF-guarded, quota-checked)
-  POST /v1/crawl       — bulk Scrapy crawl for target sets >500 URLs
-  GET  /v1/jobs/{id}   — job status from live DB
-  GET  /v1/health       — composite health check
+  POST   /v1/scrape        — single/multi-URL scrape (SSRF-guarded, quota-checked)
+  POST   /v1/crawl         — bulk Scrapy crawl for target sets >500 URLs
+  GET    /v1/jobs/{id}     — job status from live DB
+  GET    /v1/jobs/{id}/dlq — raw dead-letter detail for a job
+  DELETE /v1/jobs/{id}     — cancel a PENDING/PROCESSING job
+  GET    /v1/health        — composite health check
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 from scraper_engine.config.schema import AppConfig
 from scraper_engine.core.models import (
     CrawlRequest,
+    DeadLetterEntryResponse,
     FailureCategory,
     FetchResult,
     JobStatus,
@@ -53,6 +56,7 @@ def _validate_uuid(value: str, name: str = "id") -> str:
 async def scrape(
     request: ScrapeRequest,
     x_api_key: str = Header(..., alias="X-API-Key"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> dict[str, object]:
     """Enqueue a scrape job with SSRF validation, tenant auth, and quota check."""
     from scraper_engine.api.dependencies import (
@@ -82,6 +86,28 @@ async def scrape(
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    # Idempotency-Key dedup (round 29) — must run BEFORE the quota charge
+    # below, that ordering is the actual point of the fix: a client retry
+    # after a timeout should hand back the still-live original job instead
+    # of enqueuing a duplicate and double-charging quota. Excludes dead
+    # terminal states (FAILED/CANCELLED/DEAD_LETTER) — a retry after one of
+    # those should get a fresh attempt, not be pinned to a dead one forever.
+    if idempotency_key and _storage_pg is not None:
+        existing = await _storage_pg.fetchrow(
+            tenant_id,
+            """SELECT job_id, status FROM scrape_jobs
+               WHERE idempotency_key = $1 AND status NOT IN ('FAILED', 'CANCELLED', 'DEAD_LETTER')
+               ORDER BY created_at DESC LIMIT 1""",
+            idempotency_key,
+        )
+        if existing is not None:
+            return {
+                "job_id": str(existing["job_id"]),
+                "status": existing["status"],
+                "urls": len(request.urls),
+                "tenant": str(tenant_id),
+            }
+
     # Quota enforcement
     if _storage_redis is not None and _storage_pg is not None:
         from scraper_engine.core.exceptions import QuotaExceededError
@@ -101,7 +127,13 @@ async def scrape(
                 daily_limit=daily_limit,
             ).check_and_increment(tenant_id, count=len(request.urls))
         except QuotaExceededError:
-            raise HTTPException(status_code=429, detail="Daily quota exceeded") from None
+            from scraper_engine.core.quota import seconds_until_quota_reset
+
+            raise HTTPException(
+                status_code=429,
+                detail="Daily quota exceeded",
+                headers={"Retry-After": str(seconds_until_quota_reset())},
+            ) from None
 
     # Persist job
     job_id = str(uuid.uuid4())
@@ -111,13 +143,15 @@ async def scrape(
         )
         await _storage_pg.execute(
             tenant_id,
-            """INSERT INTO scrape_jobs (job_id, urls, config_used, status, webhook_url)
-               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5)""",
+            """INSERT INTO scrape_jobs
+                   (job_id, urls, config_used, status, webhook_url, idempotency_key)
+               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
             job_id,
             [str(u) for u in request.urls],
             config_json,
             JobStatus.PENDING.value,
             str(request.webhook) if request.webhook else None,
+            idempotency_key,
         )
 
         if _queue is not None:
@@ -125,6 +159,7 @@ async def scrape(
                 "scraper_engine.orchestrator.tasks.run_scrape_job",
                 str(tenant_id),
                 job_id,
+                job_id=job_id,
                 job_timeout=_SCRAPE_JOB_TIMEOUT_SECONDS,
             )
 
@@ -140,6 +175,7 @@ async def scrape(
 async def crawl(
     request: CrawlRequest,
     x_api_key: str = Header(..., alias="X-API-Key"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> dict[str, object]:
     """Enqueue a bulk Scrapy crawl job — for target sets larger than /v1/scrape's
     500-URL cap. Same auth/SSRF/quota checks; runs on the same job queue/worker
@@ -169,6 +205,23 @@ async def crawl(
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    # Idempotency-Key dedup — same rationale as POST /v1/scrape above.
+    if idempotency_key and _storage_pg is not None:
+        existing = await _storage_pg.fetchrow(
+            tenant_id,
+            """SELECT job_id, status FROM scrape_jobs
+               WHERE idempotency_key = $1 AND status NOT IN ('FAILED', 'CANCELLED', 'DEAD_LETTER')
+               ORDER BY created_at DESC LIMIT 1""",
+            idempotency_key,
+        )
+        if existing is not None:
+            return {
+                "job_id": str(existing["job_id"]),
+                "status": existing["status"],
+                "start_urls": len(request.start_urls),
+                "tenant": str(tenant_id),
+            }
+
     if _storage_redis is not None and _storage_pg is not None:
         from scraper_engine.core.exceptions import QuotaExceededError
         from scraper_engine.core.quota import QuotaManager
@@ -187,7 +240,13 @@ async def crawl(
                 daily_limit=daily_limit,
             ).check_and_increment(tenant_id, count=len(request.start_urls))
         except QuotaExceededError:
-            raise HTTPException(status_code=429, detail="Daily quota exceeded") from None
+            from scraper_engine.core.quota import seconds_until_quota_reset
+
+            raise HTTPException(
+                status_code=429,
+                detail="Daily quota exceeded",
+                headers={"Retry-After": str(seconds_until_quota_reset())},
+            ) from None
 
     job_id = str(uuid.uuid4())
     if _storage_pg is not None:
@@ -200,13 +259,15 @@ async def crawl(
         )
         await _storage_pg.execute(
             tenant_id,
-            """INSERT INTO scrape_jobs (job_id, urls, config_used, status, webhook_url)
-               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5)""",
+            """INSERT INTO scrape_jobs
+                   (job_id, urls, config_used, status, webhook_url, idempotency_key)
+               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
             job_id,
             [str(u) for u in request.start_urls],
             config_json,
             JobStatus.PENDING.value,
             str(request.webhook) if request.webhook else None,
+            idempotency_key,
         )
 
         if _queue is not None:
@@ -214,6 +275,7 @@ async def crawl(
                 "scraper_engine.orchestrator.tasks.run_scrape_job",
                 str(tenant_id),
                 job_id,
+                job_id=job_id,
                 job_timeout=_CRAWL_JOB_TIMEOUT_SECONDS,
             )
 
@@ -248,7 +310,7 @@ async def get_job(
 
     rows = await _storage_pg.fetch(
         tenant_id,
-        "SELECT job_id, status FROM scrape_jobs WHERE job_id = $1::uuid",
+        "SELECT job_id, status, urls FROM scrape_jobs WHERE job_id = $1::uuid",
         job_id,
     )
     if not rows:
@@ -280,15 +342,19 @@ async def get_job(
             failure_category=(
                 FailureCategory(r["failure_category"]) if r["failure_category"] else None
             ),
+            html_snapshot_url=r["html_snapshot_url"],
             fetched_at=r["extracted_at"],
         )
         for r in result_rows
     ]
     errors = [r.error_message for r in results if not r.success and r.error_message]
 
-    progress = (
-        1.0 if status in _TERMINAL_STATUSES else (0.5 if status == JobStatus.PROCESSING else 0.0)
-    )
+    # Real per-URL progress (round 29) — results now persist incrementally
+    # as each URL completes (see orchestrator/tasks.py's on_result
+    # callback), so len(result_rows) genuinely reflects how many of the
+    # job's URLs are done, not a hardcoded stand-in.
+    total_urls = len(row["urls"]) or 1
+    progress = 1.0 if status in _TERMINAL_STATUSES else min(1.0, len(result_rows) / total_urls)
 
     return JobStatusResponse(
         # asyncpg returns a uuid.UUID for the UUID column; JobStatusResponse.job_id
@@ -300,6 +366,102 @@ async def get_job(
         results=results or None,
         error="; ".join(errors) if errors else None,
     )
+
+
+@router.get("/jobs/{job_id}/dlq")
+async def get_job_dlq(
+    job_id: str,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> list[DeadLetterEntryResponse]:
+    """Raw dead-letter detail for one job (round 29) — a permanently failed
+    URL already gets a row in GET /v1/jobs/{job_id}'s normal `results` list
+    (with error_message/failure_category), but the DLQ additionally carries
+    enqueued_at/dead_at timestamps and is the basis for ops tooling
+    (DeadLetterQueue.retry(), the dlq_size Prometheus gauge) — this route
+    just opens a door onto detail that already existed internally."""
+    from scraper_engine.api.dependencies import _storage_pg, _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+    from scraper_engine.storage.dlq import DeadLetterQueue
+
+    _validate_uuid(job_id)
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        tenant_id = await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    if _storage_pg is None:
+        return []
+
+    entries = await DeadLetterQueue(_storage_pg).list_for_tenant(tenant_id, job_id=job_id)
+    return [
+        DeadLetterEntryResponse(
+            job_id=e.job_id,
+            url=e.url,
+            failure_category=e.failure_category,
+            error_message=e.error_message,
+            level_attempted=e.level_attempted,
+            enqueued_at=e.enqueued_at,
+            dead_at=e.dead_at,
+        )
+        for e in entries
+    ]
+
+
+@router.delete("/jobs/{job_id}")
+async def cancel_job(
+    job_id: str,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> dict[str, object]:
+    """Cancel a PENDING/PROCESSING job (round 29). Best-effort: removes a
+    still-queued job from rq outright; an in-flight job cooperatively checks
+    for CANCELLED between URLs (Worker._is_cancelled) and stops there —
+    results already persisted for prior URLs (on_result callback, see
+    orchestrator/tasks.py) are kept, not rolled back."""
+    from scraper_engine.api.dependencies import _queue, _storage_pg, _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    _validate_uuid(job_id)
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        tenant_id = await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    if _storage_pg is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    terminal_values = [s.value for s in _TERMINAL_STATUSES]
+    row = await _storage_pg.fetchrow(
+        tenant_id,
+        """UPDATE scrape_jobs SET status = $1, updated_at = NOW()
+           WHERE job_id = $2::uuid AND status <> ALL($3::text[])
+           RETURNING status""",
+        JobStatus.CANCELLED.value,
+        job_id,
+        terminal_values,
+    )
+    if row is None:
+        exists = await _storage_pg.fetchrow(
+            tenant_id, "SELECT 1 FROM scrape_jobs WHERE job_id = $1::uuid", job_id
+        )
+        if exists is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        raise HTTPException(status_code=409, detail="Job already in a terminal state")
+
+    if _queue is not None:
+        job = _queue.fetch_job(job_id)
+        if job is not None:
+            try:
+                job.cancel()
+            except Exception:
+                logger.warning("rq_job_cancel_failed job_id=%s", job_id, exc_info=True)
+
+    return {"job_id": job_id, "status": JobStatus.CANCELLED.value}
 
 
 @router.get("/health")

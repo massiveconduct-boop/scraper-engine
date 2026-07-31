@@ -15,7 +15,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import scraper_engine.api.dependencies as deps
-from scraper_engine.api.routes import crawl, get_job, health, register_routes, scrape
+from scraper_engine.api.routes import (
+    cancel_job,
+    crawl,
+    get_job,
+    get_job_dlq,
+    health,
+    register_routes,
+    scrape,
+)
 from scraper_engine.config.schema import AppConfig
 from scraper_engine.core.models import JobStatus
 from scraper_engine.core.ssrf_guard import SSRFGuard
@@ -38,7 +46,10 @@ def wired_deps(monkeypatch):
 async def test_get_job_coerces_uuid_job_id_to_str(wired_deps):
     jid = uuid.uuid4()
     # First fetch() is the scrape_jobs lookup, second is the scrape_results join.
-    wired_deps.fetch.side_effect = [[{"job_id": jid, "status": "PENDING"}], []]
+    wired_deps.fetch.side_effect = [
+        [{"job_id": jid, "status": "PENDING", "urls": ["https://example.com"]}],
+        [],
+    ]
 
     resp = await get_job(str(jid), x_api_key="sk-admin")
 
@@ -124,6 +135,57 @@ async def test_crawl_enqueues_with_crawl_job_type(wired_scrape_deps):
     config_used = insert_call.args[4]
     assert '"_job_type": "crawl"' in config_used
     assert '"spider_name": "titles"' in config_used
+
+
+@pytest.mark.asyncio
+async def test_scrape_idempotency_key_hit_returns_existing_job_without_new_work(
+    wired_scrape_deps,
+):
+    """A retry with the same Idempotency-Key while the original job is still
+    live (round 29) must hand back the original job — no new quota charge,
+    no new INSERT, no new enqueue."""
+    from scraper_engine.core.models import ScrapeRequest
+
+    pg, redis, queue = wired_scrape_deps
+    existing_job_id = uuid.uuid4()
+    pg.fetchrow.return_value = {"job_id": existing_job_id, "status": "PROCESSING"}
+    request = ScrapeRequest(urls=["http://example.com"])
+
+    resp = await scrape(request, x_api_key="sk-admin", idempotency_key="retry-key-1")
+
+    assert resp == {
+        "job_id": str(existing_job_id),
+        "status": "PROCESSING",
+        "urls": 1,
+        "tenant": "system",
+    }
+    queue.enqueue.assert_not_called()
+    insert_calls = [
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_jobs" in c.args[1]
+    ]
+    assert len(insert_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_crawl_idempotency_key_hit_returns_existing_job_without_new_work(
+    wired_scrape_deps,
+):
+    from scraper_engine.core.models import CrawlRequest
+
+    pg, redis, queue = wired_scrape_deps
+    existing_job_id = uuid.uuid4()
+    pg.fetchrow.return_value = {"job_id": existing_job_id, "status": "PENDING"}
+    request = CrawlRequest(spider_name="titles", start_urls=["http://example.com"])
+
+    resp = await crawl(request, x_api_key="sk-admin", idempotency_key="retry-key-2")
+
+    assert resp == {
+        "job_id": str(existing_job_id),
+        "status": "PENDING",
+        "start_urls": 1,
+        "tenant": "system",
+    }
+    queue.enqueue.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +313,12 @@ async def test_scrape_reads_tenant_daily_limit_when_row_present(wired_scrape_dep
     pg.fetchrow.return_value = {"quota_daily_limit": 5000}
     request = ScrapeRequest(urls=["http://example.com"])
 
-    resp = await scrape(request, x_api_key="sk-admin")
+    # idempotency_key explicit: this test's pg.fetchrow mock always returns
+    # a quota-limit-shaped dict, so leaving idempotency_key at its raw
+    # FastAPI Header() marker default (truthy when the route is called
+    # directly, bypassing DI) would make the dedup lookup misread that same
+    # mock as a "duplicate job found" row.
+    resp = await scrape(request, x_api_key="sk-admin", idempotency_key=None)
 
     assert resp["status"] == "PENDING"
 
@@ -339,7 +406,8 @@ async def test_crawl_reads_tenant_daily_limit_when_row_present(wired_scrape_deps
     pg.fetchrow.return_value = {"quota_daily_limit": 5000}
     request = CrawlRequest(spider_name="titles", start_urls=["http://example.com"])
 
-    resp = await crawl(request, x_api_key="sk-admin")
+    # idempotency_key explicit — same reason as the scrape() equivalent above.
+    resp = await crawl(request, x_api_key="sk-admin", idempotency_key=None)
 
     assert resp["status"] == "PENDING"
 
@@ -500,3 +568,181 @@ def test_metrics_endpoint_survives_gauge_refresh_failures(monkeypatch):
     resp = client.get("/metrics")
 
     assert resp.status_code == 200
+
+
+# ── GET /v1/jobs/{job_id}/dlq (round 29) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_job_dlq_returns_entries(wired_deps, monkeypatch):
+    from datetime import UTC, datetime
+
+    from scraper_engine.core.models import FailureCategory
+    from scraper_engine.storage.dlq import DeadLetterEntry
+
+    jid = str(uuid.uuid4())
+    entry = DeadLetterEntry(
+        job_id=jid,
+        tenant_id="system",
+        url="http://example.com",
+        failure_category=FailureCategory.PROXY_EXHAUSTED,
+        error_message="All fetch levels exhausted",
+        level_attempted=3,
+        enqueued_at=datetime.now(UTC),
+        dead_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        "scraper_engine.storage.dlq.DeadLetterQueue.list_for_tenant",
+        AsyncMock(return_value=[entry]),
+    )
+
+    result = await get_job_dlq(jid, x_api_key="sk-admin")
+
+    assert len(result) == 1
+    assert result[0].job_id == jid
+    assert result[0].url == "http://example.com"
+    assert result[0].failure_category == FailureCategory.PROXY_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_get_job_dlq_returns_empty_list_when_pg_not_initialized(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "system"
+    monkeypatch.setattr(deps, "_tenant_resolver", resolver)
+    monkeypatch.setattr(deps, "_storage_pg", None)
+
+    result = await get_job_dlq(str(uuid.uuid4()), x_api_key="sk-admin")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_job_dlq_service_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await get_job_dlq(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_job_dlq_invalid_api_key_401(wired_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await get_job_dlq(str(uuid.uuid4()), x_api_key="sk-bad")
+    assert ei.value.status_code == 401
+
+
+# ── DELETE /v1/jobs/{job_id} (round 29) ───────────────────────────────────
+
+
+@pytest.fixture
+def wired_cancel_deps(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "system"
+    monkeypatch.setattr(deps, "_tenant_resolver", resolver)
+
+    pg = AsyncMock()
+    monkeypatch.setattr(deps, "_storage_pg", pg)
+
+    queue = MagicMock()
+    monkeypatch.setattr(deps, "_queue", queue)
+
+    return pg, queue
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_success_cancels_queued_rq_job(wired_cancel_deps):
+    pg, queue = wired_cancel_deps
+    pg.fetchrow.return_value = {"status": "CANCELLED"}
+    rq_job = MagicMock()
+    queue.fetch_job.return_value = rq_job
+
+    jid = str(uuid.uuid4())
+    resp = await cancel_job(jid, x_api_key="sk-admin")
+
+    assert resp == {"job_id": jid, "status": "CANCELLED"}
+    queue.fetch_job.assert_called_once_with(jid)
+    rq_job.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_success_when_rq_job_already_gone(wired_cancel_deps):
+    """The job already finished dequeuing and rq no longer has a handle for
+    it — cancellation still succeeds via the cooperative in-loop check."""
+    pg, queue = wired_cancel_deps
+    pg.fetchrow.return_value = {"status": "CANCELLED"}
+    queue.fetch_job.return_value = None
+
+    resp = await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+
+    assert resp["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_rq_cancel_failure_is_logged_not_raised(wired_cancel_deps):
+    pg, queue = wired_cancel_deps
+    pg.fetchrow.return_value = {"status": "CANCELLED"}
+    rq_job = MagicMock()
+    rq_job.cancel.side_effect = RuntimeError("redis unavailable")
+    queue.fetch_job.return_value = rq_job
+
+    resp = await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")  # must not raise
+
+    assert resp["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_not_found_404(wired_cancel_deps):
+    pg, queue = wired_cancel_deps
+    pg.fetchrow.side_effect = [None, None]  # UPDATE...RETURNING finds nothing, then existence check
+
+    with pytest.raises(HTTPException) as ei:
+        await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert ei.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_already_terminal_409(wired_cancel_deps):
+    pg, queue = wired_cancel_deps
+    # UPDATE...RETURNING finds nothing (already terminal), existence check finds the row
+    pg.fetchrow.side_effect = [None, {"?column?": 1}]
+
+    with pytest.raises(HTTPException) as ei:
+        await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert ei.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_tenant_resolver_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_storage_not_initialized_503(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "system"
+    monkeypatch.setattr(deps, "_tenant_resolver", resolver)
+    monkeypatch.setattr(deps, "_storage_pg", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_invalid_api_key_401(wired_cancel_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await cancel_job(str(uuid.uuid4()), x_api_key="sk-bad")
+    assert ei.value.status_code == 401

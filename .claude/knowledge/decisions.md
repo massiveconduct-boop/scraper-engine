@@ -3,7 +3,12 @@
 **Purpose:** Record WHY decisions were made, TRADEOFFS considered, ALTERNATIVES rejected.
 **Scope:** Irreversible or high-cost decisions. Routine implementation choices excluded.
 **When to read:** Before changing architecture; when a decision seems wrong and needs context.
-**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/architecture.md`
+**Keywords:** design rationale, tradeoffs, alternatives considered, ADR,
+rejected approaches, why-not-X.
+**Dependencies:** none — each entry is self-contained; cross-references
+`architecture.md` for the resulting design and `technical-debt.md` for the
+round it shipped in.
+**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/architecture.md`, `.claude/knowledge/technical-debt.md`
 
 ---
 
@@ -754,7 +759,7 @@ that, but is otherwise deliberately minimal: `parallel=1`, headless/xvfb,
 own §3.6 code sample shows. `google_get`/`bypass_cloudflare` and the rest of
 Botasaurus's anti-detection surface were deliberately **not** added in this
 pass — that's the separate, already-researched-but-not-yet-implemented
-follow-up tracked in `.claude/MEMORY.md` → Technical Debt (round 25
+follow-up tracked in `.claude/knowledge/technical-debt.md` (round 25
 follow-up).
 
 **Tradeoffs:** `Level2Fetcher` now makes up to two fetch attempts
@@ -895,3 +900,254 @@ match CI instead of the reverse.
   redis-py's own types.
 
 **Status:** Active. Do not re-add `types-redis` to dev dependencies.
+
+---
+
+## Decision: Coverage Gate — One Combined Run in `chaos`, Not Per-Job
+
+**Date:** 2026-07-29 | **Round:** 28
+
+**What:** `--cov=src/scraper_engine --cov-fail-under=100` runs once, in the
+`chaos` job's final pytest invocation (`tests/unit/ tests/integration/
+tests/chaos/` together). The `unit` and `integration` jobs run their own
+subset without `--cov` at all.
+
+**Why:** Coverage data (`.coverage`) doesn't cross GitHub Actions job
+boundaries — each job is a fresh runner/filesystem. Measuring per-job and
+combining would need `coverage combine` plus `actions/upload-artifact` /
+`download-artifact` to carry `.coverage` files between `unit` →
+`integration` → `chaos`, for a gate that only makes sense evaluated against
+the *whole* suite (a file fully covered by an integration test shouldn't
+fail the unit job's own number). `chaos` already `needs: integration`
+(which `needs: unit`), already brings up full docker-compose infra
+(Postgres/Redis/PgBouncer/MinIO), and is the only job that ever runs all
+three test directories together — so it's the one place a single
+`--cov-fail-under=100` invocation can honestly represent "the whole test
+suite covers 100% of the code," which is what the gate is actually meant to
+assert.
+
+**Alternatives considered:**
+- Per-job `--cov` + artifact-based `coverage combine` across jobs. Rejected
+  — real complexity (upload/download steps, combine step, a 4th place
+  `--cov-fail-under` could live) for a gate that's simpler to reason about
+  as "the last job that has everything running enforces the final number."
+- `--cov` on every job, each gated independently at a lower threshold.
+  Rejected — three different partial-coverage thresholds to maintain in
+  sync is its own drift risk (the exact bug class this whole round is
+  about), and `unit`-only coverage of integration-tested code would be
+  arbitrarily low regardless of tuning.
+
+**Status:** Active. If `unit`/`integration`'s now-`--cov`-free runs are
+ever reconsidered (see `.wolf/STATUS.md` → Next phase), keep the actual
+gate — `--cov-fail-under=100` — in exactly one place; don't let it drift
+back into two or three.
+
+---
+
+## Decision: Scrapling Engine — Manual Redirect Loop, Not `follow_redirects=True`
+
+**Date:** 2026-07-29 | **Round:** 28
+
+**What:** `ScraplingWrapper.fetch()` always calls Scrapling's
+`AsyncFetcher.get(..., follow_redirects=False)` and returns a
+`ScraplingResponse(status_code, text, location)`. `Level1Fetcher.
+_fetch_via_scrapling` drives its own loop over that response, resolving
+`location`, calling `self._ssrf_guard.validate(next_url)`, then fetching
+the next hop itself — the same shape `_fetch_via_ja3` already used for the
+JA3-matched client (round 26) and the plain httpx path uses natively.
+
+**Why:** Spec §1.1 #4 (non-negotiable) requires every redirect hop
+re-validated against the SSRF guard, not just the initial URL — closing
+the DNS-rebind/redirect-to-internal-target TOCTOU gap (round 22). Letting
+Scrapling follow redirects itself (`follow_redirects=True` or its default
+`"safe"`) would hand that hop-by-hop decision to a library with no
+awareness of this guard at all — a redirect straight to a private/metadata
+address would go through unchecked, silently reopening the exact gap round
+22 closed for the other two engines.
+
+**Alternatives considered:**
+- Trust `follow_redirects="safe"` (Scrapling's default) and only validate
+  the final landed URL. Rejected outright — this is precisely the
+  submit-time-only check the round-22 fix replaced; a multi-hop redirect
+  chain could touch a denied address mid-chain without ever surfacing in
+  the final URL.
+- Give `ScraplingWrapper` its own `SSRFGuard` and validate internally.
+  Rejected — would duplicate the guard instance Level1Fetcher already
+  owns (`self._ssrf_guard`, config-built via `fetcher/factory.py::
+  _build_ssrf_guard`), risking the two guards drifting out of sync
+  (different `additional_denied_cidrs`) the same way the pre-round-24
+  8-call-site `SSRFGuard()` construction did (see the SSRF DI decision
+  above).
+
+**Status:** Active. Any future engine added to `Level1Fetcher` (a 4th
+first-attempt path) should follow this same shape — return a raw,
+redirect-unresolved response and let `Level1Fetcher` own the loop — rather
+than trusting the underlying library's own redirect handling.
+
+---
+
+## Decision: Scrape Cache Reuses `scrape_results`, No New Cache Table
+
+**Date:** 2026-07-29 | **Round:** 29
+
+**What:** `Worker._check_cache` queries the existing per-tenant
+`scrape_results` table directly (`WHERE url = $1 AND success = true AND
+extracted_at > NOW() - INTERVAL '7 days' ORDER BY extracted_at DESC LIMIT
+1`), reusing the table's existing `(url, content_hash)` index rather than
+introducing a dedicated cache table/Redis structure. `CACHE_TTL_DAYS = 7`
+is a **sliding** window: a cache hit persists its own fresh
+`scrape_results` row (via the same `on_result`/`_persist_one_result` path
+as a real fetch), which extends freshness from that moment rather than
+counting down from the original scrape.
+
+**Why:** `scrape_results` already has everything a cache hit needs to
+reconstruct a `FetchResult` — `markdown`, `json_data` (→ `extracted`),
+`html_snapshot_url`, `level_used`, `http_status` — and already has an
+index with `url` as the leading column, so a lookup by URL alone uses it
+efficiently. A separate cache store would duplicate data that's already
+being written on every successful scrape for an unrelated reason (the
+normal results/audit trail), and would need its own invalidation logic
+kept in sync with `scrape_results`' own lifecycle. Sliding TTL (vs. a
+fixed clock from the original scrape) was chosen because it needs zero
+extra bookkeeping — the existing `extracted_at DESC LIMIT 1` query is
+naturally "most recent", whether that's the original scrape or the last
+reuse — and matches how most caches (e.g. HTTP `Cache-Control` refreshed
+by revalidation) behave in practice; a strict "exactly 7 days from first
+scrape, never longer" semantic would need tracking a separate
+"originally_scraped_at" column and was explicitly flagged to the user as
+the alternative, not silently assumed.
+
+**Alternatives considered:**
+- New dedicated `scrape_cache` table (or Redis hash) keyed by URL.
+  Rejected — pure duplication of `scrape_results`' existing content for no
+  new capability; two places to keep in sync, two invalidation policies.
+- Fixed TTL anchored to first-scrape time. Rejected for the reason above —
+  real but small extra bookkeeping for a stricter guarantee nobody asked
+  for; can be added later without touching the lookup query's shape if a
+  real need for it shows up.
+- Cache scoped globally (cross-tenant) rather than per-tenant. Rejected —
+  every other query in this codebase is tenant-scoped for isolation
+  (`self._pg.fetchrow(tenant_id, ...)`); a cross-tenant cache would leak
+  "did another tenant scrape this URL" and let one tenant's extraction
+  settings silently serve another's request.
+
+**Status:** Active. Directly coupled to the S3 retention decision below —
+`CACHE_TTL_DAYS` and `S3Client.SUCCESS_RETENTION_DAYS` must stay equal (or
+the S3 retention must stay ≥ the cache TTL); both constants document this
+cross-dependency in their own comments.
+
+---
+
+## Decision: S3 Success-Snapshot Retention Bumped 1 Day → 7 to Match Cache TTL
+
+**Date:** 2026-07-29 | **Round:** 29
+
+**What:** `S3Client.SUCCESS_RETENTION_DAYS` changed from `1` to `7`.
+
+**Why:** Round 22's original BD-07 policy set successful snapshots to
+expire after 1 day on the reasoning that "content is already extracted" by
+then, so the raw HTML has no further use. Round 29 changed two things that
+invalidate that reasoning: (1) `html_snapshot_url` is now actually
+returned to callers (previously computed and silently dropped — see the
+technical-debt.md round-29 entry, item 1), so a caller might reasonably
+expect to fetch it; (2) the new cache-reuse feature tells callers a
+result is "fresh" for 7 days, but if the backing S3 object was already
+gone after 1, the pointer would be a dead link for 6 of those 7 days. Not
+bumping this would have shipped a caching feature that quietly returns
+broken links most of the time.
+
+**Alternatives considered:**
+- Leave retention at 1 day, strip `html_snapshot_url` back out of cache-hit
+  responses specifically. Rejected — inconsistent (a fresh scrape's
+  pointer works, a cache hit's doesn't) and reintroduces exactly the gap
+  item 1 just closed, just conditionally.
+- Decouple the two constants entirely (cache says "fresh" for longer than
+  the snapshot is guaranteed to exist). Rejected — a caller has no way to
+  know the pointer might already be dead without hitting S3 and finding
+  out; better to make the guarantee actually hold.
+
+**Status:** Active. Failed snapshots still retain 30 days (unchanged,
+BD-07) — that number was never about "how long is this useful," it was
+about debugging window for failures, which this round didn't touch.
+
+---
+
+## Decision: Idempotency Dedup — Non-Unique Index + Query-Time Exclusion, Not a DB Constraint
+
+**Date:** 2026-07-29 | **Round:** 29
+
+**What:** Migration 005 adds `scrape_jobs.idempotency_key TEXT` with a
+plain **non-unique** btree index. `POST /v1/scrape`/`/v1/crawl` look up
+`WHERE idempotency_key = $1 AND status NOT IN ('FAILED', 'CANCELLED',
+'DEAD_LETTER') ORDER BY created_at DESC LIMIT 1` *before* the quota charge,
+returning the existing job if found instead of creating a new one.
+
+**Why:** A hard unique constraint on `idempotency_key` would make the
+*second* legitimate use of the same key — a genuine retry after the first
+attempt died (`FAILED`/`CANCELLED`) — a database error instead of a
+sensible new job. "Idempotent" here means "don't double-submit *live*
+work," not "this key may only ever be attached to one job for all time."
+Excluding dead terminal states from the lookup encodes that meaning
+directly in the query rather than requiring a workaround (e.g. deleting
+the old row, or generating a synthetic suffixed key) to satisfy a
+constraint that's stricter than the actual intent.
+
+**Alternatives considered:**
+- Unique constraint on `idempotency_key`, with the API layer catching the
+  resulting DB error and translating it. Rejected — pushes business logic
+  (what counts as "the same request") into exception-handling around a
+  constraint violation instead of an explicit, readable query condition;
+  also would need a partial unique index (`WHERE status NOT IN (...)`) to
+  even express the same intent, which is more DB-specific machinery for
+  the same result.
+- Store the idempotency key in Redis (TTL'd) instead of Postgres. Rejected
+  — `scrape_jobs` already has `created_at`/`status` needed for the dead-
+  state exclusion and the "most recent" ordering; a Redis-side store would
+  need to duplicate or query back to Postgres for status anyway, and loses
+  the automatic consistency of living in the same transactional row.
+
+**Status:** Active. The dedup check runs before the quota charge
+specifically — that ordering is the actual bug fix (a retry must not
+double-charge); reordering it after quota in any future change would
+silently reintroduce the double-charge this round closed.
+
+---
+
+## Decision: Markdown Conversion Centralized in `Worker.process_job`, Not Per-Fetcher
+
+**Date:** 2026-07-29 | **Round:** 29
+
+**What:** All three inline `self._firecrawl.convert_to_markdown(...)` call
+sites inside `fetcher/level_1.py` were deleted, along with
+`Level1Fetcher`'s `firecrawl_client` constructor parameter. Markdown
+conversion now happens once, inside `Worker.process_job`, immediately
+after `AdaptiveSelector` extraction — the same location, right after
+whichever escalation level actually succeeded.
+
+**Why:** Firecrawl conversion was wired into L1 only since round 22 —
+purely an accident of L1 being the first fetcher built, not a deliberate
+choice that L2/L3 shouldn't have it. A page that had to escalate past L1
+(the majority of "hard" targets — the entire reason L2/L3 exist) lost
+markdown entirely regardless of configuration. `AdaptiveSelector`
+extraction hit this exact same bug shape in round 28 (wired into L1-
+equivalent thinking, fixed by centralizing in the worker) — markdown gets
+the identical fix for the identical reason, right next to it in the same
+function.
+
+**Alternatives considered:**
+- Add the same three call sites to `Level2Fetcher`/`Level3Fetcher` too.
+  Rejected — triples the maintenance surface (3 fetchers × however many
+  internal code paths each has) for logic that has nothing to do with any
+  individual fetcher's job (fetching HTML), and was already duplicated
+  three times *within* L1 alone before this fix.
+- Keep it fetcher-owned but inject a shared converter via the factory.
+  Rejected — still requires every fetcher to remember to call it and
+  every internal success path within each fetcher to remember it too
+  (`level_1.py` alone had 3 such paths); centralizing in the one place
+  that already knows "this URL's fetch just succeeded, at this level"
+  removes the possibility of a missed call site entirely.
+
+**Status:** Active. Firecrawl itself was also generalized in the same
+round (`services/firecrawl_client.py` — `FIRECRAWL_BASE_URL` for
+self-hosted instances, API key no longer required) but that's a separate,
+independent decision from where the call site lives.

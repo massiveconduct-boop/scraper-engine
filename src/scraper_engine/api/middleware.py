@@ -57,6 +57,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     "detail": "Rate limit exceeded",
                     "retry_after_seconds": self._window_seconds,
                 },
+                headers={"Retry-After": str(self._window_seconds)},
             )
 
         self._store.setdefault(key, []).append(now)

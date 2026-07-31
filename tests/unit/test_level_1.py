@@ -1,7 +1,8 @@
 # tests/unit/test_level_1.py
-"""Level1Fetcher — plain-httpx redirect chain, timeout/exception handling,
-and JA3-path markdown conversion. Complements test_level1_ja3_wiring.py,
-which covers the JA3-first/httpx-fallback wiring but not these branches."""
+"""Level1Fetcher — plain-httpx redirect chain and timeout/exception
+handling. Complements test_level1_ja3_wiring.py, which covers the
+JA3-first/httpx-fallback wiring but not these branches. Markdown conversion
+moved to Worker.process_job in round 29 — see test_worker.py."""
 
 from unittest.mock import AsyncMock
 
@@ -12,7 +13,6 @@ from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.level_1 import Level1Fetcher
 from scraper_engine.fetcher.scrapling_wrapper import ScraplingResponse
-from scraper_engine.services.botasaurus_requests_client import Ja3Response
 
 
 class _FakeResponse:
@@ -77,20 +77,6 @@ class TestPlainHttpxRedirects:
         assert result.html == "<html>final</html>"
         assert result.http_status == 200
 
-    @pytest.mark.asyncio
-    async def test_redirect_hop_calls_firecrawl_markdown(self, monkeypatch):
-        monkeypatch.setattr(httpx, "AsyncClient", _RedirectThenFinalClient)
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# final"
-        fetcher = Level1Fetcher(firecrawl_client=firecrawl)
-
-        result = await fetcher.fetch("http://example.com", TenantId("system"))
-
-        assert result.markdown == "# final"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>final</html>", "http://example.com"
-        )
-
 
 class TestPlainHttpxExceptions:
     @pytest.mark.asyncio
@@ -113,29 +99,6 @@ class TestPlainHttpxExceptions:
 
         assert result.success is False
         assert result.error_message == "unexpected boom"
-
-
-class TestJa3MarkdownConversion:
-    @pytest.mark.asyncio
-    async def test_ja3_success_path_calls_firecrawl_markdown(self):
-        session = AsyncMock()
-        session.get.return_value = Ja3Response(
-            status_code=200, text="<html>ja3</html>", location=None
-        )
-        ja3 = AsyncMock()
-        ja3.open_session.return_value = session
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# ja3"
-
-        fetcher = Level1Fetcher(ja3_client=ja3, firecrawl_client=firecrawl)
-
-        result = await fetcher.fetch("http://example.com", TenantId("system"))
-
-        assert result.success is True
-        assert result.markdown == "# ja3"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>ja3</html>", "http://example.com"
-        )
 
 
 class TestScraplingWiring:
@@ -217,20 +180,3 @@ class TestScraplingWiring:
 
         assert result.success is True
         assert result.html == "<html>final</html>"
-
-    @pytest.mark.asyncio
-    async def test_scrapling_success_calls_firecrawl_markdown(self):
-        scrapling = AsyncMock()
-        scrapling.fetch.return_value = ScraplingResponse(
-            status_code=200, text="<html>scrapling</html>", location=None
-        )
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# scrapling"
-        fetcher = Level1Fetcher(scrapling_client=scrapling, firecrawl_client=firecrawl)
-
-        result = await fetcher.fetch("http://example.com", TenantId("system"))
-
-        assert result.markdown == "# scrapling"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>scrapling</html>", "http://example.com"
-        )

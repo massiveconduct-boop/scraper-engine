@@ -95,6 +95,34 @@ class TestDeadLetterQueue:
         assert call_args == (50, 10)
 
     @pytest.mark.asyncio
+    async def test_list_for_tenant_scoped_to_one_job(self, dlq, pg) -> None:
+        """job_id filter (round 29) — GET /v1/jobs/{job_id}/dlq scopes to one
+        job, distinct from the tenant-wide None-job_id view used elsewhere."""
+        from scraper_engine.core.tenant import TenantId
+
+        tenant = TenantId("test")
+        now = datetime.now(UTC)
+        pg.fetch_rows = [
+            {
+                "job_id": "job-scoped",
+                "url": "http://example.com/dead",
+                "failure_category": "circuit_open",
+                "error_message": "circuit open",
+                "level_attempted": 1,
+                "enqueued_at": now,
+                "dead_at": now,
+            }
+        ]
+
+        entries = await dlq.list_for_tenant(tenant, job_id="job-scoped")
+
+        assert len(entries) == 1
+        assert entries[0].job_id == "job-scoped"
+        _, query, call_args = pg.fetch_calls
+        assert "WHERE job_id = $1::uuid" in query
+        assert call_args == ("job-scoped", 100, 0)
+
+    @pytest.mark.asyncio
     async def test_list_for_tenant_empty(self, dlq, pg) -> None:
         from scraper_engine.core.tenant import TenantId
 

@@ -1,9 +1,20 @@
 # Troubleshooting & Known Bugs
 
 **Purpose:** Diagnostic patterns, known failure modes, and their fixes.
-**Scope:** Bugs encountered during 7 rounds of audit. Recurring failure patterns.
-**When to read:** Debugging failures; encountering familiar error patterns.
-**Related:** `.claude/knowledge/decisions.md`, `.archive/{evidence,directive,closure}/round-6-*.md` (local-only, not tracked in git)
+**Scope:** Bugs encountered across this project's full history (rounds 1-29
+and counting). Recurring failure patterns, not one-off fixes already fully
+covered by `technical-debt.md`.
+**When to read:** Debugging failures; encountering familiar error patterns;
+before assuming a live-test or CI failure means the code under test is
+broken.
+**Keywords:** bugs, gotchas, diagnostics, known failures, CI failures,
+browser/pool failures, proxy/harvest failures, CAPTCHA gotchas, SSRF
+diagnostic patterns, import rebinding, type stub drift.
+**Dependencies:** none — self-contained diagnostic reference.
+**Related:** `.claude/knowledge/decisions.md` (WHY a fix was chosen),
+`.claude/knowledge/technical-debt.md` (full round-by-round history a bug
+belongs to), `.archive/{evidence,directive,closure}/round-6-*.md`
+(local-only, not tracked in git)
 
 ---
 
@@ -133,6 +144,43 @@ resolves relative to the ini file's own directory instead of cwd:
 `script_location = %(here)s/migrations`. Prefer a tool's own built-in
 location-independence mechanism over hand-rolled `Path(__file__)` tricks
 when one exists.
+
+### Round 29: FastAPI `Header()` marker leaks through when a route function is called directly, not via DI
+**Symptom:** Adding a new *optional* `Header(...)`-typed parameter to a
+FastAPI route function breaks existing unit tests that call the route as
+a plain Python coroutine (`await scrape(request, x_api_key="sk-admin")`)
+without touching the new parameter — even though the parameter has a
+`None` default and the test never passes it. The failure is often a
+confusing downstream `KeyError` on a mock's return value, not an obvious
+"missing argument" error.
+**Root cause:** `Header(None, alias=...)` as a function default is a
+`fastapi.params.Header` marker object (a `FieldInfo` subclass) — FastAPI's
+dependency-injection layer resolves it to the real header value (or `None`
+if absent) only when the route runs through an actual `Request`. Call the
+function directly as ordinary Python, bypassing that DI layer entirely (a
+pattern this codebase's route tests already rely on for every route,
+`x_api_key="sk-admin"` always passed explicitly), and an omitted parameter
+gets the marker object itself as its "default" — which is truthy, not
+`None`. Existing required headers (`x_api_key: str = Header(...)`) never
+hit this because every test already passes them explicitly; the bug only
+surfaces the first time an *optional* Header-typed parameter is added and
+some existing test doesn't pass it.
+**Real occurrence (round 29):** adding `idempotency_key: str | None =
+Header(None, alias="Idempotency-Key")` to `scrape()`/`crawl()` broke two
+existing tests whose mocked `pg.fetchrow` returned a quota-limit-shaped
+dict for every call — the truthy marker object made the new idempotency
+dedup lookup run unexpectedly, and it misread that same mock as a "found a
+duplicate job" row, `KeyError`'ing on the missing `job_id`/`status` keys.
+**Fix:** Pass the new optional parameter explicitly (e.g.
+`idempotency_key=None`) at every direct-call test site that doesn't
+specifically exercise it — matching the existing explicit-kwarg convention
+this test suite already uses for required headers, rather than adding
+runtime `isinstance` workarounds in production code for what is purely a
+test-calling-convention gap. If a route gains many optional Header params
+over time, consider whether route-level tests should switch to FastAPI's
+`TestClient`/`AsyncClient` (real request path, no marker-leak risk) instead
+of direct coroutine calls — not done in round 29 since the existing
+convention only needed two call sites fixed.
 
 ---
 
@@ -418,7 +466,7 @@ validator machinery can make this manifest as an intermittent concurrency
 race rather than a deterministic failure on the very first request.
 **Fix:** import the type at module level, not inside whichever function
 happens to use it as a return annotation.
-**Full evidence:** `.claude/MEMORY.md` → Technical Debt (round 23) — this was
+**Full evidence:** `.claude/knowledge/technical-debt.md` (round 23) — this was
 found by the first-ever real run of `tests/load/locustfile.py`, itself a
 separate lesson: an unrun load test is not a passing load test.
 
@@ -450,3 +498,43 @@ caught via a live `/metrics` cross-check against real running containers.
 hit the real `/metrics` endpoint, and grep the output for every metric name
 referenced in `monitoring/alerts/prometheus_rules.yml` — don't just confirm
 the Python code compiles and the call site exists.
+
+---
+
+## Live-Test Infra Failures (Round 28)
+
+### `tests/live/test_escalation_ladder.py` fails with `FailureCategory.SSRF_BLOCKED`, not an escalation bug
+**Symptom:** `test_l1_correctly_fails_against_standard_challenge` (and the
+L2/L3 variants, if unskipped) hard-fail with `AssertionError: Expected
+200, got None` — looks like a broken escalation ladder.
+**Meaning:** It isn't. `result.failure_category ==
+FailureCategory.SSRF_BLOCKED` — `core/ssrf_guard.py`'s `DENIED_NETWORKS`
+(127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
+never weakened for test convenience) rejected the mirror URL before any
+fetch happened. `CHALLENGE_MIRROR_URL`'s default (`http://127.0.0.1:8090`)
+and this host's own docker-bridge address are *always* in a denied range
+by construction — this test can never pass against them, for anyone.
+**First (wrong) diagnosis:** concluded a *separate* external VPS was
+needed to test the escalation ladder for real, echoing the test file's own
+"requires... a real VPS" framing at face value without verifying it.
+**Actual fix — point `CHALLENGE_MIRROR_URL` at this host's Tailscale
+interface instead:** `100.64.0.0/10` (Tailscale's CGNAT range) is **not**
+in `SSRFGuard.DENIED_NETWORKS` at all, and — unlike this host's NAT'd
+egress-only public IP (`curl ifconfig.me`-style; times out on self-connect
+from the same box, classic hairpin-NAT, a separate unrelated networking
+quirk) — it's a real, directly-bound interface, so self-testing actually
+works: `ip -4 addr show tailscale0` → `CHALLENGE_MIRROR_URL=http://<that
+IP>:8090 pytest tests/live/test_escalation_ladder.py -m live`. Verified
+end to end: L1 correctly rejected, L2 solved the standard tier in ~5.1s,
+L3 the strict tier in ~13.8s — matching the file's own recorded historical
+timings almost exactly. This is what "the real VPS" in the file's original
+docstring actually meant.
+**Fix applied to the test file itself:** a `_skip_if_ssrf_blocked` helper
+now turns the SSRF-blocked case into an honest `pytest.skip` with a clear
+reason, instead of a confusing bare assertion failure that reads like a
+product bug.
+**General lesson:** `result.failure_category` is always the first thing to
+check on an unexpected live-test failure before assuming the code under
+test is broken — a `SSRFBlockedError`/`NETWORK_TIMEOUT`/etc. failure
+category means the *test's own target address* is the problem, not the
+escalation ladder.

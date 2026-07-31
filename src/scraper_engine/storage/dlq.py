@@ -66,21 +66,44 @@ class DeadLetterQueue:
         )
 
     async def list_for_tenant(
-        self, tenant_id: TenantId, limit: int = 100, offset: int = 0
+        self,
+        tenant_id: TenantId,
+        limit: int = 100,
+        offset: int = 0,
+        job_id: str | None = None,
     ) -> list[DeadLetterEntry]:
-        """List DLQ entries for a tenant, newest first."""
-        rows = await self._pg.fetch(
-            tenant_id,
-            """
-            SELECT job_id, url, failure_category, error_message, level_attempted,
-                   enqueued_at, dead_at
-            FROM dead_letter_queue
-            ORDER BY dead_at DESC
-            LIMIT $1 OFFSET $2
-            """,
-            limit,
-            offset,
-        )
+        """List DLQ entries for a tenant, newest first. When job_id is given,
+        scoped to that one job (round 29 — GET /v1/jobs/{job_id}/dlq); None
+        keeps the existing tenant-wide "everything currently dead" view used
+        by ops tooling and the dlq_size Prometheus gauge."""
+        if job_id is not None:
+            rows = await self._pg.fetch(
+                tenant_id,
+                """
+                SELECT job_id, url, failure_category, error_message, level_attempted,
+                       enqueued_at, dead_at
+                FROM dead_letter_queue
+                WHERE job_id = $1::uuid
+                ORDER BY dead_at DESC
+                LIMIT $2 OFFSET $3
+                """,
+                job_id,
+                limit,
+                offset,
+            )
+        else:
+            rows = await self._pg.fetch(
+                tenant_id,
+                """
+                SELECT job_id, url, failure_category, error_message, level_attempted,
+                       enqueued_at, dead_at
+                FROM dead_letter_queue
+                ORDER BY dead_at DESC
+                LIMIT $1 OFFSET $2
+                """,
+                limit,
+                offset,
+            )
         from scraper_engine.core.models import FailureCategory
 
         return [

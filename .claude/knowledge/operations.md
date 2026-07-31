@@ -2,8 +2,16 @@
 
 **Purpose:** Infrastructure, deployment, CI, monitoring, alerts.
 **Scope:** How to run, deploy, monitor, and debug this system in production.
-**When to read:** Deploying; setting up CI; configuring alerts; production incidents.
-**Related:** `docs/guides/deployment.md`, `.claude/knowledge/architecture.md`
+**When to read:** Deploying; setting up CI; configuring alerts; production incidents; adding a new dependency; changing the CI job matrix.
+**Keywords:** CI pipeline, GitHub Actions, branch protection, required
+status checks, docker compose, PgBouncer, monitoring, Prometheus, alerts,
+scaling, config-driven timeouts, known operational gaps, lockfiles,
+dependency drift.
+**Dependencies:** `.github/workflows/test.yml`, `docker-compose.yml`,
+`pyproject.toml`, `requirements-lock.txt` / `requirements-dev-lock.txt` —
+this document describes their live, current behavior; check those files
+directly if this doc and reality ever disagree.
+**Related:** `docs/guides/deployment.md`, `.claude/knowledge/architecture.md`, `.claude/knowledge/technical-debt.md`
 
 ---
 
@@ -132,19 +140,45 @@ containers get service names. Symptom if missing:
 
 ## CI Pipeline (Live)
 
-**File:** `.github/workflows/test.yml` — 5 jobs, GitHub Actions hosted, green as of round 25.
+**File:** `.github/workflows/test.yml` — 5 named jobs (`lint`/`unit`/
+`integration`/`chaos`/`build-and-push`), but `unit`/`integration`/`chaos`
+each run a `strategy.matrix.python-version: ["3.11", "3.12"]` (round 28), so
+7 real check contexts report per run. GitHub Actions hosted, green as of
+round 28 (PR #15).
 
 **Jobs (each `needs:` the previous):**
-- **lint (round 13-18, paths updated round 27 for the src/ layout):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across `src/scraper_engine/{core,proxy,orchestrator,api,storage,fetcher,browser,observability}`) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + `tests/fixtures/challenge_mirror` ruff baseline + mypy-shrinkage advisory. **Coverage gate is NOT run here or anywhere** — see Known Operational Gaps below, round-27 finding, OPEN for next session.
-- **unit:** explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently; also see "Known Operational Gaps" #12 on this list drifting from `pyproject.toml` — this exact drift caused a real round-27 mypy failure, see below); 341 tests as of round 27. Note: `types-redis` was removed from `pyproject.toml`'s dev extras in round 27 (stale stub shadowing real redis-py 8.0.1's own inline types) — do not re-add it.
-- **integration:** Postgres 16 + Redis 7 as GitHub Actions `services:`. Alembic upgrade head before tests. Runs the *full* `tests/integration/` — `test_promotion.py` is no longer excluded (round 23; see below).
+- **lint:** `pip install -r requirements-dev-lock.txt` (single source of
+  pinned versions, round 28 — see Known Operational Gaps #12) + a drift
+  check (`uv pip compile --python-version 3.11 ...` into `/tmp`, diffed
+  against the committed lockfiles, fails the build on drift) + `pip-audit
+  -r requirements-lock.txt` (round 28, fails on known vulnerabilities) +
+  `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error
+  across `src/scraper_engine/{core,proxy,orchestrator,api,storage,fetcher,
+  browser,observability}`) + grep-gates (no direct fetcher construction
+  outside `factory.py`; `force_engine` never in production) +
+  `tests/fixtures/challenge_mirror` ruff baseline + mypy-shrinkage
+  advisory. Python 3.12 only — mypy/ruff don't need matrix coverage.
+- **unit / integration:** `python-version` matrix (3.11 + 3.12, round 28);
+  install is `pip install -r requirements-dev-lock.txt` +
+  `pip install -e . --no-deps` (was a hand-listed ~40-package `pip install`
+  line per job through round 27 — see Known Operational Gaps #12).
+  `integration` additionally brings up `minio` via the project's own
+  `docker compose` (round 28 — `tests/integration/test_s3_client.py`/
+  `test_api_main.py` need a real S3-compatible endpoint; GitHub Actions
+  service containers can't override a container's CMD, which `minio`'s
+  image requires, so it can't be a bare `services:` entry like
+  postgres/redis are).
 - **chaos:** **Real PgBouncer, not GH Actions `services:`** (round 23) — a bare
   `services:` container pair can't produce the SCRAM-auth-off-a-live-`pg_authid`
   transaction pooling that G-05's test needs, so this job runs
-  `docker compose up -d postgres redis pgbouncer` instead (reusing the
+  `docker compose up -d postgres redis pgbouncer minio` instead (reusing the
   project's own `pgbouncer-init` dependency chain from `docker-compose.yml`),
-  polls `:6432` for TCP readiness, then runs the *full* `tests/chaos/` —
-  `test_pgbouncer_search_path_isolation.py` is no longer excluded either.
+  polls `:6432` for TCP readiness, then runs the combined
+  `tests/unit/ tests/integration/ tests/chaos/` suite with `--cov=
+  src/scraper_engine --cov-fail-under=100` (round 28 — this is where the
+  previously-dead coverage gate is now actually enforced; the other two
+  jobs run without `--cov` since this job re-runs everything anyway with
+  full infra up). See Known Operational Gaps #14.
 - **build-and-push (round 22):** builds the root `Dockerfile`, pushes to GHCR
   (`ghcr.io/<owner>/<repo>:<sha>` and `:latest`) via the automatic
   `GITHUB_TOKEN` — no new secret needed. Gated `if: github.event_name ==
@@ -156,9 +190,17 @@ containers get service names. Symptom if missing:
 
 **Run URL:** https://github.com/massiveconduct-boop/scraper-engine/actions
 
+**Branch protection on `main`:** required status checks must list the exact
+7 job-context names above (`lint`, `unit (3.11)`, `unit (3.12)`,
+`integration (3.11)`, `integration (3.12)`, `chaos (3.11)`, `chaos (3.12)`),
+not the bare job names — see Known Operational Gaps #15 for what happens
+when this drifts.
+
 **Still excluded from CI (by design, unchanged):**
 - 2 Camoufox-dependent unit tests (binary ~300MB, run locally)
 - L2/L3 live escalation tests (Camoufox + challenge mirror)
+- `browser/` package's own coverage (needs real Firefox) — real local
+  number checked round 28: 84%, not gated
 
 **Historical note (superseded round 23):** `test_promotion.py` and
 `test_pgbouncer_search_path_isolation.py` used to be permanently `--ignore`'d
@@ -272,7 +314,7 @@ levels:
     per rq job, leased by `Level2Fetcher`/`Level3Fetcher` via
     `fetcher/factory.py`. Also fixed a real correctness bug found while
     wiring it in (mismatch used to destroy live browsers instead of keeping
-    them pooled). Full story: `.claude/MEMORY.md` → Technical Debt (round
+    them pooled). Full story: `.claude/knowledge/technical-debt.md` (round
     25); `.claude/knowledge/architecture.md` → "Browser Pool".
 9. **CapSolver budget was a single hardcoded global ceiling (RESOLVED round
     25).** `CapSolverBudget` now reads the real per-tenant DB column
@@ -282,12 +324,12 @@ levels:
     the DB column, kept as the single source of truth.) Also fixed a real
     bug found alongside it: `_spend_key()` ignored `tenant_id`, pooling every
     tenant's spend into one Redis key regardless of ceiling. Full story:
-    `.claude/MEMORY.md` → Technical Debt (round 25).
+    `.claude/knowledge/technical-debt.md` (round 25).
 10. **Camoufox config entirely ignored (RESOLVED round 25).**
     `geoip`/`humanize`/`headless_mode` now flow into `CamoufoxWrapper`'s
     constructor from config; `max_total_instances` now sizes
     `BROWSER_SEMAPHORE` via a new `configure_budget()` called once at rq
-    worker process startup. Full story: `.claude/MEMORY.md` → Technical Debt
+    worker process startup. Full story: `.claude/knowledge/technical-debt.md`
     (round 25).
 11. **`fetcher/botasaurus_wrapper.py` — deleted, then restored for real
     (RESOLVED round 25).** Was orphaned (never imported, `botasaurus` not a
@@ -295,10 +337,24 @@ levels:
     real per an explicit follow-up ask (the authoritative spec §3.6
     designs a real implementation). `level_2.engine` config now genuinely
     reflects what runs. Full story + the reversal reasoning:
-    `.claude/MEMORY.md` → Technical Debt (round 25);
+    `.claude/knowledge/technical-debt.md` (round 25);
     `.claude/knowledge/decisions.md` → "Botasaurus".
 12. **Dependency declarations live in 5 separate places, none read from each
-    other (OPEN — known drift risk, structural fix planned for round 28).**
+    other (RESOLVED round 28 — see `.claude/knowledge/technical-debt.md`,
+    round 28, for the full story).** `requirements-lock.txt` (runtime) /
+    `requirements-dev-lock.txt` (+dev extras), generated via `uv pip
+    compile --python-version 3.11 --no-header`, are now the single source
+    every job and the Dockerfile install from; a `lint`-job step
+    regenerates both into `/tmp` and diffs against committed, failing the
+    build on drift. **`--python-version 3.11` is load-bearing, not
+    cosmetic** — without it, `uv` resolves against whatever interpreter
+    ran the compile, and can silently pick a version that doesn't support
+    `requires-python`'s floor (`numpy==2.5.1`, needs Python >=3.12, broke
+    the `unit (3.11)` CI job the first time this lockfile setup shipped,
+    round 28 — caught by real CI, not local testing, since this box's dev
+    venv is 3.12). Regenerate with the exact command in `CONTRIBUTING.md`,
+    not a bare `uv pip compile`.
+    Original finding (kept for context — the drift class this closes):
     `pyproject.toml`'s `dependencies` list, the Dockerfile's `deps` stage
     (a hardcoded `RUN pip install ...` line, "mirrors .github/workflows/
     test.yml" per its own comment — but only by convention, not by any
@@ -318,14 +374,14 @@ levels:
     argument CI's mypy (correctly, using the real types) rejected. Fixed by
     removing `types-redis` from `pyproject.toml`'s dev extras (confirmed via
     `git stash` that the underlying conflict predated the round-27 change
-    that exposed it) — but this only patches the one symptom. The
-    structural fix (round 28, see `.claude/MEMORY.md` → Technical Debt,
-    round 27 "NEXT QUEST", item 4) is still open. **Operator checklist when
-    adding any new Python dependency:** update `pyproject.toml`,
-    `Dockerfile`'s `deps` stage, and every `pip install` block in
-    `.github/workflows/test.yml`, then rebuild + `docker run --rm <image>
-    python -c "import <pkg>"` to actually confirm it landed — don't trust
-    that editing `pyproject.toml` alone did anything.
+    that exposed it) — that patched the one symptom; the structural fix
+    (single lockfile, everything installs from it) is the round-28 work
+    described above. **Operator checklist when adding any new Python
+    dependency:** update `pyproject.toml`, regenerate both lockfiles with
+    the `CONTRIBUTING.md` command (`--python-version 3.11`, not a bare `uv
+    pip compile`), then `pip install -r requirements-dev-lock.txt` +
+    `python -c "import <pkg>"` locally to actually confirm it resolves —
+    don't trust that editing `pyproject.toml` alone did anything.
 13. **`proxy_source_healthy` had the same cross-process gap as the round-25
     alert metrics (RESOLVED round 25 follow-up).** Set inside the
     `proxy-harvester` container, invisible to the `api` process's
@@ -333,17 +389,42 @@ levels:
     gauge at scrape time. Missed by the original round-25 audit (the Gauge
     object exists and is called somewhere, so a naive check doesn't catch
     it) — found only via a live `/metrics` cross-check after the rest of
-    round 25 landed. Full story: `.claude/MEMORY.md` → Technical Debt
+    round 25 landed. Full story: `.claude/knowledge/technical-debt.md`
     (round 25 follow-up).
-    Full finding: `.claude/MEMORY.md` → Technical Debt (round 24).
-14. **Coverage gate is dead config (OPEN — round 27 finding, NEXT QUEST,
-    priority item for round 28).** `[tool.coverage.report] fail_under = 90`
-    in `pyproject.toml` is declared but never enforced — none of the three
-    pytest invocations in `.github/workflows/test.yml` (`unit`/
-    `integration`/`chaos`) pass `--cov`. Real measured coverage: 82%, not
-    90%. `orchestrator/job_queue.py` 0% (untested), `proxy/harvester.py`
-    47%, `orchestrator/worker.py` 67%. Same bug class as #8-11 above
-    (config/gate declared, nothing actually calls it) — the sixth
-    occurrence of this exact pattern in this codebase's history. Full
-    finding + full 8-item list: `.claude/MEMORY.md` → Technical Debt
-    (round 27, "Senior-dev review findings").
+    Full finding: `.claude/knowledge/technical-debt.md` (round 24).
+14. **Coverage gate was dead config (RESOLVED round 28).**
+    `[tool.coverage.report] fail_under` was declared (90, then 100) but
+    never enforced — none of the three pytest invocations in
+    `.github/workflows/test.yml` passed `--cov`. Real measured coverage at
+    the time: 72% once `include` was corrected to match `[tool.coverage.
+    run] source`'s 8 packages (was silently only gating 3). Same bug class
+    as #8-11 above (config/gate declared, nothing actually calls it) — the
+    sixth occurrence of this exact pattern in this codebase's history, and
+    the reason round 28 treated it as the top priority rather than another
+    one-off patch. Now wired into the `chaos` job (see CI Pipeline above)
+    and brought to 100% across every package in scope except `browser/`
+    (documented exclusion, needs real Firefox). Full story + the other 7
+    findings closed alongside it: `.claude/knowledge/technical-debt.md`
+    (round 28).
+15. **CI job matrix changes can silently break branch protection (RESOLVED
+    round 28, found post-merge while watching real CI).** Adding
+    `strategy.matrix.python-version` to `unit`/`integration`/`chaos`
+    changed their reported check names from `unit`/`integration`/`chaos`
+    to `unit (3.11)`/`unit (3.12)`/etc. `main`'s branch protection
+    `required_status_checks.contexts` still listed the old bare names —
+    GitHub has no way to reconcile "a required check that will never exist
+    again" with "these new checks that did run and passed," so it left the
+    PR permanently `mergeStateStatus: BLOCKED` even with all 7 real checks
+    green (`gh pr merge` reported "not mergeable" with no explanation
+    pointing at this — surfaced only by fetching
+    `required_pull_request_reviews.required_approving_review_count` (0,
+    ruling out a review block) and `required_status_checks.contexts`
+    directly via `gh api repos/.../branches/main/protection`). Fixed by
+    `PATCH`ing the protection rule's `required_status_checks` to the 7
+    real context names (`lint`, `unit (3.11)`, `unit (3.12)`,
+    `integration (3.11)`, `integration (3.12)`, `chaos (3.11)`,
+    `chaos (3.12)`). **Operator checklist when adding/removing a
+    `strategy.matrix` on any required job:** update `main`'s branch
+    protection required status checks in the same change — a passing CI
+    run is not sufficient evidence the PR is actually mergeable; check
+    `gh pr view <n> --json mergeStateStatus` too.

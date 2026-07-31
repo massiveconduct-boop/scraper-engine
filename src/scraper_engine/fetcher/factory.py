@@ -42,13 +42,13 @@ def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     """Construct the L1 (HTTP/Scrapling) fetcher. Takes no wait-strategy config
     today, but centralised here so every production call site has one path.
 
-    Threads an optional FirecrawlClient (env-gated on FIRECRAWL_API_KEY, same
-    pattern as captcha_solver) for markdown conversion — None disables it.
+    Markdown conversion (FirecrawlClient) is not built here (round 29) — it
+    moved to Worker.process_job so it applies uniformly regardless of which
+    level actually succeeded, instead of being wired into L1 alone.
 
     Threads an optional BotasaurusRequestsClient (round 26), gated on
     config.botasaurus.l1_ja3_client_enabled (default off — a brand-new code
-    path with no live-traffic validation yet). None disables it, same
-    build-or-None pattern as the firecrawl client above.
+    path with no live-traffic validation yet). None disables it.
 
     Threads an optional ScraplingWrapper (round 28), gated on
     config.levels.level_1.engine == "scrapling" (base.yaml's default) — L1's
@@ -57,11 +57,9 @@ def build_level1_fetcher(config: AppConfig) -> Level1Fetcher:
     attempt entirely, same as L2/L3's engine-gated Botasaurus construction."""
     from scraper_engine.fetcher.scrapling_wrapper import ScraplingWrapper
     from scraper_engine.services.botasaurus_requests_client import build_ja3_client
-    from scraper_engine.services.firecrawl_client import build_firecrawl_client
 
     lvl = config.levels.level_1
     return Level1Fetcher(
-        firecrawl_client=build_firecrawl_client(),
         ssrf_guard=_build_ssrf_guard(config),
         ja3_client=build_ja3_client(
             config.botasaurus.l1_ja3_client_enabled,

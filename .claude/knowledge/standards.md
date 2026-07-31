@@ -3,6 +3,8 @@
 **Purpose:** Conventions for writing code, tests, and reports in this project.
 **Scope:** All new code, tests, reports, commits.
 **When to read:** Before writing any code, test, or report.
+**Keywords:** coding conventions, test patterns, lint rules, ruff, mypy strict, commit style, report format.
+**Dependencies:** `pyproject.toml` (`[tool.ruff]`, `[tool.mypy]` — this doc explains the conventions those enforce, doesn't duplicate the config itself).
 **Related:** `.claude/knowledge/architecture.md`, `.claude/knowledge/decisions.md`
 
 ---

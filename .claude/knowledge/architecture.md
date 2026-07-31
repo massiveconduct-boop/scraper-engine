@@ -3,7 +3,13 @@
 **Purpose:** System design, invariants, module interactions, data flow.
 **Scope:** Complete system architecture. Does NOT duplicate the specification — references it.
 **When to read:** Understanding how components connect; adding new modules; debugging cross-cutting concerns.
-**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`
+**Keywords:** design invariants, escalation ladder, proxy pipeline, browser
+pool, PgBouncer, API routing, SSRF enforcement, fetcher construction,
+CAPTCHA solving, observability, tracing, botasaurus, metrics, data flow,
+repository layout, src layout.
+**Dependencies:** none — describes the system as built; cross-references
+`decisions.md` for WHY and `technical-debt.md` for full round history.
+**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`, `.claude/knowledge/technical-debt.md`
 
 **Path note (round 27):** every bare package path below (`core/`, `proxy/`,
 `browser/pool.py`, etc.) means `src/scraper_engine/<that path>` — all
@@ -30,11 +36,94 @@ See "Repository Layout" near the end of this file for the full picture.
 PENDING → CIRCUIT_CHECK → FETCHING_L1 → PARSING_L1
                                       ↘ failure → ESCALATING_L2 → FETCHING_L2 → PARSING_L2
                                                                                ↘ failure → ESCALATING_L3 → FETCHING_L3
-                                                                                                              ↘ failure → DEAD_LETTER
-Non-retryable (SSRF, quota, proxy exhausted): direct → DEAD_LETTER
+                                                                                                              ↘ failure → dead-lettered (per-URL)
+Non-retryable (SSRF, quota, proxy exhausted, unresolvable host): direct → dead-lettered (per-URL)
+Cache hit (round 29): reused, no escalation attempted at all — see below
+Cancellation (round 29): checked once per URL, before escalation starts
 ```
 
 Levels: L1 (httpx/Scrapling, timeout 20s, any proxy), L2 (Botasaurus+Camoufox, timeout 40s, anonymous+ proxy), L3 (Camoufox-only, timeout 60s, elite proxy).
+
+**Note on `DEAD_LETTER` (corrected round 29):** `JobStatus.DEAD_LETTER` is a
+valid enum value and DB CHECK-constraint entry, but no code path has ever
+set a job's *status* to it — "dead-lettered" above means the per-URL entry
+written to the `dead_letter_queue` table (`DeadLetterQueue.enqueue`,
+readable via `GET /v1/jobs/{job_id}/dlq`), which is a different thing from
+the job's own terminal `status` (which lands on `FAILED` if no URL in the
+job succeeded, `COMPLETED` if at least one did — see `Worker.process_job`'s
+status derivation). Earlier versions of this doc conflated the two.
+
+**Per-URL loop order (round 29), top to bottom inside `Worker.process_job`:**
+1. Cooperative cancellation check (`_is_cancelled` — one Postgres point
+   read per URL, not per fetch attempt). If the job's `scrape_jobs.status`
+   is already `CANCELLED` (set by `DELETE /v1/jobs/{job_id}`), the whole
+   URL loop stops here; results already recorded for prior URLs are kept.
+2. Cache-reuse check (`_check_cache`, skippable per-request via
+   `config_overrides.bypass_cache`) — see "Scrape Result Caching" below.
+3. The escalation ladder itself (unchanged shape from round 1, plus
+   markdown conversion and `on_result` persistence — see below).
+
+Every terminal outcome for a URL — success, a synthesized failure
+`FetchResult` from any of the three failure paths, or a cache hit — is now
+appended to `results` (not just successes, see technical-debt.md round-29
+item 2) and, if the caller (`orchestrator/tasks.py`) supplied one, awaited
+through `on_result` immediately (see "Incremental Persistence" below).
+
+## Scrape Result Caching (Round 29)
+
+Before attempting L1, `Worker._check_cache(tenant_id, url)` looks up a
+fresh (`extracted_at` within `CACHE_TTL_DAYS = 7`, a sliding window — see
+`.claude/knowledge/decisions.md`) successful `scrape_results` row for that
+exact URL, scoped to the tenant. A hit builds a `FetchResult` with
+`from_cache=True` directly from the stored row (`markdown`, `extracted`,
+`html_snapshot_url` carried forward, `html` deliberately left `None` — no
+S3 re-upload needed) and skips the escalation ladder entirely: no
+circuit-breaker/politeness/proxy cost, no quota consumption for that URL.
+A caller forces a fresh scrape via `config_overrides.bypass_cache: true`.
+`S3Client.SUCCESS_RETENTION_DAYS` (round 29: bumped 1 → 7) must stay ≥
+`CACHE_TTL_DAYS`, or a cache hit's `html_snapshot_url` could point at an
+already-expired S3 object.
+
+## Incremental Persistence & Real Progress (Round 29)
+
+`Worker.process_job` accepts an optional `on_result: Callable[[FetchResult],
+Awaitable[None]]`, awaited once per URL the instant it reaches a terminal
+outcome. `orchestrator/tasks.py::_run_scrape` builds a closure over
+`pg`/`s3`/`tenant_id`/`job_id` and passes it as `on_result`; the closure
+calls `_persist_one_result` (the per-item body `_persist_results` was
+split into — the batch wrapper still exists, used only by the bulk-crawl
+path, which has no per-item callback available since
+`ScrapyAdapter.run_spider` returns a full batch). This replaced the old
+"batch-persist everything after the whole job finishes" model, which is
+what makes two things possible: `GET /v1/jobs/{job_id}`'s `progress` field
+is now `len(result_rows) / len(urls)` while the job is `PROCESSING` (a real
+fraction, not the old hardcoded `0.5`), and job cancellation (below) can
+actually take effect mid-job with prior-URL results already durable.
+
+## Job Cancellation (Round 29)
+
+`DELETE /v1/jobs/{job_id}` does an atomic `UPDATE scrape_jobs SET status =
+'CANCELLED' WHERE status <> ALL(terminal_values) RETURNING status` (404 if
+no row exists at all, 409 if the row exists but was already terminal), then
+best-effort calls `queue.fetch_job(job_id).cancel()` (rq 2.10.0's real
+`Job.cancel()`) to pull a still-queued job before it's ever dequeued.
+`job_id` is now passed explicitly to `_queue.enqueue(...)` at submission
+time so rq's internal job id matches `scrape_jobs.job_id` — required for
+`fetch_job(job_id)` to find the right job at all. An already-dequeued,
+in-flight job is caught instead by `Worker._is_cancelled`'s per-URL check
+(see loop order above). `orchestrator/tasks.py::_run_scrape_job` also
+guards against a cancel that races ahead of rq actually dequeuing the job:
+its initial job-row read now includes `status`, and returns immediately if
+already `CANCELLED` instead of unconditionally flipping it to `PROCESSING`.
+
+## Idempotent Submission (Round 29)
+
+`POST /v1/scrape`/`/v1/crawl` accept an `Idempotency-Key` header. Before
+the quota charge, `scrape_jobs` is queried for a live (not `FAILED`/
+`CANCELLED`/`DEAD_LETTER`) job with that same key; if found, it's returned
+as-is — no new row, no new quota deduction, no new enqueue. See
+`.claude/knowledge/decisions.md` for why this is a non-unique index +
+query-time exclusion rather than a DB uniqueness constraint.
 
 ---
 
@@ -459,6 +548,77 @@ against `challenge-mirror` returns real content
 `BotasaurusPool.fetch()` run confirms exactly one `Driver()` construction
 across both calls (the 2nd fetch used `driver.requests.get()`, not a new
 browser launch) — both are now real, not just source-cited + mocked.
+
+---
+
+## Scrapling Engine + Structured Extraction (Round 28)
+
+Two modules — `fetcher/scrapling_wrapper.py::ScraplingWrapper` and
+`fetcher/adaptive_selector.py::AdaptiveSelector` — existed fully unit-tested
+but with zero production callers until this round; both are now real.
+
+**Scrapling engine (`Level1Fetcher`'s third first-attempt path):**
+`base.yaml`'s `levels.level_1.engine: scrapling` was declared config but
+never read — L1 always used plain httpx regardless. `fetcher/factory.py::
+build_level1_fetcher` now constructs a `ScraplingWrapper` whenever
+`engine == "scrapling"` and threads it in as `scrapling_client`. Dispatch
+order in `Level1Fetcher.fetch()`: JA3 client (if enabled) → Scrapling (if
+engine says so) → plain httpx fallback — same first-attempt/fallback shape
+as every other engine chain in this codebase (L2's Botasaurus-then-
+Camoufox, L1's own JA3-then-httpx).
+
+`ScraplingWrapper.fetch()` always calls `scrapling.fetchers.AsyncFetcher.
+get(..., follow_redirects=False)` and returns a raw `ScraplingResponse
+(status_code, text, location)` — it does **not** follow redirects itself.
+`Level1Fetcher._fetch_via_scrapling` drives its own redirect loop over
+that response, revalidating `self._ssrf_guard` on every hop before
+following it (spec §1.1 #4 — see `.claude/knowledge/decisions.md` →
+"Scrapling Engine — Manual Redirect Loop" for the full why/alternatives).
+Real dependency gotcha: `scrapling==0.4.11` alone doesn't install
+`curl_cffi`, which `AsyncFetcher` needs at import time — fixed by
+declaring `curl_cffi>=0.15.0` directly rather than the `scrapling
+[fetchers]` extra, which pins a `playwright` version that conflicts with
+`camoufox`. See `.claude/knowledge/operations.md` Known Operational Gaps
+#12 and `.claude/knowledge/technical-debt.md`.
+
+**Structured extraction (`Worker.process_job`'s post-fetch step):**
+`core.models.FetchResult.extracted` and `ConfigOverrides.extraction_schema`
+were both declared and even already *persisted*
+(`orchestrator/tasks.py` already `json.dumps`'d `result.extracted`) but
+nothing ever populated the field. Wired once, centrally, in
+`orchestrator/worker.py::Worker.process_job`, immediately after any
+level's fetch succeeds and before the result is appended — applies
+uniformly regardless of which level (L1/L2/L3) actually won, with zero
+duplication across the three fetcher classes. Calls `AdaptiveSelector()
+.extract(result.html, schema=request.config_overrides.extraction_schema
+if request.config_overrides else None)` — content/title/link extraction
+via bs4 selectors (falls back to regex if `bs4` isn't importable), `schema`
+just echoed back into the result if the caller provided one (the class
+doesn't do schema-guided extraction beyond that yet).
+
+**Live-verified for real**, not just unit-tested:
+`tests/live/test_scrapling_engine_wiring.py` proves the factory-built
+client is real, a plain GET/2-hop redirect/404 all work against real
+`httpbin.org`/`example.com` traffic, and `AdaptiveSelector` correctly
+extracts title+content from real HTML (and correctly omits `title` when a
+real page genuinely has none). Full story, including the live-testing
+process that found the `curl_cffi` gap: `.claude/knowledge/
+technical-debt.md`.
+
+**Round 29 addendum — markdown conversion moved here too.** Firecrawl
+markdown conversion (`services/firecrawl_client.py`) previously lived
+entirely inside `fetcher/level_1.py` (three separate inline call sites,
+one per L1 internal code path) and so never ran for a URL that had to
+escalate to L2/L3. It's now called from the exact same spot as
+`AdaptiveSelector` above — right after any level's fetch succeeds, before
+`results.append(result)` — for the identical "applies regardless of which
+level won" reason. `Level1Fetcher` no longer references Firecrawl at all.
+`build_firecrawl_client()` also now accepts `FIRECRAWL_BASE_URL` (a
+self-hosted Firecrawl instance) as an alternative to `FIRECRAWL_API_KEY` —
+a self-hosted instance typically needs no key, so either one alone is
+enough to build a working client. See `.claude/knowledge/decisions.md` →
+"Markdown Conversion Centralized in Worker.process_job" for the full
+before/after and alternatives considered.
 
 ---
 

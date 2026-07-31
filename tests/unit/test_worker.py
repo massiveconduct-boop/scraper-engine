@@ -200,6 +200,180 @@ class TestWorker:
         assert worker._fetch_url.await_count == 2
         assert response.status == JobStatus.COMPLETED
 
+    @pytest.mark.asyncio
+    async def test_process_job_cancelled_before_starting_stops_immediately(self, tenant, worker):
+        """A DELETE /v1/jobs/{job_id} landing between URLs (round 29) — the
+        cooperative _is_cancelled check must stop the loop before any fetch
+        for the next URL, not just log it."""
+        worker._pg = AsyncMock()
+        worker._pg.fetchrow.return_value = {"status": JobStatus.CANCELLED.value}
+        worker._fetch_url = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-cancelled", request)
+
+        assert response.status == JobStatus.CANCELLED
+        worker._fetch_url.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_job_cache_hit_skips_fetch_and_calls_on_result(self, tenant, worker):
+        """A fresh scrape_results row for this exact URL (round 29) is reused
+        instead of re-fetching — the cache-hit FetchResult still flows
+        through on_result like any other terminal outcome."""
+        worker._pg = AsyncMock()
+        worker._pg.fetchrow.side_effect = [
+            {"status": JobStatus.PROCESSING.value},  # _is_cancelled check
+            {
+                "http_status": 200,
+                "is_challenge_page": False,
+                "level_used": 1,
+                "proxy_used": None,
+                "markdown": "# cached",
+                "json_data": None,
+                "html_snapshot_url": "snapshots/t/j/old.html",
+            },
+        ]
+        worker._fetch_url = AsyncMock()
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-cache-hit", request, on_result=on_result)
+
+        worker._fetch_url.assert_not_awaited()
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None
+        cached = response.results[0]
+        assert cached.from_cache is True
+        assert cached.markdown == "# cached"
+        assert cached.html_snapshot_url == "snapshots/t/j/old.html"
+        on_result.assert_awaited_once_with(cached)
+
+    @pytest.mark.asyncio
+    async def test_process_job_cache_miss_with_pg_configured_falls_through_to_fetch(
+        self, tenant, worker
+    ):
+        """pg configured but no matching cache row (round 29) — must fall
+        through to a real fetch, not be mistaken for the pg-is-None
+        short-circuit path."""
+        worker._pg = AsyncMock()
+        worker._pg.fetchrow.side_effect = [
+            {"status": JobStatus.PROCESSING.value},  # _is_cancelled check
+            None,  # _check_cache: no matching row
+        ]
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=1, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-cache-miss", request)
+
+        worker._fetch_url.assert_awaited_once()
+        assert response.status == JobStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_process_job_populates_markdown_when_firecrawl_configured(self, tenant, worker):
+        """Markdown conversion (round 29) is centralized here so it applies
+        regardless of which escalation level actually succeeded — Firecrawl
+        wiring itself moved out of Level1Fetcher entirely."""
+        worker._firecrawl = AsyncMock()
+        worker._firecrawl.convert_to_markdown.return_value = "# converted"
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com",
+                success=True,
+                level_used=1,
+                duration_ms=10,
+                html="<html>hi</html>",
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-markdown", request)
+
+        assert response.results is not None
+        assert response.results[0].markdown == "# converted"
+        worker._firecrawl.convert_to_markdown.assert_awaited_once_with(
+            "<html>hi</html>", "http://example.com/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_job_calls_on_result_for_success(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=1, duration_ms=10
+            )
+        )
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(
+            tenant, "job-on-result-ok", request, on_result=on_result
+        )
+
+        on_result.assert_awaited_once_with(response.results[0])
+
+    @pytest.mark.asyncio
+    async def test_process_job_calls_on_result_for_non_retryable_failure(self, tenant, worker):
+        result = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=1,
+            duration_ms=10,
+            failure_category=FailureCategory.SSRF_BLOCKED,
+            error_message="blocked",
+        )
+        worker._fetch_url = AsyncMock(return_value=result)
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-on-result-nonretryable", request, on_result=on_result)
+
+        on_result.assert_awaited_once_with(result)
+
+    @pytest.mark.asyncio
+    async def test_process_job_calls_on_result_for_circuit_open(self, tenant, worker):
+        worker._circuit_breaker.allow_request.return_value = False
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(
+            tenant, "job-on-result-circuit", request, on_result=on_result
+        )
+
+        assert response.status == JobStatus.FAILED
+        on_result.assert_awaited_once()
+        assert on_result.await_args.args[0].failure_category == FailureCategory.CIRCUIT_OPEN
+
+    @pytest.mark.asyncio
+    async def test_process_job_calls_on_result_for_exhausted_levels(self, tenant, worker):
+        """All 3 levels exhausted with a retryable failure category — the
+        for/else branch synthesizes its own FetchResult (round 29) since
+        none of the individual level attempts produced one worth keeping."""
+        timeout_failure = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=1,
+            duration_ms=5,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+            error_message="timed out",
+        )
+        worker._fetch_url = AsyncMock(return_value=timeout_failure)
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(
+            tenant, "job-on-result-exhausted", request, on_result=on_result
+        )
+
+        assert response.status == JobStatus.FAILED
+        assert worker._fetch_url.await_count == 3  # L1, L2, L3 all attempted
+        on_result.assert_awaited_once()
+        exhausted = on_result.await_args.args[0]
+        assert exhausted.failure_category == FailureCategory.PROXY_EXHAUSTED
+        assert exhausted.error_message == "All fetch levels exhausted"
+
 
 class TestFetchUrlDispatch:
     """Real `_fetch_url` dispatch — every existing test above stubs this
@@ -220,7 +394,7 @@ class TestFetchUrlDispatch:
 
         assert result is expected
         build_mock.assert_called_once_with(worker._config)
-        fake_fetcher.fetch.assert_awaited_once_with("http://example.com", tenant)
+        fake_fetcher.fetch.assert_awaited_once_with("http://example.com", tenant, overrides=None)
 
     @pytest.mark.asyncio
     async def test_level2_leases_proxy_and_dispatches_via_factory(
@@ -251,7 +425,7 @@ class TestFetchUrlDispatch:
             botasaurus_pool=worker._botasaurus_pool,
         )
         fake_fetcher.fetch.assert_awaited_once_with(
-            "http://example.com", tenant, proxy=proxy_sentinel
+            "http://example.com", tenant, proxy=proxy_sentinel, overrides=None
         )
         # the async-context-managed lease must have been released, not leaked
         assert lease._released is True
@@ -302,7 +476,7 @@ class TestFetchUrlDispatch:
             pool=worker._browser_pool,
         )
         fake_fetcher.fetch.assert_awaited_once_with(
-            "http://example.com", tenant, proxy=proxy_sentinel
+            "http://example.com", tenant, proxy=proxy_sentinel, overrides=None
         )
         assert lease._released is True
 

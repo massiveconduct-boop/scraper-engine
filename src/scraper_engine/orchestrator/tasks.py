@@ -94,11 +94,19 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
         ):
             row = await pg.fetchrow(
                 tenant_id,
-                "SELECT urls, config_used, webhook_url FROM scrape_jobs WHERE job_id = $1::uuid",
+                """SELECT urls, config_used, webhook_url, status
+                   FROM scrape_jobs WHERE job_id = $1::uuid""",
                 job_id,
             )
             if row is None:
                 logger.error("job_not_found job_id=%s tenant=%s", job_id, tenant_id)
+                return
+
+            if row["status"] == JobStatus.CANCELLED.value:
+                # A DELETE /v1/jobs/{job_id} raced ahead of rq dequeuing this
+                # job (round 29) — honor the cancel rather than silently
+                # overwriting it back to PROCESSING below.
+                logger.info("job_already_cancelled job_id=%s tenant=%s", job_id, tenant_id)
                 return
 
             config_used: dict[str, Any] = (
@@ -119,17 +127,22 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
                 results = await _run_crawl_job(config_used)
                 status = JobStatus.COMPLETED
                 error = None
+                # Batch persist — ScrapyAdapter.run_spider returns a full
+                # batch, not a stream, so there's no per-item callback to
+                # hook here the way the escalation path below has.
+                await _persist_results(pg, s3, tenant_id, job_id, results)
             else:
                 request = ScrapeRequest(
                     urls=list(row["urls"]),
                     config_overrides=ConfigOverrides(**config_used) if config_used else None,
                 )
-                response = await _run_scrape(tenant_id, job_id, request, redis, pg, cfg)
+                # _run_scrape persists each result as it lands (on_result
+                # callback threaded into Worker.process_job, round 29) —
+                # no batch persist needed here, unlike the crawl branch above.
+                response = await _run_scrape(tenant_id, job_id, request, redis, pg, s3, cfg)
                 results = response.results or []
                 status = response.status
                 error = response.error
-
-            await _persist_results(pg, s3, tenant_id, job_id, results)
 
             await pg.execute(
                 tenant_id,
@@ -180,6 +193,7 @@ async def _run_scrape(
     request: ScrapeRequest,
     redis: RedisClient,
     pg: PostgresClient,
+    s3: S3Client,
     cfg: AppConfig,
 ) -> JobStatusResponse:
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
@@ -227,6 +241,13 @@ async def _run_scrape(
     # browser/botasaurus_pool.py for why this doesn't use botasaurus's own
     # reuse_driver=True.
     botasaurus_pool = BotasaurusPool(tenant_id=tenant_id, config=cfg.botasaurus)
+
+    async def _on_result(result: FetchResult) -> None:
+        """Persist each result the moment it lands (round 29) instead of
+        batching everything until the whole job finishes — see
+        _persist_one_result below."""
+        await _persist_one_result(pg, s3, tenant_id, job_id, result)
+
     try:
         worker = Worker(
             redis=redis,
@@ -238,7 +259,7 @@ async def _run_scrape(
             browser_pool=browser_pool,
             botasaurus_pool=botasaurus_pool,
         )
-        return await worker.process_job(tenant_id, job_id, request)
+        return await worker.process_job(tenant_id, job_id, request, on_result=_on_result)
     finally:
         await browser_pool.shutdown()
         await botasaurus_pool.shutdown()
@@ -262,6 +283,61 @@ async def _run_crawl_job(config_used: dict[str, Any]) -> list[FetchResult]:
     ]
 
 
+async def _persist_one_result(
+    pg: PostgresClient,
+    s3: S3Client,
+    tenant_id: TenantId,
+    job_id: str,
+    result: FetchResult,
+) -> None:
+    """Persist a single FetchResult — one scrape_results row, plus an S3
+    snapshot when there's HTML to store. Split out from _persist_results
+    (round 29) so the escalation path (_run_scrape) can call this per-result
+    via the on_result callback instead of waiting for the whole job to
+    finish. A cache-hit result (FetchResult.from_cache=True) has no `html`
+    (see Worker._check_cache), so the S3 upload is skipped and the existing
+    html_snapshot_url pointer it already carries is persisted as-is —
+    no duplicate snapshot for content that's already stored."""
+    html_snapshot_url = result.html_snapshot_url
+    if result.html:
+        html_snapshot_url = await s3.store_snapshot(
+            tenant_id, job_id, result.url, result.html, result.success
+        )
+        # Mutate the in-memory result so the webhook payload (built from
+        # these same objects, see _dispatch_webhook below) carries the
+        # snapshot pointer too, not just the polling response.
+        result.html_snapshot_url = html_snapshot_url
+    content_source = result.html or result.markdown or ""
+    content_hash = (
+        hashlib.sha256(content_source.encode("utf-8")).hexdigest() if content_source else None
+    )
+
+    await pg.execute(
+        tenant_id,
+        """
+        INSERT INTO scrape_results
+            (job_id, url, success, http_status, is_challenge_page, level_used,
+             proxy_used, markdown, json_data, html_snapshot_url, content_hash,
+             time_taken_ms, error_message, failure_category)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14)
+        """,
+        job_id,
+        result.url,
+        result.success,
+        result.http_status,
+        result.is_challenge_page,
+        result.level_used,
+        result.proxy_used,
+        result.markdown,
+        json.dumps(result.extracted) if result.extracted is not None else None,
+        html_snapshot_url,
+        content_hash,
+        result.duration_ms,
+        result.error_message,
+        result.failure_category.value if result.failure_category else None,
+    )
+
+
 async def _persist_results(
     pg: PostgresClient,
     s3: S3Client,
@@ -269,41 +345,14 @@ async def _persist_results(
     job_id: str,
     results: list[FetchResult],
 ) -> None:
+    """Batch persist — used only by the bulk-crawl path (_run_crawl_job),
+    which has no per-item callback available since ScrapyAdapter.run_spider
+    returns a full batch rather than a stream. The L1->L2->L3 escalation
+    path (_run_scrape) persists incrementally instead, via
+    _persist_one_result threaded in as Worker.process_job's on_result
+    callback."""
     for result in results:
-        html_snapshot_url = None
-        if result.html:
-            html_snapshot_url = await s3.store_snapshot(
-                tenant_id, job_id, result.url, result.html, result.success
-            )
-        content_source = result.html or result.markdown or ""
-        content_hash = (
-            hashlib.sha256(content_source.encode("utf-8")).hexdigest() if content_source else None
-        )
-
-        await pg.execute(
-            tenant_id,
-            """
-            INSERT INTO scrape_results
-                (job_id, url, success, http_status, is_challenge_page, level_used,
-                 proxy_used, markdown, json_data, html_snapshot_url, content_hash,
-                 time_taken_ms, error_message, failure_category)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14)
-            """,
-            job_id,
-            result.url,
-            result.success,
-            result.http_status,
-            result.is_challenge_page,
-            result.level_used,
-            result.proxy_used,
-            result.markdown,
-            json.dumps(result.extracted) if result.extracted is not None else None,
-            html_snapshot_url,
-            content_hash,
-            result.duration_ms,
-            result.error_message,
-            result.failure_category.value if result.failure_category else None,
-        )
+        await _persist_one_result(pg, s3, tenant_id, job_id, result)
 
 
 async def _dispatch_webhook(

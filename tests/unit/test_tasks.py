@@ -27,6 +27,7 @@ def fake_clients(monkeypatch):
         "urls": ["http://example.com"],
         "config_used": "{}",
         "webhook_url": "http://hooks.example.com/cb",
+        "status": "PENDING",
     }
     redis = AsyncMock()
     redis.raw = AsyncMock()
@@ -54,7 +55,14 @@ def fake_clients(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_scrape_job_persists_results_and_dispatches_webhook(fake_clients, monkeypatch):
+async def test_run_scrape_job_updates_status_and_dispatches_webhook(fake_clients, monkeypatch):
+    """For the non-crawl (escalation-ladder) path, _run_scrape_job no longer
+    batch-persists results itself (round 29) — _run_scrape persists each
+    result incrementally via the on_result callback as it lands (see
+    test_run_scrape_on_result_callback_persists_incrementally below), which
+    is invisible here since _run_scrape is mocked out entirely. This test
+    covers what _run_scrape_job still does directly: the PROCESSING ->
+    COMPLETED status transitions and the webhook dispatch."""
     pg, redis, s3, cfg = fake_clients
 
     response = JobStatusResponse(
@@ -84,12 +92,6 @@ async def test_run_scrape_job_persists_results_and_dispatches_webhook(fake_clien
     status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
     assert status_updates == [JobStatus.PROCESSING.value, JobStatus.COMPLETED.value]
 
-    insert_calls = [
-        c for c in pg.execute.await_args_list if "INSERT INTO scrape_results" in c.args[1]
-    ]
-    assert len(insert_calls) == 1
-
-    s3.store_snapshot.assert_awaited_once()
     deliver_mock.assert_awaited_once()
 
     pg.start.assert_awaited_once()
@@ -101,12 +103,59 @@ async def test_run_scrape_job_persists_results_and_dispatches_webhook(fake_clien
 
 
 @pytest.mark.asyncio
+async def test_run_scrape_on_result_callback_persists_incrementally(fake_clients, monkeypatch):
+    """_run_scrape's on_result closure (round 29) is what actually persists
+    each result as it lands, in place of the old end-of-job batch persist —
+    drive it directly rather than through the full Worker.process_job loop."""
+    pg, redis, s3, cfg = fake_clients
+
+    monkeypatch.setattr(
+        "scraper_engine.browser.pool.BrowserPool", MagicMock(return_value=AsyncMock())
+    )
+    monkeypatch.setattr(
+        "scraper_engine.browser.botasaurus_pool.BotasaurusPool", MagicMock(return_value=AsyncMock())
+    )
+    monkeypatch.setattr("scraper_engine.browser.session_state.SessionStateManager", MagicMock())
+    monkeypatch.setattr("scraper_engine.orchestrator.circuit_breaker.CircuitBreaker", MagicMock())
+    monkeypatch.setattr("scraper_engine.orchestrator.politeness.PolitenessController", MagicMock())
+    monkeypatch.setattr("scraper_engine.storage.dlq.DeadLetterQueue", MagicMock())
+
+    captured_on_result = {}
+
+    async def fake_process_job(tenant_id, job_id, request, on_result=None):
+        captured_on_result["cb"] = on_result
+        return JobStatusResponse(job_id=job_id, status=JobStatus.COMPLETED)
+
+    worker_instance = MagicMock()
+    worker_instance.process_job = fake_process_job
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.worker.Worker", MagicMock(return_value=worker_instance)
+    )
+
+    tenant_id = TenantId("system")
+    request = ScrapeRequest(urls=["http://example.com"])
+    await tasks_module._run_scrape(tenant_id, "job-incremental", request, redis, pg, s3, cfg)
+
+    result = FetchResult(
+        url="http://example.com", success=True, level_used=1, duration_ms=5, html="<html>hi</html>"
+    )
+    await captured_on_result["cb"](result)
+
+    s3.store_snapshot.assert_awaited_once()
+    insert_calls = [
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_results" in c.args[1]
+    ]
+    assert len(insert_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_scrape_job_skips_webhook_when_not_set(fake_clients, monkeypatch):
     pg, redis, s3, cfg = fake_clients
     pg.fetchrow.return_value = {
         "urls": ["http://example.com"],
         "config_used": "{}",
         "webhook_url": None,
+        "status": "PENDING",
     }
     monkeypatch.setattr(
         tasks_module,
@@ -121,6 +170,27 @@ async def test_run_scrape_job_skips_webhook_when_not_set(fake_clients, monkeypat
     await tasks_module._run_scrape_job("system", "job-2")
 
     deliver_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_job_honors_cancel_that_raced_ahead_of_dequeue(fake_clients, monkeypatch):
+    """A DELETE /v1/jobs/{job_id} that lands between enqueue and rq actually
+    dequeuing the job (round 29) must not get silently overwritten back to
+    PROCESSING — _run_scrape_job returns immediately instead."""
+    pg, redis, s3, cfg = fake_clients
+    pg.fetchrow.return_value = {
+        "urls": ["http://example.com"],
+        "config_used": "{}",
+        "webhook_url": None,
+        "status": "CANCELLED",
+    }
+    run_scrape_mock = AsyncMock()
+    monkeypatch.setattr(tasks_module, "_run_scrape", run_scrape_mock)
+
+    await tasks_module._run_scrape_job("system", "job-precancelled")
+
+    run_scrape_mock.assert_not_awaited()
+    assert pg.execute.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -145,6 +215,7 @@ async def test_run_scrape_job_crawl_type_routes_to_scrapy_adapter(fake_clients, 
             {"_job_type": "crawl", "spider_name": "titles", "start_urls": ["http://example.com"]}
         ),
         "webhook_url": None,
+        "status": "PENDING",
     }
 
     run_spider_mock = AsyncMock(return_value=[{"url": "http://example.com", "title": "Example"}])
@@ -272,13 +343,19 @@ async def test_run_scrape_builds_worker_and_brackets_pool_lifecycle(fake_clients
     tenant_id = TenantId("system")
     request = ScrapeRequest(urls=["http://example.com"])
 
-    response = await tasks_module._run_scrape(tenant_id, "job-run-scrape", request, redis, pg, cfg)
+    response = await tasks_module._run_scrape(
+        tenant_id, "job-run-scrape", request, redis, pg, s3, cfg
+    )
 
     assert response is expected_response
     browser_pool_instance.start.assert_awaited_once()
     browser_pool_instance.shutdown.assert_awaited_once()
     botasaurus_pool_instance.shutdown.assert_awaited_once()
-    worker_instance.process_job.assert_awaited_once_with(tenant_id, "job-run-scrape", request)
+    # process_job is called with an on_result callback (round 29 — persists
+    # each result as it lands) in addition to the original positional args.
+    call = worker_instance.process_job.await_args
+    assert call.args == (tenant_id, "job-run-scrape", request)
+    assert callable(call.kwargs["on_result"])
 
     _, worker_kwargs = worker_cls.call_args
     assert worker_kwargs["browser_pool"] is browser_pool_instance
@@ -319,7 +396,7 @@ async def test_run_scrape_shuts_down_pools_even_if_process_job_raises(fake_clien
     request = ScrapeRequest(urls=["http://example.com"])
 
     with pytest.raises(RuntimeError, match="fetch pipeline exploded"):
-        await tasks_module._run_scrape(tenant_id, "job-run-scrape-2", request, redis, pg, cfg)
+        await tasks_module._run_scrape(tenant_id, "job-run-scrape-2", request, redis, pg, s3, cfg)
 
     browser_pool_instance.shutdown.assert_awaited_once()
     botasaurus_pool_instance.shutdown.assert_awaited_once()

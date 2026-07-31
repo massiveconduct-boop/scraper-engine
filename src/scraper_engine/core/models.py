@@ -78,6 +78,8 @@ class FetchResult(BaseModel):
     failure_category: FailureCategory | None = None
     error_message: str | None = None
     proxy_used: str | None = None
+    html_snapshot_url: str | None = None
+    from_cache: bool = False
     duration_ms: int
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -90,6 +92,9 @@ class ConfigOverrides(BaseModel):
     include_tags: list[str] | None = None
     exclude_tags: list[str] | None = None
     extraction_schema: dict[str, Any] | None = None
+    # round 29 — skip the "reuse a recent result for this URL" cache check
+    # (see Worker.process_job) and force a fresh scrape for this request.
+    bypass_cache: bool = False
 
 
 class ScrapeRequest(BaseModel):
@@ -141,3 +146,16 @@ class JobStatusResponse(BaseModel):
     progress: float | None = None
     results: list[FetchResult] | None = None
     error: str | None = None
+
+
+class DeadLetterEntryResponse(BaseModel):
+    """API-facing shape of storage.dlq.DeadLetterEntry (a dataclass, not a
+    BaseModel, so FastAPI needs a serializable response model)."""
+
+    job_id: str
+    url: str
+    failure_category: FailureCategory
+    error_message: str
+    level_attempted: int
+    enqueued_at: datetime
+    dead_at: datetime

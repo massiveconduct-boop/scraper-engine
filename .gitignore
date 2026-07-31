@@ -16,8 +16,8 @@ htmlcov/
 .DS_Store
 .wolf/
 profiles/
-.claude/
-!.claude/knowledge/
+.claude/*
+!.claude/knowledge
 !.claude/MEMORY.md
 .archive/
 .local/

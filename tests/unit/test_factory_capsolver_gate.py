@@ -58,20 +58,17 @@ def test_level3_fetcher_keeps_solver_when_enabled():
     assert fetcher._captcha_solver is solver
 
 
-def test_build_level1_fetcher_returns_configured_fetcher(monkeypatch):
-    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+def test_build_level1_fetcher_returns_configured_fetcher():
     fetcher = build_level1_fetcher(AppConfig())
 
     assert isinstance(fetcher, Level1Fetcher)
-    assert fetcher._firecrawl is None
     assert fetcher._ja3_client is None
     # Default level_1.engine is "scrapling" (base.yaml) — L1's own
     # "HTTP/Scrapling" identity, wired for real in round 28.
     assert isinstance(fetcher._scrapling_client, ScraplingWrapper)
 
 
-def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling(monkeypatch):
-    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling():
     config = AppConfig(
         levels=LevelsConfig(
             level_1=LevelConfig(engine="camoufox", proxy_tier_min_score=40.0, timeout_seconds=20)
