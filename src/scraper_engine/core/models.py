@@ -95,6 +95,13 @@ class ConfigOverrides(BaseModel):
     # round 29 — skip the "reuse a recent result for this URL" cache check
     # (see Worker.process_job) and force a fresh scrape for this request.
     bypass_cache: bool = False
+    # extraction-engine integration — only take effect when extraction_schema is
+    # also set AND EXTRACTION_ENGINE_BASE_URL is configured (see Worker.process_job);
+    # otherwise extraction falls back to AdaptiveSelector, which ignores both.
+    extraction_enable_smallmodel: bool = False
+    # Spends real operator money if extraction-engine's own EXTRACTION_LLM_API_KEY
+    # is configured on that service — off by default for the same reason.
+    extraction_enable_llm: bool = False
 
 
 class ScrapeRequest(BaseModel):

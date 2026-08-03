@@ -555,6 +555,92 @@ class TestExtractionWiring:
         assert response.results[0].extracted["schema"] == schema
 
     @pytest.mark.asyncio
+    async def test_uses_extraction_engine_when_configured_and_schema_provided(
+        self, tenant, worker
+    ):
+        """When EXTRACTION_ENGINE_BASE_URL is configured (self._extraction_engine
+        is not None) and a real schema is supplied, extraction-engine's real
+        result is used instead of AdaptiveSelector's -- and the two new
+        ConfigOverrides flags reach the client call."""
+        worker._extraction_engine = AsyncMock()
+        worker._extraction_engine.extract.return_value = {
+            "fields": {"price": {"value": "9.99"}}
+        }
+        result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=10,
+            html="<html><body>x</body></html>",
+        )
+        worker._fetch_url = AsyncMock(return_value=result)
+        schema = {"price": "string"}
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")],
+            config_overrides=ConfigOverrides(
+                extraction_schema=schema,
+                extraction_enable_smallmodel=True,
+                extraction_enable_llm=True,
+            ),
+        )
+
+        response = await worker.process_job(tenant, "job-extract-engine", request)
+
+        assert response.results is not None
+        assert response.results[0].extracted == {"fields": {"price": {"value": "9.99"}}}
+        worker._extraction_engine.extract.assert_awaited_once_with(
+            "<html><body>x</body></html>",
+            schema,
+            enable_smallmodel=True,
+            enable_llm=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_adaptive_selector_when_extraction_engine_fails(
+        self, tenant, worker
+    ):
+        """extraction-engine fails soft (returns None, never raises) -- the job
+        must still complete via AdaptiveSelector, not be lost."""
+        worker._extraction_engine = AsyncMock()
+        worker._extraction_engine.extract.return_value = None
+        result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=10,
+            html="<html><body>x</body></html>",
+        )
+        worker._fetch_url = AsyncMock(return_value=result)
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")],
+            config_overrides=ConfigOverrides(extraction_schema={"price": "string"}),
+        )
+
+        response = await worker.process_job(tenant, "job-extract-fallback", request)
+
+        assert response.results is not None
+        assert response.results[0].extracted["schema"] == {"price": "string"}
+
+    @pytest.mark.asyncio
+    async def test_extraction_engine_not_called_without_schema(self, tenant, worker):
+        """No schema -- AdaptiveSelector's existing autonomous-fallback path,
+        extraction-engine is never invoked even if configured."""
+        worker._extraction_engine = AsyncMock()
+        result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=10,
+            html="<html><body>x</body></html>",
+        )
+        worker._fetch_url = AsyncMock(return_value=result)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-extract-noschema", request)
+
+        worker._extraction_engine.extract.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_skips_extraction_when_no_html(self, tenant, worker):
         result = FetchResult(url="http://example.com", success=True, level_used=1, duration_ms=10)
         worker._fetch_url = AsyncMock(return_value=result)

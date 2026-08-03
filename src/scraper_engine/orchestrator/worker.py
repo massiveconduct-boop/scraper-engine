@@ -101,6 +101,14 @@ class Worker:
         from scraper_engine.services.firecrawl_client import build_firecrawl_client
 
         self._firecrawl = build_firecrawl_client()
+        # Built once here, same rationale as firecrawl/captcha_solver above. None
+        # when EXTRACTION_ENGINE_BASE_URL isn't set — schema-driven extraction
+        # simply falls back to AdaptiveSelector (see process_job below).
+        from scraper_engine.services.extraction_engine_client import (
+            build_extraction_engine_client,
+        )
+
+        self._extraction_engine = build_extraction_engine_client()
 
     async def process_job(
         self,
@@ -205,9 +213,32 @@ class Worker:
                             if request.config_overrides
                             else None
                         )
-                        result.extracted = await AdaptiveSelector().extract(
-                            result.html, schema=schema
-                        )
+                        # extraction-engine is used only when both a real schema was
+                        # supplied AND EXTRACTION_ENGINE_BASE_URL is configured;
+                        # otherwise (and on any extraction-engine failure — it fails
+                        # soft, returning None rather than raising) this falls back
+                        # to today's exact AdaptiveSelector behavior unchanged.
+                        extracted = None
+                        if self._extraction_engine is not None and schema:
+                            extracted = await self._extraction_engine.extract(
+                                result.html,
+                                schema,
+                                enable_smallmodel=(
+                                    request.config_overrides.extraction_enable_smallmodel
+                                    if request.config_overrides
+                                    else False
+                                ),
+                                enable_llm=(
+                                    request.config_overrides.extraction_enable_llm
+                                    if request.config_overrides
+                                    else False
+                                ),
+                            )
+                        if extracted is None:
+                            extracted = await AdaptiveSelector().extract(
+                                result.html, schema=schema
+                            )
+                        result.extracted = extracted
                         # Markdown conversion (round 29) — same "wired once,
                         # applies regardless of level" rationale as
                         # extraction above. Previously only L1 ever produced
