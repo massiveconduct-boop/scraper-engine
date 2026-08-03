@@ -60,11 +60,37 @@ class TestExtractionEngineClientExtract:
         assert args[0] == "http://extraction-engine:8080/v1/extract"
         assert kwargs["json"] == {
             "html": "<html>hi</html>",
-            "schema": {"price": "string"},
+            # Bare shorthand auto-wrapped into extraction-engine's real wire
+            # envelope -- a bare dict sent as-is 422s against a real running
+            # instance (found via live cross-container verification).
+            "schema": {"schema_version": "1.0.0", "fields": {"price": "string"}},
             "enable_smallmodel": False,
             "enable_llm": False,
         }
         assert kwargs["headers"] == {"Authorization": "Bearer ee-key"}
+
+    @pytest.mark.asyncio
+    async def test_passes_through_an_already_complete_schema_envelope(self, monkeypatch):
+        """A caller that already built extraction-engine's real envelope
+        (schema_version + fields) must not get double-wrapped."""
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {}
+        http_client = AsyncMock()
+        http_client.post.return_value = resp
+        http_client.__aenter__.return_value = http_client
+        http_client.__aexit__.return_value = False
+
+        import httpx
+
+        monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=http_client))
+
+        client = ExtractionEngineClient("http://extraction-engine:8080")
+        envelope = {"schema_version": "1.0.0", "fields": {"price": "string"}}
+        await client.extract("<html/>", envelope)
+
+        _, kwargs = http_client.post.call_args
+        assert kwargs["json"]["schema"] == envelope
 
     @pytest.mark.asyncio
     async def test_passes_enable_flags_through(self, monkeypatch):

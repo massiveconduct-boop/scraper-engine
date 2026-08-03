@@ -14,6 +14,22 @@ from typing import Any
 
 import httpx
 
+# extraction-engine's wire schema requires a {"schema_version", "fields"} envelope
+# (its own core/schema/compiler.py rejects anything else with a 422) -- but every
+# real caller here (ConfigOverrides.extraction_schema, AdaptiveSelector's own
+# shorthand convention) supplies a bare {"field_name": "type"} mapping. Detected
+# live: a bare shorthand dict sent as-is 422'd against a real running
+# extraction-engine instance. Auto-wrapping keeps callers ergonomic without
+# needing to know extraction-engine's wire format.
+_ENVELOPE_KEYS = frozenset({"schema_version", "fields"})
+_DEFAULT_SCHEMA_VERSION = "1.0.0"
+
+
+def _as_wire_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    if _ENVELOPE_KEYS.issubset(schema.keys()):
+        return schema
+    return {"schema_version": _DEFAULT_SCHEMA_VERSION, "fields": schema}
+
 
 class ExtractionEngineClient:
     """Thin client over extraction-engine's /v1/extract API for schema-driven
@@ -35,9 +51,13 @@ class ExtractionEngineClient:
         enable_smallmodel: bool = False,
         enable_llm: bool = False,
     ) -> dict[str, Any] | None:
-        """Real extraction-engine call. Returns None (never raises) on any
-        connection error, timeout, non-2xx response, or malformed JSON —
-        same fail-soft contract as FirecrawlClient.convert_to_markdown."""
+        """Real extraction-engine call. `schema` may be a bare
+        {"field_name": "type"} shorthand mapping (auto-wrapped into
+        extraction-engine's real {schema_version, fields} envelope) or an
+        already-complete envelope (passed through unchanged). Returns None
+        (never raises) on any connection error, timeout, non-2xx response,
+        or malformed JSON — same fail-soft contract as
+        FirecrawlClient.convert_to_markdown."""
         try:
             headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
             async with httpx.AsyncClient(timeout=30) as client:
@@ -45,7 +65,7 @@ class ExtractionEngineClient:
                     f"{self._base_url}/v1/extract",
                     json={
                         "html": html,
-                        "schema": schema,
+                        "schema": _as_wire_schema(schema),
                         "enable_smallmodel": enable_smallmodel,
                         "enable_llm": enable_llm,
                     },

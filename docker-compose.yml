@@ -9,12 +9,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
       - postgres
       - redis
       - pgbouncer
       - minio
       - jaeger
+    networks:
+      - default
+      - extraction-scraper-net
 
   # worker-l1/l2/l3 are 3 replicas of the SAME worker pulling from ONE queue
   # ("scraper-jobs"), not per-level queues — Worker.process_job already runs
@@ -28,12 +35,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
       - postgres
       - redis
       - pgbouncer
       - minio
       - jaeger
+    networks:
+      - default
+      - extraction-scraper-net
 
   worker-l2:
     build: .
@@ -43,12 +57,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
       - postgres
       - redis
       - pgbouncer
       - minio
       - jaeger
+    networks:
+      - default
+      - extraction-scraper-net
 
   worker-l3:
     build: .
@@ -58,12 +79,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
       - postgres
       - redis
       - pgbouncer
       - minio
       - jaeger
+    networks:
+      - default
+      - extraction-scraper-net
 
   proxy-harvester:
     build: .
@@ -173,3 +201,9 @@ volumes:
   pgdata:
   miniodata:
   pgbouncer_config:
+
+networks:
+  # Shared with the separate extraction-engine repo's own compose project --
+  # one-time setup: `docker network create extraction-scraper-net`.
+  extraction-scraper-net:
+    external: true
