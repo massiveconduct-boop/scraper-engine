@@ -189,14 +189,36 @@ class Worker:
 
                 if result.success:
                     await self._circuit_breaker.record_success(domain)
-                    # A JS-gated shell from a non-final level is not real content
-                    # — an HTTP-only L1 fetch of a SPA returns 200 with an empty
-                    # mount point. Escalate to a browser level that runs JS instead
-                    # of caching the shell (round 15 — closes the "200 but
-                    # under-rendered" gap). Browser levels render JS so they won't
-                    # trip this; the final level accepts whatever it got.
-                    if level < LEVELS[-1] and self._challenge_detector.looks_javascript_gated(
-                        result.html or ""
+                    # `FetchResult.is_challenge_page` was declared on the model,
+                    # persisted, and even gated dedup.py's caching decision, but
+                    # no fetcher ever actually set it — L1 in particular only
+                    # checks the HTTP status code (`success = status < 400`), so
+                    # a 200 response whose body is literally an unsolved
+                    # challenge/interstitial page (e.g. a JS proof-of-work gate)
+                    # was accepted as real content and never escalated. Classify
+                    # it here, once, centrally — same rationale as the
+                    # extraction/markdown wiring below — so every level's result
+                    # is labeled correctly regardless of which fetcher produced
+                    # it. short_page_is_suspect=False matches the convention
+                    # L2/L3's own internal solve-polling loops already use, so a
+                    # short-but-genuinely-solved page isn't misclassified.
+                    result.is_challenge_page = self._challenge_detector.is_challenge_page(
+                        result.html or "", result.http_status or 200, short_page_is_suspect=False
+                    )
+                    # A JS-gated shell or an unsolved challenge page from a
+                    # non-final level is not real content — an HTTP-only L1
+                    # fetch of a SPA returns 200 with an empty mount point, and
+                    # an HTTP-only L1 fetch of a JS PoW challenge returns 200
+                    # with the interstitial itself. Escalate to a browser level
+                    # instead of caching either as success (round 15 for the
+                    # JS-gated-shell half of this; this round for the
+                    # challenge-page half). Browser levels render JS and already
+                    # loop internally until solved or exhausted, so a genuine L2/
+                    # L3 success won't trip this; the final level accepts
+                    # whatever it got.
+                    if level < LEVELS[-1] and (
+                        result.is_challenge_page
+                        or self._challenge_detector.looks_javascript_gated(result.html or "")
                     ):
                         continue
                     if result.html:

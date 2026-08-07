@@ -138,6 +138,39 @@ class TestWorker:
         assert response.results is not None and response.results[0].level_used == 2
 
     @pytest.mark.asyncio
+    async def test_unsolved_challenge_page_l1_escalates(self, tenant, worker):
+        """L1 returns HTTP 200 for a genuine 200-status challenge/interstitial
+        page (e.g. a JS proof-of-work gate) — `success = status < 400` alone
+        makes this look like a real fetch. Must not be accepted as content;
+        escalates to L2 which actually solves it. Regression test for a live
+        production-readiness re-verification finding: `is_challenge_page` was
+        declared on FetchResult and even gated dedup.py's caching decision,
+        but no fetcher ever set it, so this exact case silently short-
+        circuited the whole escalation ladder."""
+        interstitial = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=10,
+            http_status=200,
+            html="<html><body>Checking your browser before continuing…</body></html>",
+        )
+        solved_l2 = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=50,
+            http_status=200,
+            html="<html><body>challenge-mirror-ok</body></html>",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[interstitial, solved_l2])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-challenge", request)
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None and response.results[0].level_used == 2
+
+    @pytest.mark.asyncio
     async def test_host_unreachable_dead_letters_without_escalation(self, tenant, worker):
         """A dead/unresolvable host (round 15) dead-letters immediately — a
         browser can't resolve DNS the HTTP client couldn't, so escalating is
