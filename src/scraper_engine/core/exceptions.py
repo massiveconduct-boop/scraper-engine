@@ -70,3 +70,22 @@ class TenantNotFoundError(ScraperEngineError):
     def __init__(self, tenant_id: str) -> None:
         self.tenant_id = tenant_id
         super().__init__(f"Tenant not found: {tenant_id}")
+
+
+class PostgresClientMissingError(ScraperEngineError):
+    """Raised when Worker attempts an L2/L3 fetch without a real PostgresClient.
+
+    Unlike ProxyPoolExhaustedError (a transient, per-attempt condition worth
+    downgrading to a per-URL failure), a missing pg is a construction-time
+    misconfiguration — every subsequent L2/L3 fetch on this worker would fail
+    identically, so this is left to propagate uncaught rather than converted
+    to a FetchResult failure.
+    """
+
+    def __init__(self, level: int) -> None:
+        self.level = level
+        super().__init__(
+            f"Worker.pg is None — cannot dispatch level-{level} fetch (proxy leasing "
+            "requires Postgres). Worker was constructed without pg=<PostgresClient>; "
+            "see orchestrator/tasks.py::_run_scrape for the production constructor."
+        )

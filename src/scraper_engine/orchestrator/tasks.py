@@ -88,6 +88,10 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
     await s3.start()
     tracer = trace.get_tracer(__name__)
     job_start = time.monotonic()
+    # Hoisted so the except block below can reference it even if the crash
+    # happens before the row fetch assigns a real value — None means there's
+    # nothing to notify, correctly skipping the webhook dispatch.
+    webhook_url: str | None = None
     try:
         with tracer.start_as_current_span(
             "scrape_job", attributes={"job_id": job_id, "tenant_id": tenant_id_raw}
@@ -112,7 +116,7 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
             config_used: dict[str, Any] = (
                 json.loads(row["config_used"]) if row["config_used"] else {}
             )
-            webhook_url: str | None = row["webhook_url"]
+            webhook_url = row["webhook_url"]
 
             await pg.execute(
                 tenant_id,
@@ -167,6 +171,26 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
                 )
             except Exception:
                 logger.warning("job_duration metric update failed", exc_info=True)
+    except Exception:
+        # A worker-level crash (e.g. a bug in the escalation pipeline) must
+        # never leave scrape_jobs.status stuck at PROCESSING forever — that
+        # left GET /v1/jobs/{id} reporting a phantom in-progress job with no
+        # way for a caller to detect the failure short of reading worker
+        # logs. Mark FAILED and re-raise so rq's own failure bookkeeping
+        # still sees the exception (marking our DB row correct must not
+        # silently lie to rq's own tracking).
+        logger.exception("scrape_job_crashed job_id=%s tenant=%s", job_id, tenant_id_raw)
+        await pg.execute(
+            tenant_id,
+            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+            JobStatus.FAILED.value,
+            job_id,
+        )
+        if webhook_url:
+            await _dispatch_webhook(
+                webhook_url, job_id, JobStatus.FAILED, [], "internal error — see server logs"
+            )
+        raise
     finally:
         await s3.stop()
         await redis.stop()

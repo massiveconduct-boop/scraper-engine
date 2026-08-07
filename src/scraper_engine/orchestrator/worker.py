@@ -389,11 +389,16 @@ class Worker:
             l1_fetcher = build_level1_fetcher(self._config)
             return await l1_fetcher.fetch(url, tenant_id, overrides=overrides)
         elif level == 2:
+            from scraper_engine.core.exceptions import (
+                PostgresClientMissingError,
+                ProxyPoolExhaustedError,
+            )
             from scraper_engine.fetcher.factory import build_level2_fetcher
             from scraper_engine.proxy.manager import ProxyManager
 
-            pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
-            from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+            if self._pg is None:
+                raise PostgresClientMissingError(level=level)
+            pm = ProxyManager(redis=self._redis, pg=self._pg)
 
             try:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
@@ -417,11 +422,16 @@ class Worker:
                     error_message="Proxy pool exhausted",
                 )
         elif level == 3:
+            from scraper_engine.core.exceptions import (
+                PostgresClientMissingError,
+                ProxyPoolExhaustedError,
+            )
             from scraper_engine.fetcher.factory import build_level3_fetcher
             from scraper_engine.proxy.manager import ProxyManager
 
-            pm = ProxyManager(redis=self._redis, pg=None)  # type: ignore[arg-type]
-            from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+            if self._pg is None:
+                raise PostgresClientMissingError(level=level)
+            pm = ProxyManager(redis=self._redis, pg=self._pg)
 
             try:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))

@@ -3,7 +3,7 @@ services:
     build: .
     command: uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -14,11 +14,18 @@ services:
       # process_job simply falls back to AdaptiveSelector, no error.
       EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      pgbouncer:
+        condition: service_started
+      minio:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     networks:
       - default
       - extraction-scraper-net
@@ -40,11 +47,18 @@ services:
       # process_job simply falls back to AdaptiveSelector, no error.
       EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      pgbouncer:
+        condition: service_started
+      minio:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     networks:
       - default
       - extraction-scraper-net
@@ -62,11 +76,18 @@ services:
       # process_job simply falls back to AdaptiveSelector, no error.
       EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      pgbouncer:
+        condition: service_started
+      minio:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     networks:
       - default
       - extraction-scraper-net
@@ -84,11 +105,18 @@ services:
       # process_job simply falls back to AdaptiveSelector, no error.
       EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      pgbouncer:
+        condition: service_started
+      minio:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     networks:
       - default
       - extraction-scraper-net
@@ -101,9 +129,14 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
     depends_on:
-      - postgres
-      - redis
-      - jaeger
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
 
   postgres:
     image: postgres:16-alpine
@@ -114,7 +147,27 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  # One-shot init service — same shape as pgbouncer-init below (short-lived,
+  # gated via `condition: service_completed_successfully`). Runs `alembic
+  # upgrade head` exactly once, before any Postgres-writing service starts,
+  # so a fresh `docker compose up` never 500s on missing tables (previously
+  # nothing ran migrations automatically; an operator had to know to run
+  # `alembic upgrade head` by hand). Talks directly to postgres:5432, never
+  # through pgbouncer:6432 — DDL needs one stable session for the whole
+  # migration run, and PgBouncer's transaction-pooling mode doesn't
+  # guarantee that (same reasoning as postgres_client.py's own
+  # BEGIN...COMMIT-per-checkout wrapper, applied there for app queries).
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@postgres:5432/scraper_engine
+    depends_on:
+      postgres:
+        condition: service_started
 
   pgbouncer-init:
     image: postgres:16-alpine
@@ -148,7 +201,7 @@ services:
       - ./infra/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - pgbouncer_config:/etc/pgbouncer-config:ro
     ports:
-      - "6432:6432"
+      - "${PGBOUNCER_PORT:-6432}:6432"
     depends_on:
       pgbouncer-init:
         condition: service_completed_successfully
@@ -163,14 +216,14 @@ services:
     environment:
       DATA_SOURCE_NAME: "postgres://scraper:${POSTGRES_PASSWORD:-scraper}@pgbouncer:6432/pgbouncer?sslmode=disable"
     ports:
-      - "9127:9127"
+      - "${PGBOUNCER_EXPORTER_PORT:-9127}:9127"
     depends_on:
       - pgbouncer
 
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
 
   minio:
     image: minio/minio:latest
@@ -181,8 +234,8 @@ services:
     volumes:
       - miniodata:/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
 
   # Real tracing backend — Jaeger's all-in-one image speaks OTLP gRPC natively
   # (no separate otel-collector needed). observability.otlp_endpoint points
@@ -193,9 +246,38 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"  # UI
-      - "4317:4317"    # OTLP gRPC receiver
-      - "4318:4318"    # OTLP HTTP receiver
+      - "${JAEGER_UI_PORT:-16686}:16686"        # UI
+      - "${JAEGER_OTLP_GRPC_PORT:-4317}:4317"   # OTLP gRPC receiver
+      - "${JAEGER_OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP receiver
+
+  # Config already existed, git-tracked, fully written (infra/prometheus/
+  # prometheus.yml, monitoring/alerts/prometheus_rules.yml) but was never
+  # actually wired into this compose file — see .claude/knowledge/
+  # operations.md for the alert rules this scrapes and evaluates.
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts/prometheus_rules.yml:/etc/prometheus/alerts/prometheus_rules.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - api
+
+  # Same story as prometheus above — monitoring/alertmanager/alertmanager.yml
+  # (two-tier Slack routing) and its docker-entrypoint.sh (substitutes
+  # SLACK_WEBHOOK_URL into the config at container start) already existed,
+  # git-tracked, never wired in.
+  alertmanager:
+    image: prom/alertmanager:latest
+    entrypoint: ["/docker-entrypoint.sh"]
+    volumes:
+      - ./monitoring/alertmanager/docker-entrypoint.sh:/docker-entrypoint.sh:ro
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
 
 volumes:
   pgdata:

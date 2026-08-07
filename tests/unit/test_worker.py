@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import HttpUrl
 
-from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+from scraper_engine.core.exceptions import PostgresClientMissingError, ProxyPoolExhaustedError
 from scraper_engine.core.models import (
     ConfigOverrides,
     FailureCategory,
@@ -37,7 +37,14 @@ def worker():
     pc.wait_if_needed.return_value = None
     dlq = AsyncMock()
     dlq.enqueue.return_value = None
-    return Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq)
+    # Real PostgresClient (not None) so _dispatch_level's L2/L3 guard
+    # (PostgresClientMissingError, round-N fix for pg=None crashing every
+    # real escalation) doesn't fire for tests that don't care about it.
+    # fetchrow defaults to None so _is_cancelled/_check_cache keep their
+    # pre-existing "no cancellation, no cache hit" default behavior.
+    pg = AsyncMock()
+    pg.fetchrow.return_value = None
+    return Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq, pg=pg)
 
 
 class TestWorker:
@@ -404,9 +411,8 @@ class TestFetchUrlDispatch:
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
-        monkeypatch.setattr(
-            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
-        )
+        pm_ctor = MagicMock(return_value=pm_instance)
+        monkeypatch.setattr("scraper_engine.proxy.manager.ProxyManager", pm_ctor)
 
         expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=20)
         fake_fetcher = MagicMock()
@@ -417,6 +423,9 @@ class TestFetchUrlDispatch:
         result = await worker._fetch_url(tenant, "http://example.com", 2)
 
         assert result is expected
+        # proves the pg=None regression stays fixed — ProxyManager must be
+        # constructed with the worker's real PostgresClient, not a hardcoded None
+        pm_ctor.assert_called_once_with(redis=worker._redis, pg=worker._pg)
         pm_instance.get_proxy.assert_awaited_once_with(tenant, level=2, domain="example.com")
         build_mock.assert_called_once_with(
             worker._config,
@@ -456,9 +465,8 @@ class TestFetchUrlDispatch:
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
-        monkeypatch.setattr(
-            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
-        )
+        pm_ctor = MagicMock(return_value=pm_instance)
+        monkeypatch.setattr("scraper_engine.proxy.manager.ProxyManager", pm_ctor)
 
         expected = FetchResult(url="http://example.com", success=True, level_used=3, duration_ms=30)
         fake_fetcher = MagicMock()
@@ -469,6 +477,7 @@ class TestFetchUrlDispatch:
         result = await worker._fetch_url(tenant, "http://example.com", 3)
 
         assert result is expected
+        pm_ctor.assert_called_once_with(redis=worker._redis, pg=worker._pg)
         pm_instance.get_proxy.assert_awaited_once_with(tenant, level=3, domain="example.com")
         build_mock.assert_called_once_with(
             worker._config,
@@ -497,6 +506,32 @@ class TestFetchUrlDispatch:
         assert result.level_used == 3
         assert result.failure_category == FailureCategory.PROXY_EXHAUSTED
         assert result.error_message == "Proxy pool exhausted"
+
+    @pytest.mark.asyncio
+    async def test_level2_dispatch_raises_when_pg_missing(self, tenant):
+        """A Worker constructed with pg=None must fail loudly at the L2 guard,
+        not crash inside ProxyManager with an AttributeError on None (the
+        original bug) — construction-time misconfiguration propagates
+        uncaught rather than degrading to a per-URL failure result."""
+        redis = AsyncMock()
+        cb = AsyncMock()
+        pc = AsyncMock()
+        dlq = AsyncMock()
+        pg_missing_worker = Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq, pg=None)
+
+        with pytest.raises(PostgresClientMissingError):
+            await pg_missing_worker._fetch_url(tenant, "http://example.com", 2)
+
+    @pytest.mark.asyncio
+    async def test_level3_dispatch_raises_when_pg_missing(self, tenant):
+        redis = AsyncMock()
+        cb = AsyncMock()
+        pc = AsyncMock()
+        dlq = AsyncMock()
+        pg_missing_worker = Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq, pg=None)
+
+        with pytest.raises(PostgresClientMissingError):
+            await pg_missing_worker._fetch_url(tenant, "http://example.com", 3)
 
     @pytest.mark.asyncio
     async def test_unhandled_level_falls_through_to_none(self, tenant, worker):

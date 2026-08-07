@@ -224,7 +224,7 @@ harvest_once()
 
 **Architecture:** `pgbouncer-init` Docker service auto-regenerates SCRAM userlist from Postgres `pg_authid.rolpassword`. PgBouncer mounts shared volume. Zero manual steps.
 
-**Transaction pooling:** `PostgresClient.acquire()` wraps SET search_path in `BEGIN...COMMIT` to ensure all statements hit the same backend connection.
+**Transaction pooling:** `PostgresClient.acquire()` wraps SET search_path in `BEGIN...COMMIT` to ensure all statements hit the same backend connection. On success: `SET search_path=public` then `COMMIT`. On any exception (including cancellation): `ROLLBACK` only, no `SET search_path` attempt — a failed query aborts the transaction server-side, so issuing anything but ROLLBACK/COMMIT there would itself raise `InFailedSQLTransactionError`, masking the real error and skipping COMMIT entirely, which returned the connection to the pool mid-transaction (this was also the source of the "Resetting connection with an active transaction" error-level log noise from asyncpg's own pool-release safety net — see `.claude/knowledge/troubleshooting.md`).
 
 ---
 

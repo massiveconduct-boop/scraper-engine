@@ -40,7 +40,7 @@ When adding a Prometheus gauge: define it in `observability/metrics.py`, update 
 
 ### Integration Tests
 - Require Docker (Postgres, Redis, PgBouncer).
-- Start infrastructure: `docker compose up -d postgres redis pgbouncer && alembic upgrade head`.
+- Start infrastructure: `docker compose up -d postgres redis pgbouncer migrate` (the `migrate` service applies `alembic upgrade head` then exits).
 - Verify migration state before running: `alembic current` must equal `alembic heads`.
 - Test real database interactions, schema creation, concurrency.
 - Tests that mutate global tables (`DELETE FROM proxy_pool`) against the live DB are documented as a known risk. Acceptable on disposable CI instances; not acceptable if DB is shared.

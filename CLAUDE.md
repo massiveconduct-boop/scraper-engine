@@ -72,8 +72,8 @@ from repo-root-level packages in src-layout consolidation.
 ```bash
 source .venv/bin/activate
 pre-commit install  # one-time per clone
-docker compose up -d postgres redis pgbouncer minio && alembic upgrade head
-pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-fail-under=100   # 623 pass / 1 skip / 0 error / 100% (round 28)
+docker compose up -d postgres redis pgbouncer minio migrate   # migrate applies alembic upgrade head, then exits
+pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-fail-under=100   # pass count: see CI, not hardcoded here per operating rule #4
 ruff check . --exclude 'tests/fixtures/challenge_mirror'
 ```
 

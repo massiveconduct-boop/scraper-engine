@@ -18,6 +18,8 @@ pip install -e ".[dev]"
 # Copy env
 cp .env.example .env
 # Edit .env: add CapSolver key, Firecrawl key if using those services
+# .env is gitignored — never commit real secrets. If a key is ever exposed,
+# rotate it immediately at the provider rather than just removing it from the file.
 
 # Start infrastructure
 docker compose up -d postgres redis
@@ -26,7 +28,7 @@ docker compose up -d postgres redis
 alembic upgrade head
 
 # Start API server
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # Verify
 curl http://localhost:8000/v1/health
@@ -62,17 +64,32 @@ Services started:
 - `pgbouncer` — connection pooler (transaction mode, max 500 clients)
 - `redis` — queue + cache
 - `minio` — S3-compatible snapshot storage
+- `prometheus`, `alertmanager` — metrics + alert routing
+- `migrate` — one-shot, applies migrations then exits; every service above
+  that writes to Postgres waits on it via `depends_on: condition:
+  service_completed_successfully`
 
-### 3. Run Migrations
+Every host-side port above is overridable via env var (`API_PORT`,
+`POSTGRES_PORT`, etc. — see `docker-compose.yml`); defaults match the ports
+referenced throughout this guide.
+
+### 3. Migrations (automatic)
+
+`docker compose up -d` already applied migrations via the `migrate` init
+service before `api`/workers started — no manual step needed for a fresh
+deploy. To manually re-run or check migration state (e.g. after adding a new
+migration file to an already-running stack):
 
 ```bash
-docker compose exec api alembic upgrade head
+docker compose run --rm migrate
+# or, equivalently:
+docker compose exec api alembic upgrade head   # idempotent
 ```
 
 ### 4. Create Admin Tenant
 
 ```bash
-docker compose exec api python cli/entrypoint.py create-tenant <name>
+docker compose exec api scraper-engine create-tenant <name>
 # Saves API key — store securely
 ```
 
@@ -146,3 +163,5 @@ Key alerts:
 | All jobs fail L3 | Proxy pool empty? Check `proxy_pool_size` metric |
 | PgBouncer unreachable | `docker compose logs pgbouncer` |
 | Migration fails | Run `alembic current` to check state |
+| Jobs stuck `PROCESSING` forever | Worker crashed mid-job (check worker logs) — a crash now marks the job `FAILED` and re-raises so rq's own bookkeeping sees it too; a job stuck `PROCESSING` with a dead worker process is the signal to look here |
+| `InFailedSQLTransactionError` / "Resetting connection with an active transaction" in logs | Historical — fixed by `postgres_client.py::acquire()`'s exception-path handling (ROLLBACK instead of a finally-block COMMIT that masked the real error). Safe to ignore if seen in logs predating that fix; should not recur |

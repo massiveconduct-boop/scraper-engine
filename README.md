@@ -20,10 +20,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env   # add CapSolver/Firecrawl keys if using those services
+# .env is gitignored — never commit real secrets. If a key is ever exposed,
+# rotate it immediately at the provider rather than just removing it from the file.
 
 docker compose up -d postgres redis pgbouncer
 alembic upgrade head
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000 --reload
 
 curl http://localhost:8000/v1/health
 ```

@@ -173,6 +173,61 @@ async def test_run_scrape_job_skips_webhook_when_not_set(fake_clients, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_run_scrape_job_crash_marks_failed_and_reraises(fake_clients, monkeypatch):
+    """A worker-level crash (e.g. the pg=None bug that used to hit here) must
+    not leave scrape_jobs stuck at PROCESSING forever — mark FAILED, fire the
+    webhook, then re-raise so rq's own failure bookkeeping still sees it."""
+    pg, redis, s3, cfg = fake_clients
+    monkeypatch.setattr(
+        tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom"))
+    )
+    deliver_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await tasks_module._run_scrape_job("system", "job-crash")
+
+    status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
+    assert status_updates == [JobStatus.PROCESSING.value, JobStatus.FAILED.value]
+    deliver_mock.assert_awaited_once()
+
+    # cleanup must still run despite the crash
+    pg.stop.assert_awaited_once()
+    redis.stop.assert_awaited_once()
+    s3.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_job_crash_without_webhook_skips_dispatch(fake_clients, monkeypatch):
+    """Same crash path, but no webhook_url on the job — must mark FAILED and
+    re-raise without ever dispatching (covers the `if webhook_url:` branch's
+    False side, needed for the 100% coverage gate)."""
+    pg, redis, s3, cfg = fake_clients
+    pg.fetchrow.return_value = {
+        "urls": ["http://example.com"],
+        "config_used": "{}",
+        "webhook_url": None,
+        "status": "PENDING",
+    }
+    monkeypatch.setattr(
+        tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom"))
+    )
+    deliver_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await tasks_module._run_scrape_job("system", "job-crash-2")
+
+    status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
+    assert status_updates == [JobStatus.PROCESSING.value, JobStatus.FAILED.value]
+    deliver_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_scrape_job_honors_cancel_that_raced_ahead_of_dequeue(fake_clients, monkeypatch):
     """A DELETE /v1/jobs/{job_id} that lands between enqueue and rq actually
     dequeuing the job (round 29) must not get silently overwritten back to

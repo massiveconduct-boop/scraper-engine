@@ -60,6 +60,9 @@ dependencies = [
     "opentelemetry-instrumentation-redis==0.65b0",
 ]
 
+[project.scripts]
+scraper-engine = "scraper_engine.cli.entrypoint:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["scraper_engine*"]

@@ -75,7 +75,19 @@ class PostgresClient:
             await conn.execute(f"SET search_path = {tenant_str}, public")
             try:
                 yield conn
-            finally:
+            except BaseException:
+                # A failed query aborts the transaction server-side — issuing
+                # anything but ROLLBACK/COMMIT here (e.g. the SET search_path
+                # below) would itself raise InFailedSQLTransactionError,
+                # masking the real error and skipping COMMIT entirely, which
+                # returns the connection to the pool mid-transaction. ROLLBACK
+                # is always accepted regardless of transaction state. Covers
+                # CancelledError too — a cancelled caller mid-transaction must
+                # not leave the connection COMMIT'd or reset with a still-open
+                # transaction either.
+                await conn.execute("ROLLBACK")
+                raise
+            else:
                 await conn.execute("SET search_path = public")
                 await conn.execute("COMMIT")
 

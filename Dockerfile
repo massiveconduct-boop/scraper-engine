@@ -44,10 +44,16 @@ WORKDIR /app
 # source tree present, defeating the point of installing deps before
 # copying source) or a 3rd hand-duplicated package list (the drift class
 # that caused the round-27 types-redis mismatch, operations.md #12).
-# dev-lock (not the runtime-only lock) because this image also runs
-# `alembic upgrade head` against migrations/, which needs alembic+sqlalchemy
-# — those are dev-extras, not src/ runtime deps, but this container ships
-# migrations/ too (COPY . . below) and is the thing that applies them.
+# dev-lock (not the runtime-only lock) because migrations need
+# alembic+sqlalchemy — those are dev-extras, not src/ runtime deps, but this
+# container ships migrations/ too (COPY . . below). This stage's own CMD does
+# NOT run migrations itself (bare uvicorn, see the runtime stage below) — the
+# same image is reused, via a `command: alembic upgrade head` override, by
+# docker-compose's one-shot `migrate` init service (see docker-compose.yml),
+# which every Postgres-writing service depends on via
+# `condition: service_completed_successfully` before it starts. Scope gap:
+# this only covers `docker compose up` — a bare `docker run <image>` outside
+# compose does not auto-migrate.
 COPY requirements-dev-lock.txt .
 RUN pip install --no-cache-dir "camoufox[geoip]" -r requirements-dev-lock.txt
 

@@ -17,29 +17,36 @@ directly if this doc and reality ever disagree.
 
 ## Infrastructure
 
-| Service | Image | Port | Purpose |
-|---|---|---|---|
-| PostgreSQL | 16-alpine | 5432 | Primary database |
-| PgBouncer | edoburu/pgbouncer:latest | 6432 | Connection pooler (transaction mode) |
-| Redis | 7-alpine | 6379 | Queue + cache |
-| MinIO | minio/minio:latest | 9000 | S3-compatible storage |
-| API | uvicorn | 8000 | FastAPI server |
-| Workers L1/L2/L3 | RQ | — | Escalation-level queue workers |
-| Proxy harvester | standalone Python | — | Background proxy collection |
-| Prometheus | prom/prometheus:latest | 9090 | Metrics collection + alert evaluation |
-| Alertmanager | prom/alertmanager:latest | 9093 | Alert routing to Slack (two-tier: default + paging-channel) |
-| PgBouncer init | postgres:16-alpine | — | SCRAM userlist auto-regeneration |
-| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | Distributed tracing backend — round 24 |
+| Service | Image | Port | Override var | Purpose |
+|---|---|---|---|---|
+| PostgreSQL | 16-alpine | 5432 | `POSTGRES_PORT` | Primary database |
+| PgBouncer | edoburu/pgbouncer:latest | 6432 | `PGBOUNCER_PORT` | Connection pooler (transaction mode) |
+| PgBouncer exporter | prometheuscommunity/pgbouncer-exporter | 9127 | `PGBOUNCER_EXPORTER_PORT` | Real pool-state metrics for Prometheus |
+| Redis | 7-alpine | 6379 | `REDIS_PORT` | Queue + cache |
+| MinIO | minio/minio:latest | 9000 (API), 9001 (console) | `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` | S3-compatible storage |
+| API | uvicorn | 8000 | `API_PORT` | FastAPI server |
+| Workers L1/L2/L3 | RQ | — | — | Escalation-level queue workers |
+| Proxy harvester | standalone Python | — | — | Background proxy collection |
+| `migrate` | same image as `api` | — | — | One-shot `alembic upgrade head`, gates every Postgres-writing service via `depends_on: condition: service_completed_successfully` — see Migrations below |
+| Prometheus | prom/prometheus:latest | 9090 | `PROMETHEUS_PORT` | Metrics collection + alert evaluation. Live `docker-compose.yml` service (previously config-only — `infra/prometheus/prometheus.yml` existed, git-tracked, but was never wired in) |
+| Alertmanager | prom/alertmanager:latest | 9093 | `ALERTMANAGER_PORT` | Alert routing to Slack (two-tier: default + paging-channel). Live `docker-compose.yml` service — same "config existed, never wired" story as Prometheus |
+| PgBouncer init | postgres:16-alpine | — | — | SCRAM userlist auto-regeneration |
+| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | `JAEGER_UI_PORT`, `JAEGER_OTLP_GRPC_PORT`, `JAEGER_OTLP_HTTP_PORT` | Distributed tracing backend — round 24 |
+
+Every host-side port above is overridable via its env var (e.g. `API_PORT=8010 docker compose up -d`) or by setting it in `.env` — container-to-container traffic is unaffected since services address each other by service name, not host port. Ports shown are the defaults, unchanged from before this was made overridable.
+
+---
+
+## Migrations
+
+`docker compose up -d` runs `alembic upgrade head` automatically via a one-shot `migrate` init service (same shape as `pgbouncer-init`) — every Postgres-writing service (`api`, `worker-l1/l2/l3`, `proxy-harvester`) declares `depends_on: migrate: condition: service_completed_successfully`, so nothing starts against a stale schema. A fresh `docker compose up -d` no longer requires a manual `alembic upgrade head` step. To manually re-run or check migration state (e.g. after adding a new migration file to an already-running stack): `docker compose run --rm migrate` or `docker compose exec api alembic upgrade head` (both work; `alembic upgrade head` is idempotent).
 
 ---
 
 ## Quick Start
 
 ```bash
-docker compose up -d postgres redis pgbouncer
-docker compose up -d pgbouncer-init  # one-time — waits for postgres, generates SCRAM userlist
-alembic upgrade head
-docker compose up -d  # start remaining services
+docker compose up -d  # migrations run automatically via the `migrate` service
 ```
 
 ---
@@ -78,6 +85,8 @@ containers get service names. Symptom if missing:
 ---
 
 ## Monitoring
+
+Prometheus + Alertmanager are live `docker-compose.yml` services (round-N fix — the config below existed and was accurate long before that, but nothing actually ran it; `docker compose up -d` now starts both for real). `SLACK_WEBHOOK_URL` in `.env` is picked up automatically by compose's own variable interpolation and substituted into Alertmanager's config at container start by `monitoring/alertmanager/docker-entrypoint.sh`.
 
 ### Prometheus Metrics
 - `proxy_pool_validated_count` — proxies with score ≥40 (L1 threshold). Updated by `harvest_once()`.
