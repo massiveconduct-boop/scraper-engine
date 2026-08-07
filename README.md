@@ -49,7 +49,6 @@ mypy src/scraper_engine/core/ src/scraper_engine/proxy/ src/scraper_engine/orche
 | `core/`, `proxy/`, `browser/`, `fetcher/`, `orchestrator/`, `api/`, `storage/`, `config/`, `cli/`, `observability/`, `services/` | Application source — see `CLAUDE.md` → Module Map for responsibilities |
 | `tests/` | Unit, integration, chaos, and live test suites |
 | `tests/fixtures/challenge_mirror/` | Self-hosted Cloudflare-like test target used for live L2/L3 anti-detection verification |
-| `tests/fixtures/judge_server.py` | Self-hosted proxy judge used by the promotion integration test |
 | `docs/reference/` | API reference |
 | `docs/guides/` | Deployment and operational guides |
 | `.claude/knowledge/` | Living architecture, decisions, standards, troubleshooting, and operations docs |

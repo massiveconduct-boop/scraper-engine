@@ -440,10 +440,12 @@ class TestFetchUrlDispatch:
     async def test_level2_leases_proxy_and_dispatches_via_factory(
         self, tenant, worker, monkeypatch
     ):
-        proxy_sentinel = object()
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
         pm_ctor = MagicMock(return_value=pm_instance)
         monkeypatch.setattr("scraper_engine.proxy.manager.ProxyManager", pm_ctor)
 
@@ -471,6 +473,10 @@ class TestFetchUrlDispatch:
         )
         # the async-context-managed lease must have been released, not leaked
         assert lease._released is True
+        # Round 32: a real fetch outcome must update the proxy's score —
+        # mark_success/mark_failure were built but never actually called.
+        pm_instance.mark_success.assert_awaited_once_with(tenant, "1.2.3.4", 8080)
+        pm_instance.mark_failure.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_level2_proxy_exhausted_returns_failure_result(self, tenant, worker, monkeypatch):
@@ -494,10 +500,12 @@ class TestFetchUrlDispatch:
     async def test_level3_leases_proxy_and_dispatches_via_factory(
         self, tenant, worker, monkeypatch
     ):
-        proxy_sentinel = object()
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
         pm_ctor = MagicMock(return_value=pm_instance)
         monkeypatch.setattr("scraper_engine.proxy.manager.ProxyManager", pm_ctor)
 
@@ -521,6 +529,8 @@ class TestFetchUrlDispatch:
             "http://example.com", tenant, proxy=proxy_sentinel, overrides=None
         )
         assert lease._released is True
+        pm_instance.mark_success.assert_awaited_once_with(tenant, "1.2.3.4", 8080)
+        pm_instance.mark_failure.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_level3_proxy_exhausted_returns_failure_result(self, tenant, worker, monkeypatch):
@@ -539,6 +549,76 @@ class TestFetchUrlDispatch:
         assert result.level_used == 3
         assert result.failure_category == FailureCategory.PROXY_EXHAUSTED
         assert result.error_message == "Proxy pool exhausted"
+
+    @pytest.mark.asyncio
+    async def test_level2_real_fetch_failure_marks_failure_not_success(
+        self, tenant, worker, monkeypatch
+    ):
+        """Round 32: a real fetch that comes back success=False must call
+        mark_failure (bans + recomputes down), never mark_success."""
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+
+        failed_result = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            duration_ms=10,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+        )
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=failed_result)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is failed_result
+        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.2.3.4", 8080, "example.com")
+        pm_instance.mark_success.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_level3_real_fetch_failure_marks_failure_not_success(
+        self, tenant, worker, monkeypatch
+    ):
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+
+        failed_result = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=10,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+        )
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=failed_result)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level3_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 3)
+
+        assert result is failed_result
+        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.2.3.4", 8080, "example.com")
+        pm_instance.mark_success.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_level2_dispatch_raises_when_pg_missing(self, tenant):

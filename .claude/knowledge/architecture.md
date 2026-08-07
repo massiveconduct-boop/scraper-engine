@@ -144,7 +144,25 @@ harvest_once()
           └─ broker.find() → validate → JSON stdout → persist
 ```
 
-**Self-hosted judge:** `judge_server.py` on port 8089. Echoes headers + origin. Replaces httpbin.org dependency.
+**Proxy validation target:** `proxy/harvester.py::JUDGE_URLS` — a small
+ordered list of independent, differently-hosted public IP-echo endpoints
+(`httpbingo.org`, `api.ipify.org`, `postman-echo.com`, all plain-HTTP —
+HTTPS would need CONNECT tunneling, which many free HTTP-only proxies
+can't do). `_http_validate()` tries each in order, stopping at the first
+200; `health_monitor.py::check_one()` imports the same list rather than
+keeping its own, so both stay in sync. Round 32 tried a self-hosted
+loopback judge (`proxy/judge_server.py`, port 8089) first — architecturally
+unfixable: when a request is routed through a forward proxy, the *proxy*
+resolves "127.0.0.1," not us, so a loopback judge can never validate a
+real third-party proxy no matter how correctly it runs. Then tried a
+single public target (`httpbin.org`, matching `health_monitor.py`'s prior
+choice) — found it live-down (persistent 503s) while building the fix,
+directly demonstrating why proxy scoring must never depend on one public
+service. `judge_server.py` remains as a deterministic, network-independent
+stand-in for tests only (`tests/unit/test_judge_server.py`,
+`tests/integration/test_promotion.py`) — not the production judge. See
+`.claude/knowledge/decisions.md` for the full decision record and
+`.claude/knowledge/troubleshooting.md` → "All Pool Proxies Score 25".
 
 **Source diversity:** 8 URLs across 6 operators (proxyscrape.com, openproxylist.xyz, TheSpeedX/GitHub, monosans/GitHub, pubproxy.com, geonode.com). 5 real failure domains (GitHub CDN shared by two repos).
 
@@ -692,9 +710,15 @@ drift): `.claude/knowledge/troubleshooting.md`, round-27 entries.
 package — they stay at repo root, unmoved, per standard src-layout
 convention. `tests/fixtures/` holds real, actively-used test
 infrastructure: `challenge_mirror/` (self-hosted Cloudflare-like test
-target, BD-05) and `judge_server.py` (self-hosted proxy judge, used by the
-promotion integration test) — both genuine working components, not scratch,
-which is why they live under `tests/` rather than being archived.
+target, BD-05) — a genuine working component, not scratch, which is why it
+lives under `tests/` rather than being archived. `judge_server.py` used to
+live here too, but round 32 found it wasn't actually test-only — it's a
+real runtime dependency of `proxy/harvester.py`'s production validation
+path (nothing else ever started it, which is exactly why that path was
+silently broken in every real deployment). Promoted to
+`src/scraper_engine/proxy/judge_server.py`; the promotion integration test
+now imports and starts it directly from there instead of via a
+subprocess pointed at a fixture path.
 
 Two directories exist purely as local, gitignored scratch space — never
 pushed to GitHub, but not deleted either:

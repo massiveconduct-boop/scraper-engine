@@ -9,12 +9,16 @@ Global reliability_score decays independently of domain-specific bans.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from scraper_engine.core.exceptions import ProxyPoolExhaustedError
-from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.models import AnonymityLevel, AsnClass, Proxy, ProxyProtocol
+from scraper_engine.proxy.scoring import ScoringEngine, compute_success_rate
 
 if TYPE_CHECKING:
+    import asyncpg
+
     from scraper_engine.core.tenant import TenantId
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
@@ -70,32 +74,93 @@ class ProxyManager:
         raise ProxyPoolExhaustedError(domain=domain, level=level, attempts=self.MAX_ATTEMPTS)
 
     async def mark_success(self, tenant_id: TenantId, ip: str, port: int) -> None:
-        """Improve proxy reliability score on successful fetch."""
-        await self._pg.execute(
+        """Improve proxy reliability score on successful fetch.
+
+        Recomputes via ScoringEngine using real accumulated success/failure
+        history (round 32 — previously a flat +5 regardless of the proxy's
+        real dimensions or track record). Two round trips (increment+read,
+        then write); a real-world proxy is never hammered concurrently
+        often enough for the small race window this leaves to matter, and
+        reliability_score is a heuristic, not something needing strict
+        serializability.
+        """
+        row = await self._pg.fetchrow(
             tenant_id,
             """
-            UPDATE proxy_pool SET reliability_score = LEAST(100.0, reliability_score + 5.0),
-                                 last_validated = NOW()
+            UPDATE proxy_pool
+            SET global_success_count = global_success_count + 1,
+                last_validated = NOW()
             WHERE ip = $1 AND port = $2
+            RETURNING anonymity_level, asn_class, response_time_ms,
+                      global_success_count, global_failure_count, last_validated
             """,
+            ip,
+            port,
+        )
+        if row is None:
+            return
+        new_score = self._recompute_score(row)
+        await self._pg.execute(
+            tenant_id,
+            "UPDATE proxy_pool SET reliability_score = $1 WHERE ip = $2 AND port = $3",
+            new_score,
             ip,
             port,
         )
 
     async def mark_failure(self, tenant_id: TenantId, ip: str, port: int, domain: str) -> None:
-        """Ban proxy for domain (TTL 1h) and decay global reliability score."""
+        """Ban proxy for domain (TTL 1h) and recompute global reliability score.
+
+        See mark_success's docstring for why this is now formula-driven
+        instead of a flat -10.
+        """
         ban_key = f"proxy_ban:{tenant_id}:{domain}:{ip}:{port}"
         await self._redis.set(tenant_id, ban_key, "1", ttl=3600)
 
-        await self._pg.execute(
+        row = await self._pg.fetchrow(
             tenant_id,
             """
-            UPDATE proxy_pool SET reliability_score = GREATEST(0.0, reliability_score - 10.0)
+            UPDATE proxy_pool
+            SET global_failure_count = global_failure_count + 1
             WHERE ip = $1 AND port = $2
+            RETURNING anonymity_level, asn_class, response_time_ms,
+                      global_success_count, global_failure_count, last_validated
             """,
             ip,
             port,
         )
+        if row is None:
+            return
+        new_score = self._recompute_score(row)
+        await self._pg.execute(
+            tenant_id,
+            "UPDATE proxy_pool SET reliability_score = $1 WHERE ip = $2 AND port = $3",
+            new_score,
+            ip,
+            port,
+        )
+
+    @staticmethod
+    def _recompute_score(row: asyncpg.Record) -> float:
+        """Shared by mark_success/mark_failure — builds compute_score()'s
+        inputs from a proxy_pool row (as returned by the RETURNING clauses
+        above, which shape identically to a normal SELECT)."""
+        recency_seconds: float | None = None
+        last_validated = row["last_validated"]
+        if last_validated is not None:
+            recency_seconds = (datetime.now(UTC) - last_validated).total_seconds()
+        success_rate = compute_success_rate(
+            row["global_success_count"],
+            row["global_failure_count"],
+        )
+        result = ScoringEngine().compute_score(
+            latency_ms=row["response_time_ms"],
+            success_rate=success_rate,
+            anonymity=AnonymityLevel(row["anonymity_level"]),
+            asn=AsnClass(row["asn_class"]),
+            last_validated_seconds_ago=recency_seconds,
+        )
+        return result.total
 
     async def _select_candidate(
         self,

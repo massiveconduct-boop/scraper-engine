@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from scraper_engine.proxy.harvester import ProxyHarvester
+from scraper_engine.proxy.harvester import ProxyHarvester, _to_asn_class
 
 
 class FakeResponse:
@@ -469,7 +469,7 @@ class TestHttpValidateReal:
     async def test_elite_when_no_forwarding_headers(self):
         from scraper_engine.core.models import AnonymityLevel
 
-        resp = FakeResponse(status_code=200, json_data={"headers": {}}, headers={})
+        resp = FakeResponse(status_code=200, json_data={"origin": "1.2.3.4"}, headers={})
         with patch(
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
@@ -483,7 +483,7 @@ class TestHttpValidateReal:
         from scraper_engine.core.models import AnonymityLevel
 
         resp = FakeResponse(
-            status_code=200, json_data={"headers": {}}, headers={"Via": "1.1 proxy"}
+            status_code=200, json_data={"origin": "1.2.3.4"}, headers={"Via": "1.1 proxy"}
         )
         with patch(
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
@@ -498,7 +498,7 @@ class TestHttpValidateReal:
         from scraper_engine.core.models import AnonymityLevel
 
         resp = FakeResponse(
-            status_code=200, json_data={"headers": {}}, headers={"X-Forwarded-For": "9.9.9.9"}
+            status_code=200, json_data={"origin": "1.2.3.4"}, headers={"X-Forwarded-For": "9.9.9.9"}
         )
         with patch(
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
@@ -507,6 +507,107 @@ class TestHttpValidateReal:
             valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.TRANSPARENT
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_next_url_when_first_is_down(self):
+        """Regression test (round 32): one judge candidate being unreachable
+        (httpbin.org was found live-down, persistent 503s, while building
+        this fix) must not fail validation for a genuinely working proxy —
+        the loop must try the next JUDGE_URLS candidate instead of giving up."""
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.proxy.harvester import JUDGE_URLS
+
+        assert len(JUDGE_URLS) >= 2, "test needs at least 2 candidates to prove fallthrough"
+        first_down = FakeResponse(status_code=503)
+        second_up = FakeResponse(status_code=200, json_data={"origin": "1.2.3.4"}, headers={})
+
+        class FallthroughClient(FakeJudgeClient):
+            async def get(self, url):
+                return first_down if url == JUDGE_URLS[0] else second_up
+
+        with patch(
+            "scraper_engine.proxy.harvester.httpx.AsyncClient",
+            return_value=FallthroughClient(),
+        ):
+            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+        assert valid is True
+        assert level == AnonymityLevel.ELITE
+
+    @pytest.mark.asyncio
+    async def test_falls_through_when_one_url_raises_mid_loop(self):
+        """A single candidate raising (e.g. connection reset) must not abort
+        the whole validation — the loop must catch it and keep trying the
+        remaining candidates."""
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.proxy.harvester import JUDGE_URLS
+
+        assert len(JUDGE_URLS) >= 2
+        second_up = FakeResponse(status_code=200, json_data={"origin": "1.2.3.4"}, headers={})
+
+        class RaisesThenSucceedsClient(FakeJudgeClient):
+            async def get(self, url):
+                if url == JUDGE_URLS[0]:
+                    raise OSError("connection reset")
+                return second_up
+
+        with patch(
+            "scraper_engine.proxy.harvester.httpx.AsyncClient",
+            return_value=RaisesThenSucceedsClient(),
+        ):
+            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+        assert valid is True
+        assert level == AnonymityLevel.ELITE
+
+    @pytest.mark.asyncio
+    async def test_falls_through_when_one_url_returns_malformed_json(self):
+        """A single candidate returning a 200 with unparseable/non-JSON body
+        must not abort the whole validation — the loop must catch the
+        json() failure and keep trying the remaining candidates."""
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.proxy.harvester import JUDGE_URLS
+
+        assert len(JUDGE_URLS) >= 2
+
+        class BadJsonResponse(FakeResponse):
+            def json(self):
+                raise ValueError("not json")
+
+        first_malformed = BadJsonResponse(status_code=200)
+        second_up = FakeResponse(status_code=200, json_data={"origin": "1.2.3.4"}, headers={})
+
+        class MalformedThenSucceedsClient(FakeJudgeClient):
+            async def get(self, url):
+                return first_malformed if url == JUDGE_URLS[0] else second_up
+
+        with patch(
+            "scraper_engine.proxy.harvester.httpx.AsyncClient",
+            return_value=MalformedThenSucceedsClient(),
+        ):
+            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+        assert valid is True
+        assert level == AnonymityLevel.ELITE
+
+
+class TestToAsnClass:
+    def test_residential(self):
+        from scraper_engine.core.models import AsnClass
+
+        assert _to_asn_class("residential-isp") == AsnClass.RESIDENTIAL
+
+    def test_mobile(self):
+        from scraper_engine.core.models import AsnClass
+
+        assert _to_asn_class("mobile-carrier") == AsnClass.MOBILE
+
+    def test_datacenter(self):
+        from scraper_engine.core.models import AsnClass
+
+        assert _to_asn_class("datacenter-cloud") == AsnClass.DATACENTER
+
+    def test_unrecognized_defaults_to_unknown(self):
+        from scraper_engine.core.models import AsnClass
+
+        assert _to_asn_class("something-else") == AsnClass.UNKNOWN
 
 
 class TestParseIpPort:
@@ -657,7 +758,28 @@ class TestHarvestViaBroker:
         assert n == 0
 
     @pytest.mark.asyncio
+    async def test_subprocess_success_skips_proxies_that_fail_real_validation(self, pg, classifier):
+        """Round 32: broker-sourced proxies now get our own real
+        _http_validate() check instead of being trusted blindly — one
+        that fails must not be persisted at all."""
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.core.tenant import TenantId
+
+        proxies = [{"host": "1.1.1.1", "port": 8080, "types": ["HTTP"]}]
+        proc = FakeProc(stdout=json.dumps(proxies).encode(), stderr=b"", returncode=0)
+        h = ProxyHarvester(pg=pg, asn_classifier=classifier)
+        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        with patch(
+            "scraper_engine.proxy.harvester.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=proc),
+        ):
+            n = await h._harvest_via_broker(10, TenantId("system"))
+        assert n == 0
+        pg.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_subprocess_success_stores_valid_proxies_and_skips_db_failures(self, pg):
+        from scraper_engine.core.models import AnonymityLevel
         from scraper_engine.core.tenant import TenantId
 
         class FlakyClassifier:
@@ -679,6 +801,11 @@ class TestHarvestViaBroker:
         proc = FakeProc(stdout=json.dumps(proxies).encode(), stderr=b"", returncode=0)
         pg.execute = AsyncMock(side_effect=[None, RuntimeError("db fail"), None, None])
         h = ProxyHarvester(pg=pg, asn_classifier=FlakyClassifier())
+        # Round 32: _harvest_via_broker now runs its own real _http_validate()
+        # instead of blindly trusting proxybroker2's own internal validation —
+        # mock it to succeed for every candidate, matching this file's
+        # existing instance-level mocking convention (see TestScrapeOneReal).
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
         with patch(
             "scraper_engine.proxy.harvester.asyncio.create_subprocess_exec",
             new=AsyncMock(return_value=proc),

@@ -1,6 +1,7 @@
 # tests/unit/test_proxy_manager.py
 """ProxyManager tests — scored selection, domain bans, exhaustion."""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -127,12 +128,81 @@ class TestProxyManager:
 
     @pytest.mark.asyncio
     async def test_mark_success(self, tenant):
-        pm = make_manager()
+        """Round 32: mark_success now recomputes reliability_score via
+        ScoringEngine from real accumulated history instead of a flat +5 —
+        assert the RETURNING row is read and a formula-consistent score is
+        written back, not just "doesn't raise"."""
+        redis = AsyncMock()
+        pg = AsyncMock()
+        pg.fetchrow.return_value = {
+            "anonymity_level": "elite",
+            "asn_class": "residential",
+            "response_time_ms": 50,
+            "global_success_count": 2,
+            "global_failure_count": 0,
+            "last_validated": datetime.now(UTC),
+        }
+        pm = ProxyManager(redis=redis, pg=pg)
+
         await pm.mark_success(tenant, "1.2.3.4", 8080)
-        # Should not raise
+
+        pg.fetchrow.assert_awaited_once()
+        pg.execute.assert_awaited_once()
+        args = pg.execute.await_args.args  # (tenant_id, sql, score, ip, port)
+        assert args[1].strip().startswith("UPDATE proxy_pool SET reliability_score")
+        new_score = args[2]
+        assert 0.0 <= new_score <= 100.0
+        # 2 successes / 0 failures -> success_rate=100, elite+residential ->
+        # should land well above L2's 70 threshold.
+        assert new_score >= 70.0
+
+    @pytest.mark.asyncio
+    async def test_mark_success_no_matching_row_is_a_noop(self, tenant):
+        """A proxy that no longer exists in the pool (e.g. reaped between
+        lease and use) must not crash — fetchrow returning None short-circuits."""
+        redis = AsyncMock()
+        pg = AsyncMock()
+        pg.fetchrow.return_value = None
+        pm = ProxyManager(redis=redis, pg=pg)
+
+        await pm.mark_success(tenant, "1.2.3.4", 8080)
+
+        pg.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_mark_failure(self, tenant):
-        pm = make_manager()
+        """Round 32: mark_failure now recomputes via ScoringEngine instead
+        of a flat -10 — a proxy with zero successes and real failures
+        should land well below L1's 40 threshold."""
+        redis = AsyncMock()
+        pg = AsyncMock()
+        pg.fetchrow.return_value = {
+            "anonymity_level": "transparent",
+            "asn_class": "unknown",
+            "response_time_ms": 500,
+            "global_success_count": 0,
+            "global_failure_count": 3,
+            "last_validated": datetime.now(UTC),
+        }
+        pm = ProxyManager(redis=redis, pg=pg)
+
         await pm.mark_failure(tenant, "1.2.3.4", 8080, "example.com")
-        # Should not raise
+
+        redis.set.assert_awaited_once()
+        pg.fetchrow.assert_awaited_once()
+        pg.execute.assert_awaited_once()
+        new_score = pg.execute.await_args.args[2]  # (tenant_id, sql, score, ip, port)
+        assert 0.0 <= new_score <= 100.0
+        assert new_score < 40.0
+
+    @pytest.mark.asyncio
+    async def test_mark_failure_no_matching_row_is_a_noop(self, tenant):
+        redis = AsyncMock()
+        pg = AsyncMock()
+        pg.fetchrow.return_value = None
+        pm = ProxyManager(redis=redis, pg=pg)
+
+        await pm.mark_failure(tenant, "1.2.3.4", 8080, "example.com")
+
+        redis.set.assert_awaited_once()  # ban is set before the DB lookup
+        pg.execute.assert_not_awaited()

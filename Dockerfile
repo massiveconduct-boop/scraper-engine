@@ -18,8 +18,23 @@ FROM python:3.12-slim AS system-base
 # fetch dies at runtime with `camoufox.exceptions.CannotFindXvfb`. (This was a
 # latent gap in the pre-round-13 image too — surfaced by running the browser
 # chaos suite inside the rebuilt image.)
+#
+# chromium is REQUIRED for Botasaurus: fetcher/botasaurus_wrapper.py's
+# @browser-decorated fetch is L2's configured first attempt
+# (config.levels.level_2.engine default "botasaurus+camoufox"), but
+# botasaurus_driver drives a real Chrome/Chromium binary — it does not bundle
+# one itself the way Playwright/Camoufox bundle Firefox. Without a browser
+# installed, botasaurus_driver.core.config.find_chrome_executable() raises
+# FileNotFoundError on every single fetch, immediately and silently (caught
+# by botasaurus_wrapper.py's broad except → falls back to Camoufox every
+# time, so this was never visibly failing — L2 still worked via the
+# fallback, just always skipping its configured first attempt). Google
+# Chrome itself ships no Linux aarch64 build at all; chromium (open-source,
+# has real aarch64 packages) is what botasaurus_driver's own
+# get_linux_executable_path() searches for as a named fallback — confirmed
+# against the installed package, no code change needed, just the binary.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates xvfb \
+    curl ca-certificates xvfb chromium \
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
     libgbm1 libpango-1.0-0 libcairo2 libasound2 \

@@ -87,7 +87,12 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
         pg, sources=ph.sources, asn_classifier=build_asn_classifier(), redis=redis
     )
     # Promotion reuses the harvester's HTTP validator — no duplicated logic.
-    promotion = ProxyPromotionJob(pg, ProxyHarvester._http_validate)
+    # Same classifier construction as the harvester above (round 32 — needed
+    # so promoted proxies get a real ASN-informed score instead of always
+    # "unknown").
+    promotion = ProxyPromotionJob(
+        pg, ProxyHarvester._http_validate, asn_classifier=build_asn_classifier()
+    )
     health = HealthMonitor(pg, redis)
     reaper = RetentionReaper(pg, cfg.session_retention)
 

@@ -226,14 +226,34 @@ convention only needed two call sites fixed.
 **Causes (check in order):**
 1. **Column name mismatch:** INSERT uses `anonymity` but schema has `anonymity_level`. Check with `SELECT column_name FROM information_schema.columns WHERE table_name='proxy_pool'`.
 2. **ON CONFLICT mismatch:** INSERT uses `ON CONFLICT (ip, port)` but constraint is `UNIQUE (ip, port, protocol)`. Check with `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='proxy_pool'::regclass`.
-3. **Judge not running:** Check `curl http://127.0.0.1:8089/`. Start with `python judge_server.py &`.
+3. **All validation targets unreachable:** validation goes through the proxy to one of `proxy/harvester.py::JUDGE_URLS` (public IP-echo endpoints — `httpbingo.org`, `api.ipify.org`, `postman-echo.com`). Check each is reachable directly from the `proxy-harvester` container: `curl -s -o /dev/null -w '%{http_code}\n' http://httpbingo.org/ip` (repeat per URL). All three down at once is unlikely but not impossible — if so, add another independent public IP-echo service to `JUDGE_URLS` rather than waiting.
 4. **All proxies failed validation:** Normal for free proxies. Check pool query for score distribution.
 
-### All Pool Proxies Score 25
-**Symptom:** Pool query shows `avg=25`, no score-60 rows.
-**Meaning:** No proxy passed HTTP validation. All are TCP-only (below L1 threshold 40 — cannot be selected).
-**Why:** Free proxy HTTP forwarding rate is ~0.02%. Expected behavior. Broker path produces validated proxies (score 60).
-**Fix:** Ensure `harvest_once()` calls both paths. Wait for `promote_tcp_only()` re-validation.
+### All Pool Proxies Score 25 (100% of them, none ever promoted)
+**Symptom:** Pool query shows `avg=25` (or similar low number), zero score-60+ rows,
+ever — not just most proxies, literally all of them, indefinitely.
+**Root cause (round 32, two layers):** first found the self-hosted judge
+server was never running in any real deployment, so every single
+`_http_validate()` call failed via connection-refused. Fixing that
+uncovered a deeper, architectural issue: a loopback judge (`127.0.0.1`)
+can never validate a real third-party proxy at all, running or not —
+when a request routes through a forward proxy, the *proxy* resolves
+"127.0.0.1" as its own machine, never the machine that made the request.
+Confirmed live via real proxies returning their own internal service
+responses instead of reaching our judge. Fixed by validating against
+public IP-echo endpoints instead (`JUDGE_URLS`, item 3 above) — genuinely
+reachable from anywhere. If you still see 100%-score-25 after confirming
+those are reachable, it's proxy quality, not validation infrastructure.
+**Separately, still true even with the judge running:** free proxy HTTP
+forwarding success rate is genuinely low (~0.02% per round 6's own
+measurement) — so *some* proxies capping at 25 (TCP-reachable but failed
+real HTTP validation) is expected. The distinguishing signal is whether
+*any* proxies ever reach 60+ — zero, ever, points at the judge; a nonzero
+but small fraction is the expected free-proxy base rate.
+**Fix:** confirm the judge is reachable (item 3) first. Only after that,
+if scores are still low, this is expected free-proxy-source behavior — wait
+for `promote_tcp_only()`/`ProxyPromotionJob` re-validation, or use a paid
+proxy source for a higher base rate.
 
 ---
 

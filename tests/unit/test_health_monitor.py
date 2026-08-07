@@ -74,6 +74,38 @@ class TestHealthMonitor:
             assert result is False
 
     @pytest.mark.asyncio
+    async def test_check_one_falls_through_when_first_url_fails(self, pg, redis):
+        """One JUDGE_URLS candidate erroring must not fail the whole check —
+        the loop must try the next candidate (round 32 fallback fix)."""
+        from scraper_engine.proxy.harvester import JUDGE_URLS
+
+        assert len(JUDGE_URLS) >= 2
+        hm = HealthMonitor(pg=pg, redis=redis)
+        calls = {"n": 0}
+
+        async def fake_get(self, url):
+            calls["n"] += 1
+            if url == JUDGE_URLS[0]:
+                raise OSError("refused")
+            response = AsyncMock()
+            response.status_code = 200
+            return response
+
+        with patch("httpx.AsyncClient.get", fake_get):
+            result = await hm.check_one("1.2.3.4", 8080)
+        assert result is True
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_check_one_outer_exception_returns_false(self, pg, redis):
+        """A failure constructing/entering the client itself (not a per-URL
+        failure) must still be caught by the outer guard."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch("httpx.AsyncClient.__aenter__", side_effect=OSError("boom")):
+            result = await hm.check_one("1.2.3.4", 8080)
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_run_forever_logs_and_loops(self, pg, redis, monkeypatch):
         hm = HealthMonitor(pg=pg, redis=redis)
 

@@ -431,9 +431,21 @@ class Worker:
                         pool=self._browser_pool,
                         botasaurus_pool=self._botasaurus_pool,
                     )
-                    return await l2_fetcher.fetch(
+                    l2_result = await l2_fetcher.fetch(
                         url, tenant_id, proxy=lease.proxy, overrides=overrides
                     )
+                    # Round 32: mark_success/mark_failure were fully built
+                    # (formula-driven reliability_score recompute) but never
+                    # actually called from the real fetch path — no real L2/L3
+                    # outcome has ever updated a proxy's score. Wired here,
+                    # once, right after the fetch's real outcome is known.
+                    if l2_result.success:
+                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                    else:
+                        await pm.mark_failure(
+                            tenant_id, lease.proxy.ip, lease.proxy.port, self._extract_domain(url)
+                        )
+                    return l2_result
             except ProxyPoolExhaustedError:
                 return FetchResult(
                     url=url,
@@ -463,9 +475,16 @@ class Worker:
                         captcha_solver=self._captcha_solver,
                         pool=self._browser_pool,
                     )
-                    return await l3_fetcher.fetch(
+                    l3_result = await l3_fetcher.fetch(
                         url, tenant_id, proxy=lease.proxy, overrides=overrides
                     )
+                    if l3_result.success:
+                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                    else:
+                        await pm.mark_failure(
+                            tenant_id, lease.proxy.ip, lease.proxy.port, self._extract_domain(url)
+                        )
+                    return l3_result
             except ProxyPoolExhaustedError:
                 return FetchResult(
                     url=url,

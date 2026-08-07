@@ -13,17 +13,13 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from scraper_engine.proxy.harvester import JUDGE_URLS
+
 if TYPE_CHECKING:
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
 
 logger = logging.getLogger(__name__)
-
-# Lightweight HTTP endpoints for proxy validation
-_JUDGE_URLS = [
-    "http://httpbin.org/ip",
-    "https://httpbin.org/ip",
-]
 
 
 def _deleted_row_count(status: str) -> int:
@@ -109,12 +105,26 @@ class HealthMonitor:
         return {"validated": validated, "removed": removed, "downgraded": downgraded}
 
     async def check_one(self, ip: str, port: int) -> bool:
-        """Validate a single proxy. Returns True if still working."""
+        """Validate a single proxy. Returns True if still working.
+
+        Tries JUDGE_URLS in order, stopping at the first 200 — previously
+        only ever tried a single hardcoded URL (a second "fallback" was
+        declared but never used), so that one public service being down
+        looked exactly like every proxy in the pool failing at once. Shared
+        list with proxy/harvester.py's own validator so both stay in sync
+        (see that module for why: httpbin.org was found live-down while
+        fixing this).
+        """
         proxy_url = f"http://{ip}:{port}"
         try:
             async with httpx.AsyncClient(proxy=proxy_url, timeout=10.0) as client:
-                response = await client.get(_JUDGE_URLS[0])
-                ok: bool = response.status_code == 200
-                return ok
+                for url in JUDGE_URLS:
+                    try:
+                        response = await client.get(url)
+                    except Exception:
+                        continue
+                    if response.status_code == 200:
+                        return True
+                return False
         except Exception:
             return False

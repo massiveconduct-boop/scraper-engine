@@ -44,6 +44,80 @@ round it shipped in.
 
 ---
 
+## Decision: Multi-Endpoint Public Judge, Superseding the Self-Hosted Judge
+
+**Date:** 2026-08-07 | **Round:** 32
+
+**What:** `proxy/harvester.py::_http_validate()` (and `health_monitor.py::
+check_one()`, which now imports the same list) validate proxies against
+`JUDGE_URLS` — an ordered tuple of independent, differently-hosted public
+IP-echo services (`httpbingo.org`, `api.ipify.org`, `postman-echo.com`,
+all plain HTTP), trying each in turn and stopping at the first 200. This
+supersedes round 6's self-hosted judge (`proxy/judge_server.py`, a
+loopback `http.server` on port 8089, built specifically to remove a
+`httpbin.org` dependency).
+
+**Why:** Live re-verification of the escalation ladder found the proxy
+pool permanently stuck at score 25 (never promoted) despite the judge
+server running correctly. Root cause: when a request routes through a
+forward proxy, the *proxy* resolves the target address — a loopback
+address (`127.0.0.1`) always means "the proxy's own machine" to it, never
+the machine that sent the request. Confirmed live: real proxies returned
+their own internal service responses (`MiCGI-Upstream: 127.0.0.1:8089`,
+various 502/503s) instead of ever reaching our judge. This is
+architectural, not a config or startup bug — a loopback judge can never
+validate a real third-party proxy, correctly running or not, and has been
+broken this way since round 6 without being caught, because the one
+integration test covering this path seeds a "proxy" pointing at the
+judge's own address (a degenerate case real external routing never
+produces).
+
+The first fix attempt — pointing at a single public target (`httpbin.org`,
+matching `health_monitor.py`'s prior choice) — was found live-down
+(persistent 503s across every scheme and repeated attempts, not
+transient) while building and testing this exact change. That is direct,
+observed evidence that a single public service must never be a hard
+dependency for proxy scoring, not just a theoretical risk.
+
+**Tradeoffs:** Depends on three external services instead of zero (fully
+offline) or one. Mitigated by requiring only ONE of the three to be up at
+any given time, chosen from different hosting providers/orgs to reduce
+correlated-outage risk. Plain HTTP only (not HTTPS) — an HTTPS target
+routed through an HTTP forward proxy needs CONNECT tunneling, which many
+free HTTP-only proxies can't do; all three candidates confirmed to serve
+plain HTTP directly (no forced redirect). Worst-case validation latency
+per proxy grows from one timeout to up to `timeout * len(JUDGE_URLS)` if
+every candidate is simultaneously unreachable — accepted since this only
+runs from already-bounded-concurrency contexts (harvest is sequential,
+`ProxyPromotionJob` caps concurrent validations at 5), never a
+request-path hot loop.
+
+**Alternatives considered:**
+- **Fix the self-hosted judge by exposing it publicly instead of on
+  loopback** — rejected. It's stdlib `ThreadingHTTPServer` with no
+  built-in timeout, request-size limit, or slow-read (slowloris)
+  protection, and one thread per connection with no cap — not hardened
+  for the open internet, and its own docstring already said
+  "Internal-only — never expose publicly" for good reason. Would trade
+  one bug for a worse one (unbounded thread growth under a trivial
+  slow-connection attack) rather than fixing the actual problem.
+- **Single public target (`httpbin.org`)** — tried first, found live-down
+  while implementing it; directly disproven as robust by observed
+  evidence, not just a theoretical concern.
+- **Add a concurrency cap on validation calls** — considered, then
+  checked against the real code and dropped: every real call site is
+  already bounded (`_scrape_one`'s harvest loop is fully sequential;
+  `ProxyPromotionJob` already wraps its only concurrent fan-out in
+  `asyncio.Semaphore(PROMOTION_CONCURRENCY=5)`). No new rate-limiting
+  code was needed.
+
+**Status:** Active. `proxy/judge_server.py` remains in the tree as a
+deterministic, network-independent stand-in for tests only
+(`tests/unit/test_judge_server.py`, `tests/integration/test_promotion.py`)
+— no longer wired into `proxy/harvester_daemon.py`'s production startup.
+
+---
+
 ## Decision: `lease()` Async Context Manager
 
 **Date:** 2026-07-24 | **Round:** 6

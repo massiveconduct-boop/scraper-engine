@@ -18,11 +18,13 @@ import os
 import re
 import sys
 import tempfile
+import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
 from scraper_engine.core.models import AnonymityLevel, AsnClass, ProxyProtocol
+from scraper_engine.proxy.scoring import ScoringEngine
 
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
@@ -31,16 +33,78 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-JUDGE_URL = "http://127.0.0.1:8089/"  # self-hosted judge (judge_server.py)
+# A loopback judge (proxy/judge_server.py) cannot validate a real external
+# proxy: "127.0.0.1" is resolved by whoever makes the request — the proxy
+# itself, not us — so it always means "the proxy's own machine," never this
+# one (found live, round 32: every validation failed via connection-refused
+# from the proxy's side, confirmed by MiCGI/Tproxy response headers showing
+# the proxy hitting its own local services instead of reaching us). Uses
+# public IP-echo endpoints instead, rather than exposing our own stdlib
+# http.server (no built-in timeout/request-size/slow-read protection — not
+# meant for the open internet) to arbitrary third-party proxies.
+# judge_server.py remains useful for fully offline/local testing
+# (tests/unit/test_judge_server.py, tests/integration/test_promotion.py) but
+# is no longer the production judge.
+#
+# Multiple independent, differently-hosted targets (round 32 follow-up) —
+# httpbin.org itself was found live-down (persistent 503s, not transient)
+# while building this fix, directly demonstrating why a single public
+# service must never be a hard dependency for proxy scoring. Tried in
+# order, first 200 wins (see _http_validate below); health_monitor.py's
+# separate re-check loop imports this same list rather than keeping its own
+# (that file previously declared a second URL as a "fallback" that was
+# never actually used — same underlying bug, fixed together).
+# Plain HTTP, deliberately — an HTTPS target routed through an HTTP forward
+# proxy needs CONNECT tunneling, which many free HTTP-only proxies (and
+# judge_server.py's own bare echo handler, used in tests) don't implement.
+# All three confirmed to serve plain HTTP directly (no redirect-to-HTTPS).
+JUDGE_URLS: tuple[str, ...] = (
+    "http://httpbingo.org/ip",
+    "http://api.ipify.org?format=json",
+    "http://postman-echo.com/ip",
+)
+# Recognized body keys across the services above — "origin" (httpbingo),
+# "ip" (ipify, postman-echo). "headers" kept for compatibility with
+# judge_server.py's own echo shape (still used in offline tests).
+_VALID_BODY_KEYS = ("origin", "ip", "headers")
 HTTP_VALIDATE_TIMEOUT = 5.0
 SCORE_TCP_ONLY = 25  # below L1 threshold (40)
-SCORE_VALIDATED = 60  # above L1 threshold
 
 
 class SupportsClassify(Protocol):
     """Anything that can classify an IP's ASN class (the harvester only needs this)."""
 
     async def classify(self, ip: str) -> str: ...
+
+
+def _to_asn_class(raw: str) -> AsnClass:
+    """Maps a classifier's free-text result to the AsnClass enum ScoringEngine
+    expects. Shared by every write path (previously only _harvest_via_broker
+    did this mapping; _scrape_one/promote_tcp_only discarded ASN entirely)."""
+    lowered = raw.lower()
+    if "residential" in lowered:
+        return AsnClass.RESIDENTIAL
+    if "mobile" in lowered:
+        return AsnClass.MOBILE
+    if "datacenter" in lowered:
+        return AsnClass.DATACENTER
+    return AsnClass.UNKNOWN
+
+
+def _score_first_validation(
+    latency_ms: int | None, anonymity: AnonymityLevel, asn: AsnClass
+) -> float:
+    """Score a proxy's first-ever validation — success_rate=None since no
+    real usage history exists yet (see scoring.py's compute_score docstring
+    for why this must not default to a guessed value). Real usage-driven
+    recomputation happens later via ProxyManager.mark_success/mark_failure."""
+    return ScoringEngine().compute_score(
+        latency_ms=latency_ms,
+        success_rate=None,
+        anonymity=anonymity,
+        asn=asn,
+        last_validated_seconds_ago=0,
+    ).total
 
 
 class ProxyHarvester:
@@ -176,23 +240,36 @@ class ProxyHarvester:
             if not await self._tcp_probe(ip, port):
                 continue
             # HTTP validation (proves proxy forwards traffic)
+            start = time.monotonic()
             is_valid, anonymity = await self._http_validate(ip, port, protocol)
-            score = SCORE_VALIDATED if is_valid else SCORE_TCP_ONLY
+            latency_ms = int((time.monotonic() - start) * 1000)
+            if is_valid:
+                asn = _to_asn_class(await self._classifier.classify(ip))
+                score = _score_first_validation(latency_ms, anonymity, asn)
+            else:
+                asn = AsnClass.UNKNOWN
+                score = SCORE_TCP_ONLY
             try:
                 await self._pg.execute(
                     tenant,
-                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity_level, asn_class, reliability_score)
-                       VALUES ($1,$2,$3,$4,$5,$6)
+                    """INSERT INTO proxy_pool
+                           (ip, port, protocol, anonymity_level, asn_class, response_time_ms, reliability_score)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7)
                        ON CONFLICT (ip, port, protocol) DO UPDATE SET
                          reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
                          anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
                            THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
+                         asn_class = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.asn_class ELSE proxy_pool.asn_class END,
+                         response_time_ms = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.response_time_ms ELSE proxy_pool.response_time_ms END,
                          last_validated = NOW()""",
                     ip,
                     port,
                     protocol,
                     anonymity.value,
-                    "unknown",
+                    asn.value,
+                    latency_ms if is_valid else None,
                     score,
                 )
                 count += 1
@@ -211,10 +288,19 @@ class ProxyHarvester:
         protocol: str,
         timeout: float = HTTP_VALIDATE_TIMEOUT,
     ) -> tuple[bool, AnonymityLevel]:
-        """Full HTTP round-trip through proxy to judge endpoint.
+        """Full HTTP round-trip through proxy to a judge endpoint.
 
         Returns (is_valid, anonymity_level).
         Never returns True on TCP-connect success alone.
+
+        Tries JUDGE_URLS in order, stopping at the first that returns a
+        real 200 with a recognized body — one endpoint's outage (httpbin.org
+        was found live-down while building this) no longer looks like every
+        proxy in the pool failing. Worst case (every candidate unreachable)
+        is timeout * len(JUDGE_URLS); acceptable since this only runs from
+        already-bounded-concurrency contexts (harvest is sequential,
+        ProxyPromotionJob caps concurrent validations at
+        PROMOTION_CONCURRENCY), never a request-path hot loop.
         """
         proxy_url = f"{protocol.lower()}://{ip}:{port}"
         try:
@@ -223,11 +309,22 @@ class ProxyHarvester:
                 timeout=timeout,
                 follow_redirects=False,
             ) as client:
-                resp = await client.get(JUDGE_URL)
-                if resp.status_code != 200:
-                    return False, AnonymityLevel.TRANSPARENT
-                data = resp.json()
-                if "headers" not in data and "origin" not in data:
+                resp = None
+                for url in JUDGE_URLS:
+                    try:
+                        candidate = await client.get(url)
+                    except Exception:
+                        continue
+                    if candidate.status_code != 200:
+                        continue
+                    try:
+                        data = candidate.json()
+                    except Exception:
+                        continue
+                    if any(key in data for key in _VALID_BODY_KEYS):
+                        resp = candidate
+                        break
+                if resp is None:
                     return False, AnonymityLevel.TRANSPARENT
         except Exception:
             return False, AnonymityLevel.TRANSPARENT
@@ -366,28 +463,41 @@ asyncio.run(main())"""
                     asn = await self._classifier.classify(ip)
                 except Exception:
                     asn = "unknown"
-                asn_class = (
-                    AsnClass.RESIDENTIAL
-                    if "residential" in asn.lower()
-                    else AsnClass.DATACENTER
-                    if "datacenter" in asn.lower()
-                    else AsnClass.UNKNOWN
-                )
+                asn_class = _to_asn_class(asn)
+                # proxybroker2 validates the proxy against ITS OWN judge
+                # providers, not ours, and never tells us the real anonymity
+                # level — previously assumed ANONYMOUS blindly. Run our own
+                # _http_validate() too (round 32 — same treatment as
+                # _scrape_one) so broker-sourced proxies get a real,
+                # comparable score instead of a guessed one. Low extra cost:
+                # this path is documented as low-volume (1-5 proxies/cycle).
+                start = time.monotonic()
+                is_valid, anonymity = await self._http_validate(ip, port, protocol.value)
+                latency_ms = int((time.monotonic() - start) * 1000)
+                if not is_valid:
+                    continue
+                score = _score_first_validation(latency_ms, anonymity, asn_class)
                 await self._pg.execute(
                     tenant,
-                    """INSERT INTO proxy_pool (ip, port, protocol, anonymity_level, asn_class, reliability_score)
-                       VALUES ($1,$2,$3,$4,$5,$6)
+                    """INSERT INTO proxy_pool
+                           (ip, port, protocol, anonymity_level, asn_class, response_time_ms, reliability_score)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7)
                        ON CONFLICT (ip, port, protocol) DO UPDATE SET
                          reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
                          anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
                            THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
+                         asn_class = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.asn_class ELSE proxy_pool.asn_class END,
+                         response_time_ms = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
+                           THEN EXCLUDED.response_time_ms ELSE proxy_pool.response_time_ms END,
                          last_validated = NOW()""",
                     ip,
                     port,
                     protocol.value,
-                    AnonymityLevel.ANONYMOUS.value,
+                    anonymity.value,
                     asn_class.value,
-                    SCORE_VALIDATED,
+                    latency_ms,
+                    score,
                 )
                 count += 1
             except Exception:
@@ -417,17 +527,24 @@ asyncio.run(main())"""
         promoted = 0
         for row in rows:
             ip, port, protocol = row["ip"], row["port"], row["protocol"]
+            start = time.monotonic()
             is_valid, anonymity = await self._http_validate(ip, port, protocol)
+            latency_ms = int((time.monotonic() - start) * 1000)
             if is_valid:
+                asn = _to_asn_class(await self._classifier.classify(ip))
+                score = _score_first_validation(latency_ms, anonymity, asn)
                 await self._pg.execute(
                     tenant,
                     """UPDATE proxy_pool
                        SET reliability_score = $1, anonymity_level = $2,
+                           asn_class = $3, response_time_ms = $4,
                            promotion_attempts = promotion_attempts + 1,
                            last_promotion_attempt_at = NOW()
-                       WHERE ip = $3 AND port = $4 AND protocol = $5""",
-                    SCORE_VALIDATED,
+                       WHERE ip = $5 AND port = $6 AND protocol = $7""",
+                    score,
                     anonymity.value,
+                    asn.value,
+                    latency_ms,
                     ip,
                     port,
                     protocol,

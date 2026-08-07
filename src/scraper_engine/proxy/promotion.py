@@ -15,14 +15,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING
+
+from scraper_engine.proxy.harvester import _score_first_validation, _to_asn_class
 
 if TYPE_CHECKING:
     import asyncpg
 
     from scraper_engine.core.models import AnonymityLevel
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.proxy.harvester import SupportsClassify
     from scraper_engine.storage.postgres_client import PostgresClient
 
 logger = logging.getLogger(__name__)
@@ -53,13 +57,16 @@ class ProxyPromotionJob:
         pg: PostgresClient,
         http_validate_fn: ValidateFn,
         system_tenant: TenantId | None = None,
+        asn_classifier: SupportsClassify | None = None,
     ) -> None:
         from scraper_engine.core.tenant import TenantId
+        from scraper_engine.proxy.asn_classifier import NullAsnClassifier
 
         self._pg = pg
         self._http_validate = http_validate_fn
         self._tenant: TenantId = system_tenant or TenantId("system")
         self._sem = asyncio.Semaphore(PROMOTION_CONCURRENCY)
+        self._classifier: SupportsClassify = asn_classifier or NullAsnClassifier()
 
     async def run_once(self) -> dict[str, int]:
         """Execute one promotion cycle. Returns counts keyed by outcome."""
@@ -85,22 +92,31 @@ class ProxyPromotionJob:
         async def _try_one(row: asyncpg.Record) -> None:
             nonlocal promoted, failed, exhausted
             async with self._sem:
+                start = time.monotonic()
                 is_valid, anonymity = await self._http_validate(
                     row["ip"],
                     row["port"],
                     row["protocol"],
                 )
+                latency_ms = int((time.monotonic() - start) * 1000)
             async with self._pg.acquire(self._tenant) as conn:
                 new_attempts = row["promotion_attempts"] + 1
                 if is_valid:
+                    asn = _to_asn_class(await self._classifier.classify(row["ip"]))
+                    score = _score_first_validation(latency_ms, anonymity, asn)
                     await conn.execute(
                         """UPDATE proxy_pool
-                           SET reliability_score = 60,
-                               anonymity_level = $1,
+                           SET reliability_score = $1,
+                               anonymity_level = $2,
+                               asn_class = $3,
+                               response_time_ms = $4,
                                promotion_attempts = promotion_attempts + 1,
                                last_promotion_attempt_at = NOW()
-                           WHERE id = $2""",
+                           WHERE id = $5""",
+                        score,
                         anonymity.value,
+                        asn.value,
+                        latency_ms,
                         row["id"],
                     )
                     promoted += 1
