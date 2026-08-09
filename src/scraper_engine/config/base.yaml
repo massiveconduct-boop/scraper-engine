@@ -70,6 +70,19 @@ proxy_harvester:
     - proxripper
   interval_seconds: 600
 
+proxy_tiers:
+  min_score_level_1: 40.0
+  min_score_level_2: 70.0
+  min_score_level_3: 90.0
+  # Stopgap while running on free-only proxy sources, where 90+-scored
+  # proxies can be structurally unreachable (round 33): when true, L3 tries
+  # a real tier-3-caliber proxy first and only falls back to a
+  # tier-2-caliber one (min_score_level_2) if that search comes up
+  # genuinely empty — never skips the tier-3 search entirely. Turn back off
+  # once paid/higher-quality proxy sources make min_score_level_3 reliably
+  # reachable on its own.
+  allow_tier2_fallback_for_tier3: false
+
 politeness:
   default_concurrency: 2
   default_delay_seconds: 5.0

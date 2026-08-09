@@ -433,7 +433,7 @@ class Worker:
 
             if self._pg is None:
                 raise PostgresClientMissingError(level=level)
-            pm = ProxyManager(redis=self._redis, pg=self._pg)
+            pm = ProxyManager(redis=self._redis, pg=self._pg, tier_config=self._config.proxy_tiers)
 
             try:
                 lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
@@ -478,7 +478,7 @@ class Worker:
 
             if self._pg is None:
                 raise PostgresClientMissingError(level=level)
-            pm = ProxyManager(redis=self._redis, pg=self._pg)
+            pm = ProxyManager(redis=self._redis, pg=self._pg, tier_config=self._config.proxy_tiers)
 
             try:
                 lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))

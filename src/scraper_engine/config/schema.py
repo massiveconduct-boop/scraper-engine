@@ -87,6 +87,21 @@ class ProxyHarvesterConfig(BaseModel):
     health_interval_seconds: int = 300
 
 
+class ProxyTierConfig(BaseModel):
+    """Reliability-score gate ProxyManager.get_proxy() requires per escalation
+    level. L3's own ceiling (min_score_level_3) can be genuinely unreachable
+    with free-only proxy sources — allow_tier2_fallback_for_tier3 is a
+    togglable stopgap letting L3 borrow a tier-2-caliber proxy instead of
+    hard-exhausting, only tried after a real tier-3-caliber proxy search
+    comes up empty. Meant to be flipped off again once paid/higher-quality
+    proxy sources make min_score_level_3 reliably reachable on its own."""
+
+    min_score_level_1: float = 40.0
+    min_score_level_2: float = 70.0
+    min_score_level_3: float = 90.0
+    allow_tier2_fallback_for_tier3: bool = False
+
+
 class PolitenessConfig(BaseModel):
     default_concurrency: int = 2
     default_delay_seconds: float = 5.0
@@ -193,6 +208,7 @@ class AppConfig(BaseModel):
     camoufox: CamoufoxConfig = Field(default_factory=CamoufoxConfig)
     botasaurus: BotasaurusConfig = Field(default_factory=BotasaurusConfig)
     proxy_harvester: ProxyHarvesterConfig = Field(default_factory=ProxyHarvesterConfig)
+    proxy_tiers: ProxyTierConfig = Field(default_factory=ProxyTierConfig)
     politeness: PolitenessConfig = Field(default_factory=PolitenessConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     capsolver: CapSolverConfig = Field(default_factory=CapSolverConfig)

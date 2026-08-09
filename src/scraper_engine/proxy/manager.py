@@ -9,9 +9,11 @@ Global reliability_score decays independently of domain-specific bans.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from scraper_engine.config.schema import ProxyTierConfig
 from scraper_engine.core.exceptions import ProxyPoolExhaustedError
 from scraper_engine.core.models import AnonymityLevel, AsnClass, Proxy, ProxyProtocol
 from scraper_engine.proxy.scoring import ScoringEngine, compute_success_rate
@@ -25,15 +27,23 @@ if TYPE_CHECKING:
 
     from .lease import ProxyLease
 
+logger = logging.getLogger(__name__)
+
 
 class ProxyManager:
     """Select a proxy from the persisted, scored pool for a given (level, domain)."""
 
     MAX_ATTEMPTS: int = 5
 
-    def __init__(self, redis: RedisClient, pg: PostgresClient) -> None:
+    def __init__(
+        self,
+        redis: RedisClient,
+        pg: PostgresClient,
+        tier_config: ProxyTierConfig | None = None,
+    ) -> None:
         self._redis = redis
         self._pg = pg
+        self._tier_config = tier_config or ProxyTierConfig()
 
     async def get_proxy(
         self,
@@ -49,11 +59,34 @@ class ProxyManager:
         """
         from .lease import ProxyLease
 
-        tier_min_score = {1: 40.0, 2: 70.0, 3: 90.0}.get(level, 50.0)
+        cfg = self._tier_config
+        tier_min_score = {
+            1: cfg.min_score_level_1,
+            2: cfg.min_score_level_2,
+            3: cfg.min_score_level_3,
+        }.get(level, 50.0)
+        # Config-gated stopgap for free-only proxy sources where L3's own
+        # ceiling can be structurally unreachable (round 33) — tried once,
+        # lazily, only if a real tier-3-caliber proxy search below comes up
+        # empty. Never skips searching for a genuine tier-3 proxy first.
+        fallback_score = (
+            cfg.min_score_level_2 if level == 3 and cfg.allow_tier2_fallback_for_tier3 else None
+        )
+        fallback_used = False
         seen: set[str] = set()
 
         for attempt in range(self.MAX_ATTEMPTS):
             proxy = await self._select_candidate(tenant_id, domain, tier_min_score, seen)
+            if proxy is None and fallback_score is not None and not fallback_used:
+                fallback_used = True
+                tier_min_score = fallback_score
+                logger.warning(
+                    "proxy_tier3_fallback_to_tier2 domain=%s tenant=%s min_score=%.1f",
+                    domain,
+                    tenant_id,
+                    tier_min_score,
+                )
+                proxy = await self._select_candidate(tenant_id, domain, tier_min_score, seen)
             if proxy is None:
                 await self._redis.raw.incr(f"metrics:proxy_exhausted_total:{level}")
                 raise ProxyPoolExhaustedError(

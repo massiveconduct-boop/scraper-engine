@@ -521,7 +521,9 @@ class TestFetchUrlDispatch:
         assert result is expected
         # proves the pg=None regression stays fixed — ProxyManager must be
         # constructed with the worker's real PostgresClient, not a hardcoded None
-        pm_ctor.assert_called_once_with(redis=worker._redis, pg=worker._pg)
+        pm_ctor.assert_called_once_with(
+            redis=worker._redis, pg=worker._pg, tier_config=worker._config.proxy_tiers
+        )
         pm_instance.get_proxy.assert_awaited_once_with(tenant, level=2, domain="example.com")
         build_mock.assert_called_once_with(
             worker._config,
@@ -579,7 +581,9 @@ class TestFetchUrlDispatch:
         result = await worker._fetch_url(tenant, "http://example.com", 3)
 
         assert result is expected
-        pm_ctor.assert_called_once_with(redis=worker._redis, pg=worker._pg)
+        pm_ctor.assert_called_once_with(
+            redis=worker._redis, pg=worker._pg, tier_config=worker._config.proxy_tiers
+        )
         pm_instance.get_proxy.assert_awaited_once_with(tenant, level=3, domain="example.com")
         build_mock.assert_called_once_with(
             worker._config,
