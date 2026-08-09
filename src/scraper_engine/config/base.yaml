@@ -81,7 +81,7 @@ proxy_tiers:
   # genuinely empty — never skips the tier-3 search entirely. Turn back off
   # once paid/higher-quality proxy sources make min_score_level_3 reliably
   # reachable on its own.
-  allow_tier2_fallback_for_tier3: false
+  allow_tier2_fallback_for_tier3: true
 
 politeness:
   default_concurrency: 2
