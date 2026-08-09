@@ -306,6 +306,45 @@ async def test_scrape_ssrf_blocked_url_returns_403(wired_scrape_deps, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_scrape_partial_ssrf_block_proceeds_with_valid_urls(wired_scrape_deps):
+    """1 bad address in a batch must not 403 the whole request (round 33) —
+    only the valid URLs get quota-charged and the job still enqueues. The
+    blocked URL is still passed through to the job (not dropped) because
+    the L1->L2->L3 escalation pipeline re-validates every URL itself and
+    already turns a blocked one into a per-URL failure result without
+    crashing (see tests/unit/test_ssrf_guard.py + fetcher/_failure.py) —
+    that's what gives the caller real per-URL visibility instead of routes.py
+    silently swallowing it."""
+    from scraper_engine.core.exceptions import SSRFBlockedError
+    from scraper_engine.core.models import ScrapeRequest
+
+    pg, redis, queue = wired_scrape_deps
+
+    async def _validate(url: str) -> None:
+        if "169.254" in url:
+            raise SSRFBlockedError(url=url, host="169.254.169.254", network="169.254.0.0/16")
+
+    import scraper_engine.core.ssrf_guard as ssrf_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssrf_module.SSRFGuard, "validate", AsyncMock(side_effect=_validate))
+
+        request = ScrapeRequest(urls=["http://example.com", "http://169.254.169.254"])
+        resp = await scrape(request, x_api_key="sk-admin")
+
+    assert resp["urls"] == 2
+    assert resp["blocked_urls"] == 1
+    queue.enqueue.assert_called_once()
+
+    # Both URLs are still persisted onto the job row — the blocked one gets
+    # its own real failure result once the pipeline itself rejects it.
+    insert_call = next(
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_jobs" in c.args[1]
+    )
+    assert insert_call.args[3] == ["http://example.com/", "http://169.254.169.254/"]
+
+
+@pytest.mark.asyncio
 async def test_scrape_reads_tenant_daily_limit_when_row_present(wired_scrape_deps):
     from scraper_engine.core.models import ScrapeRequest
 
@@ -396,6 +435,51 @@ async def test_crawl_ssrf_blocked_url_returns_403(wired_scrape_deps, monkeypatch
     with pytest.raises(HTTPException) as ei:
         await crawl(request, x_api_key="sk-admin")
     assert ei.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_crawl_partial_ssrf_block_drops_blocked_seed_only(wired_scrape_deps):
+    """Same round-33 fix as scrape, but ScrapyAdapter has no per-URL SSRF
+    re-check of its own (unlike the L1->L2->L3 pipeline), so the blocked
+    seed must actually be filtered out of start_urls rather than passed
+    through — and, since it would otherwise vanish with zero trace, a
+    synthetic failed scrape_results row is persisted for it directly."""
+    from scraper_engine.core.exceptions import SSRFBlockedError
+    from scraper_engine.core.models import CrawlRequest
+
+    pg, redis, queue = wired_scrape_deps
+
+    async def _validate(url: str) -> None:
+        if "169.254" in url:
+            raise SSRFBlockedError(url=url, host="169.254.169.254", network="169.254.0.0/16")
+
+    import scraper_engine.core.ssrf_guard as ssrf_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssrf_module.SSRFGuard, "validate", AsyncMock(side_effect=_validate))
+
+        request = CrawlRequest(
+            spider_name="titles",
+            start_urls=["http://example.com", "http://169.254.169.254"],
+        )
+        resp = await crawl(request, x_api_key="sk-admin")
+
+    assert resp["start_urls"] == 1
+    assert resp["blocked_urls"] == 1
+    queue.enqueue.assert_called_once()
+
+    insert_job_call = next(
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_jobs" in c.args[1]
+    )
+    assert insert_job_call.args[3] == ["http://example.com/"]
+    config_used = insert_job_call.args[4]
+    assert "169.254" not in config_used
+
+    insert_result_call = next(
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_results" in c.args[1]
+    )
+    assert insert_result_call.args[3] == "http://169.254.169.254/"
+    assert insert_result_call.args[5] == "ssrf_blocked"
 
 
 @pytest.mark.asyncio

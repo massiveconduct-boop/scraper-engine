@@ -73,15 +73,25 @@ on a request to force a fresh scrape regardless.
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "PENDING",
   "urls": 1,
+  "blocked_urls": 0,
   "tenant": "acme"
 }
 ```
+
+**SSRF handling (round 33):** each URL is checked individually against
+private/internal ranges — 1 bad address in a batch no longer rejects the
+whole request. Only when *every* URL in the batch is blocked does this
+endpoint return `403`; otherwise the job proceeds with the valid URLs
+(`blocked_urls` in the response tells you how many were dropped), quota is
+only charged for the valid ones, and each blocked URL still gets its own
+`failure_category: "ssrf_blocked"` entry in `GET /v1/jobs/{job_id}` — same
+as any other per-URL failure, not a silent drop.
 
 **Errors:**
 | Status | Condition |
 |---|---|
 | `400` / `422` | Validation error (bad body shape, >500 URLs) |
-| `403` | SSRF blocked (private/internal IP) |
+| `403` | Every URL in the batch was SSRF blocked (private/internal IP) |
 | `413` | Request body > 1 MB |
 | `429` | Quota exceeded or rate limit exceeded (100 req/min per IP) — carries a `Retry-After` header |
 
@@ -90,7 +100,12 @@ on a request to force a fresh scrape regardless.
 ### `POST /v1/crawl`
 
 Bulk Scrapy crawl for target sets larger than `/v1/scrape`'s 500-URL cap.
-Same auth, `Idempotency-Key`, and error shape as `/v1/scrape`.
+Same auth, `Idempotency-Key`, and error shape as `/v1/scrape`, including the
+same per-URL (not whole-batch) SSRF handling — a blocked seed URL is
+dropped from `start_urls` before the crawl runs (the Scrapy spider has no
+SSRF check of its own, unlike the L1/L2/L3 escalation ladder) and recorded
+as its own `ssrf_blocked` entry in `GET /v1/jobs/{job_id}`, same as
+`/v1/scrape`.
 
 ```json
 {
@@ -121,7 +136,6 @@ a partial failure never silently disappears. `progress` is a real fraction
       "success": true,
       "http_status": 200,
       "is_challenge_page": false,
-      "html": "<html>...</html>",
       "markdown": "# Example...",
       "extracted": {"title": "Example", "body": "..."},
       "level_used": 1,
@@ -138,12 +152,23 @@ a partial failure never silently disappears. `progress` is a real fraction
 }
 ```
 
-`markdown` is produced regardless of which escalation level (L1/L2/L3)
-actually succeeded, whenever Firecrawl conversion is configured (see
-`FIRECRAWL_API_KEY`/`FIRECRAWL_BASE_URL` in `.env.example`) — it's
-independent of `extracted`; a caller who only wants the clean markdown
-(e.g. to hand to their own extraction model) can read that field and
-ignore `extracted` entirely.
+**What you actually get back — 3 distinct fields, none of them raw HTML
+inline:**
+- `extracted` — title + main body text + links, always populated
+  (`AdaptiveSelector`, or a schema-driven extractor if
+  `config_overrides.extraction_schema` was set).
+- `markdown` — always populated (round 33). Uses Firecrawl for the
+  conversion when configured (`FIRECRAWL_API_KEY`/`FIRECRAWL_BASE_URL` in
+  `.env.example`); otherwise falls back to a local HTML→Markdown converter,
+  so this field is never left `null` waiting on an optional external tool.
+  Independent of `extracted` — a caller who only wants clean markdown
+  (e.g. to hand to their own extraction model) can read this field alone.
+- `html_snapshot_url` — a pointer to the full raw HTML in object storage
+  (S3/MinIO), not the HTML itself inline in this response. Fetch that URL
+  separately if you need the exact original page. Raw HTML is deliberately
+  never embedded in `GET /v1/jobs/{job_id}`'s JSON — a single large page
+  would otherwise bloat every job-status response, including ones the
+  caller only polls for progress.
 
 **Status values:**
 | Status | Meaning |

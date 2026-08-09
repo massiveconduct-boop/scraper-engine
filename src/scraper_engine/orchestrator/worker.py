@@ -276,6 +276,19 @@ class Worker:
                             result.markdown = await self._firecrawl.convert_to_markdown(
                                 result.html, url_str
                             )
+                        else:
+                            # Firecrawl is opt-in (FIRECRAWL_API_KEY/
+                            # FIRECRAWL_BASE_URL) — without it, markdown used
+                            # to be left None entirely, so a caller with no
+                            # Firecrawl instance only ever got `extracted`
+                            # (title/body/links), not markdown. Converting
+                            # the HTML already in hand locally (round 33)
+                            # means markdown is populated unconditionally.
+                            from scraper_engine.services.markdown_fallback import (
+                                html_to_markdown,
+                            )
+
+                            result.markdown = html_to_markdown(result.html)
                     results.append(result)
                     if on_result is not None:
                         await on_result(result)

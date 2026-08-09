@@ -68,7 +68,16 @@ class SSRFGuard:
         loop = asyncio.get_running_loop()
 
         def _resolve() -> list[str]:
-            info = socket.getaddrinfo(hostname, None)
+            try:
+                info = socket.getaddrinfo(hostname, None)
+            except socket.gaierror as err:
+                # Unresolvable host (NXDOMAIN, no DNS record, etc.) — treat the
+                # same as "resolved to nothing", not an unhandled crash. A dead
+                # domain is exactly the kind of per-URL outcome a scrape batch
+                # must tolerate without aborting the whole submission.
+                raise SSRFBlockedError(
+                    url=url, host=hostname, network="<unresolvable>"
+                ) from err
             addrs = {str(sockaddr[0]) for _family, _, _, _, sockaddr in info}
             if not addrs:
                 raise SSRFBlockedError(url=url, host=hostname, network="<unresolvable>")

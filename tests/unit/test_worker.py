@@ -339,6 +339,33 @@ class TestWorker:
         )
 
     @pytest.mark.asyncio
+    async def test_process_job_falls_back_to_local_markdown_without_firecrawl(
+        self, tenant, worker
+    ):
+        """Without Firecrawl configured (FIRECRAWL_API_KEY/FIRECRAWL_BASE_URL
+        both unset — the common case, round 33), FetchResult.markdown used
+        to stay None entirely, leaving a caller with only `extracted`
+        (title/body/links). It must now be populated via the local
+        html_to_markdown fallback instead of silently staying empty."""
+        assert worker._firecrawl is None
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com",
+                success=True,
+                level_used=1,
+                duration_ms=10,
+                html="<html><body><h1>Hi</h1></body></html>",
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-markdown-fallback", request)
+
+        assert response.results is not None
+        assert response.results[0].markdown is not None
+        assert "Hi" in response.results[0].markdown
+
+    @pytest.mark.asyncio
     async def test_process_job_calls_on_result_for_success(self, tenant, worker):
         worker._fetch_url = AsyncMock(
             return_value=FetchResult(

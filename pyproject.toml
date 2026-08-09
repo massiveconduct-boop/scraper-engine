@@ -51,6 +51,11 @@ dependencies = [
     "python-dotenv==1.2.2",
     "scrapy==2.17.0",
     "maxminddb==2.8.2",
+    # Round 33: local HTML->markdown fallback (services/markdown_fallback.py)
+    # so FetchResult.markdown is populated even when Firecrawl isn't
+    # configured (FIRECRAWL_API_KEY/FIRECRAWL_BASE_URL both unset) — see
+    # that module's docstring.
+    "markdownify==1.2.3",
     "opentelemetry-api==1.44.0",
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-grpc==1.44.0",

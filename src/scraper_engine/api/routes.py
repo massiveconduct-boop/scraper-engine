@@ -78,13 +78,29 @@ async def scrape(
 
     # SSRF validation on every URL — shared singleton so ssrf_guard.
     # additional_denied_cidrs (config) actually takes effect (see api/main.py lifespan).
+    # Partitioned rather than rejecting the whole batch on the first blocked
+    # URL (round 33) — 1 bad address in a 500-URL batch used to 403 the
+    # entire request. Only reject outright when every URL is blocked; valid
+    # URLs still proceed, and each blocked one still gets a real per-URL
+    # failure result — the escalation pipeline re-validates every URL again
+    # before its first request (fetcher/level_1.py's own ssrf_guard.validate
+    # call) and already turns that into a FailureCategory.SSRF_BLOCKED
+    # FetchResult without crashing (see fetcher/_failure.py), the same path
+    # a URL that only redirects into a private range after enqueue already
+    # goes through. Reusing that existing, tested machinery here instead of
+    # duplicating it avoids a second, divergent SSRF-failure code path.
     if _ssrf_guard is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    blocked: list[SSRFBlockedError] = []
+    valid_count = 0
     for url_val in request.urls:
         try:
             await _ssrf_guard.validate(str(url_val))
+            valid_count += 1
         except SSRFBlockedError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
+            blocked.append(exc)
+    if valid_count == 0:
+        raise HTTPException(status_code=403, detail="; ".join(str(exc) for exc in blocked))
 
     # Idempotency-Key dedup (round 29) — must run BEFORE the quota charge
     # below, that ordering is the actual point of the fix: a client retry
@@ -125,7 +141,7 @@ async def scrape(
             await QuotaManager(
                 redis=_storage_redis,
                 daily_limit=daily_limit,
-            ).check_and_increment(tenant_id, count=len(request.urls))
+            ).check_and_increment(tenant_id, count=valid_count)
         except QuotaExceededError:
             from scraper_engine.core.quota import seconds_until_quota_reset
 
@@ -167,6 +183,7 @@ async def scrape(
         "job_id": job_id,
         "status": JobStatus.PENDING.value,
         "urls": len(request.urls),
+        "blocked_urls": len(blocked),
         "tenant": str(tenant_id),
     }
 
@@ -197,13 +214,23 @@ async def crawl(
     except AuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid API key") from None
 
+    # Partitioned the same way POST /v1/scrape is (round 33) — but unlike
+    # that pipeline, ScrapyAdapter has no per-URL SSRF re-check of its own
+    # (it's a subprocess-isolated Scrapy spider, not the L1->L2->L3 ladder),
+    # so a blocked seed can't be safely let through and left to self-reject
+    # downstream — it must actually be filtered out of start_urls here.
     if _ssrf_guard is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    blocked: list[SSRFBlockedError] = []
+    valid_start_urls: list[str] = []
     for url_val in request.start_urls:
         try:
             await _ssrf_guard.validate(str(url_val))
+            valid_start_urls.append(str(url_val))
         except SSRFBlockedError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
+            blocked.append(exc)
+    if not valid_start_urls:
+        raise HTTPException(status_code=403, detail="; ".join(str(exc) for exc in blocked))
 
     # Idempotency-Key dedup — same rationale as POST /v1/scrape above.
     if idempotency_key and _storage_pg is not None:
@@ -238,7 +265,7 @@ async def crawl(
             await QuotaManager(
                 redis=_storage_redis,
                 daily_limit=daily_limit,
-            ).check_and_increment(tenant_id, count=len(request.start_urls))
+            ).check_and_increment(tenant_id, count=len(valid_start_urls))
         except QuotaExceededError:
             from scraper_engine.core.quota import seconds_until_quota_reset
 
@@ -254,7 +281,7 @@ async def crawl(
             {
                 "_job_type": "crawl",
                 "spider_name": request.spider_name,
-                "start_urls": [str(u) for u in request.start_urls],
+                "start_urls": valid_start_urls,
             }
         )
         await _storage_pg.execute(
@@ -263,12 +290,31 @@ async def crawl(
                    (job_id, urls, config_used, status, webhook_url, idempotency_key)
                VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
             job_id,
-            [str(u) for u in request.start_urls],
+            valid_start_urls,
             config_json,
             JobStatus.PENDING.value,
             str(request.webhook) if request.webhook else None,
             idempotency_key,
         )
+
+        # Blocked seeds never reach ScrapyAdapter (filtered above), so unlike
+        # /v1/scrape's blocked URLs — which still get a real per-URL result
+        # once the escalation pipeline itself rejects them — these would
+        # otherwise vanish with zero trace in GET /v1/jobs/{id}. Persist a
+        # result row for each directly, matching the same failure shape
+        # (FailureCategory.SSRF_BLOCKED, level_used=0 — blocked before any
+        # level/spider ever ran).
+        for blocked_exc in blocked:
+            await _storage_pg.execute(
+                tenant_id,
+                """INSERT INTO scrape_results
+                       (job_id, url, success, level_used, error_message, failure_category)
+                   VALUES ($1::uuid, $2, FALSE, 0, $3, $4)""",
+                job_id,
+                blocked_exc.url,
+                str(blocked_exc),
+                FailureCategory.SSRF_BLOCKED.value,
+            )
 
         if _queue is not None:
             _queue.enqueue(
@@ -282,7 +328,8 @@ async def crawl(
     return {
         "job_id": job_id,
         "status": JobStatus.PENDING.value,
-        "start_urls": len(request.start_urls),
+        "start_urls": len(valid_start_urls),
+        "blocked_urls": len(blocked),
         "tenant": str(tenant_id),
     }
 

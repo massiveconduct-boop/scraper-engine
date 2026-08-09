@@ -7,6 +7,33 @@ bug found, every design decision and why) lives in `.claude/MEMORY.md` and
 
 ## [Unreleased]
 
+- **Round 33 — fix: SSRF crash on unresolvable hosts, whole-batch rejection
+  on one bad URL, markdown-only-with-Firecrawl.** Three caller-facing
+  issues closed:
+  1. `SSRFGuard._resolve_hosts` let a bare `socket.gaierror` (dead/
+     unresolvable domain) propagate uncaught — one bad address in a
+     `/v1/scrape` batch 500'd the *entire* request instead of failing just
+     that URL. Now caught and converted to `SSRFBlockedError` like every
+     other unresolvable-host case.
+  2. `POST /v1/scrape` and `POST /v1/crawl` rejected the whole batch with
+     `403` if even 1 of N submitted URLs was SSRF-blocked. Both now
+     partition valid vs. blocked URLs, only reject outright when *every*
+     URL is blocked, and only charge quota for the valid ones. `/v1/scrape`
+     still passes blocked URLs through to the escalation pipeline (which
+     already turns them into a proper per-URL `ssrf_blocked` failure
+     result without crashing); `/v1/crawl` filters them out before they
+     reach Scrapy (which has no SSRF check of its own) and persists a
+     synthetic failed result for each so they're not silently dropped.
+  3. `FetchResult.markdown` was only ever populated when Firecrawl was
+     configured (`FIRECRAWL_API_KEY`/`FIRECRAWL_BASE_URL`) — without it, a
+     caller only got `extracted` (title/body/links), never markdown or raw
+     HTML inline (raw HTML was always S3-pointer-only, `html_snapshot_url`,
+     never embedded in the response — that part was working as designed,
+     just undocumented clearly). Added `services/markdown_fallback.py`, a
+     local HTML→Markdown converter (`markdownify` + `bs4`, no external
+     service needed) used whenever Firecrawl isn't configured, so
+     `markdown` is now populated unconditionally.
+
 - **Round 28 — chore: coverage gate wired for real + 7 senior-dev-review
   findings closed.** `pyproject.toml`'s `[tool.coverage.report] fail_under`
   was declared but no CI `pytest` invocation ever passed `--cov` — the gate
