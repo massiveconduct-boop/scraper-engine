@@ -48,7 +48,13 @@ def main() -> None:
     if args.command == "serve":
         import uvicorn
 
-        uvicorn.run("scraper_engine.api.main:app", host=args.host, port=args.port, reload=True)
+        uvicorn.run(
+            "scraper_engine.api.main:app",
+            host=args.host,
+            port=args.port,
+            reload=True,
+            server_header=False,
+        )
     elif args.command == "create-tenant":
         asyncio.run(_create_tenant(args.tenant_slug))
     elif args.command == "harvest":

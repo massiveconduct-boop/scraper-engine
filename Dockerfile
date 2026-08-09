@@ -92,4 +92,4 @@ RUN pip install --no-cache-dir --no-deps .
 ENV PYTHONUNBUFFERED=1
 ENV APP_ENV=production
 EXPOSE 8000 9090
-CMD ["uvicorn", "scraper_engine.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "scraper_engine.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
