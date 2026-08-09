@@ -188,7 +188,9 @@ class Level2Fetcher:
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
-                    await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
+                    nav_response = await page.goto(
+                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
+                    )
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
@@ -229,7 +231,17 @@ class Level2Fetcher:
                 return FetchResult(
                     url=url,
                     success=True,
-                    http_status=200,
+                    # The real navigation status, not a hardcoded 200 — a
+                    # free proxy's own upstream dying still renders a page
+                    # Playwright considers a successful navigation (no
+                    # exception), but nav_response.status carries the truth
+                    # (e.g. 502/504) so ChallengeDetector's
+                    # CHALLENGE_STATUS_CODES check (worker.py's centralized
+                    # classification, round 33) can actually see it instead
+                    # of every gateway failure looking identical to a real
+                    # 200. None only for edge navigations Playwright doesn't
+                    # attach a Response to (e.g. about:blank).
+                    http_status=nav_response.status if nav_response is not None else 200,
                     html=html,
                     level_used=2,
                     proxy_used=proxy.key() if proxy else "none",

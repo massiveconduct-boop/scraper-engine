@@ -23,13 +23,14 @@ def _proxy() -> Proxy:
 
 
 class FakePage:
-    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False):
+    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False, nav_status=200):
         self._html = html
         self.goto_exc = goto_exc
         self.trigger_route_block = trigger_route_block
         self._route_handler = None
         self.wait_calls = 0
         self.evaluate_calls = 0
+        self.nav_status = nav_status
 
     async def route(self, pattern, handler):
         self._route_handler = handler
@@ -44,6 +45,9 @@ class FakePage:
             await self._route_handler(fake_route)
         if self.goto_exc:
             raise self.goto_exc
+        # Real Playwright Response, not None (round 33 — see test_level_2.py's
+        # identical fake for the full rationale).
+        return SimpleNamespace(status=self.nav_status)
 
     async def wait_for_load_state(self, state, timeout):
         return None
@@ -91,6 +95,21 @@ class TestFetch:
         assert result.success is True
         assert result.html == _REAL_HTML
         fake_wrapper_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reports_real_navigation_status_not_hardcoded_200(self, monkeypatch):
+        """Round 33 — same fix/rationale as Level2Fetcher's identical test:
+        http_status must carry the real page.goto() response status, not a
+        hardcoded 200."""
+        page = FakePage(nav_status=504)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level3Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is True
+        assert result.http_status == 504
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

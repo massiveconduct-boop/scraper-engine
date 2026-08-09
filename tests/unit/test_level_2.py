@@ -25,13 +25,14 @@ def _proxy() -> Proxy:
 
 
 class FakePage:
-    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False):
+    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False, nav_status=200):
         self._html = html
         self.goto_exc = goto_exc
         self.trigger_route_block = trigger_route_block
         self._route_handler = None
         self.wait_calls = 0
         self.evaluate_calls = 0
+        self.nav_status = nav_status
 
     async def route(self, pattern, handler):
         self._route_handler = handler
@@ -46,6 +47,10 @@ class FakePage:
             await self._route_handler(fake_route)
         if self.goto_exc:
             raise self.goto_exc
+        # A real Playwright Response, not None — mirrors what page.goto()
+        # actually returns on a normal http(s) navigation (round 33: the
+        # production code used to discard this entirely and hardcode 200).
+        return SimpleNamespace(status=self.nav_status)
 
     async def wait_for_load_state(self, state, timeout):
         return None
@@ -130,6 +135,24 @@ class TestFetchViaCamoufox:
         assert result.success is True
         assert result.html == _REAL_HTML
         fake_wrapper_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reports_real_navigation_status_not_hardcoded_200(self, monkeypatch):
+        """Round 33: FetchResult.http_status used to be hardcoded 200
+        regardless of what page.goto() actually navigated to — a free
+        proxy's own upstream returning 502/504 was indistinguishable from a
+        real 200, which is why the gateway-error page from the original bug
+        report slipped through as success. http_status must now carry the
+        real navigation response status."""
+        page = FakePage(nav_status=502)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_2.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level2Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), proxy=_proxy())
+
+        assert result.success is True  # unchanged — worker.py reclassifies via is_challenge_page
+        assert result.http_status == 502
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

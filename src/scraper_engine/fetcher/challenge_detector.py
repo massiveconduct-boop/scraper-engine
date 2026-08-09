@@ -37,8 +37,49 @@ class ChallengeDetector:
         "checking your browser",
     ]
 
-    # HTTP status codes that strongly indicate blocks/challenges
-    CHALLENGE_STATUS_CODES: set[int] = {403, 429, 503}
+    # HTTP status codes that strongly indicate blocks/challenges. 500/502/504
+    # added round 33 — a free proxy's own upstream dying produces exactly
+    # these, and previously wasn't in this set at all (only 503 was).
+    CHALLENGE_STATUS_CODES: set[int] = {403, 429, 500, 502, 503, 504}
+
+    # A gateway/proxy failure page (the proxy's own upstream connection
+    # died — not the target blocking us) is not real content, same problem
+    # class as an unsolved anti-bot challenge. It also can't always be
+    # caught via CHALLENGE_STATUS_CODES above: the browser-level fetchers
+    # (Level2Fetcher's Botasaurus path, and any path that can't expose the
+    # real navigation status) report a fixed 200 regardless of what the
+    # page's actual content is. Real examples captured live (round 33) from
+    # 3 unrelated free proxies share no vendor string in common — nginx/
+    # openresty's stock error_page ("500 Internal Server Error ...
+    # openresty"), Squid's ("500 Internal Server Error
+    # (ERR_SOCKET_FAILURE)"), and a small proxy's own shell ("proxylite
+    # Error - 500 ... Name resolution failed.") — but do share a shape: a
+    # very short body whose only real content is a 5xx number next to an
+    # error-flavored word. A structural check generalizes to vendor
+    # software never seen before, unlike literal strings added to
+    # CHALLENGE_SIGNATURES one at a time.
+    _GATEWAY_ERROR_MAX_LEN = 300
+    _GATEWAY_ERROR_NUMBER_RE = re.compile(r"\b5\d{2}\b")
+    _GATEWAY_ERROR_WORD_RE = re.compile(
+        r"\b(error|gateway|unavailable|time-?out|refused|failure)\b", re.IGNORECASE
+    )
+
+    # Firefox/Gecko's OWN internal viewer wrapper for a non-HTML response
+    # body (plain text, unformatted JSON, etc.) — `<meta name="color-scheme"
+    # content="light dark">` + `<pre style="word-wrap: break-word;
+    # white-space: pre-wrap;">`. Camoufox is Firefox-based, so any page
+    # rendered through this wrapper means the real HTTP response was never
+    # HTML in the first place — caught live (round 33, same investigation
+    # as the gateway-error work above): a free proxy returned a bare
+    # `text/plain` body reading "DNS cache overflow" with a real HTTP 200,
+    # which the gateway-error check above didn't catch (no 5xx number, no
+    # error-flavored word — a different vocabulary than any of the 3
+    # captures that motivated that check). Matching this wrapper instead of
+    # the diagnostic text itself generalizes to whatever a misbehaving
+    # proxy's plain-text body happens to say, not just this one string.
+    _FIREFOX_PLAINTEXT_WRAPPER_RE = re.compile(
+        r'<pre\s+style="word-wrap:\s*break-word;\s*white-space:\s*pre-wrap;?"', re.IGNORECASE
+    )
 
     # Patterns for classifying challenge vendor
     VENDOR_PATTERNS: dict[str, str] = {
@@ -74,6 +115,18 @@ class ChallengeDetector:
         for sig_re in self._signatures_compiled:
             if sig_re.search(html_lower):
                 return True
+
+        # Runs unconditionally (not gated on status_code or
+        # short_page_is_suspect) — a gateway error page is short regardless
+        # of which caller is asking, including the Botasaurus path and
+        # poll_until_solved's mid-retry checks, both of which always pass
+        # status_code=200 whether or not that's the real status.
+        if self._looks_like_gateway_error(html):
+            return True
+
+        # Also unconditional, same rationale — see _FIREFOX_PLAINTEXT_WRAPPER_RE.
+        if self._FIREFOX_PLAINTEXT_WRAPPER_RE.search(html):
+            return True
 
         # Short pages with no meaningful content are suspect
         if short_page_is_suspect:
@@ -121,6 +174,18 @@ class ChallengeDetector:
         # Thin rendered content is the corroborating signal.
         return len(self._strip_html(html)) < 500
 
+    def _looks_like_gateway_error(self, html: str) -> bool:
+        """Structural check: a short body carrying a 5xx number next to an
+        error-flavored word, regardless of exact vendor wording."""
+        if not html:
+            return False
+        text = self._strip_html(html)
+        if not text or len(text) > self._GATEWAY_ERROR_MAX_LEN:
+            return False
+        return bool(
+            self._GATEWAY_ERROR_NUMBER_RE.search(text) and self._GATEWAY_ERROR_WORD_RE.search(text)
+        )
+
     def classify_challenge_type(self, html: str) -> str:
         """Return the likely challenge vendor name (e.g., 'cloudflare', 'datadome')."""
         html_lower = html.lower()
@@ -131,9 +196,16 @@ class ChallengeDetector:
 
     @staticmethod
     def _strip_html(html: str) -> str:
-        """Remove HTML tags to get visible text content."""
+        """Remove HTML tags to get visible text content.
+
+        Tags are replaced with a space, not removed outright — adjacent
+        inline elements with no whitespace between them in the source
+        (e.g. `500</title></head><body><h2>Name`) would otherwise glue
+        into one word ("500Name"), breaking any \\b-boundary regex over the
+        result (round 33 — found via a real captured gateway-error page
+        whose title and body tags directly abutted)."""
         import re as _re
 
-        text = _re.sub(r"<[^>]+>", "", html)
+        text = _re.sub(r"<[^>]+>", " ", html)
         text = _re.sub(r"\s+", " ", text)
         return text.strip()

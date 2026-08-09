@@ -104,7 +104,9 @@ class Level3Fetcher:
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
-                    await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
+                    nav_response = await page.goto(
+                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
+                    )
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
@@ -141,7 +143,10 @@ class Level3Fetcher:
                 return FetchResult(
                     url=url,
                     success=True,
-                    http_status=200,
+                    # Real navigation status, not a hardcoded 200 — same
+                    # rationale as Level2Fetcher's _fetch_via_camoufox
+                    # (round 33).
+                    http_status=nav_response.status if nav_response is not None else 200,
                     html=html,
                     level_used=3,
                     proxy_used=proxy.key() if proxy else "none",

@@ -171,6 +171,40 @@ class TestWorker:
         assert response.results is not None and response.results[0].level_used == 2
 
     @pytest.mark.asyncio
+    async def test_gateway_error_page_escalates(self, tenant, worker):
+        """Round 33: a free proxy's own upstream dying returns success=True,
+        http_status=502/504 (level_2.py/level_3.py now report the real
+        navigation status instead of a hardcoded 200) with a gateway-error
+        HTML body as the "content" — not real target content. Worker's
+        centralized is_challenge_page reclassification (fed the real status)
+        must catch this and escalate, the same way an unsolved anti-bot
+        challenge does. Regression test for the live bug that started this
+        investigation: `success: true` with `<title>504 Gateway
+        Time-out</title>` as the actual content, silently accepted."""
+        gateway_error = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            duration_ms=50,
+            http_status=504,
+            html="<html><head><title>504 Gateway Time-out</title></head><body></body></html>",
+        )
+        real_content = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=200,
+            http_status=200,
+            html="<html><body>" + "real product data " * 40 + "</body></html>",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[gateway_error, real_content])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-gateway-error", request)
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None and response.results[0].level_used == 2
+
+    @pytest.mark.asyncio
     async def test_host_unreachable_dead_letters_without_escalation(self, tenant, worker):
         """A dead/unresolvable host (round 15) dead-letters immediately — a
         browser can't resolve DNS the HTTP client couldn't, so escalating is

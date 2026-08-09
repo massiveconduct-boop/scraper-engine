@@ -34,6 +34,24 @@ bug found, every design decision and why) lives in `.claude/MEMORY.md` and
      service needed) used whenever Firecrawl isn't configured, so
      `markdown` is now populated unconditionally.
 
+- **Round 33 follow-up — fix: gateway/proxy error pages and browser-internal
+  plain-text pages silently accepted as successful scrapes.** Root cause
+  was deeper than a missing signature list: `level_2.py`/`level_3.py`
+  hardcoded `http_status=200` on every browser-level fetch, discarding
+  Playwright's real navigation `Response` entirely, so `ChallengeDetector`'s
+  own status-code check never saw a real 502/504/500. Fixed by capturing
+  and reporting the real `page.goto()` response status, adding 500/502/504
+  to `CHALLENGE_STATUS_CODES`, and adding two structural content heuristics
+  as a backstop for paths that can't expose a real status: one for generic
+  gateway-error pages (short body + a 5xx number near an error word,
+  verified against 3 real pages captured live from 3 unrelated free
+  proxies), and one for Camoufox/Firefox's own internal plain-text-viewer
+  wrapper (found live while re-verifying the first fix — a proxy's raw
+  `text/plain` diagnostic body was rendered through this wrapper and slipped
+  past the gateway-error check, which requires vocabulary this page didn't
+  use). See `.wolf/buglog.json` → `bug-r32-07`, `bug-r33-04` for the full
+  investigation.
+
 - **Round 28 — chore: coverage gate wired for real + 7 senior-dev-review
   findings closed.** `pyproject.toml`'s `[tool.coverage.report] fail_under`
   was declared but no CI `pytest` invocation ever passed `--cov` — the gate
