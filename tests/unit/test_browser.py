@@ -14,6 +14,17 @@ from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
 
 
+def _camoufox_installed() -> bool:
+    """Same "run local, skip CI" gate as tests/chaos/test_safe_content_guard.py —
+    True only if the Camoufox browser binary is actually fetched."""
+    try:
+        from camoufox.pkgman import installed_verstr
+
+        return bool(installed_verstr())
+    except Exception:
+        return False
+
+
 class TestAcquireDoubleIssue:
     """Regression: acquire() must not hand the same context to two callers."""
 
@@ -106,22 +117,29 @@ class TestBrowserPool:
         assert pool._prewarm_count == 5
         assert pool._max_idle_seconds == 600
 
-    @pytest.mark.skip(
-        reason=(
-            "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
-            "through an actually-routable proxy — the fixture proxy (1.2.3.4:8080) "
-            "is intentionally fake, so this needs a real proxy, not just Camoufox "
-            "installed; runs on host with real infra, not CI"
-        )
+    @pytest.mark.skipif(
+        not _camoufox_installed(),
+        reason="Camoufox browser binary not installed (run `camoufox fetch`); skipped in CI",
     )
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
-        """Pool without warm instances creates a new wrapper on acquire."""
+        """Pool without warm instances creates a new wrapper on acquire.
+
+        geoip=False: camoufox's geoip resolution dials out through the
+        configured proxy at launch time to resolve a public IP — the
+        fixture proxy (1.2.3.4:8080) is intentionally fake/non-routable,
+        and this test isn't exercising geoip behavior, so disable it here
+        rather than depend on a real working proxy just to launch."""
         from scraper_engine.browser.pool import BrowserPool
 
-        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
-        wrapper = await pool.acquire(proxy=proxy)
-        assert isinstance(wrapper, object)
-        assert wrapper.proxy == proxy
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, geoip=False)
+        try:
+            ctx = await pool.acquire(proxy=proxy)
+            assert ctx is not None
+            # acquire() returns the live BrowserContext, not the wrapper
+            # that created it — the wrapper stays tracked internally.
+            assert pool._active_wrappers[-1].proxy == proxy
+        finally:
+            await pool.shutdown()
 
     async def test_release_healthy_returns_to_pool(self, tenant):
         from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
