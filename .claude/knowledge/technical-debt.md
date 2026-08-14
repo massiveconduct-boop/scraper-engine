@@ -135,6 +135,59 @@ future session doesn't assume the gap means nothing happened those rounds.
   -m`) and `test_safe_content_guard.py` chaos races (pre-existing
   `browser/` real-Firefox exclusion) — neither touched by this change.
 
+  **Same-day follow-up — both "pre-existing" test exclusions above were
+  actually local-environment corruption, not real gaps; closed, real
+  100% coverage confirmed (781 passed, 1 skipped, 0 failed).**
+  1. `test_botasaurus_requests_client.py`'s 6 failures: not really an
+     "aarch64 sandbox" limitation — `unittest.mock.patch("botasaurus_
+     requests.session.firefox")` resolves its string target by actually
+     importing the module, which triggers `botasaurus_requests/cffi.py`'s
+     ctypes load of a bundled native `.so` regardless of the mock. That
+     package's own `check_library()` has an upstream bug: its "is the
+     right binary already present" check only matches filename prefix +
+     extension, not the arch segment (`linux-amd64` vs `linux-arm64`),
+     so it silently accepted a wrong-arch `.so` that happened to already
+     be in `bin/` instead of downloading the correct one. Fixed test-side
+     (can't patch a pip-installed third-party package): stub
+     `botasaurus_requests`/`botasaurus_requests.session` in `sys.modules`
+     before anything imports them for real (new `fake_firefox` fixture),
+     since these are unit tests of our own async/wiring code, not of the
+     real TLS client — makes the file architecture-independent, not just
+     an aarch64 workaround.
+  2. `test_safe_content_guard.py`'s 2 chaos-race failures: this sandbox's
+     `playwright` pip install and cached Camoufox Firefox binary
+     (`~/.cache/camoufox`) were both x86-64 artifacts on an aarch64 host —
+     `file` confirmed `ELF ... x86-64` on both `playwright/driver/node`
+     and `camoufox-bin`, `Exec format error`/`ELF: not found` at launch.
+     Root cause: environment/cache corruption (likely copied or cached
+     from an x86_64 machine at some point), not a code or test-design
+     issue — `pip download playwright==1.60.0` on this host correctly
+     resolves the aarch64 wheel on its own, confirming pip's own
+     resolution isn't the problem. Fixed by reinstalling the correct-arch
+     `playwright` wheel and clearing + re-running `camoufox fetch` (its
+     version-check alone doesn't validate the existing binary's
+     architecture, so a stale wrong-arch download isn't self-healing —
+     the directory has to be removed first). Once both binaries were the
+     right architecture, the tests also needed
+     `tests/fixtures/challenge_mirror`'s server actually running
+     (`python -m app.server` from that directory, listens on :8090) —
+     not started automatically by anything, has to be brought up by hand
+     for local chaos-suite runs.
+  3. Also un-skipped-then-re-skipped `tests/unit/test_browser.py::
+     TestBrowserPool::test_pool_acquire_when_empty_creates_new` as an
+     experiment: with Camoufox now genuinely working, tried gating it the
+     same `installed_verstr()`-conditional way as the chaos tests instead
+     of an unconditional `@pytest.mark.skip`. Real run surfaced a
+     *different*, deeper reason it was skipped: `camoufox`'s `geoip=true`
+     config does a live network call *through the configured proxy* at
+     launch time to resolve the browser's public IP, and the test
+     fixture's proxy (`1.2.3.4:8080`) is intentionally fake/non-routable
+     — so this test structurally needs a real working proxy, not just a
+     working Camoufox binary. Reverted to `@pytest.mark.skip`
+     (reason string updated to say why), left as a real, currently-
+     unactionable gap — was already covered by other passing tests either
+     way (coverage was 100% before and after this experiment).
+
   **Open follow-up, not fixed this round:** the `/v1/health` container
   healthcheck only reflects `api`'s own Postgres/Redis reachability, not
   each of the 3 daemons' individual liveness — an operator has to know to

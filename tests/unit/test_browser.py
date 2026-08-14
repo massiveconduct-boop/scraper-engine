@@ -109,7 +109,9 @@ class TestBrowserPool:
     @pytest.mark.skip(
         reason=(
             "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
-            "— runs on host, not CI"
+            "through an actually-routable proxy — the fixture proxy (1.2.3.4:8080) "
+            "is intentionally fake, so this needs a real proxy, not just Camoufox "
+            "installed; runs on host with real infra, not CI"
         )
     )
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
