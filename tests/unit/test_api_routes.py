@@ -612,6 +612,11 @@ async def test_health_route_healthy_returns_ok_payload(monkeypatch):
                 pgbouncer_reachable=True,
                 redis_reachable=True,
                 s3_reachable=True,
+                daemons={
+                    "proxy-harvester": "healthy",
+                    "dlq-reaper": "healthy",
+                    "webhook-sweeper": "healthy",
+                },
             )
         ),
     )
@@ -620,6 +625,11 @@ async def test_health_route_healthy_returns_ok_payload(monkeypatch):
 
     assert payload["status"] == "ok"
     assert payload["proxy_pool_size"] == 7
+    assert payload["daemons"] == {
+        "proxy-harvester": "healthy",
+        "dlq-reaper": "healthy",
+        "webhook-sweeper": "healthy",
+    }
 
 
 @pytest.mark.asyncio
@@ -634,7 +644,11 @@ async def test_health_route_unhealthy_returns_503_with_degraded_payload(monkeypa
             return_value=HealthStatus(
                 healthy=False,
                 pgbouncer_reachable=False,
-                checks={"pgbouncer": "connection refused"},
+                daemons={"proxy-harvester": "stale (harvest)"},
+                checks={
+                    "pgbouncer": "connection refused",
+                    "daemons": "proxy-harvester: stale (harvest)",
+                },
             )
         ),
     )
@@ -643,7 +657,8 @@ async def test_health_route_unhealthy_returns_503_with_degraded_payload(monkeypa
         await health()
     assert ei.value.status_code == 503
     assert ei.value.detail["status"] == "degraded"
-    assert ei.value.detail["checks"] == {"pgbouncer": "connection refused"}
+    assert ei.value.detail["daemons"] == {"proxy-harvester": "stale (harvest)"}
+    assert ei.value.detail["checks"]["daemons"] == "proxy-harvester: stale (harvest)"
 
 
 # ---------------------------------------------------------------------------

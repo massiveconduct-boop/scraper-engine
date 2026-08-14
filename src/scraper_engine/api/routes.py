@@ -540,7 +540,7 @@ async def cancel_job(
 
 @router.get("/health")
 async def health() -> dict[str, object]:
-    """Composite health check — pg/redis/s3 reachability + proxy pool size."""
+    """Composite health check — pg/redis/s3 reachability + daemon liveness + proxy pool size."""
     from scraper_engine.api.dependencies import _storage_pg, _storage_redis, _storage_s3
     from scraper_engine.api.health import check_health
 
@@ -554,6 +554,7 @@ async def health() -> dict[str, object]:
         "redis_reachable": status.redis_reachable,
         "s3_reachable": status.s3_reachable,
         "proxy_pool_size": status.proxy_pool_size,
+        "daemons": status.daemons,
         "checks": status.checks,
     }
     if not status.healthy:

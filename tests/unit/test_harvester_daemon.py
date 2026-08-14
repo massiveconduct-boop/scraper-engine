@@ -58,6 +58,73 @@ class TestRunPeriodic:
         with pytest.raises(asyncio.CancelledError):
             await mod._run_periodic("harvest", cycle, 600)
 
+    @pytest.mark.asyncio
+    async def test_writes_heartbeat_after_successful_cycle(self, monkeypatch):
+        cycle = AsyncMock(return_value="ok")
+        redis = AsyncMock()
+        redis.raw = AsyncMock()
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_periodic("harvest", cycle, 600, redis=redis)
+        redis.raw.set.assert_awaited_once()
+        args, kwargs = redis.raw.set.call_args
+        assert args[0] == "heartbeat:harvest"
+        assert kwargs["ex"] == 600 * 3
+
+    @pytest.mark.asyncio
+    async def test_writes_heartbeat_after_swallowed_cycle_error(self, monkeypatch):
+        """A cycle that keeps erroring but keeps attempting is a different
+        failure mode from a loop that's stopped ticking — heartbeat still
+        fires so it doesn't get misreported as dead."""
+
+        async def cycle():
+            raise RuntimeError("transient boom")
+
+        redis = AsyncMock()
+        redis.raw = AsyncMock()
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_periodic("harvest", cycle, 600, redis=redis)
+        redis.raw.set.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_heartbeat_write_when_redis_not_provided(self, monkeypatch):
+        cycle = AsyncMock(return_value="ok")
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        # No redis kwarg -- must not raise (no attribute access on None).
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_periodic("harvest", cycle, 600)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_write_failure_does_not_stop_the_loop(self, monkeypatch):
+        cycle = AsyncMock(return_value="ok")
+        redis = AsyncMock()
+        redis.raw = AsyncMock()
+        redis.raw.set.side_effect = ConnectionError("redis unreachable")
+        sleep_calls = {"n": 0}
+
+        async def fake_sleep(_):
+            sleep_calls["n"] += 1
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_periodic("harvest", cycle, 600, redis=redis)
+        # Reached the sleep call despite the heartbeat write raising.
+        assert sleep_calls["n"] == 1
+
 
 class TestRun:
     @pytest.mark.asyncio

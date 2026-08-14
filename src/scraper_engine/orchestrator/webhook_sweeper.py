@@ -161,7 +161,10 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
 
     task = asyncio.create_task(
         run_periodic(
-            "webhook_sweep", lambda: _sweep_cycle(pg, redis, cfg.webhook), SWEEP_INTERVAL_SECONDS
+            "webhook_sweep",
+            lambda: _sweep_cycle(pg, redis, cfg.webhook),
+            SWEEP_INTERVAL_SECONDS,
+            redis=redis,
         )
     )
     logger.info("webhook sweeper started (interval=%ss)", SWEEP_INTERVAL_SECONDS)

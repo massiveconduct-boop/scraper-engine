@@ -188,6 +188,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
             "dlq_reap",
             lambda: _reap_cycle(pg, redis, circuit_breaker, queue, cfg),
             cfg.dlq_reaper.interval_seconds,
+            redis=redis,
         )
     )
     logger.info("dlq reaper started (interval=%ss)", cfg.dlq_reaper.interval_seconds)

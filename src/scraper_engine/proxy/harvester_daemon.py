@@ -169,21 +169,31 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     pool_health = PoolHealthMonitor(pg, redis, cfg.proxy_tiers)
 
     tasks = [
-        asyncio.create_task(_run_periodic("harvest", harvester.harvest_once, ph.interval_seconds)),
         asyncio.create_task(
-            _run_periodic("promotion", promotion.run_once, ph.promotion_interval_seconds)
+            _run_periodic("harvest", harvester.harvest_once, ph.interval_seconds, redis=redis)
         ),
-        asyncio.create_task(_run_periodic("health", health.check_all, ph.health_interval_seconds)),
+        asyncio.create_task(
+            _run_periodic(
+                "promotion", promotion.run_once, ph.promotion_interval_seconds, redis=redis
+            )
+        ),
+        asyncio.create_task(
+            _run_periodic("health", health.check_all, ph.health_interval_seconds, redis=redis)
+        ),
         asyncio.create_task(
             _run_periodic(
                 "pool_health",
                 lambda: _pool_health_cycle(pool_health, cfg, pg, redis),
                 ph.health_interval_seconds,
+                redis=redis,
             )
         ),
         asyncio.create_task(
             _run_periodic(
-                "retention", reaper.run_once, cfg.session_retention.cleanup_interval_seconds
+                "retention",
+                reaper.run_once,
+                cfg.session_retention.cleanup_interval_seconds,
+                redis=redis,
             )
         ),
         asyncio.create_task(_run_kick_watcher(harvester, redis)),
