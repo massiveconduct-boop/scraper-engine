@@ -168,8 +168,11 @@ to `webhook_outbox` (migration `007`, per-tenant-schema, mirrors
 attempting delivery, then makes one immediate best-effort attempt via
 `WebhookDispatcher` (now `config.webhook`-driven, not hardcoded). A failed
 or crashed attempt leaves the row `pending`; a standalone
-`orchestrator/webhook_sweeper.py` daemon (own `docker-compose.yml`
-service, `_run_periodic`-shaped like `harvester_daemon.py` — the loop
+`orchestrator/webhook_sweeper.py` daemon (own supervised OS process —
+round 35 moved it, `proxy-harvester`, and `dlq-reaper` from their own
+`docker-compose.yml` services into the `api` container via supervisord,
+see "Container Topology (Round 35)" below — `_run_periodic`-shaped like
+`harvester_daemon.py` — the loop
 helper lives in `core/periodic.py` now, shared by both) sweeps every 30s
 with exponential backoff, marking `dead` after `config.webhook.
 max_retries` sweep-level attempts. `orchestrator/slack_formatter.py`
@@ -214,6 +217,25 @@ in the "Escalation State Machine" section above for the
 permanent/transient category split and the `(job_id, url)` UPSERT that
 carries `auto_retry_count` across repeat failures.
 
+**Container Topology (Round 35).** `proxy-harvester`, `dlq-reaper`, and
+`webhook-sweeper` — described above as separate daemons — are no longer
+separate `docker-compose.yml` services/containers. Root cause: the
+documented dev bring-up command never named them, so on a real deployment
+they simply never started, and the proxy pool went stale with no
+operator-visible signal (see `technical-debt.md` round-35 entry). Fixed by
+running all 4 long-running processes (`api` + the 3 daemons) as supervised
+subprocesses of one container via `supervisord` (`docker/supervisord.conf`,
+`Dockerfile`'s `CMD`) — each `autorestart`s independently, so one daemon
+crash-looping doesn't take the others or the API down. `worker-l1/l2/l3`
+stay separate compose services (different scaling unit — horizontally
+scaled compute/browser workhorses, not lightweight always-on loops).
+Operationally: `docker exec scraper_engine-api-1 supervisorctl status`
+replaces `docker compose ps` for checking these 3; see `operations.md` →
+"Self-healing daemons live inside the `api` container now" for the full
+command reference. This does not change any of the process-boundary
+reasoning elsewhere in this doc (separate OS process, separate in-process
+metrics registry, etc.) — only the container each process runs in.
+
 ---
 
 ## Proxy Pipeline
@@ -256,6 +278,24 @@ stand-in for tests only (`tests/unit/test_judge_server.py`,
 **Source diversity:** 8 URLs across 6 operators (proxyscrape.com, openproxylist.xyz, TheSpeedX/GitHub, monosans/GitHub, pubproxy.com, geonode.com). 5 real failure domains (GitHub CDN shared by two repos).
 
 **Scoring:** Two-tier. TCP-only=25 (below L1 threshold 40 — cannot be selected). HTTP-validated=60. `promote_tcp_only()` background job re-validates TCP-only proxies.
+
+**ASN classification (`proxy/asn_classifier.py`, Round 35 rewrite).**
+`build_asn_classifier()` unconditionally returns `ReverseDnsAsnClassifier`
+— a DNS PTR-hostname lookup (`loop.getnameinfo()`) matched against the
+same `_DATACENTER_KEYWORDS`/`_MOBILE_KEYWORDS` lists a MaxMind org-name
+lookup would have used. Previously (round 22–34) this was
+`MaxMindAsnClassifier`, gated on `GEOIP_ASN_DB_PATH` pointing at a
+downloaded GeoLite2-ASN database — never actually set on this repo's
+deployments, so every proxy silently scored `asn_class="unknown"` forever,
+permanently zeroing `scoring.py`'s 10-point `ASN_BONUS` dimension. Root-
+caused round 35 (see `technical-debt.md`): combined with the round-35
+container-topology fix above, the pool's max achievable score sat at
+exactly 69.8 — 0.2 points under `config.proxy_tiers.min_score_level_2`'s
+70.0 floor — so L2/L3 always failed `proxy_exhausted`. Reverse-DNS was
+chosen over fixing the MaxMind wiring because it needs no third-party
+account/license key/database file to maintain (user-directed, see
+`decisions.md`) — trade-off is lower precision (some datacenters skip a
+descriptive PTR record, some residential ISPs set one).
 
 ---
 

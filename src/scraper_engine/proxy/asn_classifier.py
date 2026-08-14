@@ -1,32 +1,33 @@
 # proxy/asn_classifier.py
 """ASN classification for proxy scoring — closes the ASN_BONUS scoring gap.
 
-Spec (scraper-engine-blueprint-v2.md §"Extensibility"): "swap MaxMind
-GeoLite2-ASN (local DB, no external calls) in for a paid IP-reputation API
-later without touching the harvester loop." ``NullAsnClassifier`` (formerly
-``FakeClassifier`` in proxy/harvester.py) was the only classifier ever wired
-in production — every harvested proxy landed as ``asn_class="unknown"``,
-zeroing the 10% ASN_BONUS scoring dimension (proxy/scoring.py) for 100% of
-proxies. ``MaxMindAsnClassifier`` is the real implementation; it activates
-automatically when ``GEOIP_ASN_DB_PATH`` points at an existing GeoLite2-ASN
-.mmdb file, mirroring the "gracefully inert without credentials" shape
-already used for CAPTCHA providers (services/captcha_solver.py).
+``NullAsnClassifier`` (formerly ``FakeClassifier`` in proxy/harvester.py)
+was the only classifier ever wired in production — every harvested proxy
+landed as ``asn_class="unknown"``, zeroing the 10% ASN_BONUS scoring
+dimension (proxy/scoring.py) for 100% of proxies.
+
+``ReverseDnsAsnClassifier`` is the real implementation: it asks DNS "what
+hostname points at this IP" (a PTR lookup) and matches the same
+hosting/mobile keyword lists a MaxMind GeoLite2-ASN org-name lookup would
+have used, but against that hostname instead. No third-party account, no
+license key, no database file to download and keep refreshing — just a
+standard DNS lookup already available wherever this process has network
+access. Less precise than a maintained IP-to-ASN database (some datacenters
+skip a descriptive PTR, some residential ISPs set one), but zero external
+dependency, so it's wired in unconditionally rather than gated behind an
+env var.
 """
 
 from __future__ import annotations
 
-import logging
-import os
+import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from scraper_engine.proxy.harvester import SupportsClassify
 
-logger = logging.getLogger(__name__)
-
-# ASN organisation-name keywords for well-known hosting/cloud/CDN providers.
-# GeoLite2-ASN doesn't label "datacenter vs residential" directly — this is
-# the same category of heuristic MaxMind's own docs point integrators at.
+# Hostname keywords for well-known hosting/cloud/CDN providers — matched
+# against a PTR record's hostname (e.g. "ec2-1-2-3-4.compute-1.amazonaws.com").
 _DATACENTER_KEYWORDS = (
     "amazon",
     "aws",
@@ -67,61 +68,55 @@ _MOBILE_KEYWORDS = (
 
 
 class NullAsnClassifier:
-    """Honest no-op fallback — used when no GeoLite2-ASN database is configured.
+    """Honest no-op fallback — used when ASN classification is disabled.
 
-    Not a stub pretending to be real: it's the documented default when
-    GEOIP_ASN_DB_PATH is unset, keeping the harvester fully functional (just
-    without the ASN_BONUS scoring signal) rather than crashing.
+    Not a stub pretending to be real: it's the documented default for
+    callers (e.g. tests) that construct a harvester without an explicit
+    classifier, keeping the harvester fully functional (just without the
+    ASN_BONUS scoring signal) rather than crashing.
     """
 
     async def classify(self, ip: str) -> str:
         return "unknown"
 
 
-class MaxMindAsnClassifier:
-    """Classify an IP's ASN class from a local MaxMind GeoLite2-ASN database.
+class ReverseDnsAsnClassifier:
+    """Classify an IP's ASN class via reverse-DNS (PTR) hostname lookup.
 
-    Pure local mmap lookup (no network I/O), safe to call inline from async
-    code despite not being declared `async def` internally.
+    No external account, no downloaded database, no license key to
+    maintain — a standard DNS PTR lookup, matched against the same keyword
+    lists a MaxMind org-name lookup would have used. Less precise (some
+    datacenters skip a descriptive PTR, some residential ISPs set one) but
+    zero third-party dependency.
     """
 
-    def __init__(self, db_path: str) -> None:
-        import maxminddb
-
-        self._reader = maxminddb.open_database(db_path)
+    def __init__(self, timeout_seconds: float = 2.0) -> None:
+        self._timeout_seconds = timeout_seconds
 
     async def classify(self, ip: str) -> str:
+        loop = asyncio.get_running_loop()
         try:
-            record = self._reader.get(ip)
-        except (ValueError, OSError):
+            hostname, _ = await asyncio.wait_for(
+                loop.getnameinfo((ip, 0), 0), timeout=self._timeout_seconds
+            )
+        except (OSError, TimeoutError):
             return "unknown"
-        if not isinstance(record, dict):
+        hostname = hostname.lower()
+        if hostname == ip:
+            # No PTR record — getnameinfo() echoed the IP back as a string.
             return "unknown"
-
-        org = str(record.get("autonomous_system_organization", "")).lower()
-        if not org:
-            return "unknown"
-        if any(kw in org for kw in _MOBILE_KEYWORDS):
+        if any(kw in hostname for kw in _MOBILE_KEYWORDS):
             return "mobile"
-        if any(kw in org for kw in _DATACENTER_KEYWORDS):
+        if any(kw in hostname for kw in _DATACENTER_KEYWORDS):
             return "datacenter"
         return "residential"
-
-    def close(self) -> None:
-        self._reader.close()
 
 
 def build_asn_classifier() -> SupportsClassify:
     """Select the ASN classifier for production use.
 
-    Returns a MaxMindAsnClassifier when GEOIP_ASN_DB_PATH points at an
-    existing file, else NullAsnClassifier — same env-gated, gracefully-inert
-    pattern as services/captcha_solver.build_captcha_solver.
+    Always returns a ReverseDnsAsnClassifier — no credential or database
+    file is needed, so unlike services/captcha_solver.build_captcha_solver
+    there's no "inert until configured" branch here.
     """
-    db_path = os.environ.get("GEOIP_ASN_DB_PATH")
-    if db_path and os.path.isfile(db_path):
-        try:
-            return MaxMindAsnClassifier(db_path)
-        except Exception:
-            logger.warning("failed to open GeoLite2-ASN db at %s", db_path, exc_info=True)
-    return NullAsnClassifier()
+    return ReverseDnsAsnClassifier()

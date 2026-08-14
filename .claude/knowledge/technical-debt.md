@@ -32,7 +32,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 34)
+## Technical Debt / Open Threads (as of round 35)
 
 **Coverage gap in this log:** rounds 30–33 were never backfilled here —
 their work only surfaces as scattered round-number references in
@@ -40,6 +40,114 @@ their work only surfaces as scattered round-number references in
 round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
 blocking). Not reconstructed retroactively for this entry — flagging so a
 future session doesn't assume the gap means nothing happened those rounds.
+
+- **RESOLVED (round 35) — 100% `proxy_exhausted` on a live deployment,
+  root-caused to a permanent scoring ceiling + two daemons nobody was
+  starting; triggered by a user-reported bug ("proxy pool never clears
+  L2/L3 score threshold... 100% proxy_exhausted on this deployment").**
+
+  Live evidence gathered before any fix: `proxy_pool` query on the
+  deployment showed `total=1448, ge40=819, ge70=0, ge90=0, max_score=69.8`
+  — zero proxies cleared `config.proxy_tiers.min_score_level_2`'s 70.0
+  floor (or tier-3's 90.0), only tier-1's 40.0. `asn_class` breakdown:
+  100% of 1448 rows = `"unknown"`. `last_validated` range: stale since
+  ~64 hours before the check. `docker compose ps` showed only
+  `api`/`worker-l1/l2/l3`/infra running — no `proxy-harvester`,
+  `dlq-reaper`, or `webhook-sweeper` rows.
+
+  **Two structural gaps, combining to exactly explain the ceiling:**
+  1. `GEOIP_ASN_DB_PATH` had never been set on any deployment of this
+     repo (confirmed: zero references anywhere outside
+     `asn_classifier.py` itself, no setup docs/tooling ever existed for
+     it) — `MaxMindAsnClassifier` (round 22) had therefore never actually
+     run in production. `build_asn_classifier()`'s silent fallback (no
+     log, no error, whether the var was unset or pointed at a missing
+     file) meant this had been invisible since round 22. Every proxy
+     scored `asn_class="unknown"`, permanently zeroing `scoring.py`'s
+     10-point `ASN_BONUS` dimension for all 1448 rows.
+  2. `proxy-harvester`/`dlq-reaper`/`webhook-sweeper` (round 34) were
+     separate `docker-compose.yml` services that this deployment simply
+     never started — CLAUDE.md's documented dev bring-up command
+     (`docker compose up -d postgres redis pgbouncer minio migrate`)
+     never named them, and no full-stack bring-up procedure existed
+     anywhere in the repo's docs (checked `operations.md`,
+     `CLAUDE.md` — confirmed via investigation, not assumption). Pool
+     recency penalty (`min(30, hours_ago * 2)`) sat maxed at -30 for
+     every proxy as a result.
+
+  Hand-computed against `scoring.py`'s actual weights: the best case for
+  a free-tier proxy (elite anonymity, near-zero latency, zero ASN bonus,
+  fresh) tops out around 69.8 with a real success-rate track record
+  factored in — 0.2 points under the tier-2 floor. Matches the live query
+  exactly. Tier-2-for-tier-3 fallback (`allow_tier2_fallback_for_tier3`,
+  round 33) couldn't rescue L3 either, since it falls back to the same
+  70.0 floor.
+
+  **Fixes (plan approved before implementation):**
+  - `proxy/asn_classifier.py`: `MaxMindAsnClassifier` deleted outright,
+    replaced with `ReverseDnsAsnClassifier` (DNS PTR-hostname lookup via
+    `loop.getnameinfo()`, matched against the same keyword lists).
+    `build_asn_classifier()` now unconditionally returns it — no env
+    gate. User explicitly rejected fixing the MaxMind wiring mid-session
+    ("don't want scraper too dependent on external like maxmind") — see
+    `decisions.md` → "ReverseDnsAsnClassifier Over Fixing the MaxMind
+    Wiring" for the full reasoning and alternatives considered.
+    `maxminddb` removed as this package's own pinned dependency (still
+    present transitively via `proxybroker2`, unrelated).
+  - `proxy-harvester`/`dlq-reaper`/`webhook-sweeper` collapsed into the
+    `api` container as supervised subprocesses via `supervisord` (new
+    `docker/supervisord.conf`; `Dockerfile`'s `CMD` now
+    `supervisord -c /etc/supervisor/supervisord.conf`; conf also copied
+    to `/etc/supervisor/` so `supervisorctl status` needs no `-c` flag).
+    `worker-l1/l2/l3` deliberately left as separate compose services
+    (different scaling unit). User explicitly directed this architecture
+    over the simpler fix of just documenting the missing service names —
+    see `decisions.md` → "Self-Healing Daemons Consolidated Into One
+    Supervised Container" for the full reasoning and alternatives
+    considered. `docker-compose.yml`: removed the 3 standalone service
+    blocks, added `restart: unless-stopped` + a healthcheck to `api`
+    hitting `/v1/health` (not `/health` — `api/routes.py`'s router has
+    `prefix="/v1"`; this tripped up the healthcheck once during live
+    verification, worth remembering).
+  - **Incidental bug found and fixed while wiring supervisord:**
+    `supervisor==4.2.5` imports `pkg_resources` internally at startup;
+    `setuptools>=81` removed that module entirely (deprecated-then-
+    deleted API), and `python:3.12-slim` doesn't bundle `pkg_resources`
+    independently of setuptools either — so supervisord crash-looped
+    with `ModuleNotFoundError: No module named 'pkg_resources'` until
+    `pyproject.toml` pinned `setuptools>=68,<81` as an explicit *runtime*
+    dependency (it was previously only a `[build-system]` requirement,
+    which doesn't propagate into the installed image).
+
+  **Live verification on the actual deployment (not just tests):**
+  rebuilt the `api` image, `docker exec scraper_engine-api-1
+  supervisorctl status` → all 4 programs `RUNNING`; captured
+  `proxy-harvester`'s PID, `kill -9`'d it directly, confirmed a new PID
+  within ~6s while `api`/`dlq-reaper`/`webhook-sweeper` and the
+  `/v1/health` container healthcheck stayed up throughout — proves the
+  "one daemon crash-looping doesn't take the others down" resilience
+  property live, not just by config inspection. Full test suite:
+  `tests/unit/test_asn_classifier.py` rewritten for
+  `ReverseDnsAsnClassifier`, hits 100% coverage on its own; the only
+  suite-wide shortfall (99.63%, 8 failures) was entirely in
+  `test_botasaurus_requests_client.py` (pre-existing, already-documented
+  aarch64-sandbox exclusion — confirmed this box is aarch64 via `uname
+  -m`) and `test_safe_content_guard.py` chaos races (pre-existing
+  `browser/` real-Firefox exclusion) — neither touched by this change.
+
+  **Open follow-up, not fixed this round:** the `/v1/health` container
+  healthcheck only reflects `api`'s own Postgres/Redis reachability, not
+  each of the 3 daemons' individual liveness — an operator has to know to
+  separately check `supervisorctl status`. Extending `/health` with
+  per-daemon status would close this but was judged out of scope for a
+  root-cause bug fix. Also: `docker exec <container> curl ...`-style
+  commands in `troubleshooting.md`/`decisions.md`/`standards.md` that
+  predate round 35 and refer to "the `proxy-harvester` container" as a
+  literal separate container are now topologically stale (it's a process
+  inside `api` now) — the process-boundary *reasoning* in those entries
+  is still accurate, only the container name changed; not chased down
+  entry-by-entry, see `operations.md`'s round-35 note for the one
+  pointer meant to cover all of them.
 
 - **RESOLVED (round 34) — proxy pool self-healing + notification system
   redesign, triggered by a user question ("why does the proxy pool get

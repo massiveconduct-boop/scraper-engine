@@ -92,4 +92,12 @@ RUN pip install --no-cache-dir --no-deps .
 ENV PYTHONUNBUFFERED=1
 ENV APP_ENV=production
 EXPOSE 8000 9090
-CMD ["uvicorn", "scraper_engine.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+# supervisord runs api + the 3 self-healing daemons (proxy-harvester,
+# dlq-reaper, webhook-sweeper) together as one container — see
+# docker/supervisord.conf. worker-l1/l2/l3 and migrate override this CMD
+# via their own `command:` in docker-compose.yml, so they're unaffected.
+# Copied to supervisorctl's default config search path (rather than left
+# under /app/docker) so `docker exec <container> supervisorctl status`
+# works without an explicit -c flag.
+RUN mkdir -p /etc/supervisor && cp docker/supervisord.conf /etc/supervisor/supervisord.conf
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]

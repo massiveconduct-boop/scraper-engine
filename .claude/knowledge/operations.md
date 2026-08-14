@@ -42,7 +42,7 @@ Every host-side port above is overridable via its env var (e.g. `API_PORT=8010 d
 
 ## Migrations
 
-`docker compose up -d` runs `alembic upgrade head` automatically via a one-shot `migrate` init service (same shape as `pgbouncer-init`) — every Postgres-writing service (`api`, `worker-l1/l2/l3`, `proxy-harvester`) declares `depends_on: migrate: condition: service_completed_successfully`, so nothing starts against a stale schema. A fresh `docker compose up -d` no longer requires a manual `alembic upgrade head` step. To manually re-run or check migration state (e.g. after adding a new migration file to an already-running stack): `docker compose run --rm migrate` or `docker compose exec api alembic upgrade head` (both work; `alembic upgrade head` is idempotent).
+`docker compose up -d` runs `alembic upgrade head` automatically via a one-shot `migrate` init service (same shape as `pgbouncer-init`) — every Postgres-writing service (`api`, `worker-l1/l2/l3`) declares `depends_on: migrate: condition: service_completed_successfully`, so nothing starts against a stale schema. A fresh `docker compose up -d` no longer requires a manual `alembic upgrade head` step. To manually re-run or check migration state (e.g. after adding a new migration file to an already-running stack): `docker compose run --rm migrate` or `docker compose exec api alembic upgrade head` (both work; `alembic upgrade head` is idempotent).
 
 ---
 
@@ -64,13 +64,41 @@ docker compose logs -f  # watch logs
 **Container vs host hostnames (round 20 deploy fix).** `.env` sets
 `REDIS_URL=redis://localhost:6379/0` and `DATABASE_URL=...@localhost:5432...`
 for **host** tools (alembic, `tools/` scripts). Inside containers `localhost`
-is the container itself, so the app services (`api`, `worker-l1/l2/l3`,
-`proxy-harvester`) each carry a compose `environment:` block overriding these to
+is the container itself, so the app services (`api`, `worker-l1/l2/l3`)
+each carry a compose `environment:` block overriding these to
 the service hostnames — `redis://redis:6379/0` and
 `...@pgbouncer:6432/scraper_engine` (DB through PgBouncer, invariant G-05).
 Compose `environment:` wins over `env_file:`, so `.env` keeps localhost while
 containers get service names. Symptom if missing:
 `Error 111 connecting to localhost:6379. Connection refused`, workers Exited(1).
+
+**Self-healing daemons live inside the `api` container now (Round 35).**
+`proxy-harvester`, `dlq-reaper`, and `webhook-sweeper` are no longer
+separate `docker-compose.yml` services/containers — they were, but nobody
+was starting them (the documented Quick Start command never mentioned
+them by name), so the proxy pool went stale with zero operator-visible
+signal. `docker/supervisord.conf` now runs all 4 long-running processes
+(`api` + the 3 daemons) as supervised subprocesses of one `scraper_engine-
+api-1` container; `worker-l1/l2/l3` stay separate (different scaling
+unit). Practical consequences:
+- `docker compose ps` no longer shows `proxy-harvester`/`dlq-reaper`/
+  `webhook-sweeper` rows — that's expected, not a regression.
+- Check daemon health with `docker exec scraper_engine-api-1
+  supervisorctl status` (no `-c` flag needed — the conf is also copied to
+  `/etc/supervisor/supervisord.conf`, supervisorctl's default search
+  path). Expect all 4 `RUNNING`.
+- Each daemon crash-restarts independently (`autorestart=true`,
+  `startretries=10`) without taking the others or the API down — verified
+  live by `kill -9`-ing `proxy-harvester`'s PID and confirming
+  `supervisorctl status` showed a new PID within ~6s while `api` kept
+  serving `/v1/health` throughout.
+- Old troubleshooting/decisions/operations entries that say "the
+  `proxy-harvester` container" meant a literal separate container at the
+  time they were written — as of round 35, read that as "the
+  `proxy-harvester` process inside the `api` container." The process-
+  boundary reasoning in those entries (separate OS process, separate
+  in-process metrics registry, etc.) is still accurate; only the
+  container topology changed.
 
 ---
 

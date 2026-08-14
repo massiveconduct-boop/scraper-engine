@@ -1504,3 +1504,133 @@ than a code change to either path.
 paths cause real double-alert confusion in practice despite the
 distinct-channel guidance — that would be evidence-based grounds to
 reconsider, not a reason to preemptively merge them now.
+
+---
+
+## Decision: ReverseDnsAsnClassifier Over Fixing the MaxMind Wiring
+
+**Date:** 2026-08-14 | **Round:** 35
+
+**What:** `proxy/asn_classifier.py::MaxMindAsnClassifier` (env-gated on
+`GEOIP_ASN_DB_PATH`, a downloaded GeoLite2-ASN database) was deleted
+outright and replaced with `ReverseDnsAsnClassifier` — a DNS PTR-hostname
+lookup (`loop.getnameinfo()`) matched against the same
+`_DATACENTER_KEYWORDS`/`_MOBILE_KEYWORDS` lists MaxMind's org-name field
+would have used. `build_asn_classifier()` now unconditionally returns it;
+there's no env gate or "inert until configured" branch anymore.
+
+**Why:** Root-caused as part of the round-35 `proxy_exhausted`
+investigation (see `technical-debt.md`): `GEOIP_ASN_DB_PATH` had never
+been set on any deployment of this repo, so `MaxMindAsnClassifier` had
+never actually run in production — every proxy scored `asn_class=
+"unknown"` forever, permanently zeroing `scoring.py`'s 10-point
+`ASN_BONUS` dimension. The obvious fix was wiring up MaxMind properly
+(sign up, generate a license key, download the `.mmdb`, keep it
+refreshed). **User explicitly rejected that path mid-session** — "don't
+want scraper too dependent on external like maxmind, come up with
+another option" — on the grounds that a third-party account + license
+key + a database file an operator has to remember to refresh is exactly
+the kind of dependency that silently rots (which is precisely what had
+just happened: the feature existed in code since round 22 and had never
+once been exercised). Reverse-DNS needs no account, no key, no file —
+just a standard DNS lookup already available wherever the harvester has
+network access, which it needs anyway to validate proxies over HTTP.
+
+**Alternatives considered:**
+- **Fix the MaxMind wiring** (add `GEOIP_ASN_DB_PATH` to `.env.example`,
+  document the MaxMind signup flow, bind-mount the `.mmdb` into the
+  container). Rejected per the user's explicit direction above — also
+  the most precise option technically (a maintained IP-to-ASN database
+  beats a hostname heuristic), but the precision wasn't worth the
+  operational dependency for this use case.
+- **RIR delegation files / Team Cymru bulk IP-to-ASN tables** (free,
+  no-signup alternatives to MaxMind). Considered and not pursued —
+  still an external file to download and refresh periodically, doesn't
+  remove the "operator has to remember to maintain something" problem
+  the user was actually objecting to, just changes the vendor.
+- **Drop ASN classification entirely**, accept the 10-point `ASN_BONUS`
+  dimension staying permanently zero. Rejected — the whole point of the
+  investigation was that the dimension being permanently zero (via
+  `NullAsnClassifier`) was contributing to the pool's score ceiling
+  sitting under `min_score_level_2`'s threshold; removing the dimension
+  entirely doesn't fix that, it just changes the math slightly
+  differently (see `scoring.py`'s weight-redistribution logic for
+  `success_rate=None`, same shape).
+
+**Trade-off accepted:** less precise than a maintained IP database — some
+datacenters don't set a descriptive PTR record (score understated), some
+residential ISPs do set one containing an ISP/provider name that happens
+to match a keyword (score overstated). Judged acceptable because the
+scoring dimension only needs to move proxies off a permanent zero, not be
+perfectly accurate, and the keyword lists already existed and needed no
+new tuning to reuse against a different data source.
+
+**Status:** Active.
+
+---
+
+## Decision: Self-Healing Daemons Consolidated Into One Supervised Container
+
+**Date:** 2026-08-14 | **Round:** 35
+
+**What:** `proxy-harvester`, `dlq-reaper`, and `webhook-sweeper` — each a
+separate `docker-compose.yml` service since round 34 — were collapsed
+into the `api` container, run as supervised subprocesses via
+`supervisord` (new `docker/supervisord.conf`, `Dockerfile`'s `CMD`
+changed from bare `uvicorn` to `supervisord -c
+/etc/supervisor/supervisord.conf`). `worker-l1/l2/l3` were deliberately
+left as separate compose services.
+
+**Why:** Root-caused as part of the same `proxy_exhausted` investigation:
+the 3 daemons existed and worked, but nobody was starting them on this
+deployment — `docker compose ps` showed only `api`/workers/infra running,
+and CLAUDE.md's documented dev bring-up command
+(`docker compose up -d postgres redis pgbouncer minio migrate`) never
+named them. The proxy pool went stale (`last_validated` ~64h old,
+maxing out `scoring.py`'s recency penalty) with zero operator-visible
+signal that anything was missing — `docker compose ps` just didn't show
+rows for services an operator wouldn't necessarily know to look for.
+**User explicitly directed this architecture** over the alternative of
+just fixing the documented bring-up command: "when the scraper engine
+container is started all dependent or related containers start as well,
+without crashes... come up with a robust and resilient way to do this" —
+i.e. starting the API should be sufficient by construction, not
+contingent on an operator remembering a longer service list correctly
+every time.
+
+**Alternatives considered:**
+- **Fix the documented bring-up command** (add the 3 service names to
+  CLAUDE.md's Quick Commands, or tell operators to run a bare
+  `docker compose up -d` with no service list). Simpler, smaller diff,
+  no new dependency (`supervisor`) or crash-isolation logic needed.
+  Rejected per the user's explicit direction — still relies on an
+  operator following documentation correctly, which is exactly the
+  failure mode that caused this incident in the first place.
+- **Keep them as separate containers, add `restart: unless-stopped` to
+  each.** Doesn't satisfy "starting the api container starts everything"
+  — an operator running `docker compose up -d api` in isolation (e.g.
+  scripted deploys, `docker run` outside compose) still gets a pool that
+  never refills. Rejected for the same reason as above.
+- **Merge `worker-l1/l2/l3` in too**, one giant supervised container for
+  every long-running process. Rejected — workers are the horizontally-
+  scaled compute/browser workhorses (3 replicas of the same rq consumer,
+  independently scaled via `docker-compose.yml` replica count in
+  practice); the self-healing daemons are lightweight singleton loops.
+  Different scaling units belong in different containers even under this
+  "start together" requirement — the requirement was about the daemons
+  an operator might forget to start, not about workers, which are
+  already visibly present in `docker compose ps` and not the thing that
+  silently went missing.
+
+**Trade-off accepted:** `docker exec <container> supervisorctl status`
+replaces `docker compose ps` as the way to check these 3 processes'
+health — a real, if minor, discoverability cost documented in
+`operations.md`. The `/v1/health` container healthcheck only reflects
+`api`'s own Postgres/Redis reachability, not each daemon's individual
+liveness — extending `/health` with per-daemon status was judged out of
+scope for this round (see `technical-debt.md`).
+
+**Status:** Active. Verified live: rebuilt image, all 4 supervisord
+programs `RUNNING`; killed `proxy-harvester`'s PID directly and confirmed
+supervisord restarted it (new PID) within ~6s while `api`/`dlq-reaper`/
+`webhook-sweeper` and the `/v1/health` check stayed up throughout.

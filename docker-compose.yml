@@ -1,7 +1,12 @@
 services:
+  # Runs the api process plus the 3 self-healing daemons (proxy-harvester,
+  # dlq-reaper, webhook-sweeper) together under supervisord (see
+  # docker/supervisord.conf) -- one container to start instead of 4
+  # separate services an operator has to remember to bring up. Each daemon
+  # crash-restarts independently; `restart: unless-stopped` + the
+  # healthcheck below are the last-resort recovery if supervisord itself dies.
   api:
     build: .
-    command: uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000 --no-server-header
     ports:
       - "${API_PORT:-8000}:8000"
     env_file: .env
@@ -29,6 +34,13 @@ services:
     networks:
       - default
       - extraction-scraper-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # worker-l1/l2/l3 are 3 replicas of the SAME worker pulling from ONE queue
   # ("scraper-jobs"), not per-level queues — Worker.process_job already runs
@@ -120,64 +132,6 @@ services:
     networks:
       - default
       - extraction-scraper-net
-
-  proxy-harvester:
-    build: .
-    command: python -m scraper_engine.proxy.harvester_daemon
-    env_file: .env
-    environment:
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
-    depends_on:
-      postgres:
-        condition: service_started
-      redis:
-        condition: service_started
-      jaeger:
-        condition: service_started
-      migrate:
-        condition: service_completed_successfully
-
-  # Round 34 — drains storage/webhook_outbox.py so a failed/crashed webhook
-  # delivery gets retried by a process that outlives the rq work-horse that
-  # originally attempted it. Same shape as proxy-harvester above.
-  webhook-sweeper:
-    build: .
-    command: python -m scraper_engine.orchestrator.webhook_sweeper
-    env_file: .env
-    environment:
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
-    depends_on:
-      postgres:
-        condition: service_started
-      redis:
-        condition: service_started
-      jaeger:
-        condition: service_started
-      migrate:
-        condition: service_completed_successfully
-
-  # Round 34 — auto-retries DLQ entries in worker.py's
-  # TRANSIENT_FAILURE_CATEGORIES (PROXY_EXHAUSTED, CIRCUIT_OPEN) once the
-  # proxy pool or circuit breaker recovers. Same shape as proxy-harvester
-  # above; needs the rq producer connection too (re-enqueues retried jobs).
-  dlq-reaper:
-    build: .
-    command: python -m scraper_engine.proxy.dlq_reaper
-    env_file: .env
-    environment:
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
-    depends_on:
-      postgres:
-        condition: service_started
-      redis:
-        condition: service_started
-      jaeger:
-        condition: service_started
-      migrate:
-        condition: service_completed_successfully
 
   postgres:
     image: postgres:16-alpine

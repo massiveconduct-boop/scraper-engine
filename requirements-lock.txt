@@ -203,9 +203,7 @@ markdown-it-py==4.2.0
 markdownify==1.2.3
     # via scraper-engine (pyproject.toml)
 maxminddb==2.8.2
-    # via
-    #   scraper-engine (pyproject.toml)
-    #   proxybroker2
+    # via proxybroker2
 mdurl==0.1.2
     # via markdown-it-py
 multidict==6.7.1
@@ -388,6 +386,10 @@ screeninfo==0.8.1
     # via camoufox
 service-identity==26.1.0
     # via scrapy
+setuptools==80.10.2
+    # via
+    #   scraper-engine (pyproject.toml)
+    #   supervisor
 six==1.17.0
     # via
     #   markdownify
@@ -397,6 +399,8 @@ soupsieve==2.9.1
 starlette==1.3.1
     # via fastapi
 structlog==26.1.0
+    # via scraper-engine (pyproject.toml)
+supervisor==4.2.5
     # via scraper-engine (pyproject.toml)
 tld==0.13.2
     # via scrapling
