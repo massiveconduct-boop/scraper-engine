@@ -299,6 +299,53 @@ future session doesn't assume the gap means nothing happened those rounds.
      since round 38's own pattern this session has repeatedly been
      "looks fixed" → real sustained traffic surfaces the next layer.
 
+  **Fourth bug in the same chain — the user pushed back a second time
+  ("there's no way that's possible, dig deeper at the root cause") rather
+  than accept "free proxies are just unreliable" as the final word, and
+  that skepticism was correct.** Checked the health-cycle logs directly:
+  the "validated"/"downgraded" split had been suspiciously constant
+  (roughly 65-80 downgraded, every single cycle, for hours) — too
+  consistent to be genuine pool-wide churn, which would fluctuate more as
+  different slices of a 1,300+-proxy pool got sampled. Confirmed with a
+  direct query: **61% of the pool (833 of 1,361 rows) hadn't been
+  re-checked in over an hour**, despite the health cycle running every
+  5-8 minutes that whole time — mathematically impossible if the cycle
+  were genuinely rotating through the pool (that many cycles have more
+  than enough capacity to have covered the whole pool 2x over).
+
+  Root cause, found in `health_monitor.py::check_all` (confirmed via `git
+  blame` to predate round 38 entirely — this bug has existed since the
+  method was first written): the query always picks the
+  `ORDER BY last_validated ASC` (oldest-first) 100 rows each cycle, but
+  **only the success branch ever updated `last_validated`.** A proxy that
+  failed its check kept its old timestamp forever, which meant it stayed
+  permanently at the front of the "oldest" ordering — it got re-picked
+  and re-punished (-20 score) every single cycle, forever, while
+  healthier or simply-not-yet-checked proxies further back in the queue
+  never got their turn. This is exactly what a rolling-coverage design
+  depends on NOT having — "last checked" and "currently healthy" have to
+  be tracked independently, or a failure permanently glues its own row to
+  the front of the queue.
+
+  Fixed: the downgrade branch's `UPDATE` now also sets
+  `last_validated = NOW()`, identical to the success branch. One-line
+  root cause, but only findable by actually querying live staleness
+  distribution and health-cycle log history rather than accepting the
+  first plausible-sounding explanation ("free proxies are unreliable" —
+  true in general, but not what was actually happening here).
+
+  Test: `test_check_all_downgrade_refreshes_last_validated` asserts the
+  downgrade UPDATE statement includes `last_validated = NOW()`. Full
+  suite: 819 passed, 100.00% coverage, ruff/mypy --strict clean.
+
+  **Live-verified post-deploy across two full cycles.** 60-min-stale
+  count: 833 (pre-fix) → 712 (after cycle 1) → 773 (before cycle 2 — time
+  alone pushed more rows past the 60-min mark while waiting) → **670**
+  (after cycle 2). Net trend across both cycles is clearly downward
+  despite the interleaved rise from elapsed time, confirming the queue is
+  genuinely advancing through fresh territory now, not stuck reprocessing
+  the same batch — the fix holds.
+
 - **RESOLVED (round 37) — round 35's scoring fix exposed a new failure
   mode: L2/L3 jobs hanging 150s+ instead of failing fast, root-caused to a
   missing preflight on leased proxies.** Triggered by a user live-test

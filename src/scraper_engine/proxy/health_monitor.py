@@ -146,11 +146,26 @@ class HealthMonitor:
                 )
                 validated += 1
             else:
+                # last_validated = NOW() here too, not just on success — a
+                # pre-existing bug (present before round 38, confirmed via
+                # git blame) that this rolling-coverage design depends on
+                # not having: the query above always picks the OLDEST
+                # last_validated first, so a proxy that fails once and
+                # never gets its timestamp bumped stays permanently at the
+                # front of that ordering, gets re-picked and re-punished
+                # every single cycle forever, and the rest of the pool
+                # never gets its turn. Confirmed live: 61% of the pool
+                # (833/1361) hadn't been touched in over an hour despite
+                # the cycle running every 5-8 minutes that whole time, and
+                # the downgraded count was suspiciously constant (65-80)
+                # cycle after cycle — the fingerprint of the same stuck
+                # batch being reprocessed, not fresh pool-wide churn.
                 await self._pg.execute(
                     system_tenant,
                     """
                     UPDATE proxy_pool
-                    SET reliability_score = GREATEST(0.0, reliability_score - 20.0)
+                    SET reliability_score = GREATEST(0.0, reliability_score - 20.0),
+                        last_validated = NOW()
                     WHERE ip = $1 AND port = $2
                     """,
                     ip,

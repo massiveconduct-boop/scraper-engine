@@ -2326,3 +2326,43 @@ rate over the following ~15 minutes of real tenant traffic: ~55-67% (up
 from ~20-30% during the collapse), `circuit_open` at 0 in every bucket
 since the manual reset. Full detail: `technical-debt.md`'s round-38
 entry, third sub-section.
+
+## Decision: A Failed Health Check Must Also Refresh last_validated
+
+**Context:** Same round-38 investigation, fourth layer. User pushed back
+a second time on "free proxies are just unreliable" as an explanation for
+why the pool wasn't fully recovering even ~1.5 hours after the timeout
+fix, asking to dig deeper rather than accept it. That skepticism was
+right. The `health_monitor.py::check_all` downgrade count had been
+suspiciously constant (65-80) every single cycle for hours — too
+consistent for genuine pool-wide churn — and a direct query confirmed 61%
+of the pool (833/1,361 rows) hadn't been re-checked in over an hour
+despite the cycle running every 5-8 minutes that whole time.
+
+**Root cause (pre-existing, confirmed via `git blame` to predate round
+38):** the query always selects the oldest-`last_validated` 100 rows each
+cycle, but only the SUCCESS branch ever updated that timestamp. A proxy
+that failed once kept its old timestamp forever, so it stayed permanently
+at the front of the "oldest" ordering — re-picked and re-punished every
+cycle, forever, while the rest of the pool never got reached.
+
+**Decision:** The downgrade branch now also sets `last_validated = NOW()`,
+matching the success branch.
+
+**Why:** A rolling-coverage design (`ORDER BY <staleness> LIMIT N` every
+cycle) fundamentally requires "when did we last look at this" to advance
+regardless of outcome — otherwise a failure permanently glues its own row
+to the front of the queue and the design's core assumption (the cycle
+eventually reaches the whole pool) silently breaks.
+
+**Alternatives considered:** none meaningfully distinct — this is a
+straightforward correctness bug (the two branches diverged when they
+should track the same "attempted" signal), not a judgment call between
+designs.
+
+**Status:** Active. Unit-tested
+(`test_check_all_downgrade_refreshes_last_validated`). Full suite: 819
+passed, 100.00% coverage. Live-verified across two full cycles:
+60-min-stale count 833 → 712 → 773 (time alone, between cycles) → 670 —
+net downward trend confirms the queue genuinely advances now instead of
+reprocessing the same stuck batch.

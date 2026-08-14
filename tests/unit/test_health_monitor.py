@@ -81,6 +81,26 @@ class TestHealthMonitor:
             assert result["downgraded"] == 1
 
     @pytest.mark.asyncio
+    async def test_check_all_downgrade_refreshes_last_validated(self, pg, redis):
+        """Regression: a failed check must still bump last_validated, or the
+        rolling ORDER BY last_validated ASC LIMIT 100 coverage design gets
+        stuck re-picking the same failing rows forever, starving the rest
+        of the pool of ever being re-checked. Confirmed live: 61% of a real
+        pool went over an hour untouched despite the cycle running every
+        5-8 minutes, because failures never advanced their timestamp."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(False, AnonymityLevel.TRANSPARENT, AsnClass.UNKNOWN, None),
+        ):
+            await hm.check_all()
+        downgrade_call = next(
+            c for c in pg.execute.await_args_list if "reliability_score - 20.0" in c.args[1]
+        )
+        assert "last_validated = NOW()" in downgrade_call.args[1]
+
+    @pytest.mark.asyncio
     async def test_check_all_writes_pool_size_metric(self, pg, redis):
         """api/health.py reads metrics:proxy_pool_size for GET /health's
         proxy_pool_size — this was previously never written anywhere."""
