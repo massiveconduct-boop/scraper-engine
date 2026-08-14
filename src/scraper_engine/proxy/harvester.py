@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from scraper_engine.core.models import AnonymityLevel, AsnClass, ProxyProtocol
+from scraper_engine.proxy.net_probe import tcp_probe
 from scraper_engine.proxy.scoring import ScoringEngine
 
 if TYPE_CHECKING:
@@ -237,7 +238,7 @@ class ProxyHarvester:
         count = 0
         for ip, port, protocol in proxies:
             # TCP probe (fast)
-            if not await self._tcp_probe(ip, port):
+            if not await tcp_probe(ip, port):
                 continue
             # HTTP validation (proves proxy forwards traffic)
             start = time.monotonic()
@@ -373,18 +374,6 @@ class ProxyHarvester:
             if ip and port and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                 result.append((ip, int(port), proto))
         return result
-
-    # ── TCP probe (fast pre-filter) ──────────────────────────────────────
-
-    @staticmethod
-    async def _tcp_probe(ip: str, port: int, timeout: float = 2.0) -> bool:
-        try:
-            _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except Exception:
-            return False
 
     # ── proxybroker2 subprocess fallback ─────────────────────────────────
 

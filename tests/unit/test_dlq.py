@@ -99,6 +99,43 @@ class TestDeadLetterQueue:
         assert call_args == (50, 10)
 
     @pytest.mark.asyncio
+    async def test_list_for_tenant_casts_non_str_job_id(self, dlq, pg) -> None:
+        """Round 37 — job_id is a Postgres uuid column; asyncpg returns a
+        native UUID object for it, not a str, despite DeadLetterEntry.job_id
+        being typed str. rq's validate_job_id() rejects anything that isn't
+        a plain str, so this silently broke every real auto-retry attempt
+        until _to_entries started casting explicitly. A plain string
+        job_id="job-1" in other tests can't catch this — str("job-1") is a
+        no-op either way — so this uses a distinct stand-in object with its
+        own __str__, the way a real asyncpg UUID behaves."""
+        from scraper_engine.core.tenant import TenantId
+
+        class _FakeUUID:
+            def __str__(self) -> str:
+                return "11111111-1111-1111-1111-111111111111"
+
+        tenant = TenantId("test")
+        now = datetime.now(UTC)
+        pg.fetch_rows = [
+            {
+                "id": 7,
+                "job_id": _FakeUUID(),
+                "url": "http://example.com/dead",
+                "failure_category": "ssrf_blocked",
+                "error_message": "blocked",
+                "level_attempted": 2,
+                "auto_retry_count": 1,
+                "enqueued_at": now,
+                "dead_at": now,
+            }
+        ]
+
+        entries = await dlq.list_for_tenant(tenant, limit=50, offset=10)
+
+        assert entries[0].job_id == "11111111-1111-1111-1111-111111111111"
+        assert isinstance(entries[0].job_id, str)
+
+    @pytest.mark.asyncio
     async def test_list_for_tenant_scoped_to_one_job(self, dlq, pg) -> None:
         """job_id filter (round 29) — GET /v1/jobs/{job_id}/dlq scopes to one
         job, distinct from the tenant-wide None-job_id view used elsewhere."""

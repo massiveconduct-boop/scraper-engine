@@ -2,7 +2,7 @@
 """ProxyHarvester tests — direct scrape + proxybroker2 subprocess fallback."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -362,9 +362,9 @@ class TestScrapeOneReal:
         geonode_data = {"data": [{"ip": "1.2.3.4", "port": 8080, "protocols": ["http"]}]}
         resp = FakeResponse(json_data=geonode_data)
         client = FakeHttpClient(resp=resp)
-        h._tcp_probe = AsyncMock(return_value=True)
         h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
-        n = await h._scrape_one("geonode", "http://x", "geonode_json", 10, pg, client)
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
+            n = await h._scrape_one("geonode", "http://x", "geonode_json", 10, pg, client)
         assert n == 1
         pg.execute.assert_awaited_once()
 
@@ -373,8 +373,8 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080\n5.6.7.8:3128")
         client = FakeHttpClient(resp=resp)
-        h._tcp_probe = AsyncMock(return_value=False)
-        n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=False)):
+            n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
         assert n == 0
         pg.execute.assert_not_awaited()
 
@@ -386,9 +386,9 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080")
         client = FakeHttpClient(resp=resp)
-        h._tcp_probe = AsyncMock(return_value=True)
         h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
-        n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
+            n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
         assert n == 1
         call_args = pg.execute.call_args
         assert call_args[0][-1] == SCORE_TCP_ONLY
@@ -400,9 +400,9 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080\n5.6.7.8:3128\n9.9.9.9:80")
         client = FakeHttpClient(resp=resp)
-        h._tcp_probe = AsyncMock(return_value=True)
         h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
-        n = await h._scrape_one("src", "http://x", "ip_port", 1, pg, client)
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
+            n = await h._scrape_one("src", "http://x", "ip_port", 1, pg, client)
         assert n == 1
         assert pg.execute.await_count == 1
 
@@ -413,10 +413,10 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080\n5.6.7.8:3128")
         client = FakeHttpClient(resp=resp)
-        h._tcp_probe = AsyncMock(return_value=True)
         h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
         pg.execute = AsyncMock(side_effect=[RuntimeError("db error"), None])
-        n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
+            n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
         assert n == 1
         assert pg.execute.await_count == 2
 
@@ -672,39 +672,6 @@ class TestParseGeonode:
         result = ProxyHarvester._parse_geonode(data, limit=10)
         assert result == []
 
-
-class TestTcpProbe:
-    """Lines 245-251: _tcp_probe — only asyncio.open_connection (the network
-    boundary) is faked."""
-
-    @pytest.mark.asyncio
-    async def test_returns_true_on_successful_connect(self):
-        writer = MagicMock()
-        writer.wait_closed = AsyncMock()
-
-        async def fake_open_connection(ip, port):
-            return MagicMock(), writer
-
-        with patch(
-            "scraper_engine.proxy.harvester.asyncio.open_connection",
-            side_effect=fake_open_connection,
-        ):
-            result = await ProxyHarvester._tcp_probe("1.2.3.4", 8080)
-        assert result is True
-        writer.close.assert_called_once()
-        writer.wait_closed.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_returns_false_on_connection_error(self):
-        async def fake_open_connection(ip, port):
-            raise ConnectionRefusedError("refused")
-
-        with patch(
-            "scraper_engine.proxy.harvester.asyncio.open_connection",
-            side_effect=fake_open_connection,
-        ):
-            result = await ProxyHarvester._tcp_probe("1.2.3.4", 8080)
-        assert result is False
 
 
 class TestHarvestViaBroker:

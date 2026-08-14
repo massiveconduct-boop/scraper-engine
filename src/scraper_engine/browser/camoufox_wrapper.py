@@ -15,6 +15,7 @@ create BrowserContext via browser.new_context(storage_state=blob) after launch.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core import budget
@@ -22,6 +23,8 @@ from scraper_engine.core import budget
 if TYPE_CHECKING:
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
+
+logger = logging.getLogger(__name__)
 
 
 class CamoufoxWrapper:
@@ -73,19 +76,7 @@ class CamoufoxWrapper:
         """
         await budget.BROWSER_SEMAPHORE.acquire()
         try:
-            from camoufox.async_api import AsyncCamoufox
-
-            proxy_config = None
-            if self.proxy is not None:
-                proxy_config = {"server": self.proxy.url()}
-
-            self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
-                geoip=self._geoip,
-                humanize=self._humanize,
-                headless=self._headless_mode,
-                proxy=proxy_config,
-            )
-            self._context = await self._browser.__aenter__()
+            self._context = await self._launch_with_geoip_fallback()
 
             kwargs: dict[str, Any] = {}
             if self._storage_state is not None:
@@ -95,6 +86,50 @@ class CamoufoxWrapper:
         except Exception:
             budget.BROWSER_SEMAPHORE.release()
             raise
+
+    async def _launch_with_geoip_fallback(self) -> Any:
+        """Launch Camoufox, retrying once without geoip if the initial
+        launch fails specifically because Camoufox's own internal IP
+        lookup (camoufox/ip.py::public_ip, which tries 6 third-party
+        IP-echo services internally) couldn't determine an IP through this
+        proxy. Live-caught (round 37): a proxy that demonstrably reaches
+        real target sites fine can still fail all 6 of those specific,
+        unrelated services — InvalidIP there doesn't mean the proxy is
+        dead, just that Camoufox's own geoip check specifically failed.
+        Falling back preserves the fetch (with reduced anti-detection
+        fidelity for this one session — invariant §1.1.2's geoip surface
+        is a best-effort, not something we can force through) instead of
+        losing the entire lease to an unrelated third-party dependency.
+        """
+        from camoufox.async_api import AsyncCamoufox
+        from camoufox.exceptions import InvalidIP
+
+        proxy_config = None
+        if self.proxy is not None:
+            proxy_config = {"server": self.proxy.url()}
+
+        self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
+            geoip=self._geoip,
+            humanize=self._humanize,
+            headless=self._headless_mode,
+            proxy=proxy_config,
+        )
+        try:
+            return await self._browser.__aenter__()
+        except InvalidIP:
+            if not self._geoip:
+                raise
+            logger.warning(
+                "camoufox_geoip_lookup_failed_retrying_without_geoip proxy=%s",
+                self.proxy.url() if self.proxy is not None else None,
+            )
+            self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]
+                geoip=False,
+                humanize=self._humanize,
+                headless=self._headless_mode,
+                proxy=proxy_config,
+            )
+            return await self._browser.__aenter__()
 
     async def __aexit__(self, *exc: object) -> None:
         """Guaranteed browser + Playwright driver cleanup, release semaphore.

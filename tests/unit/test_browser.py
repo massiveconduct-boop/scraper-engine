@@ -408,6 +408,116 @@ class TestSessionIsolation:
             assert ctx2 is not fake_ctx
 
 
+class TestCamoufoxWrapperGeoipFallback:
+    """Round 37 — CamoufoxWrapper._launch_with_geoip_fallback: a proxy that
+    passes lease-time preflight can still fail Camoufox's own internal
+    geoip IP-lookup (camoufox/ip.py::public_ip, 6 third-party services
+    tried internally) — live-caught. AsyncCamoufox is mocked directly at
+    its import source (camoufox.async_api.AsyncCamoufox) — no existing
+    test in this file exercises the real launch path with a controllable
+    mock, so these are new coverage, not a rewrite of existing tests."""
+
+    @pytest.mark.asyncio
+    async def test_launch_succeeds_without_fallback(self, tenant):
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        camoufox_ctor.assert_called_once()
+        assert camoufox_ctor.call_args.kwargs["geoip"] is True
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_without_geoip_on_invalid_ip(self, tenant, caplog):
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["geoip"] is True
+        assert camoufox_ctor.call_args_list[1].kwargs["geoip"] is False
+
+    @pytest.mark.asyncio
+    async def test_launch_reraises_invalid_ip_when_geoip_already_disabled(self, tenant):
+        """Defensive: geoip=False means Camoufox never calls its own
+        internal IP-lookup, so InvalidIP shouldn't fire in practice — but
+        if it somehow does, there's no further fallback available."""
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, geoip=False)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(InvalidIP),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_other_exception_propagates_without_fallback(self, tenant):
+        """A non-InvalidIP launch failure (e.g. a genuinely dead proxy) must
+        not trigger the geoip fallback — only the specific geoip-lookup
+        failure mode should retry."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(RuntimeError),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aenter_releases_semaphore_when_launch_fails(self, tenant):
+        """__aenter__'s existing except-release-reraise contract must still
+        hold when the failure comes from inside _launch_with_geoip_fallback
+        (not just a bare AsyncCamoufox() call as before the extraction)."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+        from scraper_engine.core import budget
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        wrapper._launch_with_geoip_fallback = AsyncMock(side_effect=RuntimeError("boom"))
+
+        before = budget.BROWSER_SEMAPHORE._value
+        with pytest.raises(RuntimeError):
+            await wrapper.__aenter__()
+        assert budget.BROWSER_SEMAPHORE._value == before
+
+
 class TestSessionState:
     """Tests for SessionStateManager — browser session persistence (Postgres-backed)."""
 

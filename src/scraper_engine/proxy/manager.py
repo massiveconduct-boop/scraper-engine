@@ -10,12 +10,14 @@ Global reliability_score decays independently of domain-specific bans.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from scraper_engine.config.schema import ProxyTierConfig
 from scraper_engine.core.exceptions import ProxyPoolExhaustedError
 from scraper_engine.core.models import AnonymityLevel, AsnClass, Proxy, ProxyProtocol
+from scraper_engine.proxy.net_probe import lease_preflight
 from scraper_engine.proxy.scoring import ScoringEngine, compute_success_rate
 
 if TYPE_CHECKING:
@@ -50,10 +52,12 @@ class ProxyManager:
         redis: RedisClient,
         pg: PostgresClient,
         tier_config: ProxyTierConfig | None = None,
+        probe: Callable[[str, int, str], Awaitable[bool]] = lease_preflight,
     ) -> None:
         self._redis = redis
         self._pg = pg
         self._tier_config = tier_config or ProxyTierConfig()
+        self._probe = probe
 
     async def get_proxy(
         self,
@@ -110,6 +114,25 @@ class ProxyManager:
             # Check domain-specific ban
             banned = await self._is_banned(tenant_id, proxy, domain)
             if banned:
+                continue
+
+            # Fast preflight (round 37, TCP-only; extended same round after
+            # a live test caught a proxy that passed a TCP-only check and
+            # then dropped mid-navigation) — before round 35's scoring fix,
+            # L2/L3 never actually leased a proxy (promotion was
+            # structurally unreachable), so a dead lease was never handed
+            # to the fetcher. Now that promotion succeeds, a leased proxy
+            # is frequently a flaky free one: some are dead on connect
+            # (caught by the TCP layer), some accept the connection but
+            # never actually forward traffic (caught by the HTTP layer).
+            # Without this, either case costs the caller a full 40-60s
+            # browser navigation timeout instead of failing in low single
+            # digit seconds. Treated exactly like a real fetch failure
+            # (mark_failure) so a proxy that keeps failing preflight decays
+            # out of the pool the same way one that keeps failing real
+            # fetches does.
+            if not await self._probe(proxy.ip, proxy.port, proxy.protocol.value):
+                await self.mark_failure(tenant_id, proxy.ip, proxy.port, domain)
                 continue
 
             return ProxyLease(proxy=proxy, tenant_id=tenant_id)
@@ -231,17 +254,34 @@ class ProxyManager:
         min_score: float,
         exclude: set[str],
     ) -> Proxy | None:
-        """Select the highest-scored proxy not in the exclude set."""
+        """Select the highest-scored proxy not in the exclude set.
+
+        `exclude` is passed into the query itself (round 37) — not just
+        filtered in Python after a fixed LIMIT 20 fetch. Filtering only in
+        Python meant every attempt within one get_proxy() call re-fetched
+        the SAME top-20-by-score rows; once ~20 of them were excluded
+        (domain-banned and/or preflight-failed earlier in the same call),
+        _select_candidate returned None and the caller saw
+        ProxyPoolExhaustedError even with dozens more viable, lower-ranked
+        candidates in the pool. Live-caught (round 37): a domain scraped
+        repeatedly in a short window accumulates exactly this — enough of
+        its top-20 domain-banned that a fresh get_proxy() call for that
+        same domain exhausted in ~1 attempt despite 50+ score-eligible
+        proxies existing overall. Excluding in SQL means each attempt's
+        LIMIT 20 is a genuinely fresh, not-yet-tried slice.
+        """
         rows = await self._pg.fetch(
             tenant_id,
             """
             SELECT id, ip, port, protocol, anonymity_level, asn_class, reliability_score
             FROM proxy_pool
             WHERE reliability_score >= $1
+              AND NOT (ip || ':' || port = ANY($2::text[]))
             ORDER BY reliability_score DESC
             LIMIT 20
             """,
             min_score,
+            list(exclude),
         )
         for row in rows:
             proxy = Proxy(

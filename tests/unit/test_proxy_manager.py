@@ -47,7 +47,7 @@ def make_manager(redis_get_return=None):
     pg = AsyncMock()
     pg.fetch.return_value = []
     pg.execute.return_value = "OK"
-    return ProxyManager(redis=redis, pg=pg)
+    return ProxyManager(redis=redis, pg=pg, probe=AsyncMock(return_value=True))
 
 
 class TestProxyManager:
@@ -118,7 +118,7 @@ class TestProxyManager:
             }
             for p in sample_proxies
         ]
-        pm = ProxyManager(redis=redis, pg=pg)
+        pm = ProxyManager(redis=redis, pg=pg, probe=AsyncMock(return_value=True))
         lease = await pm.get_proxy(tenant, level=1, domain="example.com")
         assert lease.proxy.ip == "3.3.3.3"  # highest score
 
@@ -140,9 +140,32 @@ class TestProxyManager:
             }
             for p in sample_proxies
         ]
-        pm = ProxyManager(redis=redis, pg=pg)
+        pm = ProxyManager(redis=redis, pg=pg, probe=AsyncMock(return_value=True))
         lease = await pm.get_proxy(tenant, level=2, domain="example.com")
         assert lease.proxy.ip == "2.2.2.2"  # 3.3.3.3 and 1.1.1.1 are banned
+
+    @pytest.mark.asyncio
+    async def test_second_attempt_excludes_first_candidate_in_sql(self, tenant, sample_proxies):
+        """Round 37 — exclude must be passed into the SQL query itself, not
+        just filtered in Python against a fixed LIMIT 20 snapshot. A domain
+        scraped repeatedly accumulates domain-bans across its top-scored
+        proxies; without SQL-side exclusion, get_proxy() could exhaust
+        despite plenty of viable lower-ranked candidates existing beyond
+        the first 20 rows a static query keeps re-fetching."""
+        redis = AsyncMock()
+        redis.get.side_effect = ["1", None]  # first candidate domain-banned
+        pg = AsyncMock()
+        pg.fetch.return_value = [_proxy_row(p) for p in sample_proxies]
+        pm = ProxyManager(redis=redis, pg=pg, probe=AsyncMock(return_value=True))
+
+        lease = await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        assert lease.proxy.ip == "1.1.1.1"  # 3.3.3.3 was banned, excluded on retry
+        assert pg.fetch.await_count == 2
+        first_call_args = pg.fetch.await_args_list[0].args
+        second_call_args = pg.fetch.await_args_list[1].args
+        assert first_call_args[-1] == []  # nothing excluded on the first attempt
+        assert "3.3.3.3:8080" in second_call_args[-1]  # excluded on retry
 
     @pytest.mark.asyncio
     async def test_exhausted_when_all_candidates_stay_banned(self, tenant):
@@ -296,6 +319,7 @@ class TestTier2FallbackForTier3:
             redis=redis,
             pg=pg,
             tier_config=ProxyTierConfig(allow_tier2_fallback_for_tier3=True),
+            probe=AsyncMock(return_value=True),
         )
 
         lease = await pm.get_proxy(tenant, level=3, domain="example.com")
@@ -318,6 +342,7 @@ class TestTier2FallbackForTier3:
             redis=redis,
             pg=pg,
             tier_config=ProxyTierConfig(allow_tier2_fallback_for_tier3=True),
+            probe=AsyncMock(return_value=True),
         )
 
         lease = await pm.get_proxy(tenant, level=3, domain="example.com")
@@ -358,3 +383,65 @@ class TestTier2FallbackForTier3:
         with pytest.raises(ProxyPoolExhaustedError):
             await pm.get_proxy(tenant, level=2, domain="example.com")
         pg.fetch.assert_awaited_once()  # no fallback retry attempted
+
+
+class TestPreflightProbe:
+    """Round 37 — before a candidate is leased, a fast preflight (TCP
+    connect + one lightweight HTTP round trip, see net_probe.py) must
+    clear or the candidate is treated exactly like a real fetch failure
+    (mark_failure) and the next candidate is tried. Closes the 150s+ hang
+    regression: a dead-but-promoted proxy used to cost the caller a full
+    40-60s browser navigation timeout instead of failing in low
+    single-digit seconds. These tests inject a fake `probe` callable and
+    don't care about its internal TCP+HTTP layering — that's covered in
+    test_net_probe.py."""
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_skips_to_next_candidate(self, tenant, sample_proxies):
+        redis = AsyncMock()
+        redis.get.return_value = None  # nothing domain-banned
+        pg = AsyncMock()
+        pg.fetch.return_value = [_proxy_row(p) for p in sample_proxies]
+        probe = AsyncMock(side_effect=[False, True])  # top-scored candidate dead
+        pm = ProxyManager(redis=redis, pg=pg, probe=probe)
+        pm.mark_failure = AsyncMock()
+
+        lease = await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        assert lease.proxy.ip == "1.1.1.1"  # 3.3.3.3 failed preflight, skipped
+        pm.mark_failure.assert_awaited_once_with(tenant, "3.3.3.3", 8080, "example.com")
+        assert probe.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_probe_fails_for_every_candidate_raises_exhausted(self, tenant):
+        proxies = [
+            Proxy(
+                id=i,
+                ip=f"{i}.{i}.{i}.{i}",
+                port=8080,
+                protocol=ProxyProtocol.HTTP,
+                reliability_score=90.0,
+            )
+            for i in range(1, ProxyManager.MAX_ATTEMPTS + 1)
+        ]
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = [_proxy_row(p) for p in proxies]
+        probe = AsyncMock(return_value=False)
+        pm = ProxyManager(redis=redis, pg=pg, probe=probe)
+        pm.mark_failure = AsyncMock()
+
+        with pytest.raises(ProxyPoolExhaustedError) as exc:
+            await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        assert exc.value.attempts == ProxyManager.MAX_ATTEMPTS
+        assert pm.mark_failure.await_count == ProxyManager.MAX_ATTEMPTS
+
+    def test_default_probe_is_the_shared_lease_preflight(self):
+        """The wiring itself (default param -> shared implementation) needs
+        its own assertion, not just behavior implied by other tests."""
+        from scraper_engine.proxy.net_probe import lease_preflight
+
+        pm = ProxyManager(redis=AsyncMock(), pg=AsyncMock())
+        assert pm._probe is lease_preflight

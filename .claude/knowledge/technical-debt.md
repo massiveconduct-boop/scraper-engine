@@ -32,7 +32,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 36)
+## Technical Debt / Open Threads (as of round 37)
 
 **Coverage gap in this log:** rounds 30–33 were never backfilled here —
 their work only surfaces as scattered round-number references in
@@ -40,6 +40,244 @@ their work only surfaces as scattered round-number references in
 round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
 blocking). Not reconstructed retroactively for this entry — flagging so a
 future session doesn't assume the gap means nothing happened those rounds.
+
+- **RESOLVED (round 37) — round 35's scoring fix exposed a new failure
+  mode: L2/L3 jobs hanging 150s+ instead of failing fast, root-caused to a
+  missing preflight on leased proxies.** Triggered by a user live-test
+  report right after round 35/36 shipped: "6/47 URLs scraped (barely
+  better than 5/47 pre-fix), error text changed from 'Proxy pool
+  exhausted' to 'All fetch levels exhausted', and 2/6 batches now hang
+  150s+ in PROCESSING instead of failing fast."
+
+  Live evidence gathered before any fix: `GET /v1/health` showed
+  `proxy_pool_size: 0` and `daemons.proxy-harvester: "stale (health)"`.
+  Container logs showed promotion cycles actually promoting now
+  (`candidates: 20, promoted: 1-7` per cycle — round 35's scoring fix
+  works) but health-validation cycles right behind them removing/
+  downgrading almost everything (`removed: 20, downgraded: 60-63`), logs
+  flooded with `ConnectTimeout`/`ConnectError: All connection attempts
+  failed` from the harvester's own probes — the free proxy sources are
+  mostly dead on arrival. That's a supply-quality issue round 35 never
+  claimed to fix (it fixed the scoring math, not proxy quality) and isn't
+  chased further here.
+
+  **The hang, though, was a real, newly-exposed regression.** Before round
+  35, `ProxyManager.get_proxy()` for L2/L3 *always* raised
+  `ProxyPoolExhaustedError` instantly (0% promotion meant nothing was ever
+  leased — a bad proxy was never actually tried). Now that promotion
+  sometimes succeeds, a leased proxy is frequently one of the same flaky
+  free ones, and nothing checked it before handing it to the real fetch.
+  Each level's fetcher then waited out its full navigation timeout before
+  giving up: L1 20s, L2 40s goto + botasaurus attempt + polling, L3 60s
+  goto + up to 30s challenge-poll ceiling. `orchestrator/worker.py`
+  processes URLs serially, so 20+40+60(+poll overhead) per bad-proxy URL
+  landed right at/over the reported 150s — the client's wait timeout was
+  tripping mid-job even though server-side RQ `job_timeout` is 600s (the
+  job wasn't actually stuck, just newly incurring timeouts it never used
+  to reach).
+
+  **This round shipped in six layers, each closing a gap the previous
+  layer's live re-verification actually exposed — not planned upfront, but
+  found by testing the deployed fix against the real pool each time
+  instead of trusting the plan on paper.** All six are described here
+  together since they compound into one coherent fix; see `decisions.md`
+  for each one's individual rationale/alternatives-considered.
+
+  **Layer 1 — TCP-connect preflight (initial fix).** A fast TCP-connect
+  probe inside `ProxyManager.get_proxy()`'s existing `MAX_ATTEMPTS=5` retry
+  loop (`proxy/manager.py`) — a candidate is probed (2.0s timeout) right
+  before being leased; on failure it's treated exactly like a real fetch
+  failure (`mark_failure`) and the loop moves to the next candidate. Worst
+  case ≈5×2s=10s before `ProxyPoolExhaustedError`, versus the previous
+  worst case of a full 40-60s navigation timeout. Connect logic extracted
+  from `ProxyHarvester._tcp_probe` into shared `proxy/net_probe.py`.
+
+  **Layer 2 — TCP-only wasn't enough; upgraded to TCP+HTTPS-CONNECT.**
+  Live-verified against the real pool right after layer 1 shipped: a real
+  `/v1/scrape` job still failed one URL, worker logs showed
+  `"Connection to remote host was lost"` — a proxy that accepted the TCP
+  connection but didn't actually forward traffic, exactly the residual
+  case layer 1's own docstring had explicitly scoped out as "accepted."
+  Once real evidence showed it firing, closing it stopped being optional.
+  `proxy/net_probe.py` gained `http_probe()`/`lease_preflight()`: one real
+  GET of an HTTPS URL through the proxy (httpx issues this as a CONNECT
+  tunnel) after the TCP check passes. Deliberately HTTPS, not plain HTTP —
+  a proxy that forwards plain HTTP fine can still fail HTTPS CONNECT
+  tunneling, and virtually everything L2/L3 needs a proxy for (real target
+  pages, and Camoufox's own `geoip=True` launch-time IP lookup) is HTTPS.
+  Confirmed directly: the exact proxy that failed a real L3 fetch with
+  `"Tunnel connection failed: 400 Bad Request"` also failed a standalone
+  HTTPS probe, while a plain-HTTP probe against the same proxy had passed
+  moments earlier — proving the plain-HTTP check was validating the wrong
+  thing.
+
+  **Layer 3 — SQL-side candidate exclusion, not just Python-side
+  filtering.** `_select_candidate`'s query was `SELECT ... LIMIT 20`, with
+  the `exclude` set (already-tried candidates within one `get_proxy()`
+  call) filtered only in Python *after* that fixed top-20 fetch. Caught
+  live: a domain hit repeatedly in a short window (this round's own
+  testing against `httpbin.org` counts) accumulated domain-bans across
+  enough of its top-20-by-score proxies that a fresh `get_proxy()` call
+  for that same domain exhausted in ~1 attempt despite 50+ score-eligible
+  proxies existing in the pool overall — the query kept re-fetching the
+  SAME stale top-20 slice every attempt, never looking further down the
+  ranking. Fixed by passing `exclude` into the SQL itself
+  (`AND NOT (ip || ':' || port = ANY($2::text[]))`), so each attempt's
+  `LIMIT 20` is a genuinely fresh, not-yet-tried slice. Verified directly
+  against real Postgres (excluded IPs correctly dropped; empty-exclude
+  case correctly returns everything unfiltered).
+
+  **Layer 4 — same-level retry with a fresh proxy on proxy-attributable
+  fetch failures.** Even with layers 1-3, `_fetch_url` only ever leased
+  ONE proxy per level — if that specific lease passed preflight but then
+  failed once handed to the real browser fetch (for a reason preflight
+  can't predict), the entire level was burned on that one proxy with no
+  retry, even with 50+ other viable proxies sitting in the pool. Live
+  root-caused: Camoufox's own `geoip=True` (`config.camoufox.geoip`,
+  default `True`, wired into the real `BrowserPool` in
+  `orchestrator/tasks.py`) makes its own out-of-band IP lookup at browser
+  launch, trying 6 different third-party IP-echo services internally
+  (`camoufox/ip.py::public_ip` — api.ipify.org, checkip.amazonaws.com,
+  ipinfo.io, icanhazip.com, ifconfig.co, ipecho.net). A proxy that passed
+  our HTTPS-CONNECT preflight against ONE judge endpoint still sometimes
+  failed all 6 of Camoufox's internal targets — different destinations
+  than our probe, and free proxies can have per-destination routing/
+  reachability quirks unrelated to general CONNECT capability. Confirmed
+  directly: a standalone `Level3Fetcher.fetch()` call with a
+  preflight-passing proxy raised
+  `FailureCategory.BROWSER_CRASH` / `"Failed to get IP address: ..."`.
+  Fix: `orchestrator/worker.py` gained `_fetch_with_proxy()`, a shared
+  L2/L3 lease-fetch-score helper with one bounded retry
+  (`_SAME_LEVEL_PROXY_RETRIES = 1`) — on a failure whose category is in
+  `_PROXY_RETRYABLE_CATEGORIES` (`BROWSER_CRASH`, `NETWORK_TIMEOUT`
+  specifically, not every category — a detection/content failure
+  wouldn't plausibly be fixed by a different proxy), it leases a fresh
+  proxy and tries once more before giving up on the level.
+
+  **Layer 5 — Camoufox geoip launch failures get one retry without geoip,
+  same proxy.** Live evidence across repeated clean-measurement runs
+  showed `BROWSER_CRASH` recurring even with layers 1-4 in place (three
+  separate 6-12-trial runs on a fresh-domain-per-trial methodology: 92%,
+  75%, 100% — the variance itself confirming this is transient
+  proxy/target flakiness, not a deterministic bug, since nothing in the
+  code changed between runs). Root-caused: `camoufox/ip.py::public_ip`'s
+  own 6-service internal IP lookup (see layer 4) can fail for a proxy that
+  otherwise works fine for real traffic — Camoufox has no built-in
+  fallback for this, it just raises `InvalidIP` and aborts the whole
+  launch. `browser/camoufox_wrapper.py` gained
+  `_launch_with_geoip_fallback()` — on `InvalidIP` specifically (not any
+  other exception), retries the launch once with `geoip=False`, same
+  proxy, logging a warning for observability. Preserves anti-detection
+  fidelity (design invariant §1.1.2) whenever geoip succeeds, degrades
+  gracefully only when Camoufox's own unrelated dependency fails. 5 new
+  unit tests added (`camoufox.async_api.AsyncCamoufox` mocked directly —
+  no prior test in this file exercised the real launch path with a
+  controllable mock).
+
+  **Layer 6 — the real closing argument: round 34's DLQ auto-retry safety
+  net was silently disabled for exactly this failure category.** Every URL
+  that exhausts all 3 levels — regardless of which specific per-level
+  failure caused it (`BROWSER_CRASH`, `NETWORK_TIMEOUT`, whatever) — always
+  DLQs as `FailureCategory.PROXY_EXHAUSTED` (see `orchestrator/worker.py`'s
+  `process_job`, the `else` clause on the level loop). That category is
+  in `TRANSIENT_FAILURE_CATEGORIES`, meaning `dlq_reaper.py` is *supposed*
+  to auto-retry it once the pool recovers (round 34) — no human
+  intervention needed. But `_is_eligible()`'s `PROXY_EXHAUSTED` check used
+  `entry.level_attempted` (always 3 for an all-levels-exhausted entry)
+  directly against `pool_health.py`'s raw tier-3 count (score ≥ 90). Round
+  33's own documented finding is that free proxy sources structurally
+  cannot reach that threshold — confirmed live this session: `l3_ok` was
+  `0` for the entire session, and `pool_health.py`'s tier-3 state read
+  `CRITICAL` throughout, even while real level-3 leases (via round 33's
+  `allow_tier2_fallback_for_tier3`) succeeded ~87% of the time across this
+  round's live tests. **Every level-3-exhaustion DLQ entry was therefore
+  permanently ineligible for auto-retry** — the exact mechanism built to
+  heal transient proxy exhaustion was silently dead for the exact
+  deployment shape (free-proxy-only, fallback-enabled) this repo actually
+  runs in, and nobody had cross-referenced these two mechanisms together
+  with live evidence until now. Fixed: `_is_eligible()` now checks tier 2
+  instead of tier 3 when `level_attempted == 3` and
+  `allow_tier2_fallback_for_tier3` is enabled — the tier that actually
+  gates whether a retry will succeed. Live-verified directly against the
+  real deployed config/Redis: a level-3-exhausted `PROXY_EXHAUSTED` entry
+  flipped from `eligible=False` (old, broken — tier 3 reads `CRITICAL`) to
+  `eligible=True` (new, correct — tier 2 reads `HEALTHY`).
+
+  **What this actually means for "does it work every time":** single-shot
+  synchronous success sits around ~87% on live measurement (three
+  clean-methodology runs: 92%, 75%, 100%) — that ceiling is real and
+  cannot be removed by code, since it's bounded by free-proxy flakiness
+  and httpbin.org's own third-party reliability, both outside this
+  codebase's control. But this system was never architected for
+  single-shot guarantees — it's architected for retry-until-success, and
+  layer 6 is what makes that architecture actually work for this exact
+  failure category: a URL that fails on a given job attempt now
+  automatically gets re-queued (same `job_id`, cache-aware so only the
+  still-failing URL re-fetches) once the tier that actually governs its
+  retry is healthy — which, per the same live evidence, is true most of
+  the time (tier 2: `HEALTHY` throughout this session). The honest,
+  now-accurate claim: escalations fail fast instead of hanging, use every
+  genuinely live proxy the pool has, and — new as of layer 6 — a URL that
+  fails is not silently dropped; it keeps retrying automatically until it
+  succeeds or a human intervenes, closing the gap between "works most of
+  the time on the first try" and "the system converges every URL to
+  success without requiring a caller to notice and manually resubmit."
+
+  **Layer 6 continued — two more bugs in the same DLQ auto-retry chain,
+  found live-verifying the eligibility fix itself (not planned, same
+  pattern as every other layer this round).** Fixing eligibility only
+  proved the mechanism was *allowed* to fire; actually watching it fire
+  against real production data (this session's own `research_agent`
+  tenant, real DLQ entries from the user's original batch test) surfaced
+  two more:
+
+  1. **`_retry_entry`'s re-enqueue guard never matched the common case.**
+     `WHERE status IN ('FAILED', 'DEAD_LETTER')` — but `worker.py`'s status
+     computation never actually sets a job's `status` to `'DEAD_LETTER'`
+     (that value only ever appears in a docstring's state diagram, not in
+     real code — grepped, confirmed), and a batch job where most URLs
+     succeed and a few don't settles at `'COMPLETED'` (any_success=True),
+     not `'FAILED'`. Live-caught against the user's own real data: their
+     DLQ'd URLs sat at `auto_retry_count=0` because their job's status was
+     `'COMPLETED'`, so this guard matched zero rows every cycle — silently
+     no-opping the retry for the majority real-world case even once
+     eligibility said yes. Fixed: broadened to
+     `WHERE status NOT IN ('PENDING', 'PROCESSING', 'CANCELLED')` — retry
+     whenever the job isn't currently active or intentionally cancelled.
+  2. **`queue.enqueue(job_id=entry.job_id, ...)` crashed on every real
+     attempt.** `DeadLetterEntry.job_id` is typed `str`, but
+     `storage/dlq.py::_to_entries()` never actually cast it —
+     `job_id` is a Postgres `uuid` column, and asyncpg returns a native
+     `asyncpg.pgproto.pgproto.UUID` object for it, not a `str`. `rq`'s
+     `validate_job_id()` rejects anything that isn't a plain string:
+     `TypeError: Job ID must be a string, not <class
+     'asyncpg.pgproto.pgproto.UUID'>` — caught live in the real
+     `dlq-reaper` daemon's logs the moment bugs 1 and 2 above stopped
+     blocking this line from ever being reached. This means the DLQ
+     auto-retry mechanism had **never once successfully re-enqueued a
+     job in this repo's entire history** — round 34 built it, but three
+     independent bugs (tier-3-vs-tier-2 eligibility, the status guard,
+     and this type mismatch) each silently prevented it from ever
+     actually running end-to-end, and none had ever been individually
+     visible without the other two being fixed first. Fixed: cast
+     `job_id=str(r["job_id"])` in `_to_entries()`.
+
+  **Live-verified end-to-end against real, historical production data,
+  not synthetic test entries:** after deploying all three DLQ-chain fixes,
+  the real `dlq-reaper` daemon's next two natural 60s cycles logged
+  `periodic_dlq_reap_cycle: retried=20` (twice — 40 total), with real
+  `dlq_auto_retry` log lines for actual URLs from the user's own original
+  batch test (Facebook posts, academia.edu, government/investment sites).
+  Confirmed several of those jobs completed and specific previously-dead
+  URLs now succeeded on retry (`investdelta.ng`, `dida.deltastate.gov.ng`
+  — both `200 OK` where they'd been stuck failed since 2026-08-11); a few
+  others (specific Facebook post URLs) still fail on retry too, but for an
+  unrelated, legitimate reason (Facebook's own access requirements, not a
+  proxy or code issue) — an honest result, not silently omitted.
+
+  Full suite across all six layers (nine total fixes, three of them in
+  this DLQ chain alone): 814 passed, 0 failed, 100.00% coverage;
+  `ruff`/`mypy --strict` clean.
 
 - **RESOLVED (round 36) — `/v1/health` extended with daemon liveness,
   closing round 35's self-flagged "Open follow-up."** Every one of the 7

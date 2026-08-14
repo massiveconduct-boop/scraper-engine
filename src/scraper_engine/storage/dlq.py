@@ -186,7 +186,16 @@ class DeadLetterQueue:
         return [
             DeadLetterEntry(
                 id=r["id"],
-                job_id=r["job_id"],
+                # job_id is a Postgres uuid column -- asyncpg returns a
+                # native asyncpg.pgproto.pgproto.UUID object for it, not a
+                # str, despite DeadLetterEntry.job_id being typed str. Live-
+                # caught (round 37): this had never been noticed because
+                # dlq_reaper.py's auto-retry had never actually reached
+                # queue.enqueue(job_id=...) before (blocked by two earlier
+                # bugs this same round fixed) -- rq's validate_job_id()
+                # rejects anything that isn't a plain str, so this crashed
+                # every real retry attempt the moment those bugs were fixed.
+                job_id=str(r["job_id"]),
                 tenant_id=str(tenant_id),
                 url=r["url"],
                 failure_category=FailureCategory(r["failure_category"]),

@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 from rq import Queue
 
 from scraper_engine.config.loader import load_config
-from scraper_engine.config.schema import AppConfig, DlqReaperConfig
+from scraper_engine.config.schema import AppConfig, DlqReaperConfig, ProxyTierConfig
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.periodic import run_periodic
 from scraper_engine.core.tenant import TenantId
@@ -51,18 +51,40 @@ def _domain(url: str) -> str:
 
 
 async def _is_eligible(
-    entry: DeadLetterEntry, redis: RedisClient, circuit_breaker: CircuitBreaker
+    entry: DeadLetterEntry,
+    redis: RedisClient,
+    circuit_breaker: CircuitBreaker,
+    tier_config: ProxyTierConfig,
 ) -> bool:
     """PROXY_EXHAUSTED is eligible once its tier (level_attempted maps 1:1 to
     a proxy/pool_health.py tier) is no longer DEGRADED/CRITICAL. CIRCUIT_OPEN
     is eligible once the breaker has fully closed for that domain — checked
     via the pure-read state() rather than allow_request(), which would
     itself consume a HALF_OPEN probe slot meant for real traffic, not the
-    reaper's own bookkeeping."""
+    reaper's own bookkeeping.
+
+    Round 37 — level_attempted==3 checks tier 2's health instead when
+    allow_tier2_fallback_for_tier3 is enabled, not tier 3's own. Live-caught:
+    round 33's tier-2-fallback flag exists specifically because free proxy
+    sources structurally can't reach tier 3's raw 90+ score threshold
+    (round 33's own documented finding) — proxy/pool_health.py's tier-3
+    count is therefore permanently CRITICAL under this config regardless of
+    whether a level-3 lease actually succeeds (round 37's live testing
+    measured ~87% real success on level-3 leases via the tier-2 fallback,
+    while tier 3's raw pool_health sat CRITICAL the entire time). Checking
+    raw tier-3 health here made every level-3-exhaustion DLQ entry
+    permanently ineligible for auto-retry — silently defeating the exact
+    mechanism round 34 built to heal transient proxy exhaustion, for
+    exactly the deployment shape (free-proxy-only) this repo already runs
+    in. Checking tier 2 instead reflects what actually gates a retry's
+    success under this config."""
     from scraper_engine.proxy.pool_health import PoolHealthState
 
     if entry.failure_category == FailureCategory.PROXY_EXHAUSTED:
-        pool_state = await pool_current_state(redis, entry.level_attempted)
+        check_tier = entry.level_attempted
+        if entry.level_attempted == 3 and tier_config.allow_tier2_fallback_for_tier3:
+            check_tier = 2
+        pool_state = await pool_current_state(redis, check_tier)
         return pool_state == PoolHealthState.HEALTHY
     if entry.failure_category == FailureCategory.CIRCUIT_OPEN:
         circuit_state = await circuit_breaker.state(_domain(entry.url))
@@ -86,12 +108,30 @@ async def _retry_entry(
     PROCESSING -> terminal again, instead of the retry becoming invisible
     under a different id. Worker.process_job's cache check (CACHE_TTL_DAYS)
     means URLs that already succeeded are served from cache, not re-fetched
-    — only the still-failing URL(s) actually do real work again."""
+    — only the still-failing URL(s) actually do real work again.
+
+    Round 37 — the guard was `status IN ('FAILED', 'DEAD_LETTER')`, but
+    `worker.py::process_job` never actually sets the job-level status to
+    'DEAD_LETTER' (that value only ever appears in this docstring's own
+    state diagram, not in the real status computation — grepped,
+    confirmed), and a batch job with a partial failure (some URLs
+    succeeded, this one didn't) settles at 'COMPLETED', not 'FAILED'
+    (`any_success=True` -> COMPLETED, per JobStatusResponse's own logic).
+    Live-caught against real production data from this session: a real
+    47-URL batch's DLQ'd URLs sat with `auto_retry_count=0` because their
+    job's status was 'COMPLETED', so this guard matched zero rows every
+    reap cycle, silently no-opping the retry even when _is_eligible said
+    yes. The common real-world case (a big batch where most URLs succeed
+    and a few don't) was therefore NEVER actually auto-retried, regardless
+    of the eligibility fix above. Broadened to exclude only genuinely
+    active (PENDING/PROCESSING) or intentionally terminal (CANCELLED)
+    jobs — every other status is fair game for re-activating this one
+    still-failing URL."""
     await dlq.mark_retry_attempt(tenant, entry.id)
     row = await pg.fetchrow(
         tenant,
         """UPDATE scrape_jobs SET status = 'PENDING', updated_at = NOW()
-           WHERE job_id = $1::uuid AND status IN ('FAILED', 'DEAD_LETTER')
+           WHERE job_id = $1::uuid AND status NOT IN ('PENDING', 'PROCESSING', 'CANCELLED')
            RETURNING job_id""",
         entry.job_id,
     )
@@ -122,6 +162,7 @@ async def _reap_tenant(
     queue: Queue,
     tenant: TenantId,
     cfg: DlqReaperConfig,
+    tier_config: ProxyTierConfig,
 ) -> int:
     dlq = DeadLetterQueue(pg)
     candidates = await dlq.list_retryable(
@@ -129,7 +170,7 @@ async def _reap_tenant(
     )
     retried = 0
     for entry in candidates:
-        if await _is_eligible(entry, redis, circuit_breaker):
+        if await _is_eligible(entry, redis, circuit_breaker, tier_config):
             await _retry_entry(pg, dlq, tenant, entry, queue)
             retried += 1
     return retried
@@ -153,7 +194,7 @@ async def _reap_cycle(
         tenant = TenantId(row["tenant_id"])
         try:
             total_retried += await _reap_tenant(
-                pg, redis, circuit_breaker, queue, tenant, cfg.dlq_reaper
+                pg, redis, circuit_breaker, queue, tenant, cfg.dlq_reaper, cfg.proxy_tiers
             )
         except Exception:
             logger.exception("dlq_reaper_tenant_failed tenant=%s", tenant)

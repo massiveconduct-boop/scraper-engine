@@ -663,7 +663,12 @@ class TestFetchUrlDispatch:
         self, tenant, worker, monkeypatch
     ):
         """Round 32: a real fetch that comes back success=False must call
-        mark_failure (bans + recomputes down), never mark_success."""
+        mark_failure (bans + recomputes down), never mark_success. Round 37:
+        NETWORK_TIMEOUT is a proxy-retryable category (_PROXY_RETRYABLE_
+        CATEGORIES) — with _SAME_LEVEL_PROXY_RETRIES=1, a fetcher that keeps
+        failing the same way gets tried twice (fresh lease each time)
+        before this level gives up, so both get_proxy/fetch/mark_failure
+        fire twice, not once."""
         proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
@@ -691,13 +696,17 @@ class TestFetchUrlDispatch:
         result = await worker._fetch_url(tenant, "http://example.com", 2)
 
         assert result is failed_result
-        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.2.3.4", 8080, "example.com")
+        assert pm_instance.get_proxy.await_count == 2
+        assert pm_instance.mark_failure.await_count == 2
+        pm_instance.mark_failure.assert_awaited_with(tenant, "1.2.3.4", 8080, "example.com")
         pm_instance.mark_success.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_level3_real_fetch_failure_marks_failure_not_success(
         self, tenant, worker, monkeypatch
     ):
+        """See test_level2_real_fetch_failure_marks_failure_not_success —
+        same round-37 retry semantics apply to L3."""
         proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
@@ -725,8 +734,91 @@ class TestFetchUrlDispatch:
         result = await worker._fetch_url(tenant, "http://example.com", 3)
 
         assert result is failed_result
-        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.2.3.4", 8080, "example.com")
+        assert pm_instance.get_proxy.await_count == 2
+        assert pm_instance.mark_failure.await_count == 2
+        pm_instance.mark_failure.assert_awaited_with(tenant, "1.2.3.4", 8080, "example.com")
         pm_instance.mark_success.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_level2_retryable_failure_then_success_uses_fresh_lease(
+        self, tenant, worker, monkeypatch
+    ):
+        """Round 37 — first lease's fetch fails with a proxy-retryable
+        category; the retry must lease a NEW proxy (not reuse the failed
+        one) and, on success, mark_success only the second proxy."""
+        proxy_a = MagicMock(ip="1.1.1.1", port=8080)
+        proxy_b = MagicMock(ip="2.2.2.2", port=8080)
+        lease_a = ProxyLease(proxy=proxy_a, tenant_id=tenant)
+        lease_b = ProxyLease(proxy=proxy_b, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(side_effect=[lease_a, lease_b])
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+
+        failed_result = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            duration_ms=10,
+            failure_category=FailureCategory.BROWSER_CRASH,
+        )
+        success_result = FetchResult(
+            url="http://example.com", success=True, level_used=2, duration_ms=15
+        )
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(side_effect=[failed_result, success_result])
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is success_result
+        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.1.1.1", 8080, "example.com")
+        pm_instance.mark_success.assert_awaited_once_with(tenant, "2.2.2.2", 8080)
+
+    @pytest.mark.asyncio
+    async def test_level2_non_retryable_failure_category_gives_up_immediately(
+        self, tenant, worker, monkeypatch
+    ):
+        """Round 37 — a failure category NOT in _PROXY_RETRYABLE_CATEGORIES
+        (e.g. DETECTION_BLOCK, a page/content-level failure, not a proxy
+        one) must NOT trigger a same-level retry — retrying with a
+        different proxy wouldn't plausibly fix a detection/content issue,
+        just burn another lease for no reason."""
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+
+        failed_result = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            duration_ms=10,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+        )
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=failed_result)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is failed_result
+        pm_instance.get_proxy.assert_awaited_once()
+        pm_instance.mark_failure.assert_awaited_once_with(tenant, "1.2.3.4", 8080, "example.com")
 
     @pytest.mark.asyncio
     async def test_level2_dispatch_raises_when_pg_missing(self, tenant):

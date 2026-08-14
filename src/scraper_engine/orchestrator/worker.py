@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 
@@ -30,6 +30,23 @@ if TYPE_CHECKING:
     from .politeness import PolitenessController
 
 LEVELS = [1, 2, 3]
+
+# Round 37 — a proxy that clears the lease-time preflight (proxy/net_probe.py)
+# can still fail once handed to the real browser fetch, for reasons the
+# preflight can't predict (e.g. Camoufox's own internal geoip IP-lookup
+# hitting a different, unrelated third-party endpoint than the preflight
+# checks, and failing there specifically — live-caught, see
+# technical-debt.md's round-37 entry). Before this, one such proxy burned
+# the ENTIRE level (get_proxy() is only called once per level in
+# _fetch_url) even though dozens of other viable proxies existed in the
+# pool. These two categories are the ones live evidence tied to a bad
+# proxy specifically, not the target site or the page content itself —
+# retrying with a fresh lease is only correct for failures the proxy
+# itself plausibly caused.
+_PROXY_RETRYABLE_CATEGORIES = frozenset(
+    {FailureCategory.BROWSER_CRASH, FailureCategory.NETWORK_TIMEOUT}
+)
+_SAME_LEVEL_PROXY_RETRIES = 1  # one retry with a fresh proxy before giving up on this level
 
 # round 29 — how long a successful scrape_results row is considered a valid
 # cache hit before it must be re-scraped. Sliding: a hit refreshes freshness
@@ -447,80 +464,71 @@ class Worker:
             l1_fetcher = build_level1_fetcher(self._config)
             return await l1_fetcher.fetch(url, tenant_id, overrides=overrides)
         elif level == 2:
-            from scraper_engine.core.exceptions import (
-                PostgresClientMissingError,
-                ProxyPoolExhaustedError,
-            )
+            from scraper_engine.core.exceptions import PostgresClientMissingError
             from scraper_engine.fetcher.factory import build_level2_fetcher
-            from scraper_engine.proxy.manager import ProxyManager
 
             if self._pg is None:
                 raise PostgresClientMissingError(level=level)
-            pm = ProxyManager(redis=self._redis, pg=self._pg, tier_config=self._config.proxy_tiers)
 
-            try:
-                lease = await pm.get_proxy(tenant_id, level=2, domain=self._extract_domain(url))
-                async with lease:
-                    l2_fetcher = build_level2_fetcher(
-                        self._config,
-                        captcha_solver=self._captcha_solver,
-                        pool=self._browser_pool,
-                        botasaurus_pool=self._botasaurus_pool,
-                    )
-                    l2_result = await l2_fetcher.fetch(
-                        url, tenant_id, proxy=lease.proxy, overrides=overrides
-                    )
-                    # Round 32: mark_success/mark_failure were fully built
-                    # (formula-driven reliability_score recompute) but never
-                    # actually called from the real fetch path — no real L2/L3
-                    # outcome has ever updated a proxy's score. Wired here,
-                    # once, right after the fetch's real outcome is known.
-                    if l2_result.success:
-                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
-                    else:
-                        await pm.mark_failure(
-                            tenant_id, lease.proxy.ip, lease.proxy.port, self._extract_domain(url)
-                        )
-                    return l2_result
-            except ProxyPoolExhaustedError:
-                return FetchResult(
-                    url=url,
-                    success=False,
-                    level_used=level,
-                    duration_ms=0,
-                    failure_category=FailureCategory.PROXY_EXHAUSTED,
-                    error_message="Proxy pool exhausted",
+            def _build_l2() -> object:
+                return build_level2_fetcher(
+                    self._config,
+                    captcha_solver=self._captcha_solver,
+                    pool=self._browser_pool,
+                    botasaurus_pool=self._botasaurus_pool,
                 )
-        elif level == 3:
-            from scraper_engine.core.exceptions import (
-                PostgresClientMissingError,
-                ProxyPoolExhaustedError,
+
+            return await self._fetch_with_proxy(
+                tenant_id, url, level, overrides, self._pg, _build_l2
             )
+        elif level == 3:
+            from scraper_engine.core.exceptions import PostgresClientMissingError
             from scraper_engine.fetcher.factory import build_level3_fetcher
-            from scraper_engine.proxy.manager import ProxyManager
 
             if self._pg is None:
                 raise PostgresClientMissingError(level=level)
-            pm = ProxyManager(redis=self._redis, pg=self._pg, tier_config=self._config.proxy_tiers)
 
+            def _build_l3() -> object:
+                return build_level3_fetcher(
+                    self._config,
+                    captcha_solver=self._captcha_solver,
+                    pool=self._browser_pool,
+                )
+
+            return await self._fetch_with_proxy(
+                tenant_id, url, level, overrides, self._pg, _build_l3
+            )
+        return None
+
+    async def _fetch_with_proxy(
+        self,
+        tenant_id: TenantId,
+        url: str,
+        level: int,
+        overrides: ConfigOverrides | None,
+        pg: PostgresClient,
+        build_fetcher: Callable[[], Any],
+    ) -> FetchResult:
+        """Shared L2/L3 lease-fetch-score cycle, with a bounded same-level
+        retry (round 37, see _PROXY_RETRYABLE_CATEGORIES/
+        _SAME_LEVEL_PROXY_RETRIES above) when the real fetch fails for a
+        reason the lease-time preflight can't predict but is still
+        plausibly proxy-caused. mark_success/mark_failure wiring is round
+        32's; retrying on a fresh lease after mark_failure is round 37's.
+        `pg` is passed explicitly (not read from self._pg) so the caller's
+        `if self._pg is None: raise` guard narrows it to non-None across
+        the function boundary — mypy can't carry that narrowing through a
+        separate method call on `self._pg` directly."""
+        from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+        from scraper_engine.proxy.manager import ProxyManager
+
+        pm = ProxyManager(redis=self._redis, pg=pg, tier_config=self._config.proxy_tiers)
+        domain = self._extract_domain(url)
+        last_result: FetchResult | None = None
+
+        for _attempt in range(_SAME_LEVEL_PROXY_RETRIES + 1):
             try:
-                lease = await pm.get_proxy(tenant_id, level=3, domain=self._extract_domain(url))
-                async with lease:
-                    l3_fetcher = build_level3_fetcher(
-                        self._config,
-                        captcha_solver=self._captcha_solver,
-                        pool=self._browser_pool,
-                    )
-                    l3_result = await l3_fetcher.fetch(
-                        url, tenant_id, proxy=lease.proxy, overrides=overrides
-                    )
-                    if l3_result.success:
-                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
-                    else:
-                        await pm.mark_failure(
-                            tenant_id, lease.proxy.ip, lease.proxy.port, self._extract_domain(url)
-                        )
-                    return l3_result
+                lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
             except ProxyPoolExhaustedError:
                 return FetchResult(
                     url=url,
@@ -530,7 +538,22 @@ class Worker:
                     failure_category=FailureCategory.PROXY_EXHAUSTED,
                     error_message="Proxy pool exhausted",
                 )
-        return None
+            async with lease:
+                fetcher = build_fetcher()
+                result: FetchResult = await fetcher.fetch(
+                    url, tenant_id, proxy=lease.proxy, overrides=overrides
+                )
+                if result.success:
+                    await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                    return result
+                await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
+                last_result = result
+                if result.failure_category not in _PROXY_RETRYABLE_CATEGORIES:
+                    return result
+                # else: loop again with a freshly leased proxy
+
+        assert last_result is not None  # loop always assigns it before falling through
+        return last_result
 
     @staticmethod
     def _extract_domain(url: str) -> str:
