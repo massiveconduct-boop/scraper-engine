@@ -29,6 +29,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Debounce window for the harvest-kick signal (round 34) — set by whichever
+# exhausted request gets there first via SET NX, so a burst of concurrent
+# exhaustions on the same or different domains triggers exactly one
+# proxy/harvester_daemon.py out-of-band harvest, not one per request. Kept
+# short relative to the daemon's own 60s harvest cooldown (harvester_daemon.py)
+# so a kick is never stale by the time the daemon's fast-poll watcher sees it.
+HARVEST_KICK_KEY = "proxy:harvest:kick"
+HARVEST_KICK_TTL_SECONDS = 30
+HARVEST_KICK_CHANNEL = "proxy:events:exhausted"
+
 
 class ProxyManager:
     """Select a proxy from the persisted, scored pool for a given (level, domain)."""
@@ -89,6 +99,7 @@ class ProxyManager:
                 proxy = await self._select_candidate(tenant_id, domain, tier_min_score, seen)
             if proxy is None:
                 await self._redis.raw.incr(f"metrics:proxy_exhausted_total:{level}")
+                await self._signal_exhaustion()
                 raise ProxyPoolExhaustedError(
                     domain=domain,
                     level=level,
@@ -104,7 +115,25 @@ class ProxyManager:
             return ProxyLease(proxy=proxy, tenant_id=tenant_id)
 
         await self._redis.raw.incr(f"metrics:proxy_exhausted_total:{level}")
+        await self._signal_exhaustion()
         raise ProxyPoolExhaustedError(domain=domain, level=level, attempts=self.MAX_ATTEMPTS)
+
+    async def _signal_exhaustion(self) -> None:
+        """Debounced out-of-band harvest trigger (round 34) — closes the gap
+        where the harvester only ran on a fixed timer, fully decoupled from
+        real demand. SET NX is the debounce: only the caller that actually
+        creates the key (i.e. no kick is already pending) also publishes, so
+        a stampede of concurrent exhausted requests produces one signal, not
+        one per request. Best-effort — a failure here must never surface as
+        a fetch failure, so exceptions are swallowed after a warning."""
+        try:
+            created = await self._redis.raw.set(
+                HARVEST_KICK_KEY, "1", nx=True, ex=HARVEST_KICK_TTL_SECONDS
+            )
+            if created:
+                await self._redis.raw.publish(HARVEST_KICK_CHANNEL, "1")
+        except Exception:
+            logger.warning("proxy_exhaustion_signal_failed", exc_info=True)
 
     async def mark_success(self, tenant_id: TenantId, ip: str, port: int) -> None:
         """Improve proxy reliability score on successful fetch.

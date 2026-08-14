@@ -102,6 +102,18 @@ async def scrape(
     if valid_count == 0:
         raise HTTPException(status_code=403, detail="; ".join(str(exc) for exc in blocked))
 
+    # SSRF-guard the webhook URL too (round 34) — it's a POST target the
+    # worker process reaches out to unattended, same class of risk as a
+    # scrape target. Unlike the batch of scrape targets above (partitioned
+    # so one bad URL doesn't sink the whole request), there's exactly one
+    # webhook, so a blocked one rejects the whole request rather than being
+    # silently dropped.
+    if request.webhook is not None:
+        try:
+            await _ssrf_guard.validate(str(request.webhook))
+        except SSRFBlockedError as exc:
+            raise HTTPException(status_code=403, detail=f"webhook blocked: {exc}") from None
+
     # Idempotency-Key dedup (round 29) — must run BEFORE the quota charge
     # below, that ordering is the actual point of the fix: a client retry
     # after a timeout should hand back the still-live original job instead
@@ -231,6 +243,14 @@ async def crawl(
             blocked.append(exc)
     if not valid_start_urls:
         raise HTTPException(status_code=403, detail="; ".join(str(exc) for exc in blocked))
+
+    # SSRF-guard the webhook URL too (round 34) — see POST /v1/scrape for
+    # the same check and rationale.
+    if request.webhook is not None:
+        try:
+            await _ssrf_guard.validate(str(request.webhook))
+        except SSRFBlockedError as exc:
+            raise HTTPException(status_code=403, detail=f"webhook blocked: {exc}") from None
 
     # Idempotency-Key dedup — same rationale as POST /v1/scrape above.
     if idempotency_key and _storage_pg is not None:
@@ -402,6 +422,11 @@ async def get_job(
     # job's URLs are done, not a hardcoded stand-in.
     total_urls = len(row["urls"]) or 1
     progress = 1.0 if status in _TERMINAL_STATUSES else min(1.0, len(result_rows) / total_urls)
+    # Same partial_failure formula as Worker.process_job (round 34) — this
+    # is a second construction site for JobStatusResponse (DB-reconstructed
+    # rather than the in-memory one the worker returns), so it must be kept
+    # in sync rather than assuming polling always sees the worker's copy.
+    partial_failure = bool(errors) and any(r.success for r in results)
 
     return JobStatusResponse(
         # asyncpg returns a uuid.UUID for the UUID column; JobStatusResponse.job_id
@@ -412,6 +437,7 @@ async def get_job(
         progress=progress,
         results=results or None,
         error="; ".join(errors) if errors else None,
+        partial_failure=partial_failure,
     )
 
 
@@ -450,6 +476,7 @@ async def get_job_dlq(
             failure_category=e.failure_category,
             error_message=e.error_message,
             level_attempted=e.level_attempted,
+            auto_retry_count=e.auto_retry_count,
             enqueued_at=e.enqueued_at,
             dead_at=e.dead_at,
         )

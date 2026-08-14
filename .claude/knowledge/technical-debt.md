@@ -32,7 +32,221 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 29)
+## Technical Debt / Open Threads (as of round 34)
+
+**Coverage gap in this log:** rounds 30–33 were never backfilled here —
+their work only surfaces as scattered round-number references in
+`architecture.md`/`decisions.md` (e.g. round 32's judge-server rework,
+round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
+blocking). Not reconstructed retroactively for this entry — flagging so a
+future session doesn't assume the gap means nothing happened those rounds.
+
+- **RESOLVED (round 34) — proxy pool self-healing + notification system
+  redesign, triggered by a user question ("why does the proxy pool get
+  exhausted, and why doesn't the Slack webhook tell me").**
+
+  Two-pass investigation (Explore agents, file:line verified both times)
+  found the symptom was a stack of independent gaps, not one bug:
+  (1) `ProxyManager.get_proxy` (`proxy/manager.py`) raised
+  `ProxyPoolExhaustedError` with zero mechanism to make the pool refill
+  faster — `proxy/harvester_daemon.py`'s harvest loop ran on a fixed timer
+  (default 600s) fully decoupled from real demand; (2) `PROXY_EXHAUSTED`
+  was categorized identically to permanent failures (`SSRF_BLOCKED`,
+  `QUOTA_EXCEEDED`) even though it resolves once the pool refills — once
+  DLQ'd, nothing ever retried it automatically (`DeadLetterQueue.retry()`
+  existed but had zero callers); (3) `Worker.process_job`'s status
+  derivation marked a job `COMPLETED` if *any* URL succeeded, even when
+  others were DLQ'd — the one thing meant to surface a problem (the
+  webhook payload) reported clean success; (4) webhook delivery was
+  fire-and-forget — one inline POST, log-and-drop on failure, no retry
+  queue, no audit trail, and the rq work-horse process that attempted it
+  exits right after the job it ran; (5) no real Slack integration existed
+  anywhere in `src/` — the webhook POSTed raw `JobStatusResponse` JSON,
+  which Slack's Incoming Webhook API rejects (expects
+  `{"text": ..., "blocks": [...]}`); (6) proxy exhaustion had no
+  notification path *even in principle* — the webhook only fired on
+  whole-job completion, no event existed for "the shared pool itself is
+  unhealthy"; (7) newly found mid-investigation — `api/routes.py` SSRF-
+  validated every scrape target URL but never validated
+  `request.webhook`, so a tenant could point a webhook at
+  `http://169.254.169.254/...` and the worker would POST job data there
+  unguarded.
+
+  **Fixes, by phase (plan approved before implementation, see the plan's
+  Verification section for the full test list):**
+  - **Phase A (correctness, no new infra):** `JobStatusResponse` gained an
+    additive `partial_failure: bool` field (`bool(errors) and
+    any(r.success for r in results)`) rather than a new `JobStatus` enum
+    value — considered and rejected the enum route for blast radius
+    (every existing `status.value == "COMPLETED"` check across the
+    codebase and any external integration). Computed in two places —
+    `Worker.process_job` (in-memory) and `api/routes.py::get_job` (DB-
+    reconstructed) — kept in sync by the same formula, not shared code,
+    since the two build `JobStatusResponse` from different sources. The
+    webhook URL now runs through the same `SSRFGuard.validate()` already
+    used for target URLs, on both `/v1/scrape` and `/v1/crawl`, before
+    persisting. `WebhookDispatcher`'s retry/timeout/backoff moved from
+    hardcoded `__init__` defaults to a new `config.schema.WebhookConfig`.
+  - **Phase B (proxy self-healing):** `ProxyManager.get_proxy`'s
+    exhaustion path now does a debounced `SET proxy:harvest:kick NX EX 30`
+    (only the caller that actually creates the key also `PUBLISH`es to
+    `proxy:events:exhausted` — stops a burst of concurrent exhausted
+    requests from stampeding redundant triggers) — see
+    `decisions.md` → "Debounced Redis Kick, Not Pure Pub/Sub" for why both
+    a key and a channel exist rather than pub/sub alone.
+    `harvester_daemon.py` gained a second, ~5s-poll watcher task
+    (independent of its existing `_run_periodic` timers) that reacts to
+    the kick, gated by a separate 60s cooldown key so a flood of kicks
+    still can't run more than one out-of-band harvest per minute. New
+    `proxy/pool_health.py::PoolHealthMonitor` computes per-tier (1/2/3)
+    validated-proxy counts against new `ProxyTierConfig.degraded_below_count`
+    /`critical_below_count` thresholds, persists HEALTHY/DEGRADED/CRITICAL
+    state in Redis, and returns only real transitions (not a per-cycle
+    re-announcement) — wired into a new `pool_health` cycle in
+    `harvester_daemon.py`'s `run()`.
+  - **Phase C (durable, correctly-formatted notifications):** New
+    `orchestrator/webhook_events.py` (`WebhookEvent`/`WebhookEventType` —
+    `job.completed`/`failed`/`partial_failure`/`cancelled`,
+    `proxy_pool.degraded`/`critical`/`recovered`). New
+    `storage/webhook_outbox.py` + migration `007` (`webhook_outbox` table,
+    per-tenant-schema, mirrors `dead_letter_queue`'s shape) — a
+    transactional outbox: the row is written *before* any delivery
+    attempt, so a crash or rejected delivery is a durable, queryable fact
+    instead of a line in a dead work-horse process's stdout. New
+    `orchestrator/webhook_dispatch.py::enqueue_and_deliver_webhook_event`
+    writes the row then makes one immediate best-effort delivery attempt
+    (keeps today's latency for the common case); this was deliberately
+    split out of `orchestrator/tasks.py` rather than living there — see
+    `decisions.md` → "webhook_dispatch.py Split From tasks.py" for why
+    (`tasks.py` runs bootstrap side effects at import time meant to run
+    once per rq work-horse, and `proxy/harvester_daemon.py` needs the
+    same dispatch function for its own ops alerts without triggering that
+    bootstrap a second time in its process). New
+    `orchestrator/webhook_sweeper.py` — standalone daemon, same
+    `_run_periodic`-derived shape as `harvester_daemon.py` (the loop
+    helper itself was extracted to `core/periodic.py` so both reuse it
+    instead of a second copy), sweeps `webhook_outbox` for due rows every
+    30s, retries with exponential backoff capped at 3600s, marks a row
+    `dead` after `WebhookConfig.max_retries` sweep-level attempts. New
+    `orchestrator/slack_formatter.py` renders `WebhookEvent` into Slack's
+    Block Kit shape when the target URL contains `hooks.slack.com`,
+    otherwise passes the raw event dict through unchanged (backward
+    compatible with any existing non-Slack integration). Pool-health
+    transitions from Phase B now enqueue through this same outbox/
+    sweeper/formatter path to a new `WebhookConfig.ops_webhook_url` — see
+    the **open thread** below, this was built without checking whether
+    the existing Alertmanager `ProxyPoolCriticallyLow` rule already
+    covered this.
+  - **Phase D (transient-failure auto-retry):** `orchestrator/worker.py`
+    now splits DLQ-eligible categories into `PERMANENT_FAILURE_CATEGORIES`
+    (`SSRF_BLOCKED`, `QUOTA_EXCEEDED`, `HOST_UNREACHABLE` — retrying can
+    never help) and `TRANSIENT_FAILURE_CATEGORIES` (`PROXY_EXHAUSTED`,
+    `CIRCUIT_OPEN` — resolves once external state changes); both still
+    land in the DLQ, only transient ones are auto-retry-eligible.
+    `dead_letter_queue` gained `auto_retry_count` (migration `007`) plus a
+    `UNIQUE (job_id, url)` constraint, and `storage/dlq.py::enqueue` was
+    changed from plain `INSERT` to `INSERT ... ON CONFLICT (job_id, url)
+    DO UPDATE` — a repeat failure for the same URL lands back on the same
+    row (auto_retry_count carried forward via Postgres's implicit
+    "unspecified columns keep their value" UPSERT semantics) instead of a
+    fresh `INSERT` resetting the counter and defeating the retry cap. The
+    old `DeadLetterQueue.retry(tenant_id, job_id)` — which deleted every
+    DLQ row for a job_id, not scoped to one URL, and had zero real callers
+    — was removed outright and replaced with `mark_retry_attempt(tenant,
+    entry_id)` (increments in place, doesn't delete) and `clear(tenant,
+    job_id, url)` (called from `tasks.py::_persist_one_result` on every
+    success, so a URL that recovers on auto-retry stops showing as
+    permanently dead). New `proxy/dlq_reaper.py` — same daemon shape
+    again — polls `DeadLetterQueue.list_retryable()` per real tenant every
+    60s; `PROXY_EXHAUSTED` eligibility checks `pool_health.py`'s persisted
+    per-tier state (not a fresh recompute), `CIRCUIT_OPEN` eligibility
+    checks `CircuitBreaker.state()` — deliberately the pure-read state
+    getter, not `allow_request()`, which would itself consume a HALF_OPEN
+    probe slot meant for real traffic (see `decisions.md`). Re-enqueues
+    under the *same* `job_id` (not a new one) so a caller polling `GET
+    /v1/jobs/{job_id}` sees the same job transition again rather than the
+    retry becoming invisible under a different id; relies on
+    `Worker.process_job`'s existing cache check so already-succeeded URLs
+    in the same job aren't wastefully re-fetched.
+
+  **Open thread — RESOLVED (round 34 follow-up, same-day knowledge
+  audit).** `operations.md` documents a pre-existing `ProxyPoolCriticallyLow`
+  Prometheus/Alertmanager rule (`proxy_pool_validated_count < 5` for 5
+  minutes → Slack via `SLACK_WEBHOOK_URL`, live and Slack-proven since
+  round 25). This round's Phase B/C built a *second*, independent
+  pool-health-to-Slack path (`pool_health.py`'s per-tier state machine →
+  `WebhookConfig.ops_webhook_url` → outbox/sweeper) without discovering
+  or cross-referencing the Alertmanager rule during investigation.
+  Decision (see `.claude/knowledge/decisions.md` → "Keep Both Pool-Health
+  Alert Paths — Intentional, Not Duplicate" for full reasoning): **keep
+  both**, deliberately — they fail independently (Alertmanager needs
+  Prometheus + a 5-minute sustained condition and goes dark if this app's
+  own delivery pipeline breaks; the new path needs that pipeline healthy
+  and goes dark if Prometheus/Alertmanager themselves are down), so each
+  covers the other's blind spot. `config/base.yaml`'s `webhook.
+  ops_webhook_url` now documents the relationship and recommends a
+  distinct Slack channel from `SLACK_WEBHOOK_URL` so the two don't read
+  as a confusing double-alert. No code change needed — `ops_webhook_url`
+  defaults to unset, so there was never live duplication in production,
+  only a latent risk if both were pointed at the same channel.
+
+  **Verification:** migration `007` applied, downgraded to `006`, and
+  re-upgraded against the live dev Postgres — schema confirmed identical
+  after the round-trip (`\d system.webhook_outbox`,
+  `dead_letter_queue.auto_retry_count` both present). 674 unit tests pass
+  (74 new/updated this round) — the only excluded file
+  (`test_botasaurus_requests_client.py`, 6 tests) fails identically on a
+  clean `git stash`, confirmed pre-existing/environmental (missing
+  `.so`), not caused by this round. `ruff check` and `mypy --strict`
+  both clean against the empty baseline (`tools/mypy-baseline.txt`).
+  `docker compose config` validates the two new services
+  (`webhook-sweeper`, `dlq-reaper`) added to `docker-compose.yml`.
+
+  **Coverage gap — found in the round-34 knowledge audit, RESOLVED same
+  day.** The round-34 "Verification" paragraph above never actually ran
+  the `--cov-fail-under=100` gate. Full `tests/unit/ tests/integration/
+  tests/chaos/ --cov=src/scraper_engine --cov-report=term-missing`
+  against live docker-compose infra first measured **97.91% total, gate
+  FAILED**: `orchestrator/webhook_sweeper.py` 76% (missing 154-185, 189 —
+  the daemon `run()` lifecycle), `proxy/dlq_reaper.py` 72% (missing
+  170-211, 215 — same `run()` pattern), `orchestrator/slack_formatter.py`
+  97% (1 line, the `JOB_CANCELLED` branch), `orchestrator/tasks.py` 99%
+  (1 line, `_job_webhook_event_type`'s `CANCELLED` branch) — all four new
+  round-34 code with no matching test for the uncovered branch. Plus a
+  real regression in pre-existing code: `proxy/harvester_daemon.py` had
+  been at the project's standing 100% since round 28 and had dropped to
+  88% (missing 85-88, 116-139 — `_run_kick_watcher`'s exception handling
+  and the entire `_pool_health_cycle` body, both shipped with zero tests).
+
+  **Fix:** added `TestRunKickWatcher`/`TestPoolHealthCycle` to
+  `tests/unit/test_harvester_daemon.py` (5 + 3 cases — kick-pending/
+  debounced/error/cancel paths, transition-with-and-without-
+  `ops_webhook_url` paths); `TestRun`/`TestMain` (daemon lifecycle,
+  mirroring `harvester_daemon.py`'s own pattern) added to
+  `tests/unit/test_webhook_sweeper.py` and `tests/unit/test_dlq_reaper.py`,
+  which had never had lifecycle tests at all; one `JOB_CANCELLED` case
+  added to `tests/unit/test_slack_formatter.py`; a new
+  `TestJobWebhookEventType` class added to `tests/unit/test_tasks.py`
+  covering all four status→event-type mappings directly. Re-measured:
+  **99.57% total** — every round-34 file (and the `harvester_daemon.py`
+  regression) now at 100%. The only remaining gap is
+  `services/botasaurus_requests_client.py` (56%) — confirmed pre-existing
+  and NOT a round-34 regression (git-diff-verified zero files touched in
+  `fetcher/`/`browser/` this round; `.wolf/cerebrum.md`'s own
+  Do-Not-Repeat entry dated 2026-07-31, well before round 34, already
+  documents this exact aarch64-sandbox missing-`.so` issue as permanently
+  unfixable from this repo). CI's GitHub-hosted runners are x86_64, where
+  this file is unaffected — this gap is local-sandbox-only, not a CI
+  blocker, same for the 2 pre-existing chaos-test timing flakes in
+  `tests/chaos/test_safe_content_guard.py`. 776 unit+integration+chaos
+  tests pass (up from 674 unit-only), `ruff check`/`mypy --strict` still
+  clean.
+
+  **Session-level note, not code:** the host disk filled to 0 bytes free
+  mid-session (unrelated to this work — pre-existing accumulation of
+  Docker build cache/images on the box). Freed ~43GB via `docker system
+  prune -af` after explicit user confirmation, which is what let the
+  migration/build verification above actually run.
 
 - **RESOLVED (round 29) — 8 caller-facing gaps closed + caching + markdown
   generalized to all 3 escalation levels. Extraction-engine work
@@ -72,7 +286,10 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
      `DeadLetterQueue.list_for_tenant` gained an optional `job_id` filter)
      since the DLQ still carries `enqueued_at`/`dead_at` detail the
      `results` list doesn't, and remains the basis for the existing
-     `dlq_size` Prometheus gauge and `DeadLetterQueue.retry()` admin path.
+     `dlq_size` Prometheus gauge. (`DeadLetterQueue.retry()`, mentioned
+     here as the admin retry path at the time, turned out to have zero
+     real callers and a job_id-not-URL-scoped delete bug — removed and
+     replaced in round 34, see that entry above.)
   3. `ConfigOverrides.timeout_seconds` was fully plumbed into every
      fetcher's `fetch()` signature (all three already did
      `overrides.timeout_seconds if overrides else self.TIMEOUT_SECONDS`)

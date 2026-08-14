@@ -82,6 +82,10 @@ proxy_tiers:
   # once paid/higher-quality proxy sources make min_score_level_3 reliably
   # reachable on its own.
   allow_tier2_fallback_for_tier3: true
+  # Round 34 — proxy/pool_health.py thresholds: validated-proxy counts per
+  # tier below which that tier is DEGRADED / CRITICAL.
+  degraded_below_count: 20
+  critical_below_count: 5
 
 politeness:
   default_concurrency: 2
@@ -117,3 +121,39 @@ session_retention:
   browser_sessions_ttl_days: 30
   domain_ban_history_retention_days: 7
   cleanup_interval_seconds: 3600
+
+# Round 34 — orchestrator/webhook.py delivery tuning + the operator-facing
+# ops channel (proxy pool health alerts, see proxy_tiers.degraded_below_count
+# / critical_below_count above). ops_webhook_url is unset by default — pool
+# health transitions are still logged either way (proxy/harvester_daemon.py),
+# this just adds a webhook push on top when configured.
+#
+# Deliberately complementary to monitoring/alerts/prometheus_rules.yml's
+# ProxyPoolCriticallyLow rule (routed via Alertmanager to SLACK_WEBHOOK_URL
+# in .env), not a duplicate of it — decided in the round-34 knowledge audit
+# after finding the two were built independently with no awareness of each
+# other. Different failure domains and different latency: Alertmanager's
+# rule needs Prometheus scraping + a 5-minute sustained condition before it
+# fires, and stops working if this app's own Redis/Postgres/webhook-outbox
+# pipeline is what's broken; this path fires on the next health cycle (no
+# extra sustained-duration wait), is per-tier (Alertmanager's rule is
+# pool-wide), and keeps working if Prometheus/Alertmanager themselves are
+# down. Recommended setup: point this at a DIFFERENT Slack channel/webhook
+# than SLACK_WEBHOOK_URL — e.g. a fast per-tier signal channel — rather
+# than the same one Alertmanager posts to, so the two don't read as a
+# confusing double-alert for the same event. See
+# .claude/knowledge/decisions.md → "Keep Both Pool-Health Alert Paths" for
+# the full reasoning.
+webhook:
+  max_retries: 3
+  timeout_seconds: 10
+  backoff_base_seconds: 2.0
+  ops_webhook_url: "${OPS_WEBHOOK_URL:}"
+
+# Round 34 — proxy/dlq_reaper.py: auto-retries DLQ entries in
+# orchestrator/worker.py's TRANSIENT_FAILURE_CATEGORIES once the pool/circuit
+# that caused them has recovered.
+dlq_reaper:
+  interval_seconds: 60
+  max_auto_retries: 3
+  batch_size_per_tenant: 20

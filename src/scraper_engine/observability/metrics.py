@@ -118,6 +118,28 @@ proxy_exhausted_total = Gauge(
     registry=REGISTRY,
 )
 
+proxy_pool_health = Gauge(
+    "proxy_pool_health",
+    "Current per-tier proxy pool health: 2=healthy, 1=degraded, 0=critical "
+    "(proxy/pool_health.py::PoolHealthMonitor, round 34)",
+    ["tier"],
+    registry=REGISTRY,
+)
+
+webhook_outbox_pending = Gauge(
+    "webhook_outbox_pending",
+    "Current count of undelivered rows in webhook_outbox across every tenant "
+    "schema (round 34 — orchestrator/webhook_sweeper.py)",
+    registry=REGISTRY,
+)
+
+webhook_delivery_failures_total = Gauge(
+    "webhook_delivery_failures_total",
+    "Cumulative webhook delivery attempts that did not succeed (Redis-backed "
+    "counter, round 34)",
+    registry=REGISTRY,
+)
+
 job_duration_seconds_count = Gauge(
     "job_duration_seconds_count",
     "Cumulative count of completed scrape jobs per status (Redis-backed counter)",
@@ -214,3 +236,15 @@ async def refresh_redis_backed_counters(redis: RedisClient) -> None:
         sum_raw = await redis.raw.get(f"metrics:job_duration:{status}:sum")
         job_duration_seconds_count.labels(status=status).set(float(count_raw) if count_raw else 0.0)
         job_duration_seconds_sum.labels(status=status).set(float(sum_raw) if sum_raw else 0.0)
+
+    # Round 34 — written by orchestrator/webhook_sweeper.py (its own
+    # long-lived process, separate from this one serving /metrics) and
+    # orchestrator/tasks.py's inline delivery attempt. Same "write to Redis
+    # at event time, refresh the local Gauge only when scraped" pattern as
+    # every other counter in this function, for the same reason: an
+    # in-process Gauge in either of those processes would never reach this
+    # one's REGISTRY.
+    pending_raw = await redis.raw.get("metrics:webhook_outbox_pending")
+    webhook_outbox_pending.set(float(pending_raw) if pending_raw else 0.0)
+    failures_raw = await redis.raw.get("metrics:webhook_delivery_failures_total")
+    webhook_delivery_failures_total.set(float(failures_raw) if failures_raw else 0.0)

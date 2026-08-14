@@ -374,7 +374,7 @@ does not change the fix (top up), just confirms it end to end.
 
 ### Fetcher `fetch()` argument order — url FIRST, tenant SECOND
 `Level1Fetcher.fetch(url, tenant_id, proxy=None, overrides=None)` takes the URL
-first (`fetcher/level_1.py:32`). Calling `fetch(tenant_id, url)` (tenant-first, the
+first (`fetcher/level_1.py:68`). Calling `fetch(tenant_id, url)` (tenant-first, the
 intuitive order) passes the tenant slug as the URL → httpx raises
 `"Request URL is missing an 'http://' or 'https://' protocol"`, classified as
 `NETWORK_TIMEOUT`. This looks like a broken/proxy-less engine but is a caller bug.

@@ -100,6 +100,13 @@ class ProxyTierConfig(BaseModel):
     min_score_level_2: float = 70.0
     min_score_level_3: float = 90.0
     allow_tier2_fallback_for_tier3: bool = False
+    # Pool-health thresholds (round 34, proxy/pool_health.py) — validated-proxy
+    # counts per tier below which the tier is DEGRADED / CRITICAL. Independent
+    # of the score gates above: those decide whether one request can find a
+    # proxy, these decide whether the pool as a whole is healthy enough to
+    # keep serving requests without emptying out.
+    degraded_below_count: int = 20
+    critical_below_count: int = 5
 
 
 class PolitenessConfig(BaseModel):
@@ -150,6 +157,31 @@ class PgBouncerConfig(BaseModel):
     pool_mode: str = "transaction"
     max_client_conn: int = 500  # [CONFIRMED — BD-06]
     default_pool_size: int = 20
+
+
+class WebhookConfig(BaseModel):
+    """Retry/timeout knobs for orchestrator/webhook.py::WebhookDispatcher
+    (round 34 — previously hardcoded in the class's own __init__ defaults).
+    ops_webhook_url is a distinct, operator-level sink (proxy pool health
+    transitions, see proxy/pool_health.py) — not scoped to any one tenant's
+    job, so it lives here rather than on the per-job scrape_jobs.webhook_url
+    column."""
+
+    max_retries: int = 3
+    timeout_seconds: int = 10
+    backoff_base_seconds: float = 2.0
+    ops_webhook_url: str | None = None
+
+
+class DlqReaperConfig(BaseModel):
+    """proxy/dlq_reaper.py tuning (round 34) — auto-retries DLQ entries in
+    orchestrator/worker.py's TRANSIENT_FAILURE_CATEGORIES once the condition
+    that DLQ'd them has since cleared. max_auto_retries caps re-attempts per
+    entry so a flapping pool/circuit can't loop a job forever."""
+
+    interval_seconds: int = 60
+    max_auto_retries: int = 3
+    batch_size_per_tenant: int = 20
 
 
 class SessionRetentionConfig(BaseModel):
@@ -216,3 +248,5 @@ class AppConfig(BaseModel):
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     pgbouncer: PgBouncerConfig = Field(default_factory=PgBouncerConfig)
     session_retention: SessionRetentionConfig = Field(default_factory=SessionRetentionConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    dlq_reaper: DlqReaperConfig = Field(default_factory=DlqReaperConfig)

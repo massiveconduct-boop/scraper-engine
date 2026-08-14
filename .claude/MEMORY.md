@@ -73,27 +73,45 @@ force-loaded every session regardless of relevance).
 | `.claude/knowledge/technical-debt.md` | Complete round-by-round history — every bug found, every decision, every open thread, from project inception to the current round | Investigating whether something was already fixed; needing the full story behind a "RESOLVED (round N)" reference; auditing a specific round's changes |
 
 **Current state, for a quick orientation without opening that file:** as of
-round 29, 8 caller-facing gaps found via a user-requested end-to-end
-journey audit are closed — failed URLs no longer vanish from job results,
-`html_snapshot_url` reaches callers, job cancellation (`DELETE
-/v1/jobs/{job_id}`) and `Idempotency-Key` retry-safety both exist now,
-progress is a real per-URL fraction, 429s carry `Retry-After`. Plus two
-user-added features: a 7-day scrape-result cache (per-request bypass via
-`config_overrides.bypass_cache`) and markdown conversion generalized to
-all 3 escalation levels with self-hosted-Firecrawl support (was L1-only).
-One item — schema-driven extraction accepting multiple input formats,
-normalized to one internal plan — was explicitly deferred to a dedicated
-future round, not forgotten. Round 28 (coverage gate to 100% + 7 other
-senior-dev-review findings) still stands as the round before it. No other
-open thread right now. Full detail, as always, in `technical-debt.md`
-above.
+round 34, proxy pool exhaustion now self-heals (event-driven harvest
+trigger, not just a timer) and transient DLQ entries (`PROXY_EXHAUSTED`,
+`CIRCUIT_OPEN`) auto-retry once their condition clears; webhook delivery
+is a durable transactional outbox with a real Slack Block Kit formatter
+instead of fire-and-forget raw JSON; `JobStatusResponse.partial_failure`
+stops a job with a DLQ'd URL from reporting as a clean `COMPLETED`; the
+webhook URL is now SSRF-guarded like any scrape target. **Both open
+threads from round 34 are now resolved** (same-day knowledge audit +
+follow-up): (1) the pool-health-to-Slack path (`ops_webhook_url`) and the
+pre-existing `ProxyPoolCriticallyLow` Alertmanager rule are kept as
+deliberately independent, complementary alert paths — not merged, not
+reconciled into one — see `decisions.md` → "Keep Both Pool-Health Alert
+Paths"; (2) the coverage gate regression the audit found (97.91%,
+`webhook_sweeper.py`/`dlq_reaper.py`'s `run()` functions untested,
+`harvester_daemon.py` regressed from 100%) is fixed — 99.57% now, every
+round-34 file at 100%, only a pre-existing aarch64-sandbox-only gap
+remains (`botasaurus_requests_client.py`, not a CI blocker). See
+`technical-debt.md`'s round-34 entry for both. Rounds 30–33
+were not backfilled into `technical-debt.md` (see that file's header note)
+— only round 29 and round 34 have full narrative entries there, though
+scattered round-32/33 references exist in `architecture.md`/`decisions.md`.
+Round 29's 8 caller-facing gaps (failed URLs no longer vanishing from job
+results, `html_snapshot_url` reaching callers, job cancellation,
+`Idempotency-Key` retry-safety, real per-URL progress, `Retry-After` on
+429s) plus its 7-day scrape-result cache and generalized markdown
+conversion still stand as documented. Schema-driven extraction accepting
+multiple input formats remains explicitly deferred, not forgotten. Full
+detail, as always, in `technical-debt.md` above.
 
 ## Reference
 
 | Document | Purpose | When to read |
 |---|---|---|
-| `docs/reference/api-reference.md` | API endpoint reference (scrape, crawl, jobs, jobs/dlq, jobs cancel, health) — rewritten round 29 to match real behavior, previously described endpoints that never existed | Integrating with the API |
+| `docs/reference/api-reference.md` | API endpoint reference (scrape, crawl, jobs, jobs/dlq, jobs cancel, health) — rewritten round 29 to match real behavior, previously described endpoints that never existed; round 34 added `partial_failure`, `auto_retry_count`, webhook SSRF-guard, and corrected the non-retryable-categories claim (proxy_exhausted/circuit_open are now auto-retried) | Integrating with the API |
 | `.archive/evidence/auditable-verification-report.md` | Auditable report from round 4 | Historical reference |
+| `.archive/directive/*.md` (11 files, uncataloged individually) | Original task directives issued per round (round 6 through round 14) — the ask, not the outcome; outcomes are the `evidence`/`closure` files above and `technical-debt.md` | Understanding what was originally requested for a given round, distinct from what was delivered |
+| `.archive/closure/*.md` (7 more beyond the rows above, uncataloged individually — round-6 closure variants: `-closure`, `-final-admission`, `-final-report`, `-final-response`, `-report`, `-report-complete`, `-closing-items`; plus `round-8-closure-directive.md`, `final-round-report.md`, `production-readiness-report.md`) | Round-6 closure went through several iterations before `ROUND-6-DEFINITIVE.md` (cataloged above) became the actual consolidated version — these are its drafts/precursors | Only if `ROUND-6-DEFINITIVE.md` itself references one by name and you need the precursor's exact wording |
+| `.archive/evidence/*.md` (12 more beyond the rows above, uncataloged individually — round 6/8/10/10.02/12/12.1-12.4 evidence, `auditable-report-review-round3.md`, `proxybroker2-resolution-report.md`, `resolved-issues-report.md`) | Per-round raw evidence for rounds not otherwise summarized elsewhere in this table | Auditing a specific early round in detail; `technical-debt.md` is the summarized version, these are the underlying raw evidence |
+| `.archive/other/*.md` (5 files, uncataloged individually — `CLAUDE.original.md`, `node_real_js_verify.js`, `round-10.01-mypy-ratchet.md`, `round-7-implementation-plan.md`, `round-13-implementation-plan.md`) | Miscellaneous — a pre-rewrite CLAUDE.md snapshot, a JS verification script, and two rounds' implementation plans | Rarely — historical curiosity or if a specific old plan's original scope is in question |
 
 ## Update Policy
 

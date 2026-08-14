@@ -87,6 +87,51 @@ class TestWorker:
         worker._dlq.enqueue.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_process_job_partial_failure_flagged_not_masked_as_clean_success(
+        self, tenant, worker
+    ):
+        """round 34 regression test — a job with one URL succeeding and one
+        DLQ'd (PROXY_EXHAUSTED) must report status=COMPLETED (existing
+        contract: "COMPLETED" means "the job ran to completion", not "every
+        URL succeeded") AND partial_failure=True, so a caller/webhook can't
+        mistake this for a clean run. Before this round, JobStatusResponse
+        had no way to distinguish the two — this is the exact bug the
+        investigation surfaced."""
+        success = FetchResult(
+            url="http://good.example.com", success=True, level_used=1, duration_ms=10
+        )
+        exhausted = FetchResult(
+            url="http://bad.example.com",
+            success=False,
+            level_used=1,
+            duration_ms=10,
+            failure_category=FailureCategory.PROXY_EXHAUSTED,
+            error_message="Proxy pool exhausted",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[success, exhausted])
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://good.example.com"), HttpUrl("http://bad.example.com")]
+        )
+
+        response = await worker.process_job(tenant, "job-partial", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert response.partial_failure is True
+
+    @pytest.mark.asyncio
+    async def test_process_job_full_success_has_no_partial_failure(self, tenant, worker):
+        """Companion to the regression test above — a clean run must not be
+        flagged, or every caller would have to start ignoring the flag."""
+        result = FetchResult(url="http://example.com", success=True, level_used=1, duration_ms=10)
+        worker._fetch_url = AsyncMock(return_value=result)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-clean", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert response.partial_failure is False
+
+    @pytest.mark.asyncio
     async def test_process_job_escalation(self, tenant, worker):
         """L1 fails → escalates to L2 → succeeds."""
         fail_l1 = FetchResult(
@@ -373,9 +418,7 @@ class TestWorker:
         )
 
     @pytest.mark.asyncio
-    async def test_process_job_falls_back_to_local_markdown_without_firecrawl(
-        self, tenant, worker
-    ):
+    async def test_process_job_falls_back_to_local_markdown_without_firecrawl(self, tenant, worker):
         """Without Firecrawl configured (FIRECRAWL_API_KEY/FIRECRAWL_BASE_URL
         both unset — the common case, round 33), FetchResult.markdown used
         to stay None entirely, leaving a caller with only `extracted`
@@ -768,17 +811,13 @@ class TestExtractionWiring:
         assert response.results[0].extracted["schema"] == schema
 
     @pytest.mark.asyncio
-    async def test_uses_extraction_engine_when_configured_and_schema_provided(
-        self, tenant, worker
-    ):
+    async def test_uses_extraction_engine_when_configured_and_schema_provided(self, tenant, worker):
         """When EXTRACTION_ENGINE_BASE_URL is configured (self._extraction_engine
         is not None) and a real schema is supplied, extraction-engine's real
         result is used instead of AdaptiveSelector's -- and the two new
         ConfigOverrides flags reach the client call."""
         worker._extraction_engine = AsyncMock()
-        worker._extraction_engine.extract.return_value = {
-            "fields": {"price": {"value": "9.99"}}
-        }
+        worker._extraction_engine.extract.return_value = {"fields": {"price": {"value": "9.99"}}}
         result = FetchResult(
             url="http://example.com",
             success=True,

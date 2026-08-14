@@ -138,6 +138,47 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Round 34 — drains storage/webhook_outbox.py so a failed/crashed webhook
+  # delivery gets retried by a process that outlives the rq work-horse that
+  # originally attempted it. Same shape as proxy-harvester above.
+  webhook-sweeper:
+    build: .
+    command: python -m scraper_engine.orchestrator.webhook_sweeper
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+
+  # Round 34 — auto-retries DLQ entries in worker.py's
+  # TRANSIENT_FAILURE_CATEGORIES (PROXY_EXHAUSTED, CIRCUIT_OPEN) once the
+  # proxy pool or circuit breaker recovers. Same shape as proxy-harvester
+  # above; needs the rq producer connection too (re-enqueues retried jobs).
+  dlq-reaper:
+    build: .
+    command: python -m scraper_engine.proxy.dlq_reaper
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+
   postgres:
     image: postgres:16-alpine
     environment:

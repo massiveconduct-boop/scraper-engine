@@ -73,12 +73,11 @@ Every report must have: Header Metadata (date, spec ref), Environment & Infrastr
 - "Documented as limitation" is NOT closure — it's a placeholder.
 
 ### mypy Baseline Management
-- `tools/mypy-baseline.txt` contains known type findings (23 entries). Committed to repo.
+- `tools/mypy-baseline.txt` is EMPTY since round 18 (ratcheted to zero) — mypy `--strict` is fully clean, any error at all fails the build now. The mechanism below still runs (an empty baseline is a valid baseline), it just has nothing left in it to diff against.
 - CI ratchet step diffs current mypy output (`grep "^error:"` lines) against baseline via `comm -13`.
-- Any NEW error beyond baseline fails the build. Known findings are advisory.
+- Any NEW error beyond baseline fails the build.
 - `mypy==2.3.0` pinned in `pyproject.toml` — no version drift between local and CI.
-- PRs touching files in the baseline should resolve those entries, shrinking the baseline over time.
-- Local and CI produce different finding counts due to different stub resolution (pydantic, starlette versions). Baseline is CI-specific.
+- Local and CI produce different finding counts due to different stub resolution (pydantic, starlette versions) — relevant again only if the baseline is ever reopened.
 
 ### Banned Patterns
 - Paraphrased commands (`python -c "harvest + pool query"` instead of actual code)

@@ -39,6 +39,33 @@ LEVELS = [1, 2, 3]
 # reference an html_snapshot_url whose S3 object has already expired.
 CACHE_TTL_DAYS = 7
 
+# Failure taxonomy split (round 34) — both sets still land in the DLQ (still
+# visible, still auditable via GET /v1/jobs/{id}/dlq), but only TRANSIENT
+# categories are eligible for proxy/dlq_reaper.py's auto-retry. PERMANENT
+# categories describe conditions that retrying can never fix (a blocked
+# SSRF target stays blocked, an exceeded quota doesn't refill itself mid-job,
+# a dead host doesn't start resolving) — auto-retrying those would just burn
+# proxy/browser budget for a guaranteed repeat failure. TRANSIENT categories
+# describe conditions that resolve once *external* state changes: the proxy
+# pool refills (proxy/pool_health.py's recovered transition) or a circuit
+# breaker's cooldown expires — previously PROXY_EXHAUSTED was grouped with
+# the permanent set even though it's transient by nature, so a DLQ'd job
+# never got retried until a human noticed and hit the retry endpoint by hand.
+PERMANENT_FAILURE_CATEGORIES = frozenset(
+    {
+        FailureCategory.SSRF_BLOCKED,
+        FailureCategory.QUOTA_EXCEEDED,
+        FailureCategory.HOST_UNREACHABLE,
+    }
+)
+TRANSIENT_FAILURE_CATEGORIES = frozenset(
+    {
+        FailureCategory.PROXY_EXHAUSTED,
+        FailureCategory.CIRCUIT_OPEN,
+    }
+)
+DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
+
 
 class Worker:
     """RQ worker: dequeues jobs, drives the escalation state machine."""
@@ -295,14 +322,7 @@ class Worker:
                     break
                 else:
                     await self._circuit_breaker.record_failure(domain)
-                    if result.failure_category in (
-                        FailureCategory.SSRF_BLOCKED,
-                        FailureCategory.QUOTA_EXCEEDED,
-                        FailureCategory.PROXY_EXHAUSTED,
-                        # Escalating a dead/unresolvable host is futile — a browser
-                        # can't resolve DNS the HTTP client couldn't (round 15).
-                        FailureCategory.HOST_UNREACHABLE,
-                    ):
+                    if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
                         await self._dlq.enqueue(
                             tenant_id,
                             job_id,
@@ -338,25 +358,28 @@ class Worker:
                 if on_result is not None:
                     await on_result(exhausted_result)
 
+        any_success = any(r.success for r in results)
         status = (
             JobStatus.CANCELLED
             if cancelled
             else (
                 JobStatus.COMPLETED
                 if not errors
-                else (
-                    JobStatus.FAILED
-                    if not any(r.success for r in results)
-                    else JobStatus.COMPLETED
-                )
+                else (JobStatus.FAILED if not any_success else JobStatus.COMPLETED)
             )
         )
+        # partial_failure: status says COMPLETED but it isn't a clean run —
+        # some URLs DLQ'd while others succeeded. Kept as a boolean flag
+        # rather than a new JobStatus value (see JobStatusResponse docstring)
+        # so a caller polling status can't mistake this for full success.
+        partial_failure = bool(errors) and any_success
         return JobStatusResponse(
             job_id=job_id,
             status=status,
             progress=1.0,
             results=results if results else None,
             error="; ".join(errors) if errors else None,
+            partial_failure=partial_failure,
         )
 
     async def _is_cancelled(self, tenant_id: TenantId, job_id: str) -> bool:

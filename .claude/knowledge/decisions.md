@@ -1225,3 +1225,282 @@ function.
 round (`services/firecrawl_client.py` — `FIRECRAWL_BASE_URL` for
 self-hosted instances, API key no longer required) but that's a separate,
 independent decision from where the call site lives.
+
+---
+
+## Decision: Debounced Redis Kick + Pub/Sub, Not Pub/Sub Alone
+
+**Date:** 2026-08-14 | **Round:** 34
+
+**What:** `ProxyManager.get_proxy`'s exhaustion path does a debounced
+`SET proxy:harvest:kick NX EX 30` on Redis; only the caller that actually
+creates the key (i.e. no kick already pending) also `PUBLISH`es to
+`proxy:events:exhausted`. `proxy/harvester_daemon.py` reacts via a ~5s-poll
+watcher task that checks the *key*, not a pub/sub subscriber.
+
+**Why:** Redis pub/sub is at-most-once and has no replay — a message
+published while the harvester daemon is mid-restart, mid-deploy, or
+momentarily busy is gone forever, and the pool would then wait out the
+full steady-state timer (up to 10 minutes) despite a real signal having
+fired. A poll against a durable key can't miss a signal that way: the key
+persists (30s TTL) regardless of whether the daemon was listening at the
+exact publish instant. The `PUBLISH` is kept anyway as a low-latency path
+for the common case (daemon already running, not mid-restart) — the
+key-poll is the reliability backstop, not a redundant leftover.
+
+**Alternatives considered:**
+- Pub/sub only, no key. Rejected — the missed-restart failure mode above
+  is exactly the class of bug this whole round exists to close (proxy
+  pool not self-healing); a signal mechanism with a silent-miss window
+  would just relocate the bug, not fix it.
+- Poll the key only, no pub/sub. Considered acceptable (the key alone is
+  sufficient for correctness — the watcher would catch it within one 5s
+  poll interval regardless) but keeping `PUBLISH` costs nothing and
+  shaves a few seconds of latency in the common case, so both stayed.
+
+**Status:** Active. Same pattern reused deliberately for
+`proxy/dlq_reaper.py`'s eligibility checks — poll current
+state (`pool_health.py::current_state`, `CircuitBreaker.state()`) rather
+than wiring a push-only "pool recovered" event, for the identical
+missed-signal-on-restart reason.
+
+---
+
+## Decision: `webhook_dispatch.py` Split From `orchestrator/tasks.py`
+
+**Date:** 2026-08-14 | **Round:** 34
+
+**What:** The durable webhook-delivery function
+(`enqueue_and_deliver_webhook_event`) lives in a new
+`orchestrator/webhook_dispatch.py`, not inside `orchestrator/tasks.py`
+where the per-job caller (`_dispatch_job_webhook`) lives.
+
+**Why:** `tasks.py` runs bootstrap side effects at *module import time* —
+`load_config()`, `bootstrap_observability()`, `configure_budget()` —
+meant to execute exactly once per rq work-horse process. `proxy/
+harvester_daemon.py`'s pool-health cycle needs the same durable-dispatch
+function for its own ops-channel alerts (Phase C/B of this round), but
+that daemon is a different long-lived process with its own
+`bootstrap_observability()` call already in its `run()`. Importing
+`tasks.py` from `harvester_daemon.py` — even a deferred, in-function
+import — would still execute `tasks.py`'s module-level code on first
+import, double-bootstrapping observability/tracing/budget semaphores
+inside the proxy daemon process with a *different* config object than the
+one it already initialized with. Splitting the shared function into a
+module with no import-time side effects removes the hazard entirely
+rather than working around it (e.g. with a guard flag).
+
+**Alternatives considered:**
+- Guard `tasks.py`'s module-level bootstrap with an `if not
+  _already_bootstrapped` flag so a second import is a no-op. Rejected —
+  papers over the real issue (two unrelated processes sharing one
+  module's import-time side effects) instead of removing the coupling,
+  and the flag itself would need to be process-global state that's easy
+  to get wrong under module-reload edge cases (tests, `importlib.reload`).
+- Duplicate the dispatch function in `harvester_daemon.py`. Rejected —
+  the whole point of `webhook_outbox`/Slack-formatting/retry-backoff is
+  one delivery mechanism for both job events and pool-health events (see
+  the Phase C summary in `technical-debt.md`'s round-34 entry); a
+  duplicate would drift the moment either copy changed.
+
+**Status:** Active.
+
+---
+
+## Decision: DLQ Auto-Retry Eligibility Reads Pure State, Never Mutates It
+
+**Date:** 2026-08-14 | **Round:** 34
+
+**What:** `proxy/dlq_reaper.py`'s `CIRCUIT_OPEN` eligibility check calls
+`CircuitBreaker.state(domain)` (a pure Redis read) instead of
+`CircuitBreaker.allow_request(domain)` (the method the real fetch path
+uses, which *transitions* an `OPEN` circuit to `HALF_OPEN` once its
+cooldown has elapsed and treats that as permission to probe).
+
+**Why:** `allow_request()` is written for exactly one real probe attempt
+to consume — a `HALF_OPEN` circuit closes on that probe's success or
+re-opens on its failure. The reaper isn't a real fetch attempt; it's
+bookkeeping deciding whether to re-enqueue a job that will *itself* make
+real fetch attempts later, through the normal `Worker.process_job` path,
+which already calls `allow_request()` correctly. If the reaper's
+eligibility check called `allow_request()` instead, it would silently
+consume the one HALF_OPEN probe slot meant for real traffic — a domain
+recovering from an open circuit could have its single probe opportunity
+eaten by the reaper's polling cycle instead of an actual scrape attempt,
+with no observable difference from the reaper's point of view but a real
+cost to the fetch path's own recovery logic.
+
+**Alternatives considered:**
+- Call `allow_request()` and treat any `True` result (including the
+  HALF_OPEN-probing case) as eligible. Rejected for the probe-consumption
+  reason above — also would have made the reaper strictly more
+  "optimistic" than the fetch path itself, retrying jobs the breaker
+  hasn't actually confirmed healthy yet.
+
+**Status:** Active. `PROXY_EXHAUSTED` eligibility follows the same
+pure-read principle for consistency — `pool_health.py::current_state()`
+reads the last-persisted per-tier state without triggering a fresh
+Postgres recompute, which is `PoolHealthMonitor.check()`'s job on its own
+schedule, not the reaper's.
+
+---
+
+## Decision: `partial_failure` as an Additive Boolean, Not a New `JobStatus`
+
+**Date:** 2026-08-14 | **Round:** 34
+
+**What:** `JobStatusResponse` gained `partial_failure: bool = False`
+instead of a new `JobStatus.COMPLETED_WITH_ERRORS` enum value. `status`
+itself keeps its existing five values and existing semantics unchanged.
+
+**Why:** The bug being fixed (a job with a DLQ'd URL alongside a
+succeeded one reports plain `COMPLETED`, indistinguishable from a fully
+clean run) needs a machine-readable signal, but `JobStatus` is a DB CHECK-
+constraint enum (`migrations/versions/001_initial.py`) with unknown fan-
+out across every existing consumer that branches on `status.value ==
+"COMPLETED"` — the webhook payload, any external integration polling
+`GET /v1/jobs/{id}`, and this codebase's own `orchestrator/tasks.py`
+metric-status bucketing (`"completed" if status == JobStatus.COMPLETED
+else "failed"`). A new enum value changes what "COMPLETED" branches match
+against everywhere without touching those call sites' logic — the classic
+enum-widening hazard. An additive field carries the same information with
+zero blast radius: existing `status`-only consumers keep working exactly
+as before, and a consumer that cares about the distinction now has an
+explicit, unambiguous place to look instead of having to enumerate a
+wider set of "successful" enum values forever after.
+
+**Alternatives considered:**
+- `JobStatus.COMPLETED_WITH_ERRORS` new enum value. Rejected for the
+  blast-radius reason above.
+- Infer partial failure from `error` being non-null while `status ==
+  COMPLETED`. Rejected — `error` is a semicolon-joined string built for
+  human reading, not a stable contract; inferring structured meaning from
+  its presence/absence is fragile compared to a dedicated field, and ties
+  future changes to `error`'s formatting to this unrelated concern.
+
+**Status:** Active. Computed identically in two places —
+`Worker.process_job` (in-memory, the value a webhook payload is built
+from) and `api/routes.py::get_job` (reconstructed from `scrape_results`
+rows on every poll) — because they build `JobStatusResponse` from
+different sources and don't share a code path; kept in sync by using the
+exact same formula (`bool(errors) and any(r.success for r in results)`)
+in both, not by extracting a shared helper across two otherwise-unrelated
+functions.
+
+---
+
+## Decision: extraction-engine Integration Is Opt-In and Fails Soft
+
+**Date:** 2026-08-03 | **Round:** pre-34 (ported from `.wolf/cerebrum.md`'s
+Decision Log during the round-34 knowledge audit — recorded there at the
+time but never mirrored here, the project's own authoritative WHY-log;
+see the "OpenWolf ↔ `.claude/knowledge/` Division of Labor" note at the
+end of this file for why that gap existed and how it's closed going
+forward)
+
+**What:** `Worker.process_job` only calls `services/
+extraction_engine_client.py` when `EXTRACTION_ENGINE_BASE_URL` is set AND
+a real `extraction_schema` was supplied on the request. If the client
+call fails for any reason, it never raises — only returns `None` — and
+the job falls back to `AdaptiveSelector` rather than the extraction being
+lost.
+
+**Why:** Mirrors `services/firecrawl_client.py`'s already-established
+contract in this codebase: an external enrichment service is an
+enrichment, not a hard dependency. Chosen over inventing a new
+error-handling shape for this one integration — one consistent pattern
+for "optional external service that improves output when configured/
+reachable, never blocks the pipeline when it isn't" across both
+integrations, rather than two different failure philosophies a reader
+has to learn separately.
+
+**Alternatives considered:**
+- A distinct error-handling/retry shape specific to extraction-engine
+  (e.g. raising and letting the caller decide). Rejected — no other part
+  of this codebase treats an optional external enrichment service as a
+  hard dependency, and doing so here would be the one inconsistent case.
+
+**Status:** Active.
+
+---
+
+## OpenWolf ↔ `.claude/knowledge/` Division of Labor (Round 34)
+
+**Context:** A round-34 knowledge audit found `.wolf/cerebrum.md` (a
+separate, OpenWolf-tool-maintained memory file, auto-updated and
+`@`-imported into every session via `CLAUDE.md`) has its own "Decision
+Log" section, explicitly scoped to the same WHY/alternatives/tradeoffs
+purpose as this file. They had already drifted: the extraction-engine
+decision above existed only in `cerebrum.md` for 11 days before this
+audit caught it and ported it here.
+
+**Going forward:** `cerebrum.md`'s Decision Log is OpenWolf's own
+session-memory mechanism — do not edit it by hand (its own header says
+so; `openwolf scan`/the OpenWolf daemon own its lifecycle) and do not
+try to merge the two systems into one. Instead: any decision logged to
+`cerebrum.md`'s Decision Log that has real lasting architectural
+consequence (not a one-off environment gotcha — those belong in
+`cerebrum.md`'s separate "Do-Not-Repeat" section and are fine to stay
+OpenWolf-only) should ALSO be written here, in this file, in this file's
+format, in the same session it's made. `cerebrum.md` stays the fast
+session-local capture; this file stays the permanent, cross-referenced,
+project-authoritative record `CLAUDE.md`'s Navigation section actually
+points readers to. A future knowledge-maintainer/audit pass should
+re-check `cerebrum.md`'s Decision Log against this file's coverage
+periodically, the same way this round did.
+
+---
+
+## Decision: Keep Both Pool-Health Alert Paths — Intentional, Not Duplicate
+
+**Date:** 2026-08-14 | **Round:** 34 (follow-up, resolved during the
+round-34 knowledge audit)
+
+**What:** Both the pre-existing `ProxyPoolCriticallyLow` Prometheus/
+Alertmanager rule (`monitoring/alerts/prometheus_rules.yml` →
+`SLACK_WEBHOOK_URL`) and the new `proxy/pool_health.py` →
+`config.webhook.ops_webhook_url` event-driven path stay. `config/
+base.yaml` now documents the relationship and recommends pointing
+`ops_webhook_url` at a distinct Slack channel from `SLACK_WEBHOOK_URL`.
+
+**Why:** Investigated as an open thread rather than left unresolved. The
+two paths fail independently, which is the actual argument for keeping
+both rather than picking one: Alertmanager's rule needs Prometheus
+scraping + a 5-minute sustained-condition window and goes dark if this
+app's own Redis/Postgres/webhook-outbox pipeline is what broke;
+`pool_health.py`'s path needs that same app pipeline healthy and goes
+dark if Prometheus/Alertmanager themselves are misconfigured or down.
+Each covers the other's blind spot. `pool_health.py`'s path also adds
+information Alertmanager's rule structurally can't — per-tier state
+(Alertmanager's rule is pool-wide only) and the specific old→new
+transition, not just "below threshold." Since `ops_webhook_url` defaults
+to unset, there was zero live duplication in production before this
+decision — the overlap was a latent risk (both firing to the same
+channel if an operator configured them identically), not an active one,
+which is why the resolution is operator guidance + documentation rather
+than a code change to either path.
+
+**Alternatives considered:**
+- Retire the Alertmanager rule, rely solely on the new path. Rejected —
+  loses the "keeps working when this app's own delivery pipeline is the
+  thing that's broken" property, which is exactly the failure mode a
+  proxy-pool-health alert most needs to survive.
+- Retire the new `pool_health.py`/`ops_webhook_url` path, rely solely on
+  Alertmanager. Rejected — this was round 34's actual fix for the
+  original user complaint ("why doesn't Slack tell me the pool is
+  exhausted") and has properties (per-tier granularity, no 5-minute
+  sustained-condition delay, survives Prometheus/Alertmanager outages)
+  the Alertmanager rule doesn't have; removing it would reopen the
+  original gap for those specific failure modes.
+- Merge into one mechanism (e.g. have `pool_health.py` write into the
+  same `proxy_pool_validated_count` gauge Alertmanager already watches,
+  and drop the webhook-outbox path entirely). Rejected — collapses back
+  to a single point of failure (Prometheus/Alertmanager), the exact
+  property the "keep both" reasoning above argues against; the marginal
+  engineering cost of two independent paths is worth the resilience for
+  a signal this operationally important.
+
+**Status:** Active. Revisit only if operator feedback shows the two
+paths cause real double-alert confusion in practice despite the
+distinct-channel guidance — that would be evidence-based grounds to
+reconsider, not a reason to preemptively merge them now.

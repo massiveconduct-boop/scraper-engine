@@ -59,7 +59,7 @@ Submit URLs for scraping. Returns immediately with a `job_id` for async polling.
 | `config_overrides.respect_robots` | bool | no | false | Respect robots.txt |
 | `config_overrides.bypass_cache` | bool | no | false | Skip the cache reuse check below and force a fresh scrape |
 | `async_mode` | bool | no | true | Async job processing |
-| `webhook` | string | no | — | POST callback URL on completion |
+| `webhook` | string | no | — | POST callback URL on completion. SSRF-checked the same way scrape target URLs are — a webhook pointed at a private/internal address is rejected with `403` before the job is created, it is not silently dropped |
 
 **Caching:** before actually fetching a URL, a successful scrape of that
 exact URL for this tenant within the last 7 days is reused instead of
@@ -91,7 +91,7 @@ as any other per-URL failure, not a silent drop.
 | Status | Condition |
 |---|---|
 | `400` / `422` | Validation error (bad body shape, >500 URLs) |
-| `403` | Every URL in the batch was SSRF blocked (private/internal IP) |
+| `403` | Every URL in the batch was SSRF blocked (private/internal IP), or the `webhook` URL itself was SSRF blocked (rejects the whole request — there's only one webhook, unlike the per-URL batch handling above) |
 | `413` | Request body > 1 MB |
 | `429` | Quota exceeded or rate limit exceeded (100 req/min per IP) — carries a `Retry-After` header |
 
@@ -148,9 +148,18 @@ a partial failure never silently disappears. `progress` is a real fraction
       "fetched_at": "2026-07-21T12:00:00Z"
     }
   ],
-  "error": null
+  "error": null,
+  "partial_failure": false
 }
 ```
+
+**`partial_failure`:** `true` when `status` is `COMPLETED` but at least
+one URL in this job landed in the dead-letter queue alongside a
+succeeded one — `COMPLETED` alone only ever meant "at least one URL
+succeeded," not "every URL succeeded." Check this field, not just
+`status`, before treating a job as a fully clean run — the same value is
+included in the webhook payload for `job.completed`/`job.partial_failure`
+notifications.
 
 **What you actually get back — 3 distinct fields, none of them raw HTML
 inline:**
@@ -175,7 +184,7 @@ inline:**
 |---|---|
 | `PENDING` | Job enqueued, not yet processing |
 | `PROCESSING` | Worker is actively fetching |
-| `COMPLETED` | At least one URL succeeded |
+| `COMPLETED` | At least one URL succeeded — check `partial_failure` to know whether *every* URL did |
 | `FAILED` | No URL succeeded |
 | `CANCELLED` | Job cancelled via `DELETE /v1/jobs/{job_id}` |
 | `DEAD_LETTER` | Reserved for future use — not currently set by any code path |
@@ -186,7 +195,8 @@ inline:**
 
 Raw dead-letter detail for one job — the same failed URLs already appear in
 `GET /v1/jobs/{job_id}`'s `results`, but this endpoint additionally exposes
-`enqueued_at`/`dead_at` timestamps from the dead-letter queue.
+`enqueued_at`/`dead_at` timestamps from the dead-letter queue, plus
+`auto_retry_count` for entries in a self-healing category (see below).
 
 **Response:** `200 OK`
 ```json
@@ -197,11 +207,21 @@ Raw dead-letter detail for one job — the same failed URLs already appear in
     "failure_category": "proxy_exhausted",
     "error_message": "All fetch levels exhausted",
     "level_attempted": 3,
+    "auto_retry_count": 0,
     "enqueued_at": "2026-07-21T12:00:00Z",
     "dead_at": "2026-07-21T12:00:05Z"
   }
 ]
 ```
+
+**Auto-retry:** `proxy_exhausted` and `circuit_open` entries are
+automatically re-enqueued once the condition that caused them clears (the
+proxy pool tier recovers, or the circuit breaker for that domain closes)
+— up to a configured cap, tracked in `auto_retry_count`. A retried job
+keeps its original `job_id`; poll `GET /v1/jobs/{job_id}` to see it move
+through `PENDING`/`PROCESSING` again rather than watching this endpoint.
+Every other `failure_category` (`ssrf_blocked`, `quota_exceeded`,
+`host_unreachable`) is permanent and never auto-retried.
 
 ---
 
@@ -269,7 +289,12 @@ The system tries 3 levels of escalating intensity:
 | L2 | Botasaurus + Camoufox | Anonymous+ (≥ 70) | 40s | Yes |
 | L3 | Camoufox only | Elite (≥ 90) | 60s | Yes |
 
-Non-retryable failures (SSRF blocked, quota exceeded, proxy exhausted, a
-dead/unresolvable host) skip further escalation and go directly to the
-dead-letter queue — but still appear in `GET /v1/jobs/{job_id}`'s `results`
-with their real `failure_category`/`error_message`, not silently dropped.
+A failure that skips further escalation (SSRF blocked, quota exceeded,
+proxy exhausted, circuit open, a dead/unresolvable host) goes directly to
+the dead-letter queue — but still appears in `GET /v1/jobs/{job_id}`'s
+`results` with its real `failure_category`/`error_message`, not silently
+dropped. Of these, `proxy_exhausted` and `circuit_open` are transient —
+the DLQ entry is automatically retried once the underlying condition
+clears (see `GET /v1/jobs/{job_id}/dlq` above); `ssrf_blocked`,
+`quota_exceeded`, and `host_unreachable` are permanent and never
+auto-retried.

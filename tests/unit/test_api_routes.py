@@ -160,9 +160,7 @@ async def test_scrape_idempotency_key_hit_returns_existing_job_without_new_work(
         "tenant": "system",
     }
     queue.enqueue.assert_not_called()
-    insert_calls = [
-        c for c in pg.execute.await_args_list if "INSERT INTO scrape_jobs" in c.args[1]
-    ]
+    insert_calls = [c for c in pg.execute.await_args_list if "INSERT INTO scrape_jobs" in c.args[1]]
     assert len(insert_calls) == 0
 
 
@@ -438,6 +436,75 @@ async def test_crawl_ssrf_blocked_url_returns_403(wired_scrape_deps, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_scrape_webhook_pointed_at_private_address_returns_403(wired_scrape_deps):
+    """round 34 — the webhook URL is a POST target the worker reaches out to
+    unattended, same class of SSRF risk as a scrape target, but nothing
+    validated it before this. Target URL is fine; only the webhook is bad —
+    must still 403 the whole request (unlike target-URL blocking, there's
+    only one webhook, so partial-partition doesn't apply)."""
+    from scraper_engine.core.exceptions import SSRFBlockedError
+    from scraper_engine.core.models import ScrapeRequest
+
+    async def _validate(url: str) -> None:
+        if "169.254" in url:
+            raise SSRFBlockedError(url=url, host="169.254.169.254", network="169.254.0.0/16")
+
+    import scraper_engine.core.ssrf_guard as ssrf_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssrf_module.SSRFGuard, "validate", AsyncMock(side_effect=_validate))
+        request = ScrapeRequest(urls=["http://example.com"], webhook="http://169.254.169.254/steal")
+
+        with pytest.raises(HTTPException) as ei:
+            await scrape(request, x_api_key="sk-admin")
+        assert ei.value.status_code == 403
+        assert "webhook" in str(ei.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_scrape_webhook_pointed_at_public_url_is_allowed(wired_scrape_deps):
+    """Companion to the block test above — a normal (e.g. Slack) webhook URL
+    must not be rejected by the new guard."""
+    from scraper_engine.core.models import ScrapeRequest
+
+    pg, redis, queue = wired_scrape_deps
+    request = ScrapeRequest(
+        urls=["http://example.com"], webhook="https://hooks.slack.com/services/T00/B00/XXX"
+    )
+
+    resp = await scrape(request, x_api_key="sk-admin")
+
+    queue.enqueue.assert_called_once()
+    assert resp["job_id"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_webhook_pointed_at_private_address_returns_403(wired_scrape_deps):
+    """Same guard, same rationale, on the /v1/crawl path (round 34)."""
+    from scraper_engine.core.exceptions import SSRFBlockedError
+    from scraper_engine.core.models import CrawlRequest
+
+    async def _validate(url: str) -> None:
+        if "169.254" in url:
+            raise SSRFBlockedError(url=url, host="169.254.169.254", network="169.254.0.0/16")
+
+    import scraper_engine.core.ssrf_guard as ssrf_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssrf_module.SSRFGuard, "validate", AsyncMock(side_effect=_validate))
+        request = CrawlRequest(
+            spider_name="titles",
+            start_urls=["http://example.com"],
+            webhook="http://169.254.169.254/steal",
+        )
+
+        with pytest.raises(HTTPException) as ei:
+            await crawl(request, x_api_key="sk-admin")
+        assert ei.value.status_code == 403
+        assert "webhook" in str(ei.value.detail).lower()
+
+
+@pytest.mark.asyncio
 async def test_crawl_partial_ssrf_block_drops_blocked_seed_only(wired_scrape_deps):
     """Same round-33 fix as scrape, but ScrapyAdapter has no per-URL SSRF
     re-check of its own (unlike the L1->L2->L3 pipeline), so the blocked
@@ -666,12 +733,14 @@ async def test_get_job_dlq_returns_entries(wired_deps, monkeypatch):
 
     jid = str(uuid.uuid4())
     entry = DeadLetterEntry(
+        id=1,
         job_id=jid,
         tenant_id="system",
         url="http://example.com",
         failure_category=FailureCategory.PROXY_EXHAUSTED,
         error_message="All fetch levels exhausted",
         level_attempted=3,
+        auto_retry_count=0,
         enqueued_at=datetime.now(UTC),
         dead_at=datetime.now(UTC),
     )

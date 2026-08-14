@@ -153,6 +153,13 @@ class JobStatusResponse(BaseModel):
     progress: float | None = None
     results: list[FetchResult] | None = None
     error: str | None = None
+    # True when status=COMPLETED but at least one URL DLQ'd rather than
+    # succeeding (round 34) — status alone conflates "everything worked"
+    # with "some URLs permanently/transiently failed but at least one
+    # succeeded"; this field disambiguates without changing JobStatus's
+    # existing values (avoids breaking any `status.value == "COMPLETED"`
+    # check already relying on today's enum).
+    partial_failure: bool = False
 
 
 class DeadLetterEntryResponse(BaseModel):
@@ -164,5 +171,8 @@ class DeadLetterEntryResponse(BaseModel):
     failure_category: FailureCategory
     error_message: str
     level_attempted: int
+    # How many times proxy/dlq_reaper.py has auto-retried this entry (round
+    # 34) — 0 for permanent-category entries, which are never auto-retried.
+    auto_retry_count: int = 0
     enqueued_at: datetime
     dead_at: datetime

@@ -6,7 +6,9 @@
 **Keywords:** design invariants, escalation ladder, proxy pipeline, browser
 pool, PgBouncer, API routing, SSRF enforcement, fetcher construction,
 CAPTCHA solving, observability, tracing, botasaurus, metrics, data flow,
-repository layout, src layout.
+repository layout, src layout, webhook outbox, webhook sweeper, Slack
+notifications, proxy pool health, proxy self-healing, DLQ auto-retry,
+partial_failure.
 **Dependencies:** none — describes the system as built; cross-references
 `decisions.md` for WHY and `technical-debt.md` for full round history.
 **Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`, `.claude/knowledge/technical-debt.md`
@@ -52,6 +54,28 @@ readable via `GET /v1/jobs/{job_id}/dlq`), which is a different thing from
 the job's own terminal `status` (which lands on `FAILED` if no URL in the
 job succeeded, `COMPLETED` if at least one did — see `Worker.process_job`'s
 status derivation). Earlier versions of this doc conflated the two.
+
+**`COMPLETED` no longer implies "every URL succeeded" (round 34):**
+`JobStatusResponse.partial_failure` (bool) is `True` when `status ==
+COMPLETED` but at least one URL landed in the DLQ alongside a success —
+computed identically in `Worker.process_job` and
+`api/routes.py::get_job`. A webhook/poller must check this flag, not just
+`status`, to know whether a "COMPLETED" job was actually clean. See
+`decisions.md` → "`partial_failure` as an Additive Boolean" for why this
+is a field, not a new `JobStatus` value.
+
+**DLQ entries are no longer all permanent (round 34):** `dead_letter_queue`
+rows split into `PERMANENT_FAILURE_CATEGORIES` (`SSRF_BLOCKED`,
+`QUOTA_EXCEEDED`, `HOST_UNREACHABLE`) and `TRANSIENT_FAILURE_CATEGORIES`
+(`PROXY_EXHAUSTED`, `CIRCUIT_OPEN`) — both sets defined in
+`orchestrator/worker.py`. Transient entries are auto-retried by
+`proxy/dlq_reaper.py` once the condition that caused them clears (proxy
+pool tier back to HEALTHY, circuit breaker back to CLOSED), up to
+`config.dlq_reaper.max_auto_retries` attempts (`dead_letter_queue.
+auto_retry_count`). `storage/dlq.py::enqueue` UPSERTs on `(job_id, url)`
+so a repeat failure updates the same row instead of resetting the
+counter via a fresh insert. See "Notifications & Proxy Self-Healing"
+below for the full round-34 picture.
 
 **Per-URL loop order (round 29), top to bottom inside `Worker.process_job`:**
 1. Cooperative cancellation check (`_is_cancelled` — one Postgres point
@@ -124,6 +148,71 @@ the quota charge, `scrape_jobs` is queried for a live (not `FAILED`/
 as-is — no new row, no new quota deduction, no new enqueue. See
 `.claude/knowledge/decisions.md` for why this is a non-unique index +
 query-time exclusion rather than a DB uniqueness constraint.
+
+---
+
+## Notifications & Proxy Self-Healing (Round 34)
+
+Two related subsystems, built together because pool-health alerts flow
+through the same delivery mechanism as per-job webhooks.
+
+**Webhook delivery — transactional outbox, not fire-and-forget.**
+`orchestrator/webhook_events.py::WebhookEvent`/`WebhookEventType` is the
+shape everything produces: `job.completed`/`failed`/`partial_failure`/
+`cancelled`, `proxy_pool.degraded`/`critical`/`recovered`.
+`orchestrator/webhook_dispatch.py::enqueue_and_deliver_webhook_event` is
+the single delivery entry point both `orchestrator/tasks.py` (per-job) and
+`proxy/harvester_daemon.py` (pool-health, see below) call: it writes a row
+to `webhook_outbox` (migration `007`, per-tenant-schema, mirrors
+`dead_letter_queue`'s shape — `storage/webhook_outbox.py`) *before*
+attempting delivery, then makes one immediate best-effort attempt via
+`WebhookDispatcher` (now `config.webhook`-driven, not hardcoded). A failed
+or crashed attempt leaves the row `pending`; a standalone
+`orchestrator/webhook_sweeper.py` daemon (own `docker-compose.yml`
+service, `_run_periodic`-shaped like `harvester_daemon.py` — the loop
+helper lives in `core/periodic.py` now, shared by both) sweeps every 30s
+with exponential backoff, marking `dead` after `config.webhook.
+max_retries` sweep-level attempts. `orchestrator/slack_formatter.py`
+renders `WebhookEvent` into Slack's `{"text", "blocks"}` shape when the
+target URL contains `hooks.slack.com`; any other URL gets the raw event
+dict (backward compatible). Why split this way rather than one function
+in `tasks.py`: `.claude/knowledge/decisions.md` → "`webhook_dispatch.py`
+Split From `tasks.py`".
+
+**Proxy pool self-healing — event-driven, not purely timer-driven.**
+`ProxyManager.get_proxy`'s exhaustion path (`proxy/manager.py`) sets a
+debounced Redis kick key (`SET proxy:harvest:kick NX EX 30`) and publishes
+to `proxy:events:exhausted`; `harvester_daemon.py` runs a ~5s-poll watcher
+task (independent of its existing timer-driven `_run_periodic` loops) that
+reacts to the key — gated by a separate 60s cooldown key — and runs an
+out-of-band `harvester.harvest_once()` cycle. See `decisions.md` →
+"Debounced Redis Kick + Pub/Sub, Not Pub/Sub Alone" for why both the key
+and the publish exist. `proxy/pool_health.py::PoolHealthMonitor` computes
+per-tier (1/2/3) validated-proxy counts each health cycle, classifies
+HEALTHY/DEGRADED/CRITICAL against `config.proxy_tiers.
+degraded_below_count`/`critical_below_count`, persists state in Redis, and
+returns only real transitions. A transition into DEGRADED/CRITICAL or back
+to HEALTHY ("recovered") both (a) logs, and (b) — when
+`config.webhook.ops_webhook_url` is set — enqueues a `WebhookEvent` through
+the outbox/sweeper/Slack-formatter path above. **Known overlap, not
+reconciled:** `operations.md`'s pre-existing `ProxyPoolCriticallyLow`
+Prometheus/Alertmanager rule already alerts to Slack on low proxy counts
+(round 25) via a completely different mechanism (threshold+duration on a
+scraped gauge) — this round's ops-webhook path was built without
+cross-referencing it. See `technical-debt.md`'s round-34 entry, "Open
+thread" paragraph, before extending either one.
+
+**Transient DLQ auto-retry.** `proxy/dlq_reaper.py` (own daemon, same
+shape) polls `DeadLetterQueue.list_retryable()` per tenant every 60s for
+`TRANSIENT_FAILURE_CATEGORIES` entries under their retry cap, checks
+eligibility by reading current state (never mutating it — see
+`decisions.md` for why `CircuitBreaker.state()` not `allow_request()`),
+and re-enqueues the *same* `job_id` via the rq producer
+(`orchestrator/job_queue.py::build_queue`) so `GET /v1/jobs/{job_id}`
+keeps tracking the same job through a second attempt. See the DLQ note
+in the "Escalation State Machine" section above for the
+permanent/transient category split and the `(job_id, url)` UPSERT that
+carries `auto_retry_count` across repeat failures.
 
 ---
 

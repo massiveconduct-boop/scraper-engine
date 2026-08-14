@@ -60,6 +60,48 @@ class TestProxyManager:
         assert exc.value.level == 1
 
     @pytest.mark.asyncio
+    async def test_exhaustion_sets_debounced_kick_and_publishes_when_newly_set(self, tenant):
+        """round 34 — proxy/harvester_daemon.py's out-of-band harvest is
+        triggered by this SET NX; PUBLISH only fires for the caller that
+        actually creates the key, not every exhausted request."""
+        from scraper_engine.proxy.manager import HARVEST_KICK_CHANNEL, HARVEST_KICK_KEY
+
+        pm = make_manager()
+        pm._redis.raw.set.return_value = True  # key did not already exist
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        pm._redis.raw.set.assert_awaited_once_with(HARVEST_KICK_KEY, "1", nx=True, ex=30)
+        pm._redis.raw.publish.assert_awaited_once_with(HARVEST_KICK_CHANNEL, "1")
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_does_not_publish_when_kick_already_pending(self, tenant):
+        """Debounce: a kick already pending (SET NX returns falsy) means
+        another exhausted request already triggered the signal — this one
+        must not also publish, or a stampede of exhausted requests would
+        stampede the harvester with redundant triggers."""
+        pm = make_manager()
+        pm._redis.raw.set.return_value = False  # key already existed
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        pm._redis.raw.set.assert_awaited_once()
+        pm._redis.raw.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_signal_failure_does_not_fail_the_fetch(self, tenant):
+        """Best-effort: a Redis hiccup while signaling must surface as the
+        real ProxyPoolExhaustedError, not an unrelated exception from the
+        signaling side-channel."""
+        pm = make_manager()
+        pm._redis.raw.set.side_effect = RuntimeError("redis down")
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=1, domain="example.com")
+
+    @pytest.mark.asyncio
     async def test_selects_from_pool(self, tenant, sample_proxies):
         redis = AsyncMock()
         redis.get.return_value = None

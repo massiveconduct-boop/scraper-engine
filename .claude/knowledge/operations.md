@@ -6,7 +6,8 @@
 **Keywords:** CI pipeline, GitHub Actions, branch protection, required
 status checks, docker compose, PgBouncer, monitoring, Prometheus, alerts,
 scaling, config-driven timeouts, known operational gaps, lockfiles,
-dependency drift.
+dependency drift, webhook sweeper, DLQ reaper, proxy pool health, Slack
+alerting overlap.
 **Dependencies:** `.github/workflows/test.yml`, `docker-compose.yml`,
 `pyproject.toml`, `requirements-lock.txt` / `requirements-dev-lock.txt` —
 this document describes their live, current behavior; check those files
@@ -26,7 +27,9 @@ directly if this doc and reality ever disagree.
 | MinIO | minio/minio:latest | 9000 (API), 9001 (console) | `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` | S3-compatible storage |
 | API | uvicorn | 8000 | `API_PORT` | FastAPI server |
 | Workers L1/L2/L3 | RQ | — | — | Escalation-level queue workers |
-| Proxy harvester | standalone Python | — | — | Background proxy collection |
+| Proxy harvester | standalone Python | — | — | Background proxy collection + self-healing (round 34 — reacts to a Redis kick signal from exhausted requests, not just its own timer; also runs the per-tier pool-health cycle) |
+| Webhook sweeper | standalone Python | — | — | Round 34 — drains `webhook_outbox` (retries failed/crashed deliveries with backoff; the rq work-horse that made the original attempt is too short-lived to own retry state) |
+| DLQ reaper | standalone Python | — | — | Round 34 — auto-retries `dead_letter_queue` entries in the transient category (`PROXY_EXHAUSTED`, `CIRCUIT_OPEN`) once the condition that caused them clears |
 | `migrate` | same image as `api` | — | — | One-shot `alembic upgrade head`, gates every Postgres-writing service via `depends_on: condition: service_completed_successfully` — see Migrations below |
 | Prometheus | prom/prometheus:latest | 9090 | `PROMETHEUS_PORT` | Metrics collection + alert evaluation. Live `docker-compose.yml` service (previously config-only — `infra/prometheus/prometheus.yml` existed, git-tracked, but was never wired in) |
 | Alertmanager | prom/alertmanager:latest | 9093 | `ALERTMANAGER_PORT` | Alert routing to Slack (two-tier: default + paging-channel). Live `docker-compose.yml` service — same "config existed, never wired" story as Prometheus |
@@ -94,6 +97,24 @@ Prometheus + Alertmanager are live `docker-compose.yml` services (round-N fix �
 
 ### Alerts
 - `ProxyPoolCriticallyLow`: fires when `proxy_pool_validated_count < 5` for 5 minutes. Severity: critical.
+  **Round 34 note — a second, independent pool-health-alerting path now
+  exists, deliberately, not as an unreconciled duplicate.**
+  `proxy/pool_health.py::PoolHealthMonitor` computes its own per-tier
+  HEALTHY/DEGRADED/CRITICAL state every health cycle and, when
+  `config.webhook.ops_webhook_url` is set, pushes a `proxy_pool.critical`/
+  `degraded`/`recovered` event straight to Slack via the new webhook-
+  outbox/sweeper path (`.claude/knowledge/architecture.md` →
+  "Notifications & Proxy Self-Healing") — event-driven, not a scraped-
+  gauge-plus-duration rule like this one. Built independently of this
+  rule, then reconciled same-day in a knowledge audit: **decision is to
+  keep both**, since they fail independently (this rule needs Prometheus
+  + a 5-minute sustained condition and goes dark if the app's own
+  delivery pipeline breaks; the event-driven path needs that pipeline
+  healthy and goes dark if Prometheus/Alertmanager are down) — each
+  covers the other's blind spot. `config/base.yaml` recommends pointing
+  `ops_webhook_url` at a different Slack channel than `SLACK_WEBHOOK_URL`
+  so the two don't read as a confusing double-alert. Full reasoning:
+  `.claude/knowledge/decisions.md` → "Keep Both Pool-Health Alert Paths".
 - `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined and all now backed by real metrics (round 25 — see below).
 - Rules in `monitoring/alerts/prometheus_rules.yml`. 11 rules as of round 25 (was 12 — `BrowserPoolExhausted` removed, see below), `promtool check rules` validated against a real Prometheus container.
 - **`BrowserPoolExhausted` REMOVED (round 25), not fixed.** Its expr was
@@ -412,7 +433,15 @@ levels:
     the reason round 28 treated it as the top priority rather than another
     one-off patch. Now wired into the `chaos` job (see CI Pipeline above)
     and brought to 100% across every package in scope except `browser/`
-    (documented exclusion, needs real Firefox). Full story + the other 7
+    (documented exclusion, needs real Firefox). A round-34 knowledge audit
+    caught a real regression to 97.91% (round 34 shipped 3 daemon `run()`
+    functions and 2 single lines untested, plus regressed
+    `harvester_daemon.py` from 100%) and closed it same-day — real
+    measured coverage as of the fix is 99.57%, gate passes except for
+    `services/botasaurus_requests_client.py` (56%, confirmed pre-existing,
+    aarch64-sandbox-only, not a CI blocker on the x86_64 runners — see
+    `.claude/knowledge/technical-debt.md`'s round-34 "Coverage gap" entry).
+    Full story + the other 7
     findings closed alongside it: `.claude/knowledge/technical-debt.md`
     (round 28).
 15. **CI job matrix changes can silently break branch protection (RESOLVED

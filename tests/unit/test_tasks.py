@@ -18,6 +18,7 @@ from scraper_engine.core.models import (
     ScrapeRequest,
 )
 from scraper_engine.core.tenant import TenantId
+from scraper_engine.orchestrator.webhook_events import WebhookEventType
 
 
 @pytest.fixture
@@ -29,6 +30,18 @@ def fake_clients(monkeypatch):
         "webhook_url": "http://hooks.example.com/cb",
         "status": "PENDING",
     }
+
+    async def _fetchrow(tenant_id, query, *args):
+        # round 34 — WebhookOutbox.enqueue also calls fetchrow (to get the
+        # generated outbox row id back); this must not be confused with the
+        # scrape_jobs row fetch _run_scrape_job itself does. Reads
+        # pg.fetchrow.return_value dynamically (not a captured value) so
+        # individual tests can keep overriding it exactly as before.
+        if "webhook_outbox" in query:
+            return {"id": "outbox-1"}
+        return pg.fetchrow.return_value
+
+    pg.fetchrow.side_effect = _fetchrow
     redis = AsyncMock()
     redis.raw = AsyncMock()
     s3 = AsyncMock()
@@ -89,7 +102,11 @@ async def test_run_scrape_job_updates_status_and_dispatches_webhook(fake_clients
     await tasks_module._run_scrape_job("system", "job-1")
 
     # execute(tenant_id, query, *args) -> args[0]=tenant_id, args[1]=query
-    status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
+    status_updates = [
+        c.args[2]
+        for c in pg.execute.await_args_list
+        if "UPDATE scrape_jobs SET status" in c.args[1]
+    ]
     assert status_updates == [JobStatus.PROCESSING.value, JobStatus.COMPLETED.value]
 
     deliver_mock.assert_awaited_once()
@@ -118,7 +135,11 @@ async def test_run_scrape_on_result_callback_persists_incrementally(fake_clients
     monkeypatch.setattr("scraper_engine.browser.session_state.SessionStateManager", MagicMock())
     monkeypatch.setattr("scraper_engine.orchestrator.circuit_breaker.CircuitBreaker", MagicMock())
     monkeypatch.setattr("scraper_engine.orchestrator.politeness.PolitenessController", MagicMock())
-    monkeypatch.setattr("scraper_engine.storage.dlq.DeadLetterQueue", MagicMock())
+    # round 34 — _persist_one_result awaits dlq.clear() on every success, so
+    # the DLQ instance needs an async-callable clear(), not a plain MagicMock.
+    monkeypatch.setattr(
+        "scraper_engine.storage.dlq.DeadLetterQueue", MagicMock(return_value=AsyncMock())
+    )
 
     captured_on_result = {}
 
@@ -178,9 +199,7 @@ async def test_run_scrape_job_crash_marks_failed_and_reraises(fake_clients, monk
     not leave scrape_jobs stuck at PROCESSING forever — mark FAILED, fire the
     webhook, then re-raise so rq's own failure bookkeeping still sees it."""
     pg, redis, s3, cfg = fake_clients
-    monkeypatch.setattr(
-        tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom"))
-    )
+    monkeypatch.setattr(tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom")))
     deliver_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(
         "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
@@ -189,7 +208,11 @@ async def test_run_scrape_job_crash_marks_failed_and_reraises(fake_clients, monk
     with pytest.raises(RuntimeError, match="boom"):
         await tasks_module._run_scrape_job("system", "job-crash")
 
-    status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
+    status_updates = [
+        c.args[2]
+        for c in pg.execute.await_args_list
+        if "UPDATE scrape_jobs SET status" in c.args[1]
+    ]
     assert status_updates == [JobStatus.PROCESSING.value, JobStatus.FAILED.value]
     deliver_mock.assert_awaited_once()
 
@@ -211,9 +234,7 @@ async def test_run_scrape_job_crash_without_webhook_skips_dispatch(fake_clients,
         "webhook_url": None,
         "status": "PENDING",
     }
-    monkeypatch.setattr(
-        tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom"))
-    )
+    monkeypatch.setattr(tasks_module, "_run_scrape", AsyncMock(side_effect=RuntimeError("boom")))
     deliver_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(
         "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
@@ -222,7 +243,11 @@ async def test_run_scrape_job_crash_without_webhook_skips_dispatch(fake_clients,
     with pytest.raises(RuntimeError, match="boom"):
         await tasks_module._run_scrape_job("system", "job-crash-2")
 
-    status_updates = [c.args[2] for c in pg.execute.await_args_list if "SET status" in c.args[1]]
+    status_updates = [
+        c.args[2]
+        for c in pg.execute.await_args_list
+        if "UPDATE scrape_jobs SET status" in c.args[1]
+    ]
     assert status_updates == [JobStatus.PROCESSING.value, JobStatus.FAILED.value]
     deliver_mock.assert_not_awaited()
 
@@ -457,6 +482,51 @@ async def test_run_scrape_shuts_down_pools_even_if_process_job_raises(fake_clien
     botasaurus_pool_instance.shutdown.assert_awaited_once()
 
 
+def _webhook_test_cfg():
+    """round 34 — enqueue_and_deliver_webhook_event needs real numeric
+    webhook config values (timedelta()/range() don't accept a MagicMock),
+    even though WebhookDispatcher.deliver itself is monkeypatched below."""
+    cfg = MagicMock()
+    cfg.webhook.max_retries = 3
+    cfg.webhook.timeout_seconds = 10
+    cfg.webhook.backoff_base_seconds = 2.0
+    return cfg
+
+
+class TestJobWebhookEventType:
+    """_job_webhook_event_type is the single source of truth mapping a
+    job's terminal outcome to a WebhookEventType (round 34)."""
+
+    def test_cancelled_status_maps_to_job_cancelled(self):
+        assert (
+            tasks_module._job_webhook_event_type(JobStatus.CANCELLED, False)
+            == WebhookEventType.JOB_CANCELLED
+        )
+        # partial_failure is irrelevant once the job was cancelled.
+        assert (
+            tasks_module._job_webhook_event_type(JobStatus.CANCELLED, True)
+            == WebhookEventType.JOB_CANCELLED
+        )
+
+    def test_completed_without_partial_failure_maps_to_job_completed(self):
+        assert (
+            tasks_module._job_webhook_event_type(JobStatus.COMPLETED, False)
+            == WebhookEventType.JOB_COMPLETED
+        )
+
+    def test_completed_with_partial_failure_maps_to_job_partial_failure(self):
+        assert (
+            tasks_module._job_webhook_event_type(JobStatus.COMPLETED, True)
+            == WebhookEventType.JOB_PARTIAL_FAILURE
+        )
+
+    def test_failed_status_maps_to_job_failed(self):
+        assert (
+            tasks_module._job_webhook_event_type(JobStatus.FAILED, False)
+            == WebhookEventType.JOB_FAILED
+        )
+
+
 @pytest.mark.asyncio
 async def test_dispatch_webhook_logs_warning_when_delivery_returns_false(monkeypatch):
     """`deliver()` returning False (not raising) means the webhook endpoint
@@ -466,12 +536,26 @@ async def test_dispatch_webhook_logs_warning_when_delivery_returns_false(monkeyp
     monkeypatch.setattr(
         "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
     )
+    pg = AsyncMock()
+    pg.fetchrow.return_value = {"id": "outbox-1"}
+    redis = AsyncMock()
+    redis.raw = AsyncMock()
 
-    await tasks_module._dispatch_webhook(
-        "http://hooks.example.com/cb", "job-wh-1", JobStatus.COMPLETED, [], None
+    await tasks_module._dispatch_job_webhook(
+        _webhook_test_cfg(),
+        pg,
+        redis,
+        TenantId("system"),
+        "http://hooks.example.com/cb",
+        "job-wh-1",
+        JobStatus.COMPLETED,
+        [],
+        None,
+        False,
     )
 
     deliver_mock.assert_awaited_once()
+    redis.raw.incr.assert_awaited_once_with("metrics:webhook_delivery_failures_total")
 
 
 @pytest.mark.asyncio
@@ -480,9 +564,23 @@ async def test_dispatch_webhook_logs_exception_when_delivery_raises(monkeypatch)
     monkeypatch.setattr(
         "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver", deliver_mock
     )
+    pg = AsyncMock()
+    pg.fetchrow.return_value = {"id": "outbox-2"}
+    redis = AsyncMock()
+    redis.raw = AsyncMock()
 
-    await tasks_module._dispatch_webhook(
-        "http://hooks.example.com/cb", "job-wh-2", JobStatus.FAILED, [], "boom"
+    await tasks_module._dispatch_job_webhook(
+        _webhook_test_cfg(),
+        pg,
+        redis,
+        TenantId("system"),
+        "http://hooks.example.com/cb",
+        "job-wh-2",
+        JobStatus.FAILED,
+        [],
+        "boom",
+        False,
     )  # must not raise
 
     deliver_mock.assert_awaited_once()
+    redis.raw.incr.assert_awaited_once_with("metrics:webhook_delivery_failures_total")

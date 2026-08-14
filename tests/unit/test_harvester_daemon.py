@@ -130,6 +130,157 @@ class TestRun:
         redis.stop.assert_awaited_once()
 
 
+class TestRunKickWatcher:
+    """proxy/manager.py::_signal_exhaustion sets the kick key this watcher
+    polls for (round 34) — see test_proxy_manager.py for the producer side."""
+
+    @pytest.mark.asyncio
+    async def test_no_kick_pending_just_sleeps_and_loops(self, monkeypatch):
+        redis = AsyncMock()
+        redis.raw.get.return_value = None
+        harvester = MagicMock(harvest_once=AsyncMock())
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_kick_watcher(harvester, redis)
+        harvester.harvest_once.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kick_pending_and_cooldown_acquired_triggers_harvest(self, monkeypatch):
+        redis = AsyncMock()
+        redis.raw.get.return_value = "1"  # kick pending
+        redis.raw.set.return_value = True  # cooldown newly acquired
+        harvester = MagicMock(harvest_once=AsyncMock(return_value=7))
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_kick_watcher(harvester, redis)
+
+        harvester.harvest_once.assert_awaited_once()
+        redis.raw.delete.assert_awaited_once_with(mod.HARVEST_KICK_KEY)
+
+    @pytest.mark.asyncio
+    async def test_kick_pending_but_cooldown_already_active_skips_harvest(self, monkeypatch):
+        """Debounce: another watcher tick (or process) already claimed the
+        cooldown — this tick must not also run a harvest or delete the kick
+        key out from under whichever tick DID claim it."""
+        redis = AsyncMock()
+        redis.raw.get.return_value = "1"
+        redis.raw.set.return_value = False  # cooldown already held
+        harvester = MagicMock(harvest_once=AsyncMock())
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_kick_watcher(harvester, redis)
+
+        harvester.harvest_once.assert_not_awaited()
+        redis.raw.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_swallows_cycle_error_and_keeps_looping(self, monkeypatch):
+        redis = AsyncMock()
+        redis.raw.get.side_effect = RuntimeError("redis down")
+        harvester = MagicMock(harvest_once=AsyncMock())
+
+        async def fake_sleep(_):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_kick_watcher(harvester, redis)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_cycle_itself_propagates(self):
+        redis = AsyncMock()
+        redis.raw.get.side_effect = asyncio.CancelledError
+        harvester = MagicMock(harvest_once=AsyncMock())
+
+        with pytest.raises(asyncio.CancelledError):
+            await mod._run_kick_watcher(harvester, redis)
+
+
+class TestPoolHealthCycle:
+    @pytest.mark.asyncio
+    async def test_no_transitions_returns_empty_list_and_skips_webhook(self):
+        monitor = MagicMock(check=AsyncMock(return_value=[]))
+        cfg = MagicMock()
+        cfg.webhook.ops_webhook_url = None
+        pg = AsyncMock()
+        redis = AsyncMock()
+
+        result = await mod._pool_health_cycle(monitor, cfg, pg, redis)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_transition_without_ops_webhook_url_only_logs(self):
+        from scraper_engine.proxy.pool_health import PoolHealthState, PoolHealthTransition
+
+        transition = PoolHealthTransition(
+            tier=2,
+            old_state=PoolHealthState.HEALTHY,
+            new_state=PoolHealthState.DEGRADED,
+            validated_count=10,
+        )
+        monitor = MagicMock(check=AsyncMock(return_value=[transition]))
+        cfg = MagicMock()
+        cfg.webhook.ops_webhook_url = None
+        pg = AsyncMock()
+        redis = AsyncMock()
+
+        result = await mod._pool_health_cycle(monitor, cfg, pg, redis)
+
+        assert result == ["tier2:healthy->degraded"]
+
+    @pytest.mark.asyncio
+    async def test_transition_with_ops_webhook_url_dispatches_event(self, monkeypatch):
+        from scraper_engine.proxy.pool_health import PoolHealthState, PoolHealthTransition
+
+        transition = PoolHealthTransition(
+            tier=3,
+            old_state=PoolHealthState.CRITICAL,
+            new_state=PoolHealthState.HEALTHY,
+            validated_count=42,
+        )
+        monitor = MagicMock(check=AsyncMock(return_value=[transition]))
+        cfg = MagicMock()
+        cfg.webhook.ops_webhook_url = "https://hooks.slack.com/services/ops"
+        pg = AsyncMock()
+        redis = AsyncMock()
+
+        dispatch_mock = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.orchestrator.webhook_dispatch.enqueue_and_deliver_webhook_event",
+            dispatch_mock,
+        )
+
+        result = await mod._pool_health_cycle(monitor, cfg, pg, redis)
+
+        assert result == ["tier3:critical->healthy"]
+        dispatch_mock.assert_awaited_once()
+        call = dispatch_mock.await_args
+        assert call.args[0] is cfg
+        assert call.args[4] == "https://hooks.slack.com/services/ops"
+        event = call.args[5]
+        assert event.event_type.value == "proxy_pool.recovered"
+        assert event.job_id is None
+        assert event.payload == {
+            "tier": 3,
+            "old_state": "critical",
+            "new_state": "healthy",
+            "validated_count": 42,
+        }
+
+
 class TestMain:
     def test_main_drives_run_via_asyncio_run(self, monkeypatch):
         calls = {"n": 0}

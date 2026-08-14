@@ -40,9 +40,11 @@ from scraper_engine.core.models import (
 )
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.observability.bootstrap import bootstrap_observability
+from scraper_engine.orchestrator.webhook_events import WebhookEventType
 
 if TYPE_CHECKING:
     from scraper_engine.config.schema import AppConfig
+    from scraper_engine.storage.dlq import DeadLetterQueue
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
     from scraper_engine.storage.s3_client import S3Client
@@ -127,6 +129,7 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
 
             status: JobStatus
             error: str | None
+            partial_failure = False
             if config_used.get("_job_type") == "crawl":
                 results = await _run_crawl_job(config_used)
                 status = JobStatus.COMPLETED
@@ -147,6 +150,7 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
                 results = response.results or []
                 status = response.status
                 error = response.error
+                partial_failure = response.partial_failure
 
             await pg.execute(
                 tenant_id,
@@ -156,7 +160,18 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
             )
 
             if webhook_url:
-                await _dispatch_webhook(webhook_url, job_id, status, results, error)
+                await _dispatch_job_webhook(
+                    cfg,
+                    pg,
+                    redis,
+                    tenant_id,
+                    webhook_url,
+                    job_id,
+                    status,
+                    results,
+                    error,
+                    partial_failure,
+                )
 
             # Redis-backed counter, refreshed into job_duration_seconds_count/_sum
             # gauges only when /metrics is actually scraped (this rq work-horse
@@ -187,8 +202,17 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
             job_id,
         )
         if webhook_url:
-            await _dispatch_webhook(
-                webhook_url, job_id, JobStatus.FAILED, [], "internal error — see server logs"
+            await _dispatch_job_webhook(
+                cfg,
+                pg,
+                redis,
+                tenant_id,
+                webhook_url,
+                job_id,
+                JobStatus.FAILED,
+                [],
+                "internal error — see server logs",
+                partial_failure=False,
             )
         raise
     finally:
@@ -270,7 +294,7 @@ async def _run_scrape(
         """Persist each result the moment it lands (round 29) instead of
         batching everything until the whole job finishes — see
         _persist_one_result below."""
-        await _persist_one_result(pg, s3, tenant_id, job_id, result)
+        await _persist_one_result(pg, s3, tenant_id, job_id, result, dlq)
 
     try:
         worker = Worker(
@@ -313,6 +337,7 @@ async def _persist_one_result(
     tenant_id: TenantId,
     job_id: str,
     result: FetchResult,
+    dlq: DeadLetterQueue | None = None,
 ) -> None:
     """Persist a single FetchResult — one scrape_results row, plus an S3
     snapshot when there's HTML to store. Split out from _persist_results
@@ -321,14 +346,25 @@ async def _persist_one_result(
     finish. A cache-hit result (FetchResult.from_cache=True) has no `html`
     (see Worker._check_cache), so the S3 upload is skipped and the existing
     html_snapshot_url pointer it already carries is persisted as-is —
-    no duplicate snapshot for content that's already stored."""
+    no duplicate snapshot for content that's already stored.
+
+    dlq (round 34): when given and the result succeeded, clears any stale
+    DLQ entry for this exact (job_id, url) — the URL this row belongs to
+    may have previously been DLQ'd and auto-retried by proxy/dlq_reaper.py;
+    without this, a URL that recovered on retry would still show as
+    permanently dead in GET /v1/jobs/{id}/dlq forever. None (the bulk-crawl
+    path, _persist_results below) skips this — ScrapyAdapter results are
+    always success=True and crawl jobs never populate the DLQ in the first
+    place, so there's nothing to clear."""
+    if dlq is not None and result.success:
+        await dlq.clear(tenant_id, job_id, result.url)
     html_snapshot_url = result.html_snapshot_url
     if result.html:
         html_snapshot_url = await s3.store_snapshot(
             tenant_id, job_id, result.url, result.html, result.success
         )
         # Mutate the in-memory result so the webhook payload (built from
-        # these same objects, see _dispatch_webhook below) carries the
+        # these same objects, see _dispatch_job_webhook below) carries the
         # snapshot pointer too, not just the polling response.
         result.html_snapshot_url = html_snapshot_url
     content_source = result.html or result.markdown or ""
@@ -379,21 +415,51 @@ async def _persist_results(
         await _persist_one_result(pg, s3, tenant_id, job_id, result)
 
 
-async def _dispatch_webhook(
+def _job_webhook_event_type(status: JobStatus, partial_failure: bool) -> WebhookEventType:
+    """Map a job's terminal outcome to an event type — single source of
+    truth so this mapping isn't re-derived at each call site (round 34)."""
+    if status == JobStatus.CANCELLED:
+        return WebhookEventType.JOB_CANCELLED
+    if status == JobStatus.COMPLETED:
+        return (
+            WebhookEventType.JOB_PARTIAL_FAILURE
+            if partial_failure
+            else WebhookEventType.JOB_COMPLETED
+        )
+    return WebhookEventType.JOB_FAILED
+
+
+async def _dispatch_job_webhook(
+    cfg: AppConfig,
+    pg: PostgresClient,
+    redis: RedisClient,
+    tenant_id: TenantId,
     webhook_url: str,
     job_id: str,
     status: JobStatus,
     results: list[FetchResult],
     error: str | None,
+    partial_failure: bool,
 ) -> None:
-    from scraper_engine.orchestrator.webhook import WebhookDispatcher
+    """Build the job's WebhookEvent and hand it to the durable outbox path
+    (round 34) — replaces the old fire-and-forget POST. See
+    orchestrator/webhook_events.py and storage/webhook_outbox.py."""
+    from scraper_engine.orchestrator.webhook_events import WebhookEvent
 
-    payload = JobStatusResponse(
-        job_id=job_id, status=status, progress=1.0, results=results or None, error=error
+    response = JobStatusResponse(
+        job_id=job_id,
+        status=status,
+        progress=1.0,
+        results=results or None,
+        error=error,
+        partial_failure=partial_failure,
     )
-    try:
-        delivered = await WebhookDispatcher().deliver(webhook_url, payload)
-        if not delivered:
-            logger.warning("webhook_delivery_failed job_id=%s url=%s", job_id, webhook_url)
-    except Exception:
-        logger.exception("webhook_delivery_error job_id=%s url=%s", job_id, webhook_url)
+    event = WebhookEvent(
+        event_type=_job_webhook_event_type(status, partial_failure),
+        tenant_id=str(tenant_id),
+        job_id=job_id,
+        payload=response.model_dump(mode="json"),
+    )
+    from scraper_engine.orchestrator.webhook_dispatch import enqueue_and_deliver_webhook_event
+
+    await enqueue_and_deliver_webhook_event(cfg, pg, redis, tenant_id, webhook_url, event)
