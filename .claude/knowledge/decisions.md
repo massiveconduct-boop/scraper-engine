@@ -1634,3 +1634,111 @@ scope for this round (see `technical-debt.md`).
 programs `RUNNING`; killed `proxy-harvester`'s PID directly and confirmed
 supervisord restarted it (new PID) within ~6s while `api`/`dlq-reaper`/
 `webhook-sweeper` and the `/v1/health` check stayed up throughout.
+
+---
+
+## Decision: Heartbeat-via-Redis Over Supervisor RPC for Daemon Liveness
+
+**Date:** 2026-08-14 | **Round:** 36
+
+**What:** `/v1/health`'s new daemon-liveness check (`api/health.py::
+_check_daemon_liveness`) reads Redis heartbeat keys that
+`core/periodic.py::run_periodic` writes after every cycle attempt, rather
+than querying supervisord's XML-RPC socket (`/tmp/supervisor.sock`, the
+same interface `supervisorctl` itself uses) for each program's state.
+
+**Why:** Two considered mechanisms, both technically available since
+round 35 put all 3 daemons under one supervisord instance:
+1. **Supervisor RPC** — ask supervisord directly "is `proxy-harvester`
+   `RUNNING`." Rejected: only proves the OS process exists, not that its
+   loop is making progress — a process hung on a slow/blocked call
+   (stuck DB query, network call that never times out) still reads
+   `RUNNING` to supervisorctl, so this wouldn't have caught the exact
+   failure mode round 35 was fixing (a harvester that technically hadn't
+   crashed, just stopped doing useful work). It also hard-couples the
+   health check to this exact container topology — which has already
+   changed once in this repo's history (standalone containers → one
+   supervised container, round 35) — meaning a future topology change
+   would silently break this check again.
+2. **Heartbeat-via-Redis** (chosen) — each periodic job writes its own
+   "I ran" timestamp after every cycle attempt. Answers the more
+   meaningful question directly ("did this loop actually run recently"),
+   is decoupled from container topology entirely (works the same whether
+   the 3 daemons are one container, three, or something else later), and
+   reuses this codebase's own established pattern (`proxy/manager.py`'s
+   debounced kick key, `redis.raw` for system-level non-tenant keys) —
+   no new dependency, no new client library.
+
+**Trade-off accepted:** a heartbeat only proves the *event loop*
+scheduled that coroutine recently — a job that yields control properly
+(e.g. `await`s a slow-but-not-hung network call) still ticks other
+cooperative tasks including an unrelated one's heartbeat write, so this
+doesn't detect every possible partial-hang scenario. Judged sufficient:
+it correctly detects the two failure modes that actually matter operationally
+(process crashed / process fully deadlocked, both stop the loop from
+reaching the heartbeat write at all) without the topology coupling or
+false confidence of "process exists" that supervisor RPC would have
+given.
+
+**Status:** Active.
+
+---
+
+## Decision: Daemon Liveness in `/v1/health` Is Informational, Not Status-Affecting
+
+**Date:** 2026-08-14 | **Round:** 36
+
+**What:** A stale/dead daemon (heartbeat key expired) is surfaced via new
+`daemons`/`checks["daemons"]` fields in `/v1/health`'s response, but does
+**not** flip `HealthStatus.healthy` or the endpoint's HTTP status code
+(200 stays 200 even with every daemon stale). This reverses the initial
+implementation, which folded it into the same `healthy` flag pg/redis/s3
+already use.
+
+**Why:** Caught by a real, pre-existing test failure during
+implementation, not a hypothetical — `tests/integration/test_api_main.py::
+TestCreateApp::test_lifespan_wires_dependencies_and_instruments_tracing`
+creates a real app against a real Redis and asserts `GET /v1/health`
+returns 200. With the first (status-affecting) version, this started
+failing with 503, because no daemon in that Redis had ever written a
+heartbeat. Two real, legitimate scenarios both produce this same
+"no heartbeat yet" state: (1) **any fresh deploy** — `promotion`'s
+900-second default interval means up to 15 minutes pass before its first
+heartbeat exists, during which a status-affecting check would have
+reported the whole `api` as unhealthy despite pg/redis/s3/the API itself
+being completely fine; (2) **`api` run standalone**, as this exact
+integration test does — no co-located daemons at all, by design (it's
+testing `create_app()`'s lifespan wiring, not the daemons). A health
+check that false-positives on ordinary startup timing or a legitimate
+standalone-testing topology is itself a robustness bug, not the
+robustness improvement this round was asked to deliver.
+
+**Alternatives considered:**
+- **Keep it status-affecting, add a startup grace period** (track
+  `api`'s own process-start time, don't evaluate daemon liveness until
+  enough wall-clock time has passed for the slowest job to plausibly have
+  run once). Rejected — doesn't fix scenario (2) at all (standalone `api`
+  with daemons that will *never* run), adds real complexity (a second
+  timing concept, config plumbing for "how long is long enough"), and the
+  informational-only version already gives an operator everything they
+  need to know *which* daemon is stale without the false-alarm risk.
+- **Status-affecting, but only for daemons the deployment topology
+  claims to expect** (e.g. an env var declaring "this api instance always
+  has 3 co-located daemons"). Rejected as unnecessary config surface for
+  a problem the informational field already solves — an operator (or an
+  automated system) that cares about daemon liveness specifically reads
+  the `daemons` field; a passive 200-vs-503-only monitor was never going
+  to distinguish *which* daemon died anyway, so losing that distinction
+  isn't a real loss for that audience.
+
+**Precedent this follows:** the same file already treats S3 as optional —
+`s3_reachable = True` unconditionally when `s3` isn't configured, rather
+than failing health on an intentionally-absent dependency. Daemon
+liveness during a startup window (or in a topology where daemons
+genuinely aren't present) is the same shape of "absent isn't the same as
+broken."
+
+**Status:** Active. Verified live on the actual dev deployment: stopped
+`webhook-sweeper` via `supervisorctl`, confirmed `/v1/health` reported it
+`"stale (webhook_sweep)"` while `status` stayed `"ok"` (200) throughout;
+restarted it, confirmed recovery to `"healthy"` after one cycle.

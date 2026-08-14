@@ -236,6 +236,25 @@ command reference. This does not change any of the process-boundary
 reasoning elsewhere in this doc (separate OS process, separate in-process
 metrics registry, etc.) — only the container each process runs in.
 
+**Daemon Liveness in `/v1/health` (Round 36).** Closes the round-35
+"Open follow-up" — `/v1/health` previously only reflected `api`'s own
+Postgres/Redis/S3 reachability, with no signal at all for the 3 daemons
+above. `core/periodic.py::run_periodic` now optionally writes a Redis
+heartbeat (`heartbeat:<job-name>`, TTL = 3x the job's own interval) after
+every cycle attempt when a `redis` client is passed — all 7 periodic jobs
+across the 3 daemons pass one now. `api/health.py::_check_daemon_liveness`
+reads those keys grouped by owning daemon (`proxy-harvester`:
+harvest/promotion/health/pool_health/retention; `dlq-reaper`: dlq_reap;
+`webhook-sweeper`: webhook_sweep) — Redis's own TTL expiry is the
+staleness detector, no manual age math. Result surfaces as a new
+`daemons` field, **informational only** — does not affect `/v1/health`'s
+`healthy`/HTTP-status gate (a status-affecting first attempt broke a
+real pre-existing test on a legitimate cold-start/standalone-testing
+case; see `decisions.md` → "Daemon Liveness in `/v1/health` Is
+Informational, Not Status-Affecting" for the full story, and → "Heartbeat-
+via-Redis Over Supervisor RPC for Daemon Liveness" for why this reads
+Redis heartbeats rather than querying supervisord's own RPC socket).
+
 ---
 
 ## Proxy Pipeline

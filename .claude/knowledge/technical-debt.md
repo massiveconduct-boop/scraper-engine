@@ -32,7 +32,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 35)
+## Technical Debt / Open Threads (as of round 36)
 
 **Coverage gap in this log:** rounds 30–33 were never backfilled here —
 their work only surfaces as scattered round-number references in
@@ -40,6 +40,59 @@ their work only surfaces as scattered round-number references in
 round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
 blocking). Not reconstructed retroactively for this entry — flagging so a
 future session doesn't assume the gap means nothing happened those rounds.
+
+- **RESOLVED (round 36) — `/v1/health` extended with daemon liveness,
+  closing round 35's self-flagged "Open follow-up."** Every one of the 7
+  periodic jobs across the 3 supervised daemons (`proxy-harvester`:
+  harvest/promotion/health/pool_health/retention; `dlq-reaper`:
+  dlq_reap; `webhook-sweeper`: webhook_sweep) already funneled through
+  `core/periodic.py::run_periodic` — it now optionally writes a Redis
+  heartbeat (`heartbeat:<job>`, TTL = 3x the job's own interval) after
+  every cycle attempt when a `redis` client is passed, which all 7 call
+  sites now do. `api/health.py::_check_daemon_liveness` checks each
+  daemon's jobs' heartbeat keys — Redis's own TTL expiry is the staleness
+  detector (no manual timestamp/age math, no clock-skew risk). Considered
+  and rejected reaching into supervisord's XML-RPC socket instead: it
+  only proves the OS process exists (a hung-but-not-crashed process still
+  reads `RUNNING`), and hard-couples the check to this exact container
+  topology, which has already changed once this repo's history (round
+  35). See `decisions.md` → "Heartbeat-via-Redis Over Supervisor RPC for
+  Daemon Liveness".
+
+  **Real bug caught mid-implementation, not just documented:** the first
+  version folded daemon staleness into `/v1/health`'s overall
+  `healthy`/HTTP-503 gate (same treatment as pg/redis/s3). This broke
+  `tests/integration/test_api_main.py::TestCreateApp::
+  test_lifespan_wires_dependencies_and_instruments_tracing` — a
+  pre-existing test hitting a real Redis with zero daemon heartbeats
+  present, exactly the situation any fresh deploy is in for up to 15
+  minutes (promotion's 900s-default interval means that long before its
+  first heartbeat exists). A health check that 503s an otherwise-healthy
+  `api` on ordinary startup/topology variance is itself a robustness bug.
+  Fixed by making daemon liveness informational-only (`daemons`/`checks`
+  fields) — does not affect `healthy`/HTTP status, matching this file's
+  existing precedent for S3 being optional. See `decisions.md` → "Daemon
+  Liveness in `/v1/health` Is Informational, Not Status-Affecting".
+
+  **Live-verified** on the actual dev deployment (not just tests):
+  rebuilt + redeployed, `GET /v1/health` immediately showed real per-job
+  staleness (`proxy-harvester: "stale (harvest, promotion, health)"` —
+  correct, those jobs' first cycles hadn't completed yet post-rebuild —
+  while `dlq-reaper`/`webhook-sweeper`, both fast-interval, already read
+  `"healthy"`) with `status: "ok"` (200) held throughout. Proved the
+  negative case too: `supervisorctl stop webhook-sweeper`, waited past
+  its 90s heartbeat TTL, confirmed it flipped to `"stale (webhook_sweep)"`
+  while overall `status` stayed `"ok"`; `supervisorctl start
+  webhook-sweeper`, waited one 30s cycle, confirmed recovery to
+  `"healthy"`. Suite: 791 passed, 0 failed, 100.00% coverage. Commit
+  `c0d8eae`.
+
+  **Known, accepted narrower gap, not chased further:** `harvester_daemon.py`'s
+  round-34 fast-poll kick watcher (`_run_kick_watcher`) isn't wired into
+  this — it's supplementary, not a primary scheduled job, and lives in
+  the same process as the 5 heartbeat-emitting jobs, so a fully-dead
+  `proxy-harvester` process is still caught via those. Only matters if
+  the watcher alone crashes while the other 5 loops keep running.
 
 - **RESOLVED (round 35) — 100% `proxy_exhausted` on a live deployment,
   root-caused to a permanent scoring ceiling + two daemons nobody was
