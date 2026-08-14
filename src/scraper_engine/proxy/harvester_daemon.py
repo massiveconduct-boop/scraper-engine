@@ -164,7 +164,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
     promotion = ProxyPromotionJob(
         pg, ProxyHarvester._http_validate, asn_classifier=build_asn_classifier()
     )
-    health = HealthMonitor(pg, redis)
+    health = HealthMonitor(pg, redis, asn_classifier=build_asn_classifier())
     reaper = RetentionReaper(pg, cfg.session_retention)
     pool_health = PoolHealthMonitor(pg, redis, cfg.proxy_tiers)
 

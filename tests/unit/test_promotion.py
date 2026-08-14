@@ -63,7 +63,7 @@ class TestProxyPromotionJob:
                 },
             ]
         )
-        validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
         result = await job.run_once()
@@ -87,7 +87,7 @@ class TestProxyPromotionJob:
                 },
             ]
         )
-        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
         result = await job.run_once()
@@ -111,7 +111,7 @@ class TestProxyPromotionJob:
                 },
             ]
         )
-        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
         result = await job.run_once()
@@ -148,7 +148,7 @@ class TestProxyPromotionJob:
         pg = MagicMock()
         pg.acquire = MagicMock(return_value=_FakeCtx())
 
-        validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         job = ProxyPromotionJob(pg=pg, http_validate_fn=validate, system_tenant=tenant)
 
         await job.run_once()
@@ -166,7 +166,7 @@ class TestProxyPromotionJob:
         """Verify semaphore is created with PROMOTION_CONCURRENCY=5."""
         from scraper_engine.core.models import AnonymityLevel
 
-        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         job = ProxyPromotionJob(pg=_make_pg_mock(), http_validate_fn=validate, system_tenant=tenant)
 
         # Semaphore should exist and have value of 5 (plan §4.2: PROMOTION_CONCURRENCY=5)

@@ -234,7 +234,7 @@ class TestPromoteTcpOnly:
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         h._http_validate = AsyncMock(
-            return_value=(True, AnonymityLevel.ELITE),
+            return_value=(True, AnonymityLevel.ELITE, 50),
         )
         promoted = await h.promote_tcp_only(limit=5, tenant=TenantId("system"))
         assert promoted == 1
@@ -252,7 +252,7 @@ class TestPromoteTcpOnly:
             {"ip": "5.6.7.8", "port": 8080, "protocol": "HTTP"},
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
-        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         promoted = await h.promote_tcp_only(limit=5, tenant=TenantId("system"))
         assert promoted == 0
         pg.execute.assert_called_once()
@@ -280,7 +280,7 @@ class TestPromoteTcpOnly:
             {"ip": f"10.0.0.{i}", "port": 3128, "protocol": "HTTP"} for i in range(3)
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
-        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         promoted = await h.promote_tcp_only(limit=3, tenant=TenantId("system"))
         assert promoted == 3
         fetch_args = pg.fetch.call_args
@@ -314,16 +314,30 @@ class TestHarvestOnceMetricsGauge:
         h._count_validated.assert_awaited_once()
 
 
-class TestDirectScrapeBreak:
-    """Line 121: the loop over SOURCES must stop as soon as total >= limit."""
+class TestDirectScrapeBreadth:
+    """Round 38: the loop over SOURCES must try every source every cycle,
+    even after an early source alone fills `limit` — a source ordered late
+    in SOURCES must never be starved to zero just because earlier ones
+    already met the per-cycle budget (this was confirmed live: pubproxy and
+    proxyscrape_getproxies had zero Redis source-health records after 2
+    days running, because the old `if total >= limit: break` stopped the
+    loop before ever reaching them)."""
 
     @pytest.mark.asyncio
-    async def test_break_when_total_reaches_limit(self, pg, classifier):
+    async def test_all_sources_tried_even_after_limit_reached(self, pg, classifier):
         h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
         h._scrape_one = AsyncMock(return_value=5)
         total = await h._direct_scrape(limit=5, tenant=pg)
-        assert total == 5
-        assert h._scrape_one.await_count == 1
+        assert total == 5 * len(ProxyHarvester.SOURCES)
+        assert h._scrape_one.await_count == len(ProxyHarvester.SOURCES)
+
+    @pytest.mark.asyncio
+    async def test_late_source_gets_floor_quota_not_zero(self, pg, classifier):
+        h = ProxyHarvester(pg=pg, sources=["test"], asn_classifier=classifier)
+        h._scrape_one = AsyncMock(return_value=0)
+        await h._direct_scrape(limit=5, tenant=pg)
+        last_call_limit = h._scrape_one.await_args_list[-1].args[3]
+        assert last_call_limit == ProxyHarvester.MIN_PER_SOURCE
 
 
 class TestScrapeOneReal:
@@ -362,7 +376,7 @@ class TestScrapeOneReal:
         geonode_data = {"data": [{"ip": "1.2.3.4", "port": 8080, "protocols": ["http"]}]}
         resp = FakeResponse(json_data=geonode_data)
         client = FakeHttpClient(resp=resp)
-        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
             n = await h._scrape_one("geonode", "http://x", "geonode_json", 10, pg, client)
         assert n == 1
@@ -386,7 +400,7 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080")
         client = FakeHttpClient(resp=resp)
-        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
             n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
         assert n == 1
@@ -400,7 +414,7 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080\n5.6.7.8:3128\n9.9.9.9:80")
         client = FakeHttpClient(resp=resp)
-        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
             n = await h._scrape_one("src", "http://x", "ip_port", 1, pg, client)
         assert n == 1
@@ -413,7 +427,7 @@ class TestScrapeOneReal:
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         resp = FakeResponse(text="1.2.3.4:8080\n5.6.7.8:3128")
         client = FakeHttpClient(resp=resp)
-        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         pg.execute = AsyncMock(side_effect=[RuntimeError("db error"), None])
         with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
             n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
@@ -436,7 +450,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is False
         assert level == AnonymityLevel.TRANSPARENT
 
@@ -449,7 +463,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is False
         assert level == AnonymityLevel.TRANSPARENT
 
@@ -461,7 +475,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(raise_exc=OSError("refused")),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is False
         assert level == AnonymityLevel.TRANSPARENT
 
@@ -474,7 +488,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.ELITE
 
@@ -489,7 +503,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.ANONYMOUS
 
@@ -504,7 +518,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FakeJudgeClient(resp=resp),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.TRANSPARENT
 
@@ -529,7 +543,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=FallthroughClient(),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.ELITE
 
@@ -554,7 +568,7 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=RaisesThenSucceedsClient(),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.ELITE
 
@@ -583,9 +597,59 @@ class TestHttpValidateReal:
             "scraper_engine.proxy.harvester.httpx.AsyncClient",
             return_value=MalformedThenSucceedsClient(),
         ):
-            valid, level = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+            valid, level, _latency = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
         assert valid is True
         assert level == AnonymityLevel.ELITE
+
+    @pytest.mark.asyncio
+    async def test_latency_measures_only_the_winning_attempt(self):
+        """Round 38 regression: latency_ms must reflect only the request
+        that actually succeeded, not wall-clock time burned on earlier
+        JUDGE_URLS candidates that failed/timed out first. Before this fix,
+        every caller wrapped time.monotonic() around the ENTIRE _http_validate
+        call, so a slow-to-fail first candidate's delay got counted as the
+        proxy's own latency — confirmed live via response_time_ms values
+        clustering just above HTTP_VALIDATE_TIMEOUT multiples in the real
+        pool. Simulates a slow-then-fast pair: first candidate takes 0.2s
+        before raising, second answers instantly — the returned latency
+        must be near-zero, not >=0.2s."""
+        import asyncio
+
+        from scraper_engine.proxy.harvester import JUDGE_URLS
+
+        assert len(JUDGE_URLS) >= 2
+        second_up = FakeResponse(status_code=200, json_data={"origin": "1.2.3.4"}, headers={})
+
+        class SlowThenFastClient(FakeJudgeClient):
+            async def get(self, url):
+                if url == JUDGE_URLS[0]:
+                    await asyncio.sleep(0.2)
+                    raise OSError("connection reset")
+                return second_up
+
+        with patch(
+            "scraper_engine.proxy.harvester.httpx.AsyncClient",
+            return_value=SlowThenFastClient(),
+        ):
+            valid, _level, latency_ms = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+        assert valid is True
+        assert latency_ms is not None
+        assert latency_ms < 100, (
+            f"latency_ms={latency_ms} includes the first candidate's 200ms delay — "
+            "should only measure the winning (second) request"
+        )
+
+    @pytest.mark.asyncio
+    async def test_latency_is_none_when_invalid(self):
+        """No winning request means no real latency measurement to report —
+        must not return the elapsed time of a failed/timed-out attempt."""
+        with patch(
+            "scraper_engine.proxy.harvester.httpx.AsyncClient",
+            return_value=FakeJudgeClient(raise_exc=OSError("refused")),
+        ):
+            valid, _level, latency_ms = await ProxyHarvester._http_validate("1.2.3.4", 8080, "HTTP")
+        assert valid is False
+        assert latency_ms is None
 
 
 class TestToAsnClass:
@@ -735,7 +799,7 @@ class TestHarvestViaBroker:
         proxies = [{"host": "1.1.1.1", "port": 8080, "types": ["HTTP"]}]
         proc = FakeProc(stdout=json.dumps(proxies).encode(), stderr=b"", returncode=0)
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
-        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT))
+        h._http_validate = AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None))
         with patch(
             "scraper_engine.proxy.harvester.asyncio.create_subprocess_exec",
             new=AsyncMock(return_value=proc),
@@ -772,7 +836,7 @@ class TestHarvestViaBroker:
         # instead of blindly trusting proxybroker2's own internal validation —
         # mock it to succeed for every candidate, matching this file's
         # existing instance-level mocking convention (see TestScrapeOneReal).
-        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE))
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
         with patch(
             "scraper_engine.proxy.harvester.asyncio.create_subprocess_exec",
             new=AsyncMock(return_value=proc),

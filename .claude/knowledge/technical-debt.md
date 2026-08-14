@@ -32,7 +32,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 37)
+## Technical Debt / Open Threads (as of round 38)
 
 **Coverage gap in this log:** rounds 30–33 were never backfilled here —
 their work only surfaces as scattered round-number references in
@@ -40,6 +40,190 @@ their work only surfaces as scattered round-number references in
 round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
 blocking). Not reconstructed retroactively for this entry — flagging so a
 future session doesn't assume the gap means nothing happened those rounds.
+
+- **RESOLVED (round 38, partially) — grew free harvest source breadth in
+  response to round 37's open follow-up (thin/volatile L2/L3-caliber proxy
+  supply).** Round 37 closed the leasing/escalation code path; the
+  remaining gap was pure supply — free sources structurally can't sustain
+  L2/L3-caliber counts. User was asked directly (more free sources vs. a
+  paid tier) and chose more free sources.
+
+  `proxy/harvester.py`'s direct-scrape `SOURCES` tuple grew from 8 to 12:
+  added `shiftytr_http`, `shiftytr_https`
+  (raw.githubusercontent.com/ShiftyTR/Proxy-List), `clarketm_github`
+  (raw.githubusercontent.com/clarketm/proxy-list), and `sunny9577_github`
+  (raw.githubusercontent.com/sunny9577/proxy-scraper) — each URL curl-
+  verified live before adding (a `mmpx12/proxy-list` candidate was tried
+  first and dropped after its raw URL 404'd — the repo's file layout had
+  changed).
+
+  **Found a real, separate bug while doing this — not cosmetic, it had
+  fully disabled 2 of the original 8 sources for the pool's entire
+  lifetime.** `_direct_scrape`'s loop over `SOURCES` did
+  `if total >= limit: break` — once any early source alone filled the
+  per-cycle `limit` (default 100), the loop stopped outright, so every
+  source ordered after that point never ran, not even once. Confirmed via
+  Redis: `metrics:proxy_source_healthy:pubproxy` and
+  `:proxyscrape_getproxies` had zero records despite the daemon running a
+  harvest cycle every 600s for 2+ days straight — `proxyscrape_http` alone
+  was consistently filling the whole per-cycle budget before the loop
+  ever reached them.
+
+  Fixed with a `MIN_PER_SOURCE = 10` floor: each source's per-call `limit`
+  argument is now `max(limit - total, MIN_PER_SOURCE)`, and the early
+  `break` was removed entirely — every source gets tried every cycle,
+  guaranteed a minimum quota regardless of what earlier sources already
+  contributed. Trade-off: a harvest cycle can now take longer than the
+  configured `interval_seconds` (600s) when many sources are slow/dead,
+  since cycles now cover all 12 sources instead of stopping early.
+  Verified safe: `core/periodic.py`'s `run_periodic` awaits each cycle
+  fully and only starts the `asyncio.sleep(interval_seconds)` after it
+  returns — cycles are strictly sequential and can never overlap; a slow
+  cycle just delays when the next one starts, no concurrency/corruption
+  risk.
+
+  Tests: `tests/unit/test_harvester.py`'s `TestDirectScrapeBreak` (single
+  test asserting the old early-break behavior) replaced with
+  `TestDirectScrapeBreadth` (two tests — every source gets tried even
+  after `limit` is reached; a source given zero real results still gets
+  `MIN_PER_SOURCE`, not zero). Full suite: 815 passed, 100.00% coverage.
+
+  **Live-verified post-deploy**, not just unit-tested. Rebuilt and
+  redeployed `api` + `worker-l1`/`worker-l2`/`worker-l3` together (per the
+  existing `cerebrum.md` note that `api`-only rebuilds leave workers on a
+  stale image). First harvest cycle on the new build's log line:
+  `harvest source breakdown: proxyscrape_http=74, proxyscrape_https=21,
+  geonode=0, openproxylist=3, thespeedx_github=3, monosans_github=10,
+  pubproxy=2, proxyscrape_getproxies=5, shiftytr_http=4, shiftytr_https=0,
+  clarketm_github=2, sunny9577_github=10` — confirms both previously-
+  starved sources ran (`pubproxy`, `proxyscrape_getproxies`, no longer
+  zero) and all 3 new sources contributed real proxies in their first
+  cycle. `proxy_pool` counts moved from 1,645 harvested / 889 L1-usable
+  (≥40) / 13 L2-caliber (≥70) / 0 L3-caliber (≥90) immediately before this
+  round to 1,684 / 900 / 7 / 0 one cycle after — L2-caliber count itself
+  is still expected to be noisy cycle-to-cycle (documented since round 37
+  as genuine volatility from real-traffic score decay, not a measurement
+  bug), so a single before/after snapshot pair isn't proof the L2 ceiling
+  moved, only that the breadth fix is real and live.
+
+  **Correction, same round, minutes later: the "free sources have a
+  structural ceiling" claim directly above was wrong — see below.** It was
+  never actually tested; it repeated an assumption first written in round
+  33 and echoed unverified in rounds 35/37/38 (this file's own round-33
+  entry, `.wolf/STATUS.md`'s "L3-caliber (≥90) reads `0` essentially
+  always... free sources structurally can't reach it, already
+  documented"). The user pushed back the same round ("check L3 too...
+  fix it from the root cause") instead of accepting the documented
+  assumption, which is what actually surfaced the two real bugs below —
+  both fixed, and L3 immediately went from a documented-as-structural `0`
+  to a real, live `5`. Free proxy *quality* may still cap out lower than
+  paid proxies on average, but the specific claim "L3 reads 0 because free
+  sources structurally can't get there" was never true — it was two
+  measurement/scoring bugs, and both are now fixed. Leaving the wrong
+  claim here rather than deleting it, since the correction itself — a
+  documented assumption going unquestioned across 4 rounds until someone
+  asked to verify it — is worth keeping visible.
+
+  **Root cause 1 — the exact same `_http_validate` latency-measurement bug
+  above ALSO explained L3's stuck-at-0, not just L2's thinness.** Worked
+  through the math: even a theoretically ideal proxy (elite anonymity +
+  residential ASN, both scoring dimensions maxed) could only reach ~65-70
+  total under the OLD broken measurement, because `latency_score` carries
+  the single heaviest weight in the first-validation formula (up to 45%)
+  and the bug was inflating real proxies' recorded latency to 6-12
+  seconds. 90+ was arithmetically out of reach for nearly the entire pool
+  regardless of true proxy quality. Confirmed live immediately after the
+  `_http_validate` fix (before any further change): the pool's top proxy
+  jumped to score 96.85 (elite/residential, real `response_time_ms=693`)
+  — the first L3-caliber proxy this pool has ever recorded.
+
+  **Root cause 2 — a proxy's `response_time_ms` was captured exactly once,
+  at harvest/promotion time, and never refreshed for the rest of its life,
+  even as it earned a real success-rate track record through actual use.**
+  `ProxyManager.mark_success`/`mark_failure` (`proxy/manager.py`) recompute
+  `reliability_score` on every real fetch outcome via `_recompute_score`,
+  but that function always reads the STORED `response_time_ms` from the
+  row — it has no fetch-time latency input of its own. So even a proxy
+  with a flawless 100% real success rate stayed permanently capped by
+  whatever single latency sample it happened to get on day one — worked
+  through the math again: with the old-buggy 6805ms sample, even 100%
+  success + elite + residential + fresh-recency caps out at ~83, still
+  under 90. Compounding root cause 1: the bug didn't just distort one
+  reading, it froze that distorted reading in forever.
+
+  Root cause: no periodic refresh path existed for a proxy's latency/
+  anonymity/ASN reading once harvested — `health_monitor.py`'s existing
+  `check_all()` cycle (already re-checks every proxy on a rolling
+  oldest-`last_validated`-first basis, every `health_interval_seconds`,
+  default 300s) only ever recorded a bare pass/fail boolean and bumped
+  `last_validated`, discarding the anonymity/latency data its own
+  underlying judge check already computed.
+
+  Fixed by making `check_all()`'s validation cycle a real rescore, not
+  just a liveness ping: `check_one()` now delegates to
+  `ProxyHarvester._http_validate` (previously a hand-rolled duplicate of
+  the same JUDGE_URLS loop, returning only a bool) and gained ASN
+  classification (`SupportsClassify`, defaults to
+  `NullAsnClassifier`/wired to `ReverseDnsAsnClassifier` in production,
+  matching every other proxy/* module's DI convention) — on a passing
+  validation, `anonymity_level`/`asn_class`/`response_time_ms` are
+  UPDATEd from the fresh reading and `reliability_score` is recomputed via
+  `ScoringEngine`, folding in the proxy's real accumulated
+  `global_success_count`/`global_failure_count` so existing track record
+  isn't thrown away by this cycle. Every proxy in the pool now gets a
+  genuine, repeated chance for its latency reading to reflect reality,
+  instead of being frozen at a single (possibly bad) first sample forever.
+
+  **Found and fixed a real performance regression from this same change,
+  same round, before calling it done.** Adding a DNS `classify()` call per
+  successful validation, on top of the existing per-proxy judge
+  round-trip, made a fully-sequential 100-row `check_all()` cycle
+  ballooon to 15-25+ minutes — confirmed live: a fresh deploy's first
+  health cycle hadn't logged completion after 10+ minutes while
+  `last_validated` timestamps were visibly still advancing row-by-row,
+  well past the configured 300s interval. Fixed by bounding concurrency
+  to `HEALTH_CHECK_CONCURRENCY = 5` (`asyncio.Semaphore`, mirroring
+  `promotion.py`'s existing `PROMOTION_CONCURRENCY` pattern exactly) —
+  validations now run 5-at-a-time instead of one-at-a-time. Also
+  consolidated the per-row `DELETE FROM proxy_pool WHERE
+  reliability_score <= 0` (previously ran once per iteration, redundant —
+  each iteration deleted every currently-zero-score row regardless of
+  which row triggered it) into a single pass after the whole batch.
+
+  Tests: `tests/unit/test_health_monitor.py` — `check_one`'s 4 direct-
+  httpx-mock tests replaced with delegation tests (validation-loop edge
+  cases like judge-fallthrough are now covered once, in
+  `test_harvester.py`, not duplicated); added rescoring-uses-fresh-reading,
+  injected-classifier, and a concurrency-bound regression test (asserts
+  `HEALTH_CHECK_CONCURRENCY` is actually respected under a slow mocked
+  `check_one`, not just that the semaphore object exists). Full suite: 818
+  passed, 100.00% coverage, ruff/mypy --strict clean.
+
+  **Live-verified end-to-end, both fixes together.** Rebuilt/redeployed
+  `api`+workers twice more this round (once per fix). First `_http_validate`
+  fix alone: pool's top score jumped to 96.85 (first-ever L3-caliber
+  proxy). After the `health_monitor.py` rescore-cycle fix (with bounded
+  concurrency): first cycle completed in a few minutes (`periodic_health_
+  cycle: {'validated': 21, 'removed': 16, 'downgraded': 79}`, versus never
+  completing at all under the pre-concurrency-fix version), and
+  `proxy_pool` moved from 0 L3-caliber / single-digit L2-caliber (all of
+  this round, up to this point) to **43 L2-caliber (≥70) and 5 L3-caliber
+  (≥90)** after touching only 100 of the pool's 1,678 rows — one cycle,
+  ~6% of the pool. All 5 L3 proxies: elite anonymity, residential ASN,
+  real sub-2.1s response times (`164.52.216.71:8080` at 97.24/607ms down
+  to `59.153.83.186:8080` at 90.72/2041ms). Expected to keep climbing as
+  further cycles roll through the rest of the pool (health_monitor's
+  `ORDER BY last_validated ASC LIMIT 100` means every proxy gets touched
+  on a rolling basis, not just the 100 checked so far).
+
+  **Now genuinely open, not previously true:** `allow_tier2_fallback_for_
+  tier3` (`config/base.yaml`) can plausibly come back to `false` once L3
+  supply is confirmed to hold up over more cycles/time under real traffic
+  — this is a real possibility now, not blocked on a paid tier the way the
+  (incorrect) structural-ceiling claim implied. Not flipped yet — wants
+  more than one health cycle's worth of evidence first; a genuinely
+  paid tier remains a legitimate future option too but is no longer the
+  only path to non-zero L3 supply.
 
 - **RESOLVED (round 37) — round 35's scoring fix exposed a new failure
   mode: L2/L3 jobs hanging 150s+ instead of failing fast, root-caused to a

@@ -192,14 +192,45 @@ class ProxyHarvester:
             "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
             "ip_port",
         ),
+        (
+            "shiftytr_http",
+            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+            "ip_port",
+        ),
+        (
+            "shiftytr_https",
+            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+            "ip_port",
+        ),
+        (
+            "clarketm_github",
+            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+            "ip_port",
+        ),
+        (
+            "sunny9577_github",
+            "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+            "ip_port",
+        ),
     ]
+
+    # Round 38 — floor so a source late in SOURCES still gets a real quota
+    # instead of `limit - total` degrading to ~0 once earlier sources already
+    # filled the per-cycle budget. Root cause of pubproxy/proxyscrape_getproxies
+    # having zero Redis source-health records after 2 days live (confirmed):
+    # the old `if total >= limit: break` stopped the loop outright once any
+    # earlier source alone hit `limit`, so sources ordered after it never ran
+    # even once. Pool depth needs breadth (every source tried every cycle),
+    # not just raw volume from whichever source answers first.
+    MIN_PER_SOURCE = 10
 
     async def _direct_scrape(self, limit: int, tenant: TenantId) -> int:
         counts: dict[str, int] = {}
         total = 0
         async with httpx.AsyncClient(timeout=15) as client:
             for name, url, fmt in self.SOURCES:
-                n = await self._scrape_one(name, url, fmt, limit - total, tenant, client)
+                remaining = max(limit - total, self.MIN_PER_SOURCE)
+                n = await self._scrape_one(name, url, fmt, remaining, tenant, client)
                 counts[name] = n
                 # Per-source health signal (round 13 D2) — a source going dark
                 # becomes a specific named signal, not just a drop in the
@@ -210,8 +241,6 @@ class ProxyHarvester:
 
                     await record_source_health(self._redis, name, n)
                 total += n
-                if total >= limit:
-                    break
         if any(counts.values()):
             logger.info(
                 "harvest source breakdown: %s", ", ".join(f"{k}={v}" for k, v in counts.items())
@@ -241,9 +270,7 @@ class ProxyHarvester:
             if not await tcp_probe(ip, port):
                 continue
             # HTTP validation (proves proxy forwards traffic)
-            start = time.monotonic()
-            is_valid, anonymity = await self._http_validate(ip, port, protocol)
-            latency_ms = int((time.monotonic() - start) * 1000)
+            is_valid, anonymity, latency_ms = await self._http_validate(ip, port, protocol)
             if is_valid:
                 asn = _to_asn_class(await self._classifier.classify(ip))
                 score = _score_first_validation(latency_ms, anonymity, asn)
@@ -288,11 +315,27 @@ class ProxyHarvester:
         port: int,
         protocol: str,
         timeout: float = HTTP_VALIDATE_TIMEOUT,
-    ) -> tuple[bool, AnonymityLevel]:
+    ) -> tuple[bool, AnonymityLevel, int | None]:
         """Full HTTP round-trip through proxy to a judge endpoint.
 
-        Returns (is_valid, anonymity_level).
-        Never returns True on TCP-connect success alone.
+        Returns (is_valid, anonymity_level, latency_ms). latency_ms is None
+        when invalid, and — critically — measured only around the single
+        request that actually succeeded, never around the whole JUDGE_URLS
+        loop (round 38 fix: every caller used to wrap this entire call in
+        its own `time.monotonic()` pair, so a dead/slow earlier candidate's
+        full `timeout` got silently baked into the "proxy's latency" before
+        a later candidate ever answered — proxies whose first-tried judge
+        just happened to be unreachable were scored as if they took 5-15s
+        to respond, when their real latency to the judge that DID answer
+        was often under 2s. This crushed `latency_score` (the single
+        heaviest-weighted dimension, 0.25-0.45 depending on formula branch)
+        for a large fraction of the pool and was the dominant reason so few
+        proxies ever crossed the L2 (70) threshold regardless of how many
+        harvest sources fed the pool — confirmed live: `response_time_ms`
+        values clustering just above multiples of `HTTP_VALIDATE_TIMEOUT`
+        (5000ms) across the real pool, e.g. 6805ms/11878ms, consistent with
+        1-2 failed judge attempts eating their full timeout before a later
+        one answered in a more ordinary ~1-2s).
 
         Tries JUDGE_URLS in order, stopping at the first that returns a
         real 200 with a recognized body — one endpoint's outage (httpbin.org
@@ -311,7 +354,9 @@ class ProxyHarvester:
                 follow_redirects=False,
             ) as client:
                 resp = None
+                latency_ms: int | None = None
                 for url in JUDGE_URLS:
+                    attempt_start = time.monotonic()
                     try:
                         candidate = await client.get(url)
                     except Exception:
@@ -324,11 +369,12 @@ class ProxyHarvester:
                         continue
                     if any(key in data for key in _VALID_BODY_KEYS):
                         resp = candidate
+                        latency_ms = int((time.monotonic() - attempt_start) * 1000)
                         break
                 if resp is None:
-                    return False, AnonymityLevel.TRANSPARENT
+                    return False, AnonymityLevel.TRANSPARENT, None
         except Exception:
-            return False, AnonymityLevel.TRANSPARENT
+            return False, AnonymityLevel.TRANSPARENT, None
 
         # Classify anonymity from response headers
         via = resp.headers.get("Via", "")
@@ -342,7 +388,7 @@ class ProxyHarvester:
         else:
             level = AnonymityLevel.TRANSPARENT
 
-        return True, level
+        return True, level, latency_ms
 
     # ── parsers ──────────────────────────────────────────────────────────
 
@@ -460,9 +506,9 @@ asyncio.run(main())"""
                 # _scrape_one) so broker-sourced proxies get a real,
                 # comparable score instead of a guessed one. Low extra cost:
                 # this path is documented as low-volume (1-5 proxies/cycle).
-                start = time.monotonic()
-                is_valid, anonymity = await self._http_validate(ip, port, protocol.value)
-                latency_ms = int((time.monotonic() - start) * 1000)
+                is_valid, anonymity, latency_ms = await self._http_validate(
+                    ip, port, protocol.value
+                )
                 if not is_valid:
                     continue
                 score = _score_first_validation(latency_ms, anonymity, asn_class)
@@ -516,9 +562,7 @@ asyncio.run(main())"""
         promoted = 0
         for row in rows:
             ip, port, protocol = row["ip"], row["port"], row["protocol"]
-            start = time.monotonic()
-            is_valid, anonymity = await self._http_validate(ip, port, protocol)
-            latency_ms = int((time.monotonic() - start) * 1000)
+            is_valid, anonymity, latency_ms = await self._http_validate(ip, port, protocol)
             if is_valid:
                 asn = _to_asn_class(await self._classifier.classify(ip))
                 score = _score_first_validation(latency_ms, anonymity, asn)

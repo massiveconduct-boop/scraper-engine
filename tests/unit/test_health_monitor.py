@@ -6,13 +6,22 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from scraper_engine.core.models import AnonymityLevel, AsnClass
 from scraper_engine.proxy.health_monitor import HealthMonitor
 
 
 @pytest.fixture
 def pg():
     pg = AsyncMock()
-    pg.fetch.return_value = [{"ip": "1.2.3.4", "port": 8080}]
+    pg.fetch.return_value = [
+        {
+            "ip": "1.2.3.4",
+            "port": 8080,
+            "protocol": "HTTP",
+            "global_success_count": 0,
+            "global_failure_count": 0,
+        }
+    ]
     pg.execute.return_value = "DELETE 0"
     pg.fetchrow.return_value = {"n": 1}
     return pg
@@ -33,15 +42,40 @@ class TestHealthMonitor:
     @pytest.mark.asyncio
     async def test_check_all_validates(self, pg, redis):
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=True):
+        with patch.object(
+            hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+        ):
             result = await hm.check_all()
             assert result["validated"] == 1
             assert result["downgraded"] == 0
 
     @pytest.mark.asyncio
+    async def test_check_all_rescoring_uses_fresh_reading(self, pg, redis):
+        """Round 38: a passing validation must UPDATE anonymity_level/
+        asn_class/response_time_ms/reliability_score from the fresh
+        check_one() reading, not just bump last_validated."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            await hm.check_all()
+        update_call = next(
+            c for c in pg.execute.await_args_list if "SET anonymity_level" in c.args[1]
+        )
+        assert update_call.args[2] == AnonymityLevel.ELITE.value
+        assert update_call.args[3] == AsnClass.RESIDENTIAL.value
+        assert update_call.args[4] == 40
+
+    @pytest.mark.asyncio
     async def test_check_all_downgrades(self, pg, redis):
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=False):
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(False, AnonymityLevel.TRANSPARENT, AsnClass.UNKNOWN, None),
+        ):
             result = await hm.check_all()
             assert result["validated"] == 0
             assert result["downgraded"] == 1
@@ -51,7 +85,9 @@ class TestHealthMonitor:
         """api/health.py reads metrics:proxy_pool_size for GET /health's
         proxy_pool_size — this was previously never written anywhere."""
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=True):
+        with patch.object(
+            hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+        ):
             await hm.check_all()
         redis.set.assert_awaited_once()
         args, kwargs = redis.set.await_args
@@ -59,51 +95,80 @@ class TestHealthMonitor:
         assert args[2] == "1"
 
     @pytest.mark.asyncio
-    async def test_check_one_returns_bool(self, pg, redis):
-        hm = HealthMonitor(pg=pg, redis=redis)
-        with patch("httpx.AsyncClient.get") as mock_get:
-            mock_get.return_value.status_code = 200
-            result = await hm.check_one("1.2.3.4", 8080)
-            assert result is True
+    async def test_check_one_delegates_to_http_validate(self, pg, redis):
+        """check_one now delegates to ProxyHarvester._http_validate (round
+        38) instead of a hand-rolled duplicate JUDGE_URLS loop, so both
+        modules share one validation + accurate-latency implementation."""
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(True, AnonymityLevel.ELITE, 42)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis)
+            is_valid, anonymity, asn, latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert is_valid is True
+        assert anonymity == AnonymityLevel.ELITE
+        assert asn == AsnClass.UNKNOWN  # NullAsnClassifier default when none injected
+        assert latency_ms == 42
 
     @pytest.mark.asyncio
-    async def test_check_one_failure(self, pg, redis):
-        hm = HealthMonitor(pg=pg, redis=redis)
-        with patch("httpx.AsyncClient.get", side_effect=OSError("refused")):
-            result = await hm.check_one("1.2.3.4", 8080)
-            assert result is False
+    async def test_check_one_failure_returns_none_latency(self, pg, redis):
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis)
+            is_valid, anonymity, asn, latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert is_valid is False
+        assert anonymity == AnonymityLevel.TRANSPARENT
+        assert asn == AsnClass.UNKNOWN
+        assert latency_ms is None
 
     @pytest.mark.asyncio
-    async def test_check_one_falls_through_when_first_url_fails(self, pg, redis):
-        """One JUDGE_URLS candidate erroring must not fail the whole check —
-        the loop must try the next candidate (round 32 fallback fix)."""
-        from scraper_engine.proxy.harvester import JUDGE_URLS
+    async def test_check_all_bounds_concurrency(self, pg, redis):
+        """Round 38 regression: check_all must not validate all rows fully
+        sequentially or fully unbounded — must respect HEALTH_CHECK_CONCURRENCY.
+        Confirmed live: sequential validation (judge round-trip + a DNS
+        classify() call per row) turned a 100-row cycle into 15-25+ minutes
+        against a configured 300s interval before this fix."""
+        from scraper_engine.proxy.health_monitor import HEALTH_CHECK_CONCURRENCY
 
-        assert len(JUDGE_URLS) >= 2
+        pg.fetch.return_value = [
+            {
+                "ip": f"1.2.3.{i}",
+                "port": 8080,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,
+            }
+            for i in range(20)
+        ]
         hm = HealthMonitor(pg=pg, redis=redis)
-        calls = {"n": 0}
+        in_flight = {"current": 0, "max": 0}
 
-        async def fake_get(self, url):
-            calls["n"] += 1
-            if url == JUDGE_URLS[0]:
-                raise OSError("refused")
-            response = AsyncMock()
-            response.status_code = 200
-            return response
+        async def slow_check_one(ip, port, protocol="HTTP"):
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+            await asyncio.sleep(0.01)
+            in_flight["current"] -= 1
+            return True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50
 
-        with patch("httpx.AsyncClient.get", fake_get):
-            result = await hm.check_one("1.2.3.4", 8080)
-        assert result is True
-        assert calls["n"] == 2
+        with patch.object(hm, "check_one", slow_check_one):
+            await hm.check_all()
+        assert in_flight["max"] <= HEALTH_CHECK_CONCURRENCY
+        assert in_flight["max"] > 1, "test is meaningless if nothing ran concurrently"
 
     @pytest.mark.asyncio
-    async def test_check_one_outer_exception_returns_false(self, pg, redis):
-        """A failure constructing/entering the client itself (not a per-URL
-        failure) must still be caught by the outer guard."""
-        hm = HealthMonitor(pg=pg, redis=redis)
-        with patch("httpx.AsyncClient.__aenter__", side_effect=OSError("boom")):
-            result = await hm.check_one("1.2.3.4", 8080)
-        assert result is False
+    async def test_check_one_uses_injected_classifier(self, pg, redis):
+        classifier = AsyncMock()
+        classifier.classify.return_value = "residential"
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(True, AnonymityLevel.ELITE, 42)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis, asn_classifier=classifier)
+            _is_valid, _anonymity, asn, _latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert asn == AsnClass.RESIDENTIAL
+        classifier.classify.assert_awaited_once_with("1.2.3.4")
 
     @pytest.mark.asyncio
     async def test_run_forever_logs_and_loops(self, pg, redis, monkeypatch):
@@ -114,7 +179,9 @@ class TestHealthMonitor:
 
         monkeypatch.setattr("scraper_engine.proxy.health_monitor.asyncio.sleep", fake_sleep)
         with (
-            patch.object(hm, "check_one", return_value=True),
+            patch.object(
+                hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+            ),
             pytest.raises(asyncio.CancelledError),
         ):
             await hm.run_forever(interval_seconds=1)

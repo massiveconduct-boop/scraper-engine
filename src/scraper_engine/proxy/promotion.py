@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING
 
@@ -41,7 +40,7 @@ ValidateFn = Callable[
     # contract is the 3 required args; a fn with an extra defaulted param still
     # satisfies this.
     [str, int, str],
-    Coroutine[None, None, tuple[bool, "AnonymityLevel"]],
+    Coroutine[None, None, tuple[bool, "AnonymityLevel", "int | None"]],
 ]
 
 
@@ -92,13 +91,11 @@ class ProxyPromotionJob:
         async def _try_one(row: asyncpg.Record) -> None:
             nonlocal promoted, failed, exhausted
             async with self._sem:
-                start = time.monotonic()
-                is_valid, anonymity = await self._http_validate(
+                is_valid, anonymity, latency_ms = await self._http_validate(
                     row["ip"],
                     row["port"],
                     row["protocol"],
                 )
-                latency_ms = int((time.monotonic() - start) * 1000)
             async with self._pg.acquire(self._tenant) as conn:
                 new_attempts = row["promotion_attempts"] + 1
                 if is_valid:

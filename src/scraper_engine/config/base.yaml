@@ -74,13 +74,21 @@ proxy_tiers:
   min_score_level_1: 40.0
   min_score_level_2: 70.0
   min_score_level_3: 90.0
-  # Stopgap while running on free-only proxy sources, where 90+-scored
-  # proxies can be structurally unreachable (round 33): when true, L3 tries
-  # a real tier-3-caliber proxy first and only falls back to a
-  # tier-2-caliber one (min_score_level_2) if that search comes up
-  # genuinely empty — never skips the tier-3 search entirely. Turn back off
-  # once paid/higher-quality proxy sources make min_score_level_3 reliably
-  # reachable on its own.
+  # Fallback for when tier-3-caliber (90+) proxies are genuinely scarce:
+  # when true, L3 tries a real tier-3-caliber proxy first and only falls
+  # back to a tier-2-caliber one (min_score_level_2) if that search comes
+  # up genuinely empty — never skips the tier-3 search entirely.
+  #
+  # Originally framed (round 33) as a stopgap specifically for free-only
+  # proxy sources, on the assumption that 90+ scores were structurally
+  # unreachable without paid proxies. Round 38 found and fixed two real
+  # scoring bugs (a latency-measurement bug inflating recorded response
+  # times, and response_time_ms being frozen at its first-ever reading
+  # instead of refreshed by later health checks) that were the actual
+  # cause — free sources DO produce real 90+ proxies once scored
+  # correctly (5 confirmed live post-fix). Turn back off once L3 supply
+  # is confirmed to hold up over time under real traffic, not
+  # necessarily gated on adding paid proxies.
   allow_tier2_fallback_for_tier3: true
   # Round 34 — proxy/pool_health.py thresholds: validated-proxy counts per
   # tier below which that tier is DEGRADED / CRITICAL.

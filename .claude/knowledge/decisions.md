@@ -2088,3 +2088,185 @@ syntactically-fine-but-semantically-wrong WHERE clause) and
 `test_list_for_tenant_casts_non_str_job_id` (uses a stand-in object with
 its own `__str__`, since a plain string input can't distinguish "cast
 happened" from "cast was a no-op").
+
+## Decision: Harvest Source Breadth Over Per-Cycle Speed — Every Source Tried Every Cycle
+
+**Context:** Round 37 closed the L2/L3 proxy-leasing code path; the
+remaining open item was proxy *supply* — free-source L2/L3-caliber counts
+are thin and volatile. User was asked directly (more free harvest sources
+vs. a paid proxy tier) and chose more free sources. While adding 4 new
+sources to `proxy/harvester.py`'s `SOURCES` tuple, found that
+`_direct_scrape`'s `if total >= limit: break` had been silently starving
+sources ordered late in the tuple — once an early source alone filled the
+per-cycle `limit` (default 100), the loop stopped and later sources never
+ran, confirmed via 2+ days of zero Redis source-health records for
+`pubproxy`/`proxyscrape_getproxies`.
+
+**Decision:** Removed the early break. Replaced it with a
+`MIN_PER_SOURCE = 10` floor — each source's call gets
+`max(limit - total, MIN_PER_SOURCE)`, so a source late in the tuple always
+gets a real shot even if earlier sources already met the nominal budget.
+
+**Why:** The goal of adding sources at all is breadth (diversify supply
+so no single source's outage or a shifted budget starves the rest), not
+just raw per-cycle volume. A volume-only fix (e.g. just raising `limit`)
+would still let one prolific-but-low-quality source crowd out the others
+whenever it responds fast. Guaranteeing a floor per source directly
+targets the actual failure mode that was found.
+
+**Trade-off accepted:** a harvest cycle can now run longer than the
+configured `interval_seconds` (600s) when many sources are slow to
+respond or mostly return dead proxies, since every cycle now attempts all
+12 sources instead of stopping early. Confirmed this is safe, not a
+latent bug: `core/periodic.py::run_periodic` `await`s each cycle to
+completion and only calls `asyncio.sleep(interval_seconds)` afterward —
+cycles are strictly sequential, never overlapping. A slow cycle delays
+when the next one starts; it cannot corrupt state or run two harvests
+concurrently.
+
+**Alternatives considered:** raising `limit` alone (rejected — doesn't
+fix the actual starvation mechanism, just delays when it recurs as more
+sources are added); running sources concurrently via `asyncio.gather`
+instead of sequentially (rejected for this round — bigger change to
+`_direct_scrape`'s shape than the bug warranted; the sequential
+awaited-per-source form is also what keeps the safety argument above
+simple. Worth reconsidering if cycle duration becomes an actual operational
+problem, not just longer than before).
+
+**Status:** Active. Live-verified post-deploy (not just unit-tested) —
+rebuilt `api`+`worker-l1/l2/l3` together, first harvest cycle's log line
+showed all 12 sources contributing, including the two previously-starved
+ones (`pubproxy=2`, `proxyscrape_getproxies=5`) and the 3 newly-added
+sources (`shiftytr_http=4`, `clarketm_github=2`, `sunny9577_github=10`).
+Full detail and exact before/after `proxy_pool` counts:
+`technical-debt.md`'s round-38 entry.
+
+## Decision: Measure Judge Validation Latency Around Only the Winning Request
+
+**Context:** Same round-38 investigation. `proxy/harvester.py::_http_validate`
+tries up to 3 `JUDGE_URLS` in sequence, stopping at the first that answers.
+Every caller (`_scrape_one`, `_harvest_via_broker`, `promote_tcp_only`,
+`promotion.py::_try_one`) measured `latency_ms` by wrapping
+`time.monotonic()` around the *entire* `_http_validate()` call. When an
+earlier judge candidate was slow or unreachable, its full `timeout` (5.0s)
+got silently counted as part of the proxy's own latency before a later
+candidate ever answered. Confirmed live: real pool `response_time_ms`
+values clustered just above multiples of 5000ms (6805ms, 11878ms, etc.),
+consistent with 1-2 dead judge attempts eating their timeout before a
+working one answered in an ordinary ~1-2s. Since `latency_score` carries
+the heaviest single weight in the scoring formula (up to 45% for a
+first-ever validation), this was silently capping most of the pool well
+below the L2 (70) threshold and made L3 (90) arithmetically unreachable
+for nearly any proxy regardless of true quality — see the L3 root-cause
+entry below and `technical-debt.md`'s round-38 entry for the full math.
+
+**Decision:** `_http_validate` now times each judge attempt individually
+and returns `(is_valid, anonymity, latency_ms)` — `latency_ms` reflects
+only the request that actually succeeded, `None` when none did. All 4
+call sites updated to use the returned value directly instead of wrapping
+their own timer.
+
+**Why:** The proxy's real network latency is what the scoring formula is
+trying to measure; time spent waiting out an unrelated candidate's
+failure is noise that has nothing to do with the proxy's own performance.
+Fixing the measurement at its source (inside `_http_validate`) fixes it
+for every caller at once, rather than patching each call site's timer
+logic independently and risking drift.
+
+**Alternatives considered:** shortening `HTTP_VALIDATE_TIMEOUT`/reducing
+`JUDGE_URLS` to fewer candidates (rejected — reduces worst-case latency
+pollution but doesn't eliminate it, and the multi-judge fallback exists
+specifically because a single public judge can go down, per round 32's
+own finding; removing candidates trades one known failure mode for
+another). Per-candidate individual timing (chosen) directly fixes the
+actual defect instead of working around it.
+
+**Status:** Active. Unit-tested (`test_latency_measures_only_the_winning_
+attempt` — a slow-then-fast fake client proves the returned latency
+excludes the first candidate's delay; `test_latency_is_none_when_invalid`).
+Live-verified: pool `response_time_ms` values dropped from the 6000-12000ms
+range to realistic 100-2100ms for the same class of real proxies
+immediately after deploy; produced this pool's first-ever L3-caliber
+(score ≥90) proxy on the very next validation.
+
+## Decision: Refresh Proxy Latency On Every Health Check Instead Of Freezing It At Harvest Time
+
+**Context:** Same round-38 investigation, continued. Fixing the latency-
+measurement bug above (previous decision) only helps *newly* validated
+proxies going forward — `ProxyManager.mark_success`/`mark_failure`
+(`proxy/manager.py`) recompute `reliability_score` on every real fetch
+outcome, but always read the STORED `response_time_ms` off the row; they
+have no fetch-time latency input of their own. A proxy's latency reading
+was therefore captured exactly once, at harvest or promotion time, and
+never touched again for the rest of its life — even a proxy that went on
+to earn a flawless real-world success rate stayed capped by whatever
+single sample (good or, before the fix above, frequently bad) it happened
+to get on day one. Worked through the math: even 100% success + elite
+anonymity + residential ASN + fresh recency caps at ~83 total if
+`response_time_ms` is stuck at the old-buggy 6805ms sample — still under
+the 90 L3 threshold. This is why L3 stayed at 0 even immediately after
+the first fix above landed a single 96.85-scored proxy: that one instance
+got lucky by being freshly harvested post-fix; the rest of the pool's
+elite/residential proxies were still carrying their original bad samples.
+
+**Decision:** `health_monitor.py`'s existing `check_all()` cycle (already
+re-validates every pooled proxy on a rolling oldest-`last_validated`-first
+basis, every `health_interval_seconds` — default 300s, so it eventually
+covers the whole pool) now performs a real rescore on a passing
+validation instead of only bumping `last_validated`. `check_one()` was
+rewritten to delegate to `ProxyHarvester._http_validate` (was a
+hand-rolled duplicate of the same JUDGE_URLS loop, discarding everything
+but a bool) plus a new ASN classify() call, giving a fresh
+`(anonymity, asn, latency_ms)` triple every cycle. On success,
+`anonymity_level`/`asn_class`/`response_time_ms` are UPDATEd and
+`reliability_score` is recomputed via `ScoringEngine`, folding in the
+proxy's real `global_success_count`/`global_failure_count` so accumulated
+track record isn't discarded by this cycle — only the latency/anonymity/
+ASN inputs get refreshed, not the usage history.
+
+**Why:** The actual root cause wasn't that free proxies can't reach L3 —
+it's that nothing ever gave an already-harvested proxy a second chance at
+an accurate measurement. A health-check cycle that revalidates every
+proxy anyway was already the natural place to also refresh the inputs
+that feed its score, rather than adding a separate new mechanism.
+
+**Found and fixed a real regression from this same change before calling
+it done:** adding a DNS `classify()` call per successful validation, on
+top of the existing per-proxy judge round-trip, made a fully-sequential
+100-row cycle balloon to 15-25+ minutes wall-clock — confirmed live, a
+fresh deploy's first cycle hadn't logged completion after 10+ minutes
+while `last_validated` timestamps were still visibly advancing row by
+row. Fixed by bounding concurrency to `HEALTH_CHECK_CONCURRENCY = 5`
+(`asyncio.Semaphore`), mirroring `promotion.py`'s existing
+`PROMOTION_CONCURRENCY` pattern exactly rather than inventing a new
+concurrency-control convention. Also consolidated the pre-existing
+per-row `DELETE FROM proxy_pool WHERE reliability_score <= 0` (redundant
+— every iteration deleted every currently-zero-score row, not just ones
+this iteration caused) into a single pass after the batch.
+
+**Alternatives considered:** threading real fetch `duration_ms` (from
+`FetchResult`, available at `mark_success`/`mark_failure`'s call site in
+`orchestrator/worker.py`) into `response_time_ms` instead (rejected —
+`duration_ms` for L2/L3 includes browser launch, navigation, and
+challenge-solving/polling time, not raw proxy connect latency; reusing it
+would reintroduce the exact same class of measurement-contamination bug
+just fixed above, via a different path). A dedicated new periodic
+re-validation job instead of extending `health_monitor.py` (rejected —
+`check_all()` already does the right rolling-coverage validation pass;
+adding a second parallel mechanism would duplicate it for no benefit).
+
+**Status:** Active. Unit-tested (`test_check_all_rescoring_uses_fresh_
+reading`, `test_check_one_delegates_to_http_validate`,
+`test_check_one_uses_injected_classifier`,
+`test_check_all_bounds_concurrency` — the last asserts
+`HEALTH_CHECK_CONCURRENCY` is actually respected under a slow mocked
+`check_one`, not just that a semaphore object exists somewhere). Full
+suite: 818 passed, 100.00% coverage, ruff/mypy --strict clean.
+Live-verified end-to-end: rebuilt/redeployed twice (once per fix above);
+after the concurrency fix, the first health cycle completed in a few
+minutes (`periodic_health_cycle: {'validated': 21, 'removed': 16,
+'downgraded': 79}`) and `proxy_pool` moved from single-digit L2-caliber /
+0 L3-caliber to **43 L2-caliber (≥70) and 5 L3-caliber (≥90)** after
+touching only 100 of 1,678 pooled rows — one cycle, ~6% of the pool. All
+5 L3 proxies real, live, elite anonymity + residential ASN + sub-2.1s
+response times.
