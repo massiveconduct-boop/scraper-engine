@@ -173,20 +173,26 @@ future session doesn't assume the gap means nothing happened those rounds.
      (`python -m app.server` from that directory, listens on :8090) —
      not started automatically by anything, has to be brought up by hand
      for local chaos-suite runs.
-  3. Also un-skipped-then-re-skipped `tests/unit/test_browser.py::
-     TestBrowserPool::test_pool_acquire_when_empty_creates_new` as an
-     experiment: with Camoufox now genuinely working, tried gating it the
-     same `installed_verstr()`-conditional way as the chaos tests instead
-     of an unconditional `@pytest.mark.skip`. Real run surfaced a
-     *different*, deeper reason it was skipped: `camoufox`'s `geoip=true`
-     config does a live network call *through the configured proxy* at
-     launch time to resolve the browser's public IP, and the test
-     fixture's proxy (`1.2.3.4:8080`) is intentionally fake/non-routable
-     — so this test structurally needs a real working proxy, not just a
-     working Camoufox binary. Reverted to `@pytest.mark.skip`
-     (reason string updated to say why), left as a real, currently-
-     unactionable gap — was already covered by other passing tests either
-     way (coverage was 100% before and after this experiment).
+  3. **Second same-day follow-up — the last skip closed too.**
+     `tests/unit/test_browser.py::TestBrowserPool::
+     test_pool_acquire_when_empty_creates_new` was skipped because
+     `camoufox`'s `geoip=True` default dials out *through the configured
+     proxy* at launch time to resolve the browser's public IP, and the
+     test fixture's proxy (`1.2.3.4:8080`) is intentionally
+     fake/non-routable. First attempt (gating on `installed_verstr()`
+     like the chaos tests) surfaced this real distinction — Camoufox
+     being installed isn't sufficient, the proxy also has to be real.
+     Actual fix: pass `geoip=False` (a `BrowserPool`/`CamoufoxWrapper`
+     constructor param) — the test isn't exercising geoip behavior, so
+     skipping that one network call sidesteps the need for a real proxy
+     entirely, still launches real Firefox. Also caught and fixed a
+     latent assertion bug the skip had hidden: `pool.acquire()` returns
+     the live `BrowserContext`, not the `CamoufoxWrapper` that created it
+     (the wrapper stays tracked in `pool._active_wrappers`) — the
+     original assertion (`wrapper.proxy == proxy`) had never actually run
+     since the test was always skipped. Added `pool.shutdown()` cleanup
+     so the real Firefox process this test launches doesn't leak past it.
+     Suite: **782 passed, 0 skipped, 100.00% coverage.** Commit `43c3a07`.
 
   **Open follow-up, not fixed this round:** the `/v1/health` container
   healthcheck only reflects `api`'s own Postgres/Redis reachability, not
