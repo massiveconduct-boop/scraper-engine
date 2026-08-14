@@ -225,6 +225,80 @@ future session doesn't assume the gap means nothing happened those rounds.
   paid tier remains a legitimate future option too but is no longer the
   only path to non-zero L3 supply.
 
+  **Third bug in the same chain, found the same round from a real
+  consumer's live report — a downstream team ("research_agent" tenant)
+  running an actual research-agent product against this API reported the
+  fix "didn't help": their 47-URL corpus stayed stuck at the same 7/47
+  count, with `circuit_open` now showing up heavily next to
+  `proxy_exhausted`.** Confirmed this tenant's traffic was genuinely
+  hitting this exact deployment (not a stale/different one) via direct
+  Redis evidence — every domain they named had live `cb:<domain>:state`
+  keys in this deployment's Redis. Root-caused in two parts:
+
+  1. **Circuit breaker state was stale, not broken.** `orchestrator/
+     circuit_breaker.py` trips a domain open after 20 consecutive
+     failures — a separate protective layer, independent of proxy health,
+     that doesn't know or care that the underlying proxy problem got
+     fixed mid-flight. ~18 domains had tripped (`trip_count` 3-5 each)
+     from accumulated failures predating this round's fixes. 12 of 18 had
+     already passed their cooldown and would have self-healed on the next
+     natural attempt (`allow_request()`'s lazy OPEN→HALF_OPEN check); the
+     other 6 (including `pitchbook.com`, `medium.com`, `6sense.com`) were
+     still actively blocking. Manually cleared all `cb:*` keys for the
+     real corpus domains (left a `cb:example.com:*` test-fixture entry
+     alone) at the user's explicit request, rather than waiting out the
+     remaining cooldowns.
+
+  2. **The real, code-level bug: `net_probe.py::lease_preflight`'s fixed
+     2.0s timeout was rejecting exactly the proxies this round's earlier
+     fix had just started correctly promoting.** Watched the freshly-
+     recovered pool (43 L2-caliber / 5 L3-caliber, confirmed live minutes
+     earlier) crash back to 0/0 within ~75 minutes under the tenant's
+     real sustained traffic. Direct evidence on the 5 original L3 proxies:
+     every one had **0 recorded successes** and 3-11 recorded failures,
+     with real (now-accurately-measured) judge-latencies of 607-3242ms —
+     several exceeding the 2.0s preflight budget outright. Mechanism: a
+     proxy with genuine ~2-3s latency now correctly scores into L2/L3
+     range (round 38's earlier fix), but `ProxyManager.get_proxy()`'s
+     lease-time preflight (`lease_preflight`, called before every real
+     fetch) rejects it anyway on the clock, then calls `mark_failure` —
+     punishing the very proxies the scoring fix had just promoted, in a
+     tight feedback loop that reliably erased the gains within about an
+     hour of real load. `lease_preflight`'s 2.0s default was round 37's
+     own original choice (deliberately tight, to fail a dead proxy fast);
+     nothing exposed it as too tight until round 38's accurate-latency fix
+     started promoting genuinely-1-3s proxies for the first time.
+
+     Asked the user how to resolve the trade-off (raise the timeout /
+     scale it per-proxy / accept it as a deliberate fast-only filter);
+     chose raising it. `http_probe`/`lease_preflight` defaults: 2.0s →
+     4.0s (`tcp_probe`'s own separate default, used directly by
+     `harvester.py`'s unrelated candidate pre-filter, left unchanged).
+     Worst-case exhaustion path across `MAX_ATTEMPTS=5` goes from 20s to
+     40s — still well under round 37's original problem (a single bad
+     lease costing a full 40-60s browser navigation timeout with no
+     preflight at all).
+
+     Tests: existing `test_net_probe.py`/`test_proxy_manager.py` suites
+     unaffected (no test asserted the literal old default). Full suite:
+     818 passed, 100.00% coverage, ruff/mypy --strict clean (no new tests
+     added specifically for the timeout constant itself — the value is a
+     tuning parameter, not new branching logic; the existing tests already
+     cover both the tcp-reject-fast and http-round-trip-succeeds/fails
+     paths with explicit timeout overrides).
+
+     **Live-verified, still recovering at time of writing:** rebuilt/
+     redeployed. Within ~2 minutes, pool showed its first post-fix L3
+     proxy (score 98.66) and L2 count climbing (0→4). Success rate in the
+     following ~15 minutes of real tenant traffic: roughly 55-67% (up from
+     the ~20-30% range seen during the collapse), `circuit_open` at 0
+     across every minute bucket since the manual reset (part 1 above).
+     Not yet a fully-settled steady state — the pool needs more health
+     cycles to replenish past its single post-fix L3 proxy; documenting
+     this as "recovering, trending correctly" rather than "fully proven,"
+     since round 38's own pattern this session has repeatedly been
+     "looks fixed" → real sustained traffic surfaces the next layer.
+
 - **RESOLVED (round 37) — round 35's scoring fix exposed a new failure
   mode: L2/L3 jobs hanging 150s+ instead of failing fast, root-caused to a
   missing preflight on leased proxies.** Triggered by a user live-test

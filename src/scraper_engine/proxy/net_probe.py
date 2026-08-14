@@ -40,7 +40,7 @@ async def tcp_probe(ip: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-async def http_probe(ip: str, port: int, protocol: str, timeout: float = 2.0) -> bool:
+async def http_probe(ip: str, port: int, protocol: str, timeout: float = 4.0) -> bool:
     """One real GET of an HTTPS URL through the proxy — httpx issues this as
     a CONNECT tunnel. Catches two distinct live-caught failure modes: (1) a
     proxy that accepts a TCP connection but doesn't actually forward
@@ -49,7 +49,19 @@ async def http_probe(ip: str, port: int, protocol: str, timeout: float = 2.0) ->
     CONNECT tunneling ("Tunnel connection failed: 400 Bad Request") — the
     second is the more consequential case, since real target pages and
     Camoufox's own geoip launch check are both HTTPS. See
-    technical-debt.md's round-37 entry for the live evidence behind both."""
+    technical-debt.md's round-37 entry for the live evidence behind both.
+
+    Default raised 2.0s -> 4.0s (round 38, second pass): confirmed live
+    that this fixed 2.0s budget was rejecting proxies with a real,
+    accurately-measured (post round-38 harvester._http_validate fix) judge
+    round-trip of 1.9-3.2s — proxies the scoring system had just correctly
+    promoted into L2/L3 range were then failing the lease-time preflight
+    purely on a too-tight clock, not real unreliability, and getting
+    punished via mark_failure for it. Watched this collapse a fresh 43
+    L2-caliber / 5 L3-caliber pool back to 0/0 within about 75 minutes of
+    real traffic — every one of the 5 original L3 proxies had 0 recorded
+    successes and 3-11 preflight-driven failures, judge-latencies of
+    607-3242ms."""
     proxy_url = f"{protocol.lower()}://{ip}:{port}"
     try:
         async with httpx.AsyncClient(
@@ -61,13 +73,24 @@ async def http_probe(ip: str, port: int, protocol: str, timeout: float = 2.0) ->
         return False
 
 
-async def lease_preflight(ip: str, port: int, protocol: str, timeout: float = 2.0) -> bool:
+async def lease_preflight(ip: str, port: int, protocol: str, timeout: float = 4.0) -> bool:
     """Combined check run before a proxy is leased for a real fetch: cheap
     TCP reject first (catches the dominant ConnectTimeout/ConnectError
-    failure mode in ~2s), then one real HTTP round trip only if the TCP
-    check passed (catches the smaller "connects but doesn't forward"
-    residual). Worst case per candidate is bounded (2 * timeout) instead of
-    the full browser navigation timeout a bad lease used to cost."""
+    failure mode fast — a refused/unroutable connection fails in
+    milliseconds regardless of the timeout ceiling), then one real HTTP
+    round trip only if the TCP check passed (catches the smaller "connects
+    but doesn't forward" residual). Worst case per candidate is bounded
+    (2 * timeout) instead of the full browser navigation timeout a bad
+    lease used to cost.
+
+    Default raised 2.0s -> 4.0s, see http_probe's docstring for the live
+    evidence. Worst case across ProxyManager.MAX_ATTEMPTS=5 candidates is
+    now 5*2*4.0=40s (was 20s) — still a large improvement over round 37's
+    original problem (a single bad lease costing a full 40-60s browser
+    navigation timeout with NO preflight at all), just a smaller safety
+    margin than before. Accepted trade-off: correctly-scored-but-moderately
+    -slow real proxies actually getting a fair chance matters more here
+    than shaving the worst-case exhaustion path by a few seconds."""
     if not await tcp_probe(ip, port, timeout):
         return False
     return await http_probe(ip, port, protocol, timeout)

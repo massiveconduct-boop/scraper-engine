@@ -2270,3 +2270,59 @@ minutes (`periodic_health_cycle: {'validated': 21, 'removed': 16,
 touching only 100 of 1,678 pooled rows — one cycle, ~6% of the pool. All
 5 L3 proxies real, live, elite anonymity + residential ASN + sub-2.1s
 response times.
+
+## Decision: Raise lease_preflight's Timeout From 2.0s to 4.0s
+
+**Context:** Same round-38 investigation, third layer. A real downstream
+consumer (research_agent tenant) reported the fix "didn't help" — their
+corpus stayed stuck, with `circuit_open` now appearing heavily. Confirmed
+via live Redis evidence this tenant was genuinely hitting this exact
+deployment. Root-caused to two things: (1) stale circuit-breaker state
+from failures predating this round's fixes — not a code bug, resolved by
+manually clearing the affected `cb:*` keys at the user's request; (2) the
+real bug — `net_probe.py::lease_preflight`'s fixed 2.0s timeout (round
+37's own original choice) was rejecting proxies with a real,
+accurately-measured (per this round's earlier `_http_validate` fix)
+judge-latency of 1.9-3.2s. Watched a freshly-recovered pool (43 L2-caliber
+/ 5 L3-caliber) collapse back to 0/0 within ~75 minutes of real traffic —
+direct evidence on the 5 original L3 proxies showed 0 successes, 3-11
+failures each, judge-latencies of 607-3242ms, several exceeding the 2.0s
+budget outright. `mark_failure` was correctly doing its job, but the thing
+it was punishing was a too-tight clock, not real unreliability — creating
+a tight feedback loop that erased the earlier fix's gains under real load.
+
+**Decision:** Raised `http_probe`/`lease_preflight`'s default timeout
+2.0s → 4.0s. Left `tcp_probe`'s own separate default unchanged (used
+directly by `harvester.py`'s unrelated candidate pre-filter, not
+implicated in this failure).
+
+**Why:** The scoring fix earlier this round made genuinely-1-3s-latency
+proxies visible to the system for the first time (previously their
+latency was over-measured as much worse, so they never scored high enough
+to reach this code path at all). The lease-time preflight's fixed budget
+was calibrated against the OLD, artificially-slow-looking pool and never
+revisited once the measurement got fixed. Fixing measurement without also
+revisiting downstream fixed timeouts that assumed the old (wrong)
+distribution left a real gap.
+
+**Trade-off, asked the user rather than deciding unilaterally:** three
+options — raise the timeout (chosen), scale it per-proxy off its own
+known `response_time_ms` (more precise, more code), or leave it as a
+deliberate fast-proxies-only filter. Raising it was the simplest fix that
+directly addresses the confirmed mechanism. Worst-case proxy-exhaustion
+path across `MAX_ATTEMPTS=5` grows from 20s to 40s — accepted, since it's
+still well under round 37's original problem (a single bad lease costing
+a full 40-60s browser navigation timeout with zero preflight at all).
+
+**Alternatives considered:** per-proxy adaptive timeout (rejected for this
+round — real fix, but bigger change; worth reconsidering if a flat 4.0s
+still proves too tight or too loose once more data comes in over more
+health cycles).
+
+**Status:** Active, live-verified but still stabilizing at time of
+writing — rebuilt/redeployed, pool showed its first post-fix L3 proxy
+(score 98.66) within ~2 minutes and L2 count climbing from 0. Success
+rate over the following ~15 minutes of real tenant traffic: ~55-67% (up
+from ~20-30% during the collapse), `circuit_open` at 0 in every bucket
+since the manual reset. Full detail: `technical-debt.md`'s round-38
+entry, third sub-section.
