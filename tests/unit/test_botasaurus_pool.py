@@ -44,6 +44,28 @@ class TestBotasaurusPool:
         assert html == "<html>fresh</html>"
 
     @pytest.mark.asyncio
+    async def test_first_fetch_embeds_credentials_for_paid_gateway_proxy(self):
+        """Round 40 — Driver's proxy kwarg is a single string; a paid-gateway
+        Proxy's credentials must be embedded in it (auth_url()), not dropped
+        (which .url() would do)."""
+        gateway_proxy = Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=gateway_proxy, domain="a.example", session_id="s1"
+            )
+        assert driver_cls.call_args.kwargs["proxy"] == "http://user123:pass456@gw.dataimpulse.com:823"
+
+    @pytest.mark.asyncio
     async def test_second_same_domain_fetch_reuses_driver_via_requests_get(self):
         pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
         driver = _fake_driver()

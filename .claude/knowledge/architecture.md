@@ -318,6 +318,149 @@ descriptive PTR record, some residential ISPs set one).
 
 ---
 
+## Paid Gateway Proxy (Round 40)
+
+Toggleable paid rotating-gateway residential proxy (DataImpulse) for L2/L3,
+alongside — never replacing — the free-pool pipeline above. Off by default
+(`config.dataimpulse.enabled: false`); `config.dataimpulse.strategy`
+(`free_only` / `paid_only` / `free_first`) only takes effect once enabled.
+Full WHY: `decisions.md` → "Toggleable Paid Proxy Gateway". Full round
+narrative incl. the two Docker-image bugs found live-verifying this:
+`technical-debt.md`'s round-40 entry.
+
+```
+Worker._fetch_with_proxy()            [orchestrator/worker.py]
+  strategy = free_only unless config.dataimpulse.enabled
+  │
+  ├─ paid_only  → build_gateway_proxy() → ProxyLease(...) directly
+  │                (pm.get_proxy() never called)
+  │
+  ├─ free_first → pm.get_proxy() as today
+  │                └─ ProxyPoolExhaustedError → build_gateway_proxy() fallback
+  │
+  └─ free_only  → pm.get_proxy() as today, unchanged (default)
+```
+
+- **`proxy/paid_gateway.py::build_gateway_proxy()`** — pure function, 4 env
+  vars (`DATAIMPULSE_PROXY_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`,
+  `DATAIMPULSE_PASSWORD`; note the host/port names are the user's own
+  choice, not the originally-planned `DATAIMPULSE_GATEWAY_*`), no network
+  I/O, no DB row. Returns `None` on any missing/invalid var — callers treat
+  `None` as a hard misconfiguration, never a silent fallback (see
+  `Worker.__init__`'s fail-fast startup check below).
+- **`core/models.py::Proxy`** gained `username`/`password`/
+  `source: Literal["pool","paid_gateway"]` (all optional/defaulted — zero
+  effect on any existing free-pool `Proxy`) and `auth_url()`
+  (`user:pass@host:port`, identical to `url()` when unauthenticated).
+- **Deliberately bypasses `ProxyManager` entirely for a gateway lease** —
+  no `_select_candidate`, no domain-ban check, no `lease_preflight`, and
+  `mark_success`/`mark_failure` are skipped (`_fetch_with_proxy` checks
+  `lease.proxy.source == "pool"` before calling either). A rotating
+  gateway's exit IP changes server-side per connection — there's no fixed
+  identity worth scoring, banning, or preflighting. See `decisions.md` for
+  the full reasoning.
+- **`Worker.__init__`** calls `build_gateway_proxy()` eagerly when
+  `dataimpulse.enabled=true` and raises `RuntimeError` if it returns
+  `None` — fails the job process at construction time, not silently
+  mid-fetch (RQ forks one process per job).
+- **Credential plumbing to the actual fetch:**
+  `browser/camoufox_wrapper.py` adds `username`/`password` keys to the
+  `proxy={"server": ...}` dict Playwright/Camoufox already accepts natively.
+  Botasaurus takes a single proxy *string* (no dict support) — its two call
+  sites (`fetcher/botasaurus_wrapper.py`, `browser/botasaurus_pool.py`)
+  use `.auth_url()` instead of `.url()`.
+- **Two Docker-image dependencies added** (`Dockerfile`, `system-base`
+  stage): `nodejs` and `npm` — required by Botasaurus's own
+  `botasaurus_proxy_authentication` helper for ANY credentialed proxy
+  (local anonymizing-proxy chain via a lazily-`npm install`ed `proxy-chain`
+  package), invisible before round 40 since no proxy this system used ever
+  carried credentials. A related live-caught bug:
+  `fetcher/level_2.py::_fetch_via_botasaurus`'s `except Exception:` didn't
+  catch the `SystemExit` that library raises when Node is missing — fixed
+  to `except (Exception, SystemExit):` (deliberately not a bare `except:`,
+  to keep `asyncio.CancelledError`/`KeyboardInterrupt` propagating).
+- **RESOLVED (round 41)** — see "Xvfb Display-Contention Lock" below for
+  the root cause and fix. `paid_only`/`free_first` are now live-verified
+  reliable for L2 (4 rounds of increasingly concurrent real jobs, zero
+  crash-attributable job failures).
+
+---
+
+## Xvfb Display-Contention Lock (Round 41)
+
+Closes round 40's open thread above. Two compounding bugs, both in
+third-party code, worked around rather than patched (no vendored forks):
+
+1. **botasaurus_driver's Xvfb launch picks a display number by scanning
+   disk, not atomically.** `botasaurus_driver/core/config.py`'s
+   `Config.__call__()` calls `pyvirtualdisplay.Display(visible=False,
+   size=(1920, 1080))`, whose `_search_for_display()` lists
+   `/tmp/.X*-lock` files and picks `max(existing) + 3` — a plain
+   list-then-guess, not a claim. Camoufox's own launcher
+   (`camoufox/virtdisplay.py::VirtualDisplay.get()`) is race-free by
+   contrast: it launches Xvfb with `-displayfd`, so Xvfb itself claims a
+   free number atomically and reports it back over a pipe. Two engines
+   sharing one worker process (`Level2Fetcher.fetch()`'s Botasaurus-then-
+   Camoufox fallback, `core.budget.BROWSER_SEMAPHORE` permitting several
+   concurrent browser launches) meant a Botasaurus launch's stale-scan
+   guess could collide with a Camoufox (or another Botasaurus) launch
+   that had grabbed a real number moments earlier —
+   `_XSERVTransSocketUNIXCreateListener: ...SocketCreateListener() failed
+   / server already running`. Because this raises before
+   `botasaurus_driver` ever returns a `Driver` object, application code
+   had no handle to `close()` and clean up the half-started Xvfb process.
+2. **`pyvirtualdisplay.Display.stop()` never unlinks its lock/socket
+   files.** It `SIGKILL`s the Xvfb subprocess and waits for exit, but
+   SIGKILL bypasses Xvfb's own atexit cleanup, so `/tmp/.X<N>-lock` and
+   `/tmp/.X11-unix/X<N>` are left on disk even though the process is
+   gone — feeding bad guesses to bug (1) for every future launch,
+   compounding over a long-lived worker process's lifetime. (Camoufox's
+   own `virtdisplay.py::kill()` already does this cleanup correctly for
+   its own displays — this gap is specific to botasaurus_driver's use of
+   `pyvirtualdisplay`.)
+
+**Fix — `core/budget.py::XVFB_LOCK`**, a new process-wide `asyncio.Lock`
+(alongside `BROWSER_SEMAPHORE`) serializing every Xvfb spinup *and*
+teardown across both engines:
+- `browser/camoufox_wrapper.py` — held across `__aenter__`'s launch call
+  and, separately, across `__aexit__`'s `self._browser.__aexit__()`
+  teardown call. Not held across the fetch itself, so
+  `BROWSER_SEMAPHORE`'s real concurrency ceiling is unaffected.
+- `fetcher/botasaurus_wrapper.py::fetch_html()` — held for the *entire*
+  call. Botasaurus's `@browser` decorator bundles launch+navigate+close
+  into one synchronous call with no seam to release early — an accepted
+  throughput trade for correctness.
+- `browser/botasaurus_pool.py::fetch()` — held across both the
+  evict-and-close-old-entry step and the construct-new-driver step
+  together (one `async with` spanning both), so a new launch can never
+  start while a just-evicted driver's Xvfb teardown is still in flight.
+  The reuse path (`_reuse_fetch`, no display touched) stays lock-free.
+
+**Fix — `browser/_xvfb_cleanup.py::cleanup_stale_display()`** — new,
+best-effort proactive removal of a just-closed Botasaurus driver's
+`/tmp/.X<N>-lock`/`/tmp/.X11-unix/X<N>` files (reaches into
+botasaurus_driver's private `Config._display` attribute; no public API
+exists). Wired into `botasaurus_pool.py::_close_driver()` and
+`botasaurus_wrapper.py::_botasaurus_fetch()`'s `finally` block (captured
+via closure, since the `@browser` decorator never exposes the `Driver`
+back to the caller after its own internal close).
+
+**What this does and doesn't guarantee:** live verification (4 rounds of
+concurrent real jobs against nairametrics.com, up to 4 simultaneous
+2-URL jobs = 8 L2 fetches, `dataimpulse.strategy: paid_only`) showed the
+underlying collision (`SocketCreateListener() failed`) can still
+occasionally log — Xvfb's own `-displayfd` internal retry logic absorbs
+a transient collision on a stale socket file — but it no longer
+propagates into a crashed browser session or an unrecoverable job.
+Zero job failures, zero stuck jobs, zero tracebacks attributable to it
+across all 4 verification rounds, versus the pre-fix behavior (crashed
+CDP/websocket connection, `"Connection to remote host was lost -
+goodbye"`, no way to clean up the orphaned Xvfb process). This is a
+concurrency-race fix, not a guarantee the warning line disappears
+entirely — the warning is now cosmetic noise, not a failure mode.
+
+---
+
 ## Browser Pool
 
 > **CORRECTION (round 25) — wired into production; supersedes the round-24

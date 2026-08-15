@@ -12,6 +12,8 @@ from scraper_engine.core.models import (
     FailureCategory,
     FetchResult,
     JobStatus,
+    Proxy,
+    ProxyProtocol,
     ScrapeRequest,
 )
 from scraper_engine.core.tenant import TenantId
@@ -544,7 +546,7 @@ class TestFetchUrlDispatch:
     async def test_level2_leases_proxy_and_dispatches_via_factory(
         self, tenant, worker, monkeypatch
     ):
-        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080, source="pool")
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
@@ -586,6 +588,16 @@ class TestFetchUrlDispatch:
 
     @pytest.mark.asyncio
     async def test_level2_proxy_exhausted_returns_failure_result(self, tenant, worker, monkeypatch):
+        """Explicitly pinned to free_only (round 40): this tests what
+        happens on pool exhaustion specifically WITHOUT a gateway fallback
+        configured — TestDataImpulseStrategy covers the free_first-falls-
+        back-to-gateway case separately. Pinning here (rather than relying
+        on the worker fixture's default) keeps this test's outcome
+        independent of whatever config/base.yaml's real dataimpulse.enabled
+        value happens to be at any given time."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig()
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(
             side_effect=ProxyPoolExhaustedError(domain="example.com", level=2, attempts=5)
@@ -606,7 +618,7 @@ class TestFetchUrlDispatch:
     async def test_level3_leases_proxy_and_dispatches_via_factory(
         self, tenant, worker, monkeypatch
     ):
-        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080, source="pool")
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
@@ -642,6 +654,11 @@ class TestFetchUrlDispatch:
 
     @pytest.mark.asyncio
     async def test_level3_proxy_exhausted_returns_failure_result(self, tenant, worker, monkeypatch):
+        """See test_level2_proxy_exhausted_returns_failure_result — same
+        round-40 free_only pin, same reasoning."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig()
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(
             side_effect=ProxyPoolExhaustedError(domain="example.com", level=3, attempts=5)
@@ -669,7 +686,7 @@ class TestFetchUrlDispatch:
         failing the same way gets tried twice (fresh lease each time)
         before this level gives up, so both get_proxy/fetch/mark_failure
         fire twice, not once."""
-        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080, source="pool")
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
@@ -707,7 +724,7 @@ class TestFetchUrlDispatch:
     ):
         """See test_level2_real_fetch_failure_marks_failure_not_success —
         same round-37 retry semantics apply to L3."""
-        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080, source="pool")
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
@@ -746,8 +763,8 @@ class TestFetchUrlDispatch:
         """Round 37 — first lease's fetch fails with a proxy-retryable
         category; the retry must lease a NEW proxy (not reuse the failed
         one) and, on success, mark_success only the second proxy."""
-        proxy_a = MagicMock(ip="1.1.1.1", port=8080)
-        proxy_b = MagicMock(ip="2.2.2.2", port=8080)
+        proxy_a = MagicMock(ip="1.1.1.1", port=8080, source="pool")
+        proxy_b = MagicMock(ip="2.2.2.2", port=8080, source="pool")
         lease_a = ProxyLease(proxy=proxy_a, tenant_id=tenant)
         lease_b = ProxyLease(proxy=proxy_b, tenant_id=tenant)
         pm_instance = MagicMock()
@@ -790,7 +807,7 @@ class TestFetchUrlDispatch:
         one) must NOT trigger a same-level retry — retrying with a
         different proxy wouldn't plausibly fix a detection/content issue,
         just burn another lease for no reason."""
-        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080)
+        proxy_sentinel = MagicMock(ip="1.2.3.4", port=8080, source="pool")
         lease = ProxyLease(proxy=proxy_sentinel, tenant_id=tenant)
         pm_instance = MagicMock()
         pm_instance.get_proxy = AsyncMock(return_value=lease)
@@ -854,6 +871,231 @@ class TestFetchUrlDispatch:
         drives it."""
         result = await worker._fetch_url(tenant, "http://example.com", 99)
         assert result is None
+
+
+class TestDataImpulseStrategy:
+    """Round 40 — config.dataimpulse's three-way toggle
+    (free_only/paid_only/free_first) inside _fetch_with_proxy. free_only's
+    behavior is proven unchanged by every test above (the `worker` fixture's
+    default AppConfig has dataimpulse.enabled=False, so strategy resolves to
+    "free_only" and none of these branches fire) — these tests cover only
+    the two new branches this round added."""
+
+    @staticmethod
+    def _gateway_proxy() -> Proxy:
+        return Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+
+    @pytest.mark.asyncio
+    async def test_paid_only_never_touches_free_pool(self, tenant, worker, monkeypatch):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="paid_only")
+
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock()
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=self._gateway_proxy()),
+        )
+
+        expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=expected)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is expected
+        pm_instance.get_proxy.assert_not_awaited()
+        # gateway lease (source="paid_gateway") must never write to proxy_pool scoring
+        pm_instance.mark_success.assert_not_awaited()
+        pm_instance.mark_failure.assert_not_awaited()
+        fake_fetcher.fetch.assert_awaited_once_with(
+            "http://example.com", tenant, proxy=self._gateway_proxy(), overrides=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_paid_only_raises_when_gateway_misconfigured(self, tenant, worker, monkeypatch):
+        """Defense in depth — Worker.__init__ should already have caught a
+        bad config at construction time; _fetch_with_proxy must still never
+        silently fall back to the free pool if this somehow drifts out of
+        sync with the startup check."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="paid_only")
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", MagicMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=MagicMock())
+        )
+
+        with pytest.raises(RuntimeError, match="paid_only"):
+            await worker._fetch_url(tenant, "http://example.com", 2)
+
+    @pytest.mark.asyncio
+    async def test_free_first_falls_back_to_gateway_on_exhaustion(
+        self, tenant, worker, monkeypatch
+    ):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(
+            side_effect=ProxyPoolExhaustedError(domain="example.com", level=2, attempts=10)
+        )
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=self._gateway_proxy()),
+        )
+
+        expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=expected)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is expected
+        pm_instance.get_proxy.assert_awaited_once()
+        pm_instance.mark_success.assert_not_awaited()  # gateway lease, not a pool proxy
+
+    @pytest.mark.asyncio
+    async def test_free_first_never_touches_gateway_when_pool_succeeds(
+        self, tenant, worker, monkeypatch
+    ):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+
+        pool_proxy = MagicMock(ip="1.2.3.4", port=8080, source="pool")
+        lease = ProxyLease(proxy=pool_proxy, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        gateway_mock = MagicMock(return_value=self._gateway_proxy())
+        monkeypatch.setattr("scraper_engine.proxy.paid_gateway.build_gateway_proxy", gateway_mock)
+
+        expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=expected)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is expected
+        gateway_mock.assert_not_called()
+        pm_instance.mark_success.assert_awaited_once_with(tenant, "1.2.3.4", 8080)
+
+    @pytest.mark.asyncio
+    async def test_free_first_raises_when_gateway_misconfigured_after_exhaustion(
+        self, tenant, worker, monkeypatch
+    ):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(
+            side_effect=ProxyPoolExhaustedError(domain="example.com", level=2, attempts=10)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", MagicMock(return_value=None)
+        )
+
+        with pytest.raises(RuntimeError, match="free_first"):
+            await worker._fetch_url(tenant, "http://example.com", 2)
+
+
+class TestDataImpulseStartupValidation:
+    """Round 40 — Worker.__init__ fails fast when dataimpulse.enabled=True
+    but the gateway env vars aren't set, instead of every _fetch_with_proxy
+    call degrading silently mid-job. Not async — no fetch happens here."""
+
+    @staticmethod
+    def _new_worker(config):
+        redis = AsyncMock()
+        cb = AsyncMock()
+        pc = AsyncMock()
+        dlq = AsyncMock()
+        return Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq, config=config)
+
+    def test_raises_when_enabled_but_gateway_not_configured(self, monkeypatch):
+        from scraper_engine.config.schema import AppConfig, DataImpulseConfig
+
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", MagicMock(return_value=None)
+        )
+        cfg = AppConfig(dataimpulse=DataImpulseConfig(enabled=True, strategy="paid_only"))
+
+        with pytest.raises(RuntimeError, match="DATAIMPULSE"):
+            self._new_worker(cfg)
+
+    def test_does_not_raise_when_enabled_and_configured(self, monkeypatch):
+        from scraper_engine.config.schema import AppConfig, DataImpulseConfig
+
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=TestDataImpulseStrategy._gateway_proxy()),
+        )
+        cfg = AppConfig(dataimpulse=DataImpulseConfig(enabled=True, strategy="paid_only"))
+
+        self._new_worker(cfg)  # must not raise
+
+    def test_does_not_check_gateway_when_disabled(self, monkeypatch):
+        from scraper_engine.config.schema import AppConfig
+
+        gateway_mock = MagicMock(return_value=None)
+        monkeypatch.setattr("scraper_engine.proxy.paid_gateway.build_gateway_proxy", gateway_mock)
+        cfg = AppConfig()  # dataimpulse.enabled=False default
+
+        self._new_worker(cfg)
+        gateway_mock.assert_not_called()
+
+    def test_default_dataimpulse_config_is_disabled_free_only(self):
+        """Locks in the out-of-the-box default: the toggle does nothing
+        until explicitly turned on, so every deployment that predates
+        round 40 keeps today's free-pool-only behavior unchanged."""
+        from scraper_engine.config.schema import AppConfig
+
+        cfg = AppConfig()
+        assert cfg.dataimpulse.enabled is False
+        assert cfg.dataimpulse.strategy == "free_only"
 
 
 class TestExtractionWiring:

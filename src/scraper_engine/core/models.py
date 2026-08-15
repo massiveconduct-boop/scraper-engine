@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -42,9 +42,27 @@ class Proxy(BaseModel):
     anonymity_level: AnonymityLevel = AnonymityLevel.TRANSPARENT
     asn_class: AsnClass = AsnClass.UNKNOWN
     reliability_score: float = Field(ge=0, le=100, default=50.0)
+    # Round 40 — paid rotating-gateway providers (e.g. DataImpulse) authenticate
+    # via username/password rather than being an anonymous free-list IP. Both
+    # None for every proxy_pool-sourced Proxy; only set by proxy/paid_gateway.py.
+    username: str | None = None
+    password: str | None = None
+    # Distinguishes a scored proxy_pool row from a paid gateway's synthetic
+    # Proxy so callers (orchestrator/worker.py::_fetch_with_proxy) know not to
+    # run pool-only bookkeeping (mark_success/mark_failure, domain bans,
+    # lease_preflight) against a gateway that has no proxy_pool row at all.
+    source: Literal["pool", "paid_gateway"] = "pool"
 
     def url(self) -> str:
         return f"{self.protocol.value.lower()}://{self.ip}:{self.port}"
+
+    def auth_url(self) -> str:
+        """Same as url() but with credentials embedded (user:pass@host:port),
+        for consumers that take a single proxy string rather than a
+        structured dict (Botasaurus). Identical to url() when unauthenticated."""
+        if self.username is None or self.password is None:
+            return self.url()
+        return f"{self.protocol.value.lower()}://{self.username}:{self.password}@{self.ip}:{self.port}"
 
     def key(self) -> str:
         return f"{self.ip}:{self.port}"

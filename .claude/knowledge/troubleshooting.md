@@ -37,6 +37,53 @@ belongs to), `.archive/{evidence,directive,closure}/round-6-*.md`
 **Fix:** Add `# ruff: noqa: E501` at file top with comment explaining why.
 **Notable locations:** `proxy/harvester.py` (broker subprocess script strings).
 
+### Round 40: `except Exception:` Doesn't Catch a Third-Party Library's `sys.exit()`
+**Symptom:** A code path documented as "falls back gracefully on failure"
+instead crashes the entire job/process, even though it's wrapped in a
+`try/except Exception:`.
+**Root cause:** Some third-party libraries call `sys.exit(N)` on an
+environment-check failure instead of raising a normal exception (e.g.
+Botasaurus's `botasaurus_proxy_authentication` → `javascript_fixes.
+check_node()`, which `sys.exit(1)`s if Node.js isn't on `PATH`, reached
+only when a proxy string carries embedded `user:pass@` credentials).
+`sys.exit()` raises `SystemExit`, a `BaseException` subclass — NOT an
+`Exception` subclass — so a bog-standard `except Exception:` guard doesn't
+catch it, and it propagates all the way up, bypassing any
+"catch-and-fall-back" contract in between.
+**Fix:** Catch it explicitly where the fallback contract needs to hold:
+`except (Exception, SystemExit):`. Deliberately NOT a bare `except:` —
+that would also swallow `asyncio.CancelledError` (breaks cooperative job
+cancellation) and `KeyboardInterrupt`.
+**Occurrence:** `fetcher/level_2.py::_fetch_via_botasaurus` — see
+`technical-debt.md`'s round-40 entry for the live incident (one job left
+permanently stuck at `PROCESSING` before this fix).
+**General lesson:** when a documented "always falls back on failure"
+contract seems to not be holding, check whether the failure is actually a
+`SystemExit`/other non-`Exception` `BaseException` before assuming the
+fallback logic itself is broken.
+
+### Round 40: Botasaurus Authenticated Proxies Need `nodejs` AND `npm`, Not Just One
+**Symptom:** A Botasaurus fetch using a `user:pass@host:port` proxy string
+fails. Two distinct symptoms depending on which binary is missing: (1) no
+`node` on `PATH` → `SystemExit` from `javascript_fixes.check_node()` (see
+the entry above); (2) `node` present but no `npm` → silent `sh: npm: not
+found` in stdout while installing the `proxy-chain` npm package
+(`botasaurus_driver`'s `create_local_proxy()` shells out to `npm install`
+the first time it's needed — lazy, not vendored into the image).
+**Root cause:** Chrome's `--proxy-server` flag has no native username/
+password support, so `botasaurus_driver` spins up a local anonymizing
+proxy relay via a Node-based helper to strip and inject the credentials.
+This whole code path is unreachable — and therefore its missing
+dependencies invisible — for any unauthenticated proxy, which is every
+free-pool proxy this system used before round 40.
+**Fix:** `Dockerfile`'s `system-base` stage installs both `nodejs` and
+`npm` (found one at a time, live, via two separate rebuild-redeploy-retest
+cycles — don't assume fixing one is sufficient, verify the actual next
+symptom).
+**Detection:** `docker compose exec <service> node --version` and `npm
+--version` inside the running container; grep worker logs for `npm: not
+found` or `Installing 'proxy-chain'`.
+
 ### Round 27: Bare Dotted Import Rebinding on Package Rename/Move
 **Symptom:** After renaming/moving a package, a bulk import-rewrite looks
 complete (ruff/grep for `from X import Y` shows nothing left) but a specific

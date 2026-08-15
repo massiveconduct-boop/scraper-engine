@@ -2366,3 +2366,202 @@ passed, 100.00% coverage. Live-verified across two full cycles:
 60-min-stale count 833 → 712 → 773 (time alone, between cycles) → 670 —
 net downward trend confirms the queue genuinely advances now instead of
 reprocessing the same stuck batch.
+
+---
+
+## Decision: Score From Real Track Record, Not Stale Snapshots
+
+**Date:** round 39
+
+**Context:** User reported a real production run (research_agent tenant,
+47/47 URLs, only 10 succeeded) and explicitly rejected "free proxies are
+just unreliable" as an explanation, asking for the real mechanism rather
+than accepting a plausible-sounding one. That skepticism uncovered three
+compounding bugs, each found only by live re-verifying the previous fix
+instead of assuming it was sufficient.
+
+**What:** (1) `health_monitor.py::check_all` now does a fresh
+`UPDATE ... RETURNING` immediately before scoring/writing each row,
+instead of scoring off a batch snapshot read once at the top of the
+cycle — the snapshot was stale by write time, silently clobbering real
+`mark_success`/`mark_failure` updates that landed mid-cycle. (2)
+`harvester.py`'s re-harvest and promotion paths now look up a proxy's real
+`global_success_count`/`global_failure_count` and pass the real
+`compute_success_rate()` result to `ScoringEngine`, instead of hardcoding
+`success_rate=None` (which `scoring.py` deliberately reserves for "no
+track record yet," redistributing weight across the other four scoring
+dimensions) even for proxies with real accumulated history. (3) Removed
+`GREATEST(reliability_score, EXCLUDED.reliability_score)` from both
+`ON CONFLICT DO UPDATE` upserts in `harvester.py` — a ratchet that only
+ever lets a score increase, originally meant to protect a good score from
+a transient bad re-read, but which also permanently protects a WRONG,
+inflated score from ever being corrected once the real formula says it
+should drop.
+
+**Why:** Fix (2) alone produced no visible pool-wide change — the only
+reason that was investigated further, rather than accepted as "the fix
+just doesn't matter much," was fix (3): the ratchet was silently
+discarding every corrected (lower) score fix (2) computed. Together, these
+three are what surfaced the pool's honest, much lower real supply numbers
+(tier 2's real supply: a fake ~45 down to a real 4) — this was a
+correction of years of silent inflation, not a regression the fixes
+caused.
+
+**Trade-offs:** None significant — these are correctness fixes, not
+judgment calls between designs. The corrected (lower, honest) tier-2
+supply is what directly motivated the same-round
+`allow_tier1_fallback_for_tier2` addition (see next entry) — without it,
+this fix alone would have made the starvation worse in the short term by
+removing years of score inflation that had been (accidentally) keeping
+more proxies eligible than their real track record justified.
+
+**Status:** Active. 835 passed (progression 820→835 across the round),
+100% coverage, ruff/mypy clean. Live-verified via real `POST /v1/scrape`
+jobs against the `research_agent` tenant. Full detail:
+`technical-debt.md`'s round-39 entry.
+
+---
+
+## Decision: Round 39 Leasing-Reliability Hardening
+
+**Date:** round 39
+
+**Context:** Same investigation as the prior entry — once real (lower)
+supply numbers were visible, the user asked to understand exactly how the
+scraper uses proxies (single lease per site, discarded after?) rather than
+accept another surface-level fix, and to pull any thread found rather than
+defer it. Four further gaps surfaced this way, each found by live-testing
+the previous fix before declaring it sufficient.
+
+**What:**
+1. Added `allow_tier1_fallback_for_tier2` to `ProxyTierConfig`, mirroring
+   the existing `allow_tier2_fallback_for_tier3` pattern exactly (same
+   single-hop-only shape, tried only after a real tier-2-caliber search
+   comes up empty, never cascades further).
+2. Raised `ProxyManager.MAX_ATTEMPTS` from 5 to 10.
+3. `_select_candidate`'s `ORDER BY` now leads with
+   `(global_success_count > 0) DESC` before `reliability_score DESC`.
+4. `mark_failure` gained `ban_domain: bool = True`, set `False` only at the
+   lease-time preflight call site inside `ProxyManager.get_proxy()`'s own
+   loop.
+5. `net_probe.py::_LEASE_CHECK_URLS` grew from one HTTPS judge to three
+   (first-success-wins), mirroring `harvester.py`'s own multi-judge
+   pattern.
+
+**Why:** (1)+(2) directly target the corrected-lower supply from the prior
+decision — a preflight-bounded attempt costs low single-digit seconds
+against a 600s job timeout, so doubling the attempt budget is cheap
+relative to meaningfully raising the odds of finding one real working
+proxy in a low-hit-rate pool. (3): live-measured that a same-moment
+liveness probe of the real top-20-by-score candidates found 0/20 alive —
+every one had zero track record and a score built purely from a single
+judge round-trip (which `scoring.py` deliberately doesn't penalize, since
+"no data yet" must not look like "bad"), while a broader same-moment
+sample found proven-but-lower-scored proxies alive with no correlation to
+score. A proxy that has actually forwarded real traffic before, even
+imperfectly, is a better lease-time bet than one that only looked good on
+one judge round-trip and has never been used. (4): preflight checks a
+third-party judge (`_LEASE_CHECK_URLS`), never the real target domain — a
+proxy failing it says nothing about that specific domain, so a full
+1-hour domain-specific ban on that basis was locking a proxy out of
+exactly the domain it happened to be tried against when momentarily down,
+even after it recovered (free proxies churn back alive within minutes,
+live-measured this round), while every other domain remained free to try
+it immediately. (5): the same class of bug the multi-judge fix in
+`harvester.py` already guards against — one flaky/rate-limited judge
+previously looked identical to a dead proxy, false-negativing a genuinely
+working proxy straight into `mark_failure`.
+
+**Trade-offs:** (2) raises the worst-case exhaustion path's latency
+(bounded, still well under the 600s job timeout). (5) raises
+`lease_preflight`'s worst case from `2×timeout` to `(1+3)×timeout` per
+candidate (only hit if TCP connects but all three judges simultaneously
+time out for that specific proxy) — accepted because the common cases
+(proxy dead at TCP, or the first judge answers) are unaffected, and a
+correctly-scored-but-moderately-slow proxy getting a fair chance matters
+more than shaving the theoretical worst case.
+
+**Alternatives considered:** For (3), a fully independent adaptive
+ordering formula was considered and rejected as unnecessary complexity —
+leading with a boolean "has real history" split before falling back to
+the existing score ordering was the smallest change that fixed the
+measured problem.
+
+**Status:** Active. All four fixes verified live in the same
+`research_agent` batch re-run: zero domain-ban keys created after a full
+run (proving fix 4), both `proxy_tier2_fallback_to_tier1` and
+`proxy_tier3_fallback_to_tier2` firing correctly in worker logs. Full
+detail: `technical-debt.md`'s round-39 entry.
+
+---
+
+## Decision: Toggleable Paid Proxy Gateway
+
+**Date:** round 40
+
+**Context:** Following round 39's fixes, the user asked directly: if they
+provide a paid residential proxy (DataImpulse — rotating, HTTP/HTTPS,
+gateway host/port + username/password auth), would that guarantee solving
+the scrape-failure issue? The honest answer given was no guarantee, but
+that it would directly target the specific, measured bottleneck from
+rounds 38-39 (only 23/868 free-harvested proxies ever recorded a real
+success; ~16% live-measured liveness) — real per-target detection/blocking
+is a separate, unproven variable. The user chose to proceed, with an
+explicit, non-negotiable requirement: additive and toggleable, never a
+replacement for the free-pool system.
+
+**What:** Three-way `config.dataimpulse.strategy` (`free_only` default /
+`paid_only` / `free_first`), implemented as a branch inside
+`Worker._fetch_with_proxy()` rather than inside `ProxyManager.get_proxy()`
+— `ProxyManager` stays entirely `proxy_pool`-table-scoped, single
+responsibility. The gateway itself is a synthetic `Proxy` object
+(`proxy/paid_gateway.py::build_gateway_proxy()`, pure function, 4 env
+vars, no network I/O, no DB row) constructed fresh per lease attempt, not
+a permanent high-score `proxy_pool` row.
+
+**Why (bypass the DB pool entirely, don't force the gateway through
+it):** A rotating gateway has no fixed identity worth scoring or banning —
+the exit IP changes server-side per connection, so (1) `mark_success`/
+`mark_failure` scoring the gateway's own static `ip:port` would be scoring
+the wrong thing (not what actually succeeded or failed), (2) a
+domain-specific ban on that static `ip:port` would incorrectly lock out
+every future *different* real exit IP behind it, and (3) `lease_preflight`
+(TCP+HTTPS against the gateway host:port) would almost always pass since
+the gateway itself is always up — it doesn't test the thing that could
+actually fail. Modeling it as a `proxy_pool` row (the alternative
+considered) would have been simpler to wire but conflated a "scored pool
+of individually-tracked IPs" abstraction with a "always-available rotating
+gateway" that doesn't fit that shape.
+
+**Why fail-fast at `Worker.__init__`, not silent fallback:** if
+`dataimpulse.enabled=true` but the 4 required env vars aren't all set,
+`Worker.__init__` raises `RuntimeError` immediately rather than having
+`_fetch_with_proxy` silently degrade to the free pool. RQ forks one worker
+process per job, so this fails only the job(s) that process would have
+handled, loudly, at the earliest possible point — a misconfigured toggle
+should be impossible to miss, not silently indistinguishable from
+`free_only` behavior.
+
+**Trade-offs:** Two real Docker-image gaps only surfaced once the gateway
+path was actually exercised for the first time — Botasaurus's
+credentialed-proxy handling needs both `nodejs` and `npm` on the image
+(neither was there; no proxy before round 40 ever carried credentials, so
+this code path was structurally unreachable until now). Both fixed in the
+same round (see `technical-debt.md`'s round-40 entry) — accepted as the
+cost of exercising a genuinely new code path for the first time, not a
+design flaw in the toggle itself.
+
+**Alternatives considered:** Env-var-controlled toggle (rejected —
+user explicitly chose `config/base.yaml`, matching every existing
+proxy-tier toggle in this repo, e.g. `allow_tier2_fallback_for_tier3`).
+Modeling the gateway as a `proxy_pool` row (rejected, see above).
+
+**Status:** Active, but shipped with `dataimpulse.enabled: false` (safe
+default — zero behavior change unless explicitly opted in). The
+Camoufox+gateway path is live-proven working end to end (direct isolated
+test: real 200, 244,829 bytes of real page content through the gateway).
+The full L1→L2→L3 job pipeline under `paid_only`/`free_first` is NOT yet
+called fully reliable — see `technical-debt.md`'s open Xvfb-collision
+thread. 858 passed, 100.00% coverage (verified in a clean shell with no
+env vars set, matching CI), ruff/mypy clean. Full detail:
+`technical-debt.md`'s round-40 entry.

@@ -90,10 +90,31 @@ proxy_tiers:
   # is confirmed to hold up over time under real traffic, not
   # necessarily gated on adding paid proxies.
   allow_tier2_fallback_for_tier3: true
+  # Round 39 — same fallback, one tier down. Live-caught the same session
+  # the tier-3 comment above describes further correction happening in:
+  # fixing the scoring bugs that inflated L3 also exposed that L2's score
+  # column had been inflated the same way, and correcting it dropped L2's
+  # real supply from ~45 (fake) to 4 (real) — below critical_below_count,
+  # which starved a live 47-URL production job down to 10 successes, all
+  # DLQ'd as proxy_exhausted. Turn back off once L2 supply is confirmed to
+  # hold up over time under real traffic (same graduation condition as
+  # allow_tier2_fallback_for_tier3 above).
+  allow_tier1_fallback_for_tier2: true
   # Round 34 — proxy/pool_health.py thresholds: validated-proxy counts per
   # tier below which that tier is DEGRADED / CRITICAL.
   degraded_below_count: 20
   critical_below_count: 5
+
+# Round 40 — paid rotating-gateway residential proxy (DataImpulse), toggleable
+# alongside the free-pool system above rather than replacing it. Disabled by
+# default: enabled=false means free-pool behavior is byte-for-byte unchanged.
+# strategy only takes effect when enabled=true. See
+# config/schema.py::DataImpulseConfig and proxy/paid_gateway.py. Credentials
+# (DATAIMPULSE_PROXY_HOST/DATAIMPULSE_PORT/DATAIMPULSE_USERNAME/
+# DATAIMPULSE_PASSWORD) are read from the environment directly, never here.
+dataimpulse:
+  enabled: false
+  strategy: free_only  # free_only | paid_only | free_first
 
 politeness:
   default_concurrency: 2

@@ -90,10 +90,10 @@ Paths"; (2) the coverage gate regression the audit found (97.91%,
 `harvester_daemon.py` regressed from 100%) is fixed — 99.57% now, every
 round-34 file at 100%, only a pre-existing aarch64-sandbox-only gap
 remains (`botasaurus_requests_client.py`, not a CI blocker). See
-`technical-debt.md`'s round-34 entry for both. Rounds 30–33
-were not backfilled into `technical-debt.md` (see that file's header note)
-— only round 29 and round 34 have full narrative entries there, though
-scattered round-32/33 references exist in `architecture.md`/`decisions.md`.
+`technical-debt.md`'s round-34 entry for both. Rounds 30–33 are now
+backfilled into `technical-debt.md` too (round-40 knowledge-maintenance
+pass — recovered from `.wolf/STATUS.md` before that file was trimmed
+back to a true rolling snapshot).
 Round 29's 8 caller-facing gaps (failed URLs no longer vanishing from job
 results, `html_snapshot_url` reaching callers, job cancellation,
 `Idempotency-Key` retry-safety, real per-URL progress, `Retry-After` on
@@ -101,6 +101,20 @@ results, `html_snapshot_url` reaching callers, job cancellation,
 conversion still stand as documented. Schema-driven extraction accepting
 multiple input formats remains explicitly deferred, not forgotten. Full
 detail, as always, in `technical-debt.md` above.
+
+**Since then (rounds 35–40, not yet folded into the paragraph above):**
+proxy_exhausted root-caused to ASN misclassification + self-healing
+daemon consolidation (35); `/v1/health` daemon-liveness reporting (36);
+six-layer L2/L3 leasing-reliability fix (37); free-harvest source growth
+8→12 + two real L3-scoring bugs fixed, first-ever L3-caliber proxies (38);
+proxy scoring corrected from years of silent inflation (stale-snapshot
+race, hardcoded `success_rate=None`, a `GREATEST`-ratchet blocking
+downward correction) plus four leasing-reliability hardenings (39); a
+toggleable paid rotating-gateway proxy (DataImpulse) added for L2/L3,
+strictly additive to the free pool, off by default, live-proven working
+at the Camoufox layer with one open thread (a suspected Xvfb
+display-contention crash under the full job pipeline, not yet
+root-caused) (40). Full detail for all of these: `technical-debt.md`.
 
 ## Reference
 

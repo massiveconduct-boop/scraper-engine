@@ -145,7 +145,19 @@ class Level2Fetcher:
                     tenant_id=tenant_id,
                     session_id=session_id,
                 )
-        except Exception:
+        except (Exception, SystemExit):
+            # Round 40 — live-caught: botasaurus_driver's own proxy-auth
+            # helper (javascript_fixes.check_node(), reached only when the
+            # proxy string carries embedded credentials — see Dockerfile's
+            # nodejs comment) calls sys.exit(1) instead of raising when Node
+            # isn't on PATH. SystemExit is a BaseException, not Exception, so
+            # a bare `except Exception` here let it skip this module's own
+            # documented "falls back to Camoufox on failure" contract and
+            # crash the whole RQ job instead. Deliberately NOT a bare
+            # `except:` — that would also swallow asyncio.CancelledError
+            # (job cancellation, orchestrator/worker.py's `_is_cancelled`
+            # path) and KeyboardInterrupt, both of which must keep
+            # propagating.
             return None
         if self._challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False):
             return None

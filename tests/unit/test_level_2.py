@@ -121,6 +121,25 @@ class TestFetchViaBotasaurus:
         assert result.html == _REAL_HTML
         botasaurus_pool.fetch.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_system_exit_from_botasaurus_falls_back_to_camoufox(self):
+        """Round 40 — live-caught: botasaurus_driver's proxy-auth helper
+        (javascript_fixes.check_node()) calls sys.exit(1), not a normal
+        raise, when Node.js isn't on PATH. SystemExit is a BaseException,
+        not an Exception — must still be caught here so this module's
+        documented Botasaurus->Camoufox fallback contract holds instead of
+        the SystemExit propagating up and killing the whole RQ job."""
+        botasaurus = MagicMock()
+        botasaurus_pool = AsyncMock()
+        botasaurus_pool.fetch.side_effect = SystemExit(1)
+        fetcher = Level2Fetcher(botasaurus=botasaurus, botasaurus_pool=botasaurus_pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is None  # signals "fall back to Camoufox", not a raise
+
 
 class TestFetchViaCamoufox:
     @pytest.mark.asyncio

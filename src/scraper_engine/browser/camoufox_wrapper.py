@@ -107,6 +107,12 @@ class CamoufoxWrapper:
         proxy_config = None
         if self.proxy is not None:
             proxy_config = {"server": self.proxy.url()}
+            # Round 40 — paid gateway proxies (proxy/paid_gateway.py) carry
+            # credentials; free-pool proxies never do (both None), so this
+            # is a no-op for every proxy this system used before round 40.
+            if self.proxy.username is not None and self.proxy.password is not None:
+                proxy_config["username"] = self.proxy.username
+                proxy_config["password"] = self.proxy.password
 
         self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
             geoip=self._geoip,
@@ -114,27 +120,43 @@ class CamoufoxWrapper:
             headless=self._headless_mode,
             proxy=proxy_config,
         )
-        try:
-            return await self._browser.__aenter__()
-        except InvalidIP:
-            if not self._geoip:
-                raise
-            logger.warning(
-                "camoufox_geoip_lookup_failed_retrying_without_geoip proxy=%s",
-                self.proxy.url() if self.proxy is not None else None,
-            )
-            self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]
-                geoip=False,
-                humanize=self._humanize,
-                headless=self._headless_mode,
-                proxy=proxy_config,
-            )
-            return await self._browser.__aenter__()
+        # Round 41 — serialize just the Xvfb-spinup moment against a
+        # concurrent Botasaurus launch (or a still-in-flight teardown of a
+        # just-crashed browser, see __aexit__ below) racing the same
+        # virtual display number (see core/budget.py::XVFB_LOCK docstring).
+        # Held only across __aenter__, not the fetch that follows.
+        async with budget.XVFB_LOCK:
+            try:
+                return await self._browser.__aenter__()
+            except InvalidIP:
+                if not self._geoip:
+                    raise
+                logger.warning(
+                    "camoufox_geoip_lookup_failed_retrying_without_geoip proxy=%s",
+                    self.proxy.url() if self.proxy is not None else None,
+                )
+                self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]
+                    geoip=False,
+                    humanize=self._humanize,
+                    headless=self._headless_mode,
+                    proxy=proxy_config,
+                )
+                return await self._browser.__aenter__()
 
     async def __aexit__(self, *exc: object) -> None:
         """Guaranteed browser + Playwright driver cleanup, release semaphore.
 
         Closes isolated BrowserContext (if created) before closing the Browser.
+
+        Round 41 — the actual browser teardown (which tears down this
+        instance's Xvfb display, camoufox/virtdisplay.py::kill()) is held
+        under budget.XVFB_LOCK too, same as launch. A crashed browser
+        (dead CDP/websocket mid-navigation) still needs its Xvfb process
+        killed here; without serializing this against a concurrent launch,
+        a fresh retry (orchestrator/worker.py's same-level fresh-proxy
+        retry, which fires immediately on a BROWSER_CRASH-category
+        failure) could start launching before this teardown finishes,
+        colliding on the still-live display number.
         """
         try:
             if self._isolated_ctx is not None:
@@ -146,7 +168,8 @@ class CamoufoxWrapper:
         finally:
             try:
                 if self._browser is not None:
-                    await self._browser.__aexit__(*exc)
+                    async with budget.XVFB_LOCK:
+                        await self._browser.__aexit__(*exc)
             finally:
                 self._browser = None
                 self._context = None

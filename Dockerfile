@@ -33,8 +33,30 @@ FROM python:3.12-slim AS system-base
 # has real aarch64 packages) is what botasaurus_driver's own
 # get_linux_executable_path() searches for as a named fallback — confirmed
 # against the installed package, no code change needed, just the binary.
+#
+# nodejs is REQUIRED for Botasaurus proxy AUTHENTICATION specifically (round
+# 40): botasaurus_driver.core.config.create_local_proxy() only reaches
+# botasaurus_proxy_authentication.create_proxy() when the proxy string
+# carries embedded username:password (Chrome's --proxy-server flag has no
+# native auth support, so Botasaurus spins up a local anonymizing relay to
+# strip and inject the credentials) — and that helper's own
+# javascript_fixes.check_node() hard sys.exit(1)s if `node` isn't on PATH.
+# Every proxy this system used before round 40 was unauthenticated (free
+# pool), so this path was never exercised and the gap was invisible; a paid
+# gateway lease (Proxy.username/password set, see proxy/paid_gateway.py)
+# hits it on the very first Botasaurus attempt. Live-caught: SystemExit is a
+# BaseException, not Exception, so it also bypassed
+# fetcher/level_2.py::_fetch_via_botasaurus's `except Exception` fallback-
+# to-Camoufox guard entirely and crashed the whole RQ job instead of
+# degrading gracefully within L2 (see that file's own SystemExit handling,
+# added the same round). npm is ALSO required, separately from nodejs
+# itself (Debian's `nodejs` package does not bundle it) — live-caught the
+# same round, one layer deeper: with node present, create_local_proxy()
+# gets past check_node() but then shells out to `npm install proxy-chain`
+# on first use (lazy, not vendored), which silently fails ("npm: not
+# found") without npm on PATH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates xvfb chromium \
+    curl ca-certificates xvfb chromium nodejs npm \
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
     libgbm1 libpango-1.0-0 libcairo2 libasound2 \

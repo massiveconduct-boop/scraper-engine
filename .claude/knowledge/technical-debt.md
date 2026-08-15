@@ -32,14 +32,242 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 38)
+## Technical Debt / Open Threads (as of round 41)
 
-**Coverage gap in this log:** rounds 30–33 were never backfilled here —
-their work only surfaces as scattered round-number references in
-`architecture.md`/`decisions.md` (e.g. round 32's judge-server rework,
-round 33's tier-2-for-tier-3 proxy fallback and partitioned SSRF
-blocking). Not reconstructed retroactively for this entry — flagging so a
-future session doesn't assume the gap means nothing happened those rounds.
+- **RESOLVED (round 41) — root-caused and fixed the round-40 Xvfb
+  display-contention crash.** Full root cause, fix, and live-verification
+  detail: `.claude/knowledge/architecture.md` → "Xvfb Display-Contention
+  Lock (Round 41)". One-line summary: botasaurus_driver's `pyvirtualdisplay`
+  Xvfb launch picks a display number by scanning stale lock files (not
+  atomic, unlike Camoufox's `-displayfd` launcher) and its `.stop()` never
+  cleans up those files after `SIGKILL`, so two engines' Xvfb launches in
+  the same worker process could collide and leak orphaned displays. Fixed
+  with a new `core/budget.py::XVFB_LOCK` serializing every Xvfb spinup/
+  teardown across both engines, plus proactive stale-file cleanup
+  (`browser/_xvfb_cleanup.py`, new file). Live-verified across 4 rounds of
+  increasingly concurrent real jobs (up to 4 simultaneous 2-URL jobs) —
+  zero crash-attributable job failures, though the underlying
+  `SocketCreateListener() failed` warning can still transiently log
+  (now self-heals via Xvfb's own internal retry instead of crashing the
+  session). 855 passed, 100% coverage, ruff+mypy clean. Config reverted
+  to shipped default (`dataimpulse.enabled: false`) after verification.
+  **Flagged, not fixed, separate issue:** live test jobs also surfaced
+  repeated `proxy_exhausted` at L3 on some category pages even under
+  `paid_only` — this is the pre-existing, already-documented L3/free-pool-
+  supply ceiling (round 38/39 below), unrelated to the Xvfb fix; noted
+  here as a possible next investigation, not chased this round.
+
+
+**Rounds 30-33 backfilled (round-40 knowledge-maintenance pass):** this
+log previously had a gap here — those four rounds' full narrative had
+only ever been written to `.wolf/STATUS.md` (a rolling snapshot, not a
+history) and were about to be lost when that file was trimmed back down
+to a true snapshot. Recovered and inserted below, in place, before the
+trim happened.
+
+- **RESOLVED round 41 (see entry above) — Botasaurus→Camoufox fallback occasionally still
+  crashed the real browser session under paid-gateway load, cause not
+  isolated at the time.** After round 40's DataImpulse gateway integration and its two
+  Docker-image fixes (nodejs, npm — see round-40 entry below) got
+  Botasaurus's proxy-auth chain actually running for the first time ever
+  (it used to fail before even reaching a browser launch), a live full-job
+  test hit `"Connection to remote host was lost. - goodbye"` from the
+  websocket/CDP layer, and a `pyvirtualdisplay` `SocketCreateListener()
+  failed... server already running` warning right before it. This is NOT
+  the gateway wiring itself — proven separately in the same session via an
+  isolated direct test (`CamoufoxWrapper` + `paid_gateway.build_gateway_proxy()`,
+  no Botasaurus involved) that fetched a real page (nairametrics.com)
+  cleanly: 200 status, 244,829 bytes of real HTML. Leading theory,
+  unconfirmed: resource/display contention between Botasaurus's Chromium
+  (Xvfb) launch and Camoufox's Firefox (Xvfb) launch happening back-to-back
+  in the same process within `Level2Fetcher.fetch()`'s Botasaurus-then-
+  Camoufox fallback sequence — plausible because Botasaurus's Xvfb/Chromium
+  never used to get this far before (it died at `FileNotFoundError` before
+  even trying to launch a display, pre-round-40), so this specific
+  resource-contention shape was never exercised until now. Needs dedicated
+  investigation (Xvfb display lifecycle / cleanup between the two launches)
+  before the paid-gateway `paid_only`/`free_first` strategies can be called
+  fully reliable for L2 specifically; L3 (Camoufox-only, no Botasaurus) is
+  not suspected to share this risk but wasn't isolated as cleanly in the
+  live full-job test (the escalation ladder always tries L2 first). Not
+  blocking — `dataimpulse.enabled` defaults to `false`, so nothing in
+  production is affected until an operator opts in.
+
+- **RESOLVED (round 40) — DataImpulse paid rotating-gateway proxy added as
+  a three-way, config-toggleable L2/L3 proxy source, alongside (never
+  replacing) the free-pool system.** User-requested: bring in a paid
+  residential proxy provider to attack the round-38/39-confirmed raw-supply
+  ceiling (only 23/868 free-harvested proxies had ever recorded a real
+  success; live-measured liveness ~16%), but keep it strictly additive and
+  toggleable, not a replacement — explicit requirement, confirmed via
+  `AskUserQuestion` on two points: (1) the gateway host/port env-var names
+  (`DATAIMPULSE_PROXY_HOST`/`DATAIMPULSE_PORT`, user's own naming —
+  differs from the `DATAIMPULSE_GATEWAY_HOST`/`_PORT` originally planned,
+  adjusted in code rather than asking for a rename once the user's actual
+  `~/.secrets/.env` was seen), and (2) the toggle lives in `config/
+  base.yaml` (same place `allow_tier2_fallback_for_tier3` already lives),
+  not an env var — consistent with how every other proxy-tier toggle in
+  this repo already works.
+
+  **Three strategies** (`config/schema.py::DataImpulseConfig.strategy`,
+  default `free_only` — today's behavior, byte-for-byte unchanged unless
+  explicitly flipped): `paid_only` (L2/L3 skip the scored free pool
+  entirely), `free_first` (try the free pool as today, fall to the gateway
+  only on `ProxyPoolExhaustedError`). Both new fields on `AppConfig` — see
+  `architecture.md`'s new "Paid Gateway Proxy" section for the full design
+  and file map; full reasoning in `decisions.md` → "Toggleable Paid Proxy
+  Gateway".
+
+  **Two real infrastructure bugs found and fixed while live-verifying
+  (not just live-tested, actually broke a real job, root-caused, fixed):**
+  1. `fetcher/level_2.py::_fetch_via_botasaurus`'s `except Exception:`
+     didn't catch `SystemExit` — and Botasaurus's own
+     `botasaurus_proxy_authentication` library (reached only when a proxy
+     string carries embedded `user:pass@`, i.e. never before round 40)
+     calls `sys.exit(1)` instead of raising when Node.js isn't on `PATH`.
+     `SystemExit` is a `BaseException`, not an `Exception`, so it skipped
+     this module's own documented "falls back to Camoufox on failure"
+     contract entirely and crashed the whole RQ job — live-caught, one job
+     (`cf509c56-...`) left permanently stuck at `PROCESSING` in the DB as a
+     result (harmless orphan, not auto-recovered, no code fix attempted for
+     that specific stuck row). Fixed: `except (Exception, SystemExit):`
+     — deliberately not a bare `except:`, which would also swallow
+     `asyncio.CancelledError` (job cancellation) and `KeyboardInterrupt`.
+  2. The Docker image (`Dockerfile`, single image shared by `api`/
+     `worker-l1`/`worker-l2`/`worker-l3`/`migrate`) had `chromium` but never
+     `nodejs` or `npm` — invisible before round 40 because no proxy this
+     system ever used carried credentials, so Botasaurus's proxy-auth code
+     path (which needs Node to run its local anonymizing-proxy helper, and
+     `npm` separately to lazily `npm install proxy-chain` on first use —
+     two distinct missing binaries, found one at a time, live, via two
+     separate rebuild-redeploy-retest cycles) was never reached. Fixed:
+     added `nodejs npm` to the `system-base` stage's `apt-get install`
+     list.
+
+  **Design choices, stated explicitly (per this session's standing rule —
+  never silently note a gap without either fixing it or flagging it as a
+  tracked follow-up):**
+  - The gateway is a synthetic `Proxy` (`id=-1`, `source="paid_gateway"`)
+    built fresh by `proxy/paid_gateway.py::build_gateway_proxy()` — a pure,
+    no-network-I/O function reading 4 env vars — never a `proxy_pool` row.
+    `ProxyManager.get_proxy()`, `_select_candidate`, `mark_success`/
+    `mark_failure`, the domain-ban check, and `lease_preflight` are all
+    bypassed entirely for a gateway lease (guarded via `Proxy.source ==
+    "pool"` checks in `_fetch_with_proxy`), not reused: a rotating
+    gateway's exit IP changes server-side per connection, so (a) scoring/
+    banning the gateway's own static `ip:port` would be meaningless (it
+    isn't the thing that actually succeeded or failed), and (b) a TCP/
+    HTTPS preflight against the always-up gateway host:port would almost
+    always pass while testing nothing about the real exit IP a fetch
+    actually gets.
+  - `Worker.__init__` calls `build_gateway_proxy()` eagerly and raises
+    `RuntimeError` if `dataimpulse.enabled=true` but any of the 4 env vars
+    is missing — fail fast at job-process start (RQ forks one process per
+    job), not a silent fallback to the free pool that would mask a
+    misconfigured toggle.
+  - `Proxy` gained `username`/`password`/`source` fields (all optional,
+    defaulted — zero effect on every existing free-pool `Proxy`
+    construction site) and a new `auth_url()` method
+    (`user:pass@host:port`, identical to `url()` when unauthenticated).
+    Camoufox/Playwright's native `proxy={"server","username","password"}`
+    dict gets the credentials directly
+    (`browser/camoufox_wrapper.py`); Botasaurus takes a single proxy
+    *string* with no dict support, so its two call sites
+    (`fetcher/botasaurus_wrapper.py`, `browser/botasaurus_pool.py`) switched
+    from `.url()` to `.auth_url()`.
+  - Live-verified: DataImpulse gateway itself confirmed working via a
+    direct `httpx` request through it (real external IP returned, 200 OK)
+    before any app code was involved; `paid_only`/`free_first` both
+    confirmed to reach `Worker.__init__`'s startup check correctly and not
+    crash; `enabled: false` (shipped default) confirmed zero-regression via
+    a full local `pytest` run in a clean shell (no env vars sourced,
+    matching what CI sees — 858 passed, 100.00% coverage) plus a live
+    redeploy + scrape request showing identical `proxy_exhausted` behavior
+    to before the round. Final shipped `base.yaml` state:
+    `dataimpulse.enabled: false` — the feature is built, tested, and
+    live-proven functional at the Camoufox+gateway layer, but not switched
+    on in this deployment pending the open Xvfb-collision thread above.
+  - Tests: `tests/unit/test_paid_gateway.py` (new), plus extensions to
+    `test_worker.py` (new `TestDataImpulseStrategy` +
+    `TestDataImpulseStartupValidation` classes), `test_models.py`,
+    `test_browser.py`, `test_botasaurus_wrapper.py`,
+    `test_botasaurus_pool.py`, `test_level_2.py` (the `SystemExit` fallback
+    case). 858 passed, 100.00% coverage, ruff clean, mypy clean (only the
+    pre-existing repo-wide `asyncpg`/`boto3`/`botasaurus` stub-import
+    noise, unrelated).
+
+- **RESOLVED (round 39) — corrected the honest post-round-38 proxy supply
+  numbers, which round 38's own scoring fixes had (correctly) crashed back
+  down from years of silent inflation, and closed the leasing-reliability
+  gaps that crash exposed.** User reported a real production run (research_agent
+  tenant, 47-URL batch) that only got 10/47 through and explicitly rejected
+  "free proxies are just bad" as an explanation, asking for the real
+  mechanism. Root-caused to four distinct, compounding bugs — each found by
+  live re-verifying the previous fix rather than assuming it was sufficient:
+  1. **`health_monitor.py::check_all`'s rescoring used a stale batch
+     snapshot.** The 100-row batch was read once at the top of the cycle,
+     but by the time each row's score was recomputed and written, real
+     `mark_success`/`mark_failure` calls from concurrent traffic had already
+     changed that row's `global_success_count`/`global_failure_count` —
+     the health cycle's write silently clobbered those updates back to the
+     stale batch-read values. Fixed: a fresh `UPDATE ... RETURNING` read
+     immediately before scoring/writing, not the batch snapshot.
+  2. **`harvester.py`'s re-harvest and promotion paths hardcoded
+     `success_rate=None`** even for a proxy with real accumulated history —
+     `None` deliberately means "no track record yet" in
+     `scoring.py::compute_score()` (redistributes weight across the other
+     four dimensions so a genuinely untested proxy isn't punished), but
+     using it for a proxy that already had real success/failure counts
+     silently discarded that history on every re-harvest or promotion pass.
+     Fixed: both paths now `SELECT global_success_count,
+     global_failure_count` first and pass the real `compute_success_rate()`
+     result.
+  3. **`GREATEST(reliability_score, EXCLUDED.reliability_score)` in both
+     `ON CONFLICT DO UPDATE` upserts silently blocked fix #2 from ever
+     correcting a score downward** — found only because fix #2 alone
+     produced zero visible change pool-wide; a ratchet that only ever lets
+     a score go up (originally meant to protect a good score from a
+     transient bad re-read) also permanently protects a WRONG, inflated
+     score from ever being corrected once the real formula says it should
+     drop. Fixed: removed the `GREATEST` ratchet, unconditional
+     `reliability_score = EXCLUDED.reliability_score`. These three
+     together are what actually surfaced the honest, much lower real
+     supply numbers (tier 2 dropped from a fake ~45 to a real 4) — not a
+     regression, a correction.
+  4. With honest (lower) supply numbers now visible, tier 2 fell below
+     `critical_below_count` and starved the same 47-URL batch shape live.
+     Added `allow_tier1_fallback_for_tier2` (`ProxyTierConfig`), mirroring
+     the existing `allow_tier2_fallback_for_tier3` pattern exactly — same
+     single-hop-only, tried-only-after-a-real-search-comes-up-empty shape.
+  Four further leasing-reliability fixes landed the same round, each found
+  by live-testing the fix before it: raised `ProxyManager.MAX_ATTEMPTS`
+  5→10 (a preflight-bounded attempt is cheap — low single-digit seconds —
+  relative to the 600s job timeout, and a much larger real candidate pool
+  from fix #4 justified more tries); `_select_candidate`'s `ORDER BY`
+  changed to lead with `(global_success_count > 0) DESC` before score
+  (live-measured: a same-moment liveness probe of the real top-20-by-score
+  candidates found 0/20 alive — every one had zero track record and a
+  score built purely from one judge round-trip, while a broader sample
+  found proven-but-lower-scored proxies alive and uncorrelated with score;
+  proven-but-imperfect now tried before untested-but-shiny, both still
+  score-ordered within their own bucket); `mark_failure` gained a
+  `ban_domain: bool = True` param, set `False` only at the lease-time
+  preflight call site — preflight checks a third-party judge, not the real
+  target domain, so a failure there had been wrongly setting a real
+  domain-specific 1-hour ban on a proxy that was only ever tested against
+  an unrelated judge; `net_probe.py::_LEASE_CHECK_URLS` grew from one HTTPS
+  judge to three (first-success-wins), mirroring `harvester.py`'s own
+  existing multi-judge pattern for the exact same reason (a single flaky
+  judge previously looked identical to a dead proxy). Full reasoning for
+  each: `decisions.md` → "Score From Real Track Record, Not Stale
+  Snapshots" and "Round 39 Leasing-Reliability Hardening". 835 passed
+  (progression 820→...→835 across the whole round), 100% coverage
+  throughout, ruff/mypy clean. All 8 fixes live-verified via real
+  `POST /v1/scrape` jobs against the `research_agent` tenant, not just
+  unit tests — including confirming zero domain-ban keys were created
+  after a full batch run (proving the `ban_domain=False` fix) and both
+  `proxy_tier2_fallback_to_tier1`/`proxy_tier3_fallback_to_tier2` firing
+  correctly in live worker logs.
 
 - **RESOLVED (round 38, partially) — grew free harvest source breadth in
   response to round 37's open follow-up (thin/volatile L2/L3-caliber proxy
@@ -1010,6 +1238,309 @@ future session doesn't assume the gap means nothing happened those rounds.
   Docker build cache/images on the box). Freed ~43GB via `docker system
   prune -af` after explicit user confirmation, which is what let the
   migration/build verification above actually run.
+
+- **RESOLVED (round 33) — 3 caller-experience issues + the round-32
+  gateway-error false-positive fully closed, including a real free-proxy
+  routing limitation discovered along the way. Backfilled here from
+  `.wolf/STATUS.md` in the round-40 knowledge-maintenance pass — this
+  round was never logged here originally (see this file's header note on
+  the rounds 30-33 gap).**
+
+  Three independent caller-reported issues, all root-caused and fixed:
+  (1) `SSRFGuard._resolve_hosts` (`core/ssrf_guard.py`) now catches
+  `socket.gaierror` and raises `SSRFBlockedError` instead of letting an
+  unresolvable host 500 the whole `/v1/scrape` request (2 new tests,
+  `test_ssrf_guard.py`). (2) `POST /v1/scrape`/`POST /v1/crawl`
+  (`api/routes.py`) used to reject an entire batch on one SSRF-blocked
+  URL; both now partition valid/blocked URLs, only reject when *every*
+  URL is blocked, and charge quota only for valid ones — `/v1/scrape`
+  passes blocked URLs through to the existing per-URL
+  `FailureCategory.SSRF_BLOCKED` machinery, `/v1/crawl` (no SSRF check of
+  its own — subprocess-isolated Scrapy spider) filters blocked seeds out
+  of `start_urls` and inserts a synthetic failed `scrape_results` row per
+  one so they don't vanish with zero trace; both endpoints now return a
+  `blocked_urls` count. (3) "Only extracted text, not raw HTML/Markdown" —
+  asked the user, who chose a local Markdown fallback over always
+  requiring Firecrawl. New `services/markdown_fallback.py`
+  (`markdownify`+`bs4`) wired into `orchestrator/worker.py` as the `else`
+  branch alongside the existing Firecrawl call, so `FetchResult.markdown`
+  is now populated unconditionally (raw HTML was never actually missing —
+  `html_snapshot_url` already worked, just under-documented; fixed the API
+  reference's fake inline `"html"` field example too). 601 passed / 1
+  skipped, ruff/mypy --strict clean.
+
+  **Same-round follow-up — closed round 32's last open item (the
+  gateway-error-page false positive), then found and fixed a second,
+  deeper instance of the same bug class live-verifying the first fix.**
+  Root cause was structurally deeper than "add more detection
+  signatures": `level_2.py::_fetch_via_camoufox` and
+  `level_3.py::fetch()` both hardcoded `http_status=200` on every
+  browser-level fetch, discarding Playwright `page.goto()`'s real
+  `Response` object entirely — so the pre-existing `CHALLENGE_STATUS_CODES`
+  check never had a real status to inspect. Fixed by capturing
+  `nav_response = await page.goto(...)` and reporting its real
+  `.status`. Evidence gathered before writing detection code, per
+  explicit instruction: curled 20 of the pool's own top-scored real free
+  proxies against `example.com`, captured 3 genuine gateway-error pages
+  from 3 unrelated proxy vendors (nginx/openresty, Squid, a custom
+  "proxylite" shell) — added `CHALLENGE_STATUS_CODES` entries
+  (500/502/504) plus a structural `_looks_like_gateway_error` heuristic
+  (short body + 5xx number near an error word) for paths that can't
+  expose a real status (Botasaurus, `poll_until_solved`'s mid-retry
+  checks). Also found and fixed a related bug the same captures exposed:
+  `_strip_html` removed tags without inserting a space, gluing
+  `500</title><h2>Name` into `"500Name"` and breaking `\b`-boundary
+  regexes on 2 of the 3 real captures.
+
+  **Live re-verification against the real deployed stack found a THIRD
+  instance of the same bug class**, missed by both fixes above: a real
+  job (`bypass_cache: true`, forcing a fresh fetch) came back
+  `success:true, level_used:2, http_status:200,
+  is_challenge_page:false` — clean by every flag — but the actual raw
+  MinIO snapshot (checked directly, not trusted from the flags) was
+  `<pre style="word-wrap: break-word; white-space:
+  pre-wrap;">DNS cache overflow</pre>`: Camoufox/Firefox's own internal
+  plain-text-viewer wrapper around a proxy's raw diagnostic text, with no
+  5xx number and no vocabulary word the earlier heuristic recognized.
+  Fixed with a third, independent structural check matching the Gecko
+  wrapper markup itself rather than the diagnostic text inside it,
+  confirmed to generalize against a different diagnostic string in the
+  same wrapper. Verified via 2 consecutive live rejections against the
+  real deployed stack post-fix (not just unit tests). 22 new/changed
+  tests (`test_challenge_detector.py::TestGatewayErrorPages`+
+  `TestFirefoxPlaintextWrapper`, using real captured HTML verbatim), 614
+  passed / 1 skipped.
+
+  **Second follow-up — added `allow_tier2_fallback_for_tier3`
+  (`config/base.yaml`, default `true`), and discovered the real reason
+  full end-to-end verification kept stalling was routing, not proxy
+  quality.** `ProxyManager.get_proxy()` still searches for a real
+  tier-3-caliber (≥90) proxy first, only falling back to a tier-2-caliber
+  (≥70) one if that search comes up genuinely empty — thresholds
+  themselves moved out of a hardcoded dict into
+  `proxy_tiers.min_score_level_{1,2,3}` config. Live-verified the
+  fallback mechanism fires correctly (`proxy_tier3_fallback_to_tier2` in
+  worker logs, a real tier-2 proxy leased), but neither of two live test
+  jobs reached a clean success — every leased proxy's connection died
+  within seconds (`Connection to remote host was lost`). Direct test:
+  curled 3 real leased proxies straight at the test target's Tailscale IP
+  — **all 3 timed out**, while a direct no-proxy connection returned
+  `200` instantly. Root cause: free public proxies structurally have no
+  network route to a CGNAT/Tailscale address (`100.64.0.0/10`) — not a
+  quality or scoring problem, a routing impossibility. This retroactively
+  explained the round-33 "DNS cache overflow" false-positive above and
+  every "connection lost" anomaly seen across this round's live testing.
+
+  **Third follow-up — the loop closed: a genuine, fully live, full-
+  pipeline success with a real leased proxy.** User exposed the
+  challenge-mirror test target publicly via Tailscale Funnel
+  (`tailscale funnel --bg 8090`, one-time account-level enable at
+  `login.tailscale.com/f/funnel`) instead of opening local firewall
+  ports. First 2 attempts against the funnel hostname failed for reasons
+  unrelated to any bug (container DNS split-horizon resolving the
+  funnel's `.ts.net` name to a private IP the bridge network couldn't
+  route to; several free proxies don't support HTTPS CONNECT tunneling
+  at all, confirmed directly via one proxy's own 400 refusal). The 3rd
+  attempt succeeded for real: `success:true, level_used:2,
+  http_status:200, proxy_used:163.181.207.170:9999, duration_ms:6861`,
+  with the raw MinIO snapshot confirmed as genuine target content (not a
+  proxy artifact), and the markdown-fallback field matching exactly.
+  Tailscale Funnel disabled immediately after (`tailscale funnel
+  --https=443 off`, confirmed via `tailscale funnel status`). This was
+  the first genuinely clean, live, full-pipeline (real API → real queue
+  → real worker → real leased external proxy → real Camoufox → real
+  target → real content) success the rounds-28-through-33 investigation
+  produced.
+
+- **RESOLVED (round 32) — proxy pool fully unblocked for real leases: two
+  separate escalation-ladder bugs found live, plus the scoring formula
+  actually wired in and two of its own defects fixed. Backfilled here
+  from `.wolf/STATUS.md` — see this file's rounds-30-33 gap note.**
+
+  A live end-to-end re-verification (real API job, real `challenge_mirror`
+  target, not the `test_escalation_ladder.py` fixture which bypasses
+  `Worker`/`ProxyManager` entirely) surfaced **bug-r32-01**:
+  `FetchResult.is_challenge_page` was declared, persisted, and even gated
+  caching decisions, but no fetcher anywhere ever actually set it to
+  `True` — L1's success check was pure HTTP status (`<400`), zero content
+  classification, so an unsolved "Verifying your browser…" interstitial
+  page was accepted as a clean success and the ladder never escalated.
+  Fixed centrally in `worker.py`'s escalation loop: every apparent
+  success is now classified via `ChallengeDetector.is_challenge_page(...,
+  short_page_is_suspect=False)` (matching L2/L3's own existing
+  convention) before being accepted, escalating instead when a
+  non-final level's "success" is actually a challenge page. Separately,
+  bringing the stack up on a genuinely fresh volume (not an already-
+  migrated one from an earlier session) surfaced **bug-r32-02**: the
+  `migrate` service's `depends_on: postgres: condition: service_started`
+  only waited for the container to start, not for Postgres to accept
+  connections, so a cold `initdb` raced Postgres and lost
+  (`ConnectionRefusedError`). Fixed with a real `pg_isready` healthcheck
+  on `postgres` + `condition: service_healthy` on `migrate`. Re-verified
+  clean on another fresh volume; then a real job through the live API
+  showed the ladder genuinely escalating (`level_used: 2,
+  failure_category: proxy_exhausted`) instead of falsely accepting L1 —
+  confirming both this round's fixes AND round 31's earlier
+  `ProxyManager(pg=None)` fix hold under the real end-to-end path (no
+  crash, no stuck-`PROCESSING` job). Full symptom/root-cause/fix detail:
+  `.wolf/buglog.json` → `bug-r32-01`, `bug-r32-02`. 654 passed / 1
+  skipped, 99% coverage.
+
+  **Continued the same day — the proxy pool's scoring was fixed for
+  real, not just re-pointed at a working judge.** With `is_challenge_page`
+  fixed, every real L2 escalation still failed `proxy_exhausted`. Three
+  more layers, each found by testing the previous fix live: (1) the
+  self-hosted loopback judge (`proxy/judge_server.py`) can never validate
+  a real external proxy — a forward proxy resolves `127.0.0.1` as *its
+  own* machine, never ours; broken this way since round 6, invisible
+  because the only test covering it seeded a degenerate self-pointing
+  case. (2) The first fix (a single public judge, `httpbin.org`) was
+  found live-down (persistent 503s) while building it — replaced with 3
+  independent judges, first-success-wins. Both of these are the
+  `JUDGE_URLS` design fully documented in `decisions.md` → "Multi-Endpoint
+  Public Judge, Superseding the Self-Hosted Judge" — not re-duplicated
+  here. (3) Even with a working judge, every validated proxy capped at a
+  flat score of 60 (below L2's 70) because `ScoringEngine.compute_score()`
+  — a real multi-dimensional formula — existed but was never called
+  anywhere (confirmed dead code); wiring it in alone still wasn't enough,
+  since `success_rate` defaulting to 50.0 at 45% weight capped even a
+  theoretically perfect proxy around 56/100. Fixed two real defects in
+  the formula itself, never live-tested before this round:
+  `success_rate=None` (no track record yet) now redistributes its weight
+  across the other four dimensions instead of scoring against an
+  unearned guess; `ANONYMITY_BONUS`/`ASN_BONUS` rescaled to 0-100
+  (previously flat point values crushed to ~2%/~1% real impact by their
+  own weight multiplier). `ProxyManager.mark_success`/`mark_failure` now
+  recompute via this formula from real stored dimensions instead of a
+  flat +5/-10. New migration `006` adds `global_success_count` (paired
+  with the already-existing-but-unused `global_failure_count`) so a real
+  success rate exists to feed the formula. Live-verified: 2 real proxies
+  reached score 74-76 (first time ever, any proxy, this entire
+  investigation).
+
+  **User-directed continuation, same day, "I need this production
+  ready" — two more real fixes.** (1) `mark_success`/`mark_failure` were
+  fully built (above) but had zero call sites outside their own file/
+  tests — no real fetch outcome had ever updated a proxy's score. Wired
+  into `orchestrator/worker.py`'s L2/L3 dispatch, right after each
+  fetch's real outcome is known. (2) L2's first attempt (Botasaurus)
+  crashed on every single fetch, silently: `FileNotFoundError: You don't
+  have Google Chrome installed`, caught by `botasaurus_wrapper.py`'s
+  broad exception handler and falling back to Camoufox every time.
+  Botasaurus drives a real Chrome/Chromium binary and doesn't bundle
+  one; the Dockerfile never installed one, and Google Chrome ships no
+  Linux aarch64 build at all. Installed `chromium` instead (already in
+  `botasaurus_driver`'s own executable search list — zero code change
+  needed). Live-verified end to end after both fixes: `level_used: 2,
+  success: true` — the first genuine L2 success this entire
+  investigation produced. 673 passed, 99% coverage. Committed as
+  `9c8ac7b`+`bea3129`.
+
+  **One real finding left open at round-32's own close, resolved round
+  33 above:** the returned content on that first genuine success was
+  `<title>504 Gateway Time-out</title>` — a proxy-side error page,
+  `is_challenge_page`'s signature list didn't recognize generic
+  gateway-error pages, so it slipped through as a false-positive
+  success.
+
+- **RESOLVED (round 31) — production-readiness report: 6 findings, all
+  root-caused and fixed, plus a full docs sync. Backfilled here from
+  `.wolf/STATUS.md` — see this file's rounds-30-33 gap note.**
+
+  A live production-readiness test (real Docker Compose, real HTTP
+  requests) found the escalation ladder — the entire reason to adopt
+  this engine — non-functional: `worker.py:395,423` hardcoded
+  `ProxyManager(redis=self._redis, pg=None)` even though
+  `Worker.__init__` already stored `self._pg`, so every real (non-mocked)
+  L2/L3 fetch crashed with an uncaught `AttributeError`, and the crash
+  was never surfaced — `scrape_jobs.status` stayed `PROCESSING` forever
+  (`orchestrator/tasks.py::_run_scrape_job` had `try/finally` with no
+  `except`). Fixed both: `worker.py` now passes the real `pg`, with a new
+  `PostgresClientMissingError` for a genuinely-missing one; `tasks.py`
+  now marks `FAILED`, fires the webhook, and re-raises on any crash.
+
+  **Found a deeper unifying root cause the report itself treated as two
+  separate, uncertain findings:** `storage/postgres_client.py::acquire()`'s
+  `finally` block ran `SET search_path`+`COMMIT` unconditionally, even
+  after a failed query had already aborted the transaction — that
+  follow-up statement itself raised `InFailedSQLTransactionError`
+  (masking the real error) and skipped `COMMIT`, returning the
+  connection to the pool mid-transaction; asyncpg's own pool-release
+  safety net then force-`ROLLBACK`s it, logging the exact "Resetting
+  connection with an active transaction" ERROR the report had seen as
+  unexplained proxy-harvester noise. One fix (`except BaseException:
+  ROLLBACK; raise` vs. the clean `else` path) closed both findings at
+  once.
+
+  Also fixed the same round: no `[project.scripts]` entry existed at all
+  (not a Dockerfile/PATH bug as the report guessed — the `scraper-engine`
+  CLI simply never existed); migrations never ran automatically (new
+  one-shot `migrate` compose service, mirroring the existing
+  `pgbouncer-init` shape); every host port was hardcoded (now
+  `${VAR:-default}` everywhere); wired **Prometheus + Alertmanager for
+  real** — their config already existed, git-tracked, 11 real alert
+  rules, but was never connected to `docker-compose.yml` (verified live:
+  both healthy, `promtool` validated all 11 rules, Alertmanager picked up
+  the real `SLACK_WEBHOOK_URL` via compose's own `.env` interpolation).
+  `.env.example` completed; deleted an untracked, now-redundant
+  `docker-compose.test-override.yml`. Full docs sync beyond the 6
+  findings themselves: fixed `README.md`/`docs/guides/deployment.md`'s
+  stale pre-round-27 `uvicorn api.main:app` path,
+  `CONTRIBUTING.md`'s stale pre-src-layout import claims, updated
+  `CLAUDE.md`/`operations.md`/`standards.md` for the new automatic-
+  migration + overridable-port behavior.
+
+  **Sandbox note, not a repo issue:** an aarch64-vs-x86_64 compiled-wheel
+  mismatch (asyncpg, pydantic-core, others) — fixed via `uv sync
+  --all-extras` (never a single `--extra}`, which drops other extras'
+  packages). Two packages remain permanently broken on aarch64 regardless
+  (`botasaurus_requests`'s hardcoded amd64-only `.so`; Playwright's
+  bundled `node` driver is amd64-only) — pre-existing, architecture-
+  blocked, not fixable from this repo. 652 passed / 1 skipped / 0 failed,
+  99% coverage, ruff/mypy --strict clean. **Left open at the time:** the 4
+  flagged credentials were never rotated (operational, needs the account
+  holder — still not done as of round 32's own check), and the fix was
+  never live-verified end-to-end through the full stack in that session
+  (closed round 32, see above).
+
+- **RESOLVED (round 30) — extraction-engine HTTP client plug-in, fully
+  wired and cross-container-verified. Backfilled here from
+  `.wolf/STATUS.md` — see this file's rounds-30-33 gap note.**
+
+  Work driven from the separate `extraction-engine` repo's own session —
+  its vision doc requires it stay a standalone service other tools
+  consume over HTTP, never merged in-process. New
+  `services/extraction_engine_client.py` mirrors
+  `firecrawl_client.py`'s exact shape (`httpx.AsyncClient`, same
+  fail-soft-to-a-safe-value contract — here `None` rather than raw HTML,
+  since there's no natural fallback value the client itself can
+  produce). `Worker.__init__` builds it once, same construction-site
+  pattern as `self._firecrawl`/`self._captcha_solver`. `ConfigOverrides`
+  gained `extraction_enable_smallmodel`/`extraction_enable_llm` (both
+  default `False`, additive). `process_job`'s extraction call site uses
+  the extraction-engine client only when `EXTRACTION_ENGINE_BASE_URL` is
+  configured AND a real schema was supplied; any failure (client fails
+  soft, never raises) or either condition being false falls back to the
+  pre-existing `AdaptiveSelector` behavior unchanged — zero behavior
+  change for every existing caller. 12 new tests, ruff/mypy --strict
+  clean, 573→585 passing.
+
+  **Same-day follow-up — real cross-container verification found and
+  fixed a real bug live, not caught by unit tests.** Brought up both
+  repos' full compose stacks together on a shared Docker network
+  (`extraction-scraper-net`), confirmed real DNS/HTTP reachability from
+  inside `worker-l1`, then made a real `ExtractionEngineClient.extract()`
+  call against the live extraction-engine container. Found: the real
+  `/v1/extract` endpoint requires the schema wrapped as
+  `{"schema_version": "1.0.0", "fields": {...}}` — a bare
+  `{"field": "type"}` dict (`ConfigOverrides.extraction_schema`/
+  `AdaptiveSelector`'s own existing convention, and every test's
+  first-draft shape) got a real 422. Because the client fails soft, this
+  wasn't a crash — every real integration call would have silently
+  fallen back to `AdaptiveSelector` forever, with no visible error.
+  Fixed: `_as_wire_schema()` auto-wraps a bare shorthand dict, passes an
+  already-complete envelope through unchanged. Re-verified live with the
+  exact bare shape every caller actually uses. 585→587 passing.
 
 - **RESOLVED (round 29) — 8 caller-facing gaps closed + caching + markdown
   generalized to all 3 escalation levels. Extraction-engine work

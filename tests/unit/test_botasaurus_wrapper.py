@@ -33,9 +33,30 @@ class TestBotasaurusWrapper:
             assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"
-        fetch.assert_called_once_with(URL, _proxy().url(), None)
+        fetch.assert_called_once_with(URL, _proxy().auth_url(), None)
         # Released after the call, not held open
         assert budget.BROWSER_SEMAPHORE.locked() is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_html_embeds_credentials_for_paid_gateway_proxy(self):
+        """Round 40 — a paid-gateway Proxy carries username/password; the
+        string handed to Botasaurus (single-string proxy kwarg, no dict
+        support) must be the credential-embedded form, not the bare one."""
+        gateway_proxy = Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+        wrapper = BotasaurusWrapper()
+        with patch.object(wrapper, "_botasaurus_fetch", return_value="<html>ok</html>") as fetch:
+            await wrapper.fetch_html(URL, proxy=gateway_proxy, tenant_id=TENANT)
+        fetch.assert_called_once_with(
+            URL, "http://user123:pass456@gw.dataimpulse.com:823", None
+        )
 
     def test_parallel_always_forced_to_one(self):
         """caller-supplied config cannot override parallel — closes F-32."""

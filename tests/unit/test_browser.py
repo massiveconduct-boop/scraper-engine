@@ -502,6 +502,62 @@ class TestCamoufoxWrapperGeoipFallback:
         camoufox_ctor.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_launch_includes_credentials_when_proxy_has_them(self, tenant):
+        """Round 40 — a paid-gateway Proxy (proxy/paid_gateway.py) carries
+        username/password; the launch's proxy dict must forward them
+        alongside server, since Camoufox/Playwright's proxy= option natively
+        accepts username/password but nothing set them before round 40."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(
+                id=-1,
+                ip="gw.dataimpulse.com",
+                port=823,
+                protocol=ProxyProtocol.HTTP,
+                username="user123",
+                password="pass456",
+                source="paid_gateway",
+            ),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            await wrapper._launch_with_geoip_fallback()
+
+        proxy_config = camoufox_ctor.call_args.kwargs["proxy"]
+        assert proxy_config == {
+            "server": "http://gw.dataimpulse.com:823",
+            "username": "user123",
+            "password": "pass456",
+        }
+
+    @pytest.mark.asyncio
+    async def test_launch_omits_credentials_for_free_pool_proxy(self, tenant):
+        """Regression guard: a plain free-pool Proxy (no username/password)
+        must not gain those keys — the dict stays exactly {"server": ...}."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            await wrapper._launch_with_geoip_fallback()
+
+        proxy_config = camoufox_ctor.call_args.kwargs["proxy"]
+        assert proxy_config == {"server": "http://1.2.3.4:8080"}
+
+    @pytest.mark.asyncio
     async def test_aenter_releases_semaphore_when_launch_fails(self, tenant):
         """__aenter__'s existing except-release-reraise contract must still
         hold when the failure comes from inside _launch_with_geoip_fallback

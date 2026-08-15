@@ -119,6 +119,22 @@ class Worker:
 
             config = load_config()
         self._config = config
+        # Round 40 — fail fast, not silently mid-job. RQ forks one process per
+        # job, so raising here fails only the job(s) this process would have
+        # handled, loudly and immediately, instead of every _fetch_with_proxy
+        # call quietly falling back to the free pool (or worse, crashing deep
+        # inside the retry loop) because the toggle was flipped on without the
+        # gateway env vars actually being set.
+        if self._config.dataimpulse.enabled:
+            from scraper_engine.proxy.paid_gateway import build_gateway_proxy
+
+            if build_gateway_proxy() is None:
+                raise RuntimeError(
+                    "config.dataimpulse.enabled=true but one or more of "
+                    "DATAIMPULSE_PROXY_HOST / DATAIMPULSE_PORT / "
+                    "DATAIMPULSE_USERNAME / DATAIMPULSE_PASSWORD is not set "
+                    "in the environment"
+                )
         # One ChallengeDetector for escalation decisions (challenge pages and
         # JS-gated shells) — same single source of truth the fetchers use.
         from scraper_engine.fetcher.challenge_detector import ChallengeDetector
@@ -520,37 +536,78 @@ class Worker:
         the function boundary — mypy can't carry that narrowing through a
         separate method call on `self._pg` directly."""
         from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+        from scraper_engine.proxy.lease import ProxyLease
         from scraper_engine.proxy.manager import ProxyManager
+        from scraper_engine.proxy.paid_gateway import build_gateway_proxy
+
+        # Round 40 — three-way toggle (config/schema.py::DataImpulseConfig).
+        # free_only is the default and is byte-for-byte the pre-round-40 code
+        # path below (pm.get_proxy() every attempt, no gateway involved).
+        di_cfg = self._config.dataimpulse
+        strategy = di_cfg.strategy if di_cfg.enabled else "free_only"
 
         pm = ProxyManager(redis=self._redis, pg=pg, tier_config=self._config.proxy_tiers)
         domain = self._extract_domain(url)
         last_result: FetchResult | None = None
 
         for _attempt in range(_SAME_LEVEL_PROXY_RETRIES + 1):
-            try:
-                lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
-            except ProxyPoolExhaustedError:
-                return FetchResult(
-                    url=url,
-                    success=False,
-                    level_used=level,
-                    duration_ms=0,
-                    failure_category=FailureCategory.PROXY_EXHAUSTED,
-                    error_message="Proxy pool exhausted",
-                )
+            lease: ProxyLease
+            if strategy == "paid_only":
+                # Skips pm.get_proxy() entirely — the scored free pool never
+                # enters the picture for this level under paid_only. Bad
+                # config was already caught at Worker.__init__ time, so a
+                # None here is unreachable; the raise is defense in depth,
+                # never a silent fallback to the free pool.
+                gateway_proxy = build_gateway_proxy()
+                if gateway_proxy is None:
+                    raise RuntimeError(
+                        "dataimpulse strategy=paid_only but gateway is not configured"
+                    )
+                lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+            else:
+                try:
+                    lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
+                except ProxyPoolExhaustedError:
+                    if strategy == "free_first":
+                        gateway_proxy = build_gateway_proxy()
+                        if gateway_proxy is None:
+                            raise RuntimeError(
+                                "dataimpulse strategy=free_first but gateway is not configured"
+                            ) from None
+                        lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+                    else:
+                        return FetchResult(
+                            url=url,
+                            success=False,
+                            level_used=level,
+                            duration_ms=0,
+                            failure_category=FailureCategory.PROXY_EXHAUSTED,
+                            error_message="Proxy pool exhausted",
+                        )
             async with lease:
                 fetcher = build_fetcher()
                 result: FetchResult = await fetcher.fetch(
                     url, tenant_id, proxy=lease.proxy, overrides=overrides
                 )
+                # A paid-gateway lease has no proxy_pool row (see
+                # proxy/paid_gateway.py) — mark_success/mark_failure would be
+                # a harmless no-op UPDATE either way, but gating on source
+                # makes that intent explicit instead of relying on an
+                # incidental 0-row match.
                 if result.success:
-                    await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                    if lease.proxy.source == "pool":
+                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
                     return result
-                await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
+                if lease.proxy.source == "pool":
+                    await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
                 last_result = result
                 if result.failure_category not in _PROXY_RETRYABLE_CATEGORIES:
                     return result
-                # else: loop again with a freshly leased proxy
+                # else: loop again with a freshly leased proxy — for the
+                # gateway, build_gateway_proxy() returns the same static
+                # ip:port, but DataImpulse rotates the real exit IP
+                # server-side per connection (Rotating mode), so this retry
+                # still gets a genuinely different upstream identity.
 
         assert last_result is not None  # loop always assigns it before falling through
         return last_result

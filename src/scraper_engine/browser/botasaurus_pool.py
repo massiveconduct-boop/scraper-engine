@@ -37,6 +37,9 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Any
 
+from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
+from scraper_engine.core import budget
+
 if TYPE_CHECKING:
     from scraper_engine.config.schema import BotasaurusConfig
     from scraper_engine.core.models import Proxy
@@ -86,13 +89,19 @@ class BotasaurusPool:
             if entry is not None and entry.proxy_key == proxy.key() and entry.domain == domain:
                 return await loop.run_in_executor(None, self._reuse_fetch, entry.driver, url)
 
-            if entry is not None:
-                await loop.run_in_executor(None, self._close_driver, entry.driver)
-                self._entry = None
+            # Round 41 — both eviction-close and (re)launch spin the display
+            # lifecycle, serialized under one lock so a fresh launch can
+            # never start while a just-evicted driver's Xvfb teardown is
+            # still in flight. _reuse_fetch above touches no display at all
+            # and stays lock-free. See core/budget.py::XVFB_LOCK.
+            async with budget.XVFB_LOCK:
+                if entry is not None:
+                    await loop.run_in_executor(None, self._close_driver, entry.driver)
+                    self._entry = None
 
-            driver, html = await loop.run_in_executor(
-                None, self._new_driver_fetch, url, proxy, session_id
-            )
+                driver, html = await loop.run_in_executor(
+                    None, self._new_driver_fetch, url, proxy, session_id
+                )
             self._entry = _PooledDriver(driver, proxy.key(), domain)
             return html
 
@@ -108,7 +117,7 @@ class BotasaurusPool:
         kwargs: dict[str, object] = {
             "headless": False,
             "enable_xvfb_virtual_display": True,
-            "proxy": proxy.url(),
+            "proxy": proxy.auth_url(),
             "profile": session_id,
             # tiny_profile requires a profile (verified live — botasaurus_driver's
             # Config raises ValueError("Profile must be given when using tiny
@@ -142,12 +151,21 @@ class BotasaurusPool:
     def _close_driver(self, driver: Any) -> None:
         with contextlib.suppress(Exception):
             driver.close()
+        # Round 41 — driver.close() SIGKILLs the Xvfb display without
+        # unlinking its lock/socket files (see browser/_xvfb_cleanup.py).
+        # Best-effort, never lets cleanup failure mask the real close above.
+        with contextlib.suppress(Exception):
+            cleanup_stale_display(driver)
 
     async def shutdown(self) -> None:
         """Close the held driver, if any — called once at job end, same
-        bracket BrowserPool.shutdown() is called in (orchestrator/tasks.py)."""
+        bracket BrowserPool.shutdown() is called in (orchestrator/tasks.py).
+
+        Round 41 — under budget.XVFB_LOCK too, same reasoning as the
+        eviction-close in fetch()."""
         async with self._lock:
             if self._entry is not None:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._close_driver, self._entry.driver)
+                async with budget.XVFB_LOCK:
+                    await loop.run_in_executor(None, self._close_driver, self._entry.driver)
                 self._entry = None

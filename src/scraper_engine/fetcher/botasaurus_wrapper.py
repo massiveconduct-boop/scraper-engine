@@ -104,14 +104,24 @@ class BotasaurusWrapper:
         tenant_id: TenantId,
         session_id: str | None = None,
     ) -> str:
-        """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox."""
-        async with budget.BROWSER_SEMAPHORE:
+        """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox.
+
+        Round 41 — also holds budget.XVFB_LOCK for this call's whole
+        duration. Botasaurus's own @browser decorator bundles launch+
+        navigate+close into one synchronous call with no seam to release the
+        lock right after launch (unlike CamoufoxWrapper, which can release
+        immediately after __aenter__/__aexit__), so this path serializes the
+        full fetch rather than just the launch/close moments — an accepted
+        throughput trade for closing the Xvfb display-collision crash. See
+        core/budget.py::XVFB_LOCK.
+        """
+        async with budget.BROWSER_SEMAPHORE, budget.XVFB_LOCK:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None,
                 self._botasaurus_fetch,
                 url,
-                proxy.url(),
+                proxy.auth_url(),
                 session_id,
             )
 
@@ -151,9 +161,16 @@ class BotasaurusWrapper:
 
         bypass_cloudflare = self._bypass_cloudflare
         use_random_sleep = self._use_random_sleep
+        # Round 41 — stashed so we can clean up this Driver's Xvfb lock/socket
+        # files (see browser/_xvfb_cleanup.py) after the decorator's own
+        # internal close runs; botasaurus's @browser decorator owns close
+        # itself (never exposes the Driver back to us), so this closure is
+        # the only way to reach it.
+        captured_driver: list[Driver] = []
 
         @browser(**decorator_kwargs)  # type: ignore[untyped-decorator]
         def _fetch(driver: Driver, _data: object = None) -> str:
+            captured_driver.append(driver)
             # botasaurus's own decorator always calls the wrapped function as
             # func(driver, data) — POSITIONALLY (browser_decorator.py's
             # run_task) — so a second parameter with a default value (e.g.
@@ -173,4 +190,13 @@ class BotasaurusWrapper:
                 driver.short_random_sleep()
             return str(driver.page_html)
 
-        return str(_fetch())
+        try:
+            return str(_fetch())
+        finally:
+            if captured_driver:
+                import contextlib
+
+                from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
+
+                with contextlib.suppress(Exception):
+                    cleanup_stale_display(captured_driver[0])

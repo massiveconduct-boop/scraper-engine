@@ -100,6 +100,18 @@ class ProxyTierConfig(BaseModel):
     min_score_level_2: float = 70.0
     min_score_level_3: float = 90.0
     allow_tier2_fallback_for_tier3: bool = False
+    # Round 39 — same single-hop stopgap as allow_tier2_fallback_for_tier3,
+    # one tier down: L2 tries a real tier-2-caliber proxy first and only
+    # falls back to a tier-1-caliber one if that search comes up genuinely
+    # empty. Added after round 39's scoring-race/GREATEST-ratchet fixes
+    # corrected years of silently-inflated scores back down to their real
+    # values pool-wide — tier 2's *honest* supply crashed from a
+    # fake-inflated ~45 to a real 4 in the same session, live-observed
+    # starving a real production job (research_agent tenant, 47-URL batch,
+    # only 10 succeeded, remainder DLQ'd as proxy_exhausted). Does not
+    # cascade into a second hop (a tier-2 fallback never further falls to
+    # tier... there is no tier 0) — same bounded shape as the tier-3 case.
+    allow_tier1_fallback_for_tier2: bool = False
     # Pool-health thresholds (round 34, proxy/pool_health.py) — validated-proxy
     # counts per tier below which the tier is DEGRADED / CRITICAL. Independent
     # of the score gates above: those decide whether one request can find a
@@ -230,6 +242,22 @@ class S3Config(BaseModel):
     bucket: str = "scraper-snapshots"
 
 
+class DataImpulseConfig(BaseModel):
+    """Toggle for the paid rotating-gateway proxy source (round 40). Disabled
+    by default so the free-pool system (proxy/manager.py) behaves exactly as
+    before until explicitly turned on — see proxy/paid_gateway.py for the
+    gateway itself and orchestrator/worker.py::_fetch_with_proxy for the
+    strategy branch. Host/port/credentials are deliberately NOT here — same
+    split as CapSolverConfig: tuning lives in config, secrets are read
+    directly via os.environ.get() in the provider's own factory function."""
+
+    enabled: bool = False
+    # free_only: unchanged today's behavior. paid_only: L2/L3 skip the scored
+    # free pool entirely, always use the gateway. free_first: try the free
+    # pool as today, only fall to the gateway on ProxyPoolExhaustedError.
+    strategy: Literal["free_only", "paid_only", "free_first"] = "free_only"
+
+
 class AppConfig(BaseModel):
     """Root configuration schema matching config/base.yaml."""
 
@@ -241,6 +269,7 @@ class AppConfig(BaseModel):
     botasaurus: BotasaurusConfig = Field(default_factory=BotasaurusConfig)
     proxy_harvester: ProxyHarvesterConfig = Field(default_factory=ProxyHarvesterConfig)
     proxy_tiers: ProxyTierConfig = Field(default_factory=ProxyTierConfig)
+    dataimpulse: DataImpulseConfig = Field(default_factory=DataImpulseConfig)
     politeness: PolitenessConfig = Field(default_factory=PolitenessConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     capsolver: CapSolverConfig = Field(default_factory=CapSolverConfig)

@@ -26,6 +26,32 @@ BROWSER_SEMAPHORE = asyncio.Semaphore(8)
 # Bounds outstanding CAPTCHA long-poll tasks, preventing FD exhaustion (F-13)
 CAPSOLVER_CONCURRENCY = asyncio.Semaphore(10)
 
+# Serializes both the spinup AND the teardown of any headfull browser that
+# uses a virtual X display (Botasaurus's Chromium via
+# enable_xvfb_virtual_display=True, Camoufox's Firefox via headless_mode=
+# "virtual"). Round 41: even with launches serialized (this lock's first
+# cut), the crash still reproduced live — worker-l3 logs showed a browser's
+# CDP/websocket connection die mid-navigation ("Connection to remote host
+# was lost. - goodbye"), and 0.17s later a fresh Xvfb launch (round 37's
+# same-level retry-with-fresh-proxy, orchestrator/worker.py::
+# _fetch_with_proxy, firing immediately on a BROWSER_CRASH-category
+# failure) collided with the crashed browser's own display, still not torn
+# down: "_XSERVTransSocketUNIXCreateListener ... SocketCreateListener()
+# failed ... server already running". Xvfb's own -displayfd flag (used by
+# both engines, confirmed live in this environment) claims a display number
+# atomically at launch — that alone doesn't stop a *later* launch from
+# colliding with an *earlier* instance whose close is still in flight
+# (browser.__aexit__ tearing down Xvfb takes real wall-clock time, and a
+# retry racing right behind a crash doesn't wait for it). Holding this lock
+# across close too means a new launch can never start while a previous
+# instance's Xvfb is still being torn down. Scoped narrowly (the
+# spinup/teardown calls themselves, not full fetch bodies where avoidable)
+# so BROWSER_SEMAPHORE's real fetch concurrency stays mostly unaffected;
+# Botasaurus's one-shot @browser-decorator path (fetcher/botasaurus_wrapper.py)
+# bundles launch+navigate+close with no seam to split, so it holds this for
+# its whole call instead — an accepted throughput trade for correctness.
+XVFB_LOCK = asyncio.Lock()
+
 
 def configure_budget(
     *, browser_max_total_instances: int, capsolver_max_concurrent_solves: int
