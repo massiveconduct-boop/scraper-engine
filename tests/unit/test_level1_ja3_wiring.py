@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.level_1 import Level1Fetcher
 from scraper_engine.services.botasaurus_requests_client import Ja3Response
@@ -53,6 +54,21 @@ async def test_uses_ja3_result_when_it_succeeds(monkeypatch):
     assert result.success is True
     assert result.html == "<html>ja3</html>"
     session.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ja3_404_classified_as_not_found(monkeypatch):
+    """Round 43 — the JA3 path's own status-based classification, same
+    fix as plain httpx's in test_level_1.py."""
+    session = AsyncMock()
+    session.get.return_value = Ja3Response(status_code=404, text="<html>gone</html>", location=None)
+    ja3 = _fake_ja3_client(session)
+    fetcher = Level1Fetcher(ja3_client=ja3)
+
+    result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+    assert result.success is False
+    assert result.failure_category == FailureCategory.NOT_FOUND
 
 
 @pytest.mark.asyncio

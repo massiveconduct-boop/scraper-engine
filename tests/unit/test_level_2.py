@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from scraper_engine.core.exceptions import SSRFBlockedError
-from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.models import FailureCategory, Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 from scraper_engine.fetcher.level_2 import Level2Fetcher
@@ -172,6 +172,24 @@ class TestFetchViaCamoufox:
 
         assert result.success is True  # unchanged — worker.py reclassifies via is_challenge_page
         assert result.http_status == 502
+
+    @pytest.mark.asyncio
+    async def test_navigation_404_marked_failure_not_found(self, monkeypatch):
+        """Round 43 — unlike 502/504 above (worth a browser's chance to
+        bypass, reclassified downstream), a definitive 404 rendered through
+        Camoufox is still a 404: no JS execution makes a nonexistent page
+        exist. Must be marked a real failure here, not silently accepted as
+        successful content."""
+        page = FakePage(nav_status=404)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_2.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level2Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), proxy=_proxy())
+
+        assert result.success is False
+        assert result.http_status == 404
+        assert result.failure_category == FailureCategory.NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

@@ -125,7 +125,7 @@ circuit_breaker:
   failure_threshold: 0.95
   attempt_threshold: 20
   cooldown_seconds: 600
-  max_cooldown_seconds: 3600
+  max_cooldown_seconds: 1200
   failure_streak_ttl_seconds: 600
 
 capsolver:

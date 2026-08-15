@@ -175,6 +175,17 @@ class TestOpenCircuitBackoff:
         assert await redis.get("cb:tripped.com:failure_window_attempts") == "0"
 
     @pytest.mark.asyncio
+    async def test_trip_count_has_ttl_for_decay(self, breaker, redis) -> None:
+        """Round 43 — trip_count must expire after a sustained quiet period
+        (a multiple of max_cooldown_seconds) so a domain that tripped once
+        long ago, then ran healthy for a long time, doesn't get hit with
+        compounded exponential backoff on its next trip as if the earlier
+        trip were recent."""
+        for _ in range(10):
+            await breaker.record_failure("decaying.com")
+        assert await redis.ttl("cb:decaying.com:trip_count") > 0
+
+    @pytest.mark.asyncio
     async def test_repeated_trips_double_cooldown(self, breaker, redis) -> None:
         for _ in range(10):
             await breaker.record_failure("repeat.com")

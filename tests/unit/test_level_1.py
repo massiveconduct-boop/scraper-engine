@@ -78,6 +78,60 @@ class TestPlainHttpxRedirects:
         assert result.http_status == 200
 
 
+class _StatusClient:
+    def __init__(self, status_code):
+        self._status_code = status_code
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        return _FakeResponse(self._status_code, text="<html>error page</html>")
+
+
+class TestPlainHttpxStatusClassification:
+    """Round 43 — a plain HTTP failure status now carries a real
+    failure_category instead of falling through untagged."""
+
+    @pytest.mark.asyncio
+    async def test_404_classified_as_not_found(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(404))
+        fetcher = Level1Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_403_classified_as_detection_block(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(403))
+        fetcher = Level1Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+
+    @pytest.mark.asyncio
+    async def test_5xx_left_uncategorized(self, monkeypatch):
+        """5xx isn't classified here — ChallengeDetector.CHALLENGE_STATUS_CODES
+        already handles it downstream in worker.py's escalation logic."""
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(503))
+        fetcher = Level1Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category is None
+
+
 class TestPlainHttpxExceptions:
     @pytest.mark.asyncio
     async def test_timeout_returns_network_timeout_failure(self, monkeypatch):
@@ -115,6 +169,21 @@ class TestScraplingWiring:
         assert result.success is True
         assert result.html == "<html>scrapling</html>"
         scrapling.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scrapling_404_classified_as_not_found(self):
+        """Round 43 — the scrapling path's own status-based classification,
+        same fix as plain httpx's in TestPlainHttpxStatusClassification."""
+        scrapling = AsyncMock()
+        scrapling.fetch.return_value = ScraplingResponse(
+            status_code=404, text="<html>gone</html>", location=None
+        )
+        fetcher = Level1Fetcher(scrapling_client=scrapling)
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_follows_redirect_and_revalidates_ssrf(self):

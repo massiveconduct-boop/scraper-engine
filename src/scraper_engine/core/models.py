@@ -82,6 +82,17 @@ class FailureCategory(str, Enum):
     # retrying a domain that doesn't resolve just wastes browser launches
     # (round 15 — surfaced by a dead test domain crashing through all levels).
     HOST_UNREACHABLE = "host_unreachable"
+    # Round 43 — a definitive HTTP 404 is a URL-level fact, not a domain- or
+    # proxy-level one: no fetcher variant, proxy, or browser render will ever
+    # make a nonexistent page exist. Live-caught: sec.gov.ng's one URL in a
+    # batch was a genuine 404, but with no dedicated category it fell
+    # through as an untagged generic failure — escalated needlessly through
+    # L2/L3 (each a wasted browser launch) AND penalized the domain's
+    # circuit breaker exactly like a real proxy/network failure, even
+    # though it says nothing about the domain's actual health. Non-
+    # retryable and circuit-exempt for the same reason HOST_UNREACHABLE is
+    # non-retryable above.
+    NOT_FOUND = "not_found"
 
 
 class FetchResult(BaseModel):

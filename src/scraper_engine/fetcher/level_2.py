@@ -240,6 +240,26 @@ class Level2Fetcher:
                     html = await safe_content(page)
                 duration_ms = int((time.monotonic() - start) * 1000)
 
+                nav_status = nav_response.status if nav_response is not None else 200
+                # Round 43 — a definitive 404 rendered through a real browser
+                # is still a 404: no amount of JS execution makes a
+                # nonexistent page exist. Before this, ChallengeDetector's
+                # CHALLENGE_STATUS_CODES (403/429/5xx — genuinely worth a
+                # browser's chance to bypass) was the only status check
+                # here, so a 404's error-page HTML was silently accepted as
+                # real "successful" content. See _failure.py::classify_http_status.
+                if nav_status == 404:
+                    return FetchResult(
+                        url=url,
+                        success=False,
+                        http_status=nav_status,
+                        html=html,
+                        level_used=2,
+                        proxy_used=proxy.key() if proxy else "none",
+                        duration_ms=duration_ms,
+                        failure_category=FailureCategory.NOT_FOUND,
+                        error_message=f"HTTP {nav_status} Not Found",
+                    )
                 return FetchResult(
                     url=url,
                     success=True,
@@ -253,7 +273,7 @@ class Level2Fetcher:
                     # of every gateway failure looking identical to a real
                     # 200. None only for edge navigations Playwright doesn't
                     # attach a Response to (e.g. about:blank).
-                    http_status=nav_response.status if nav_response is not None else 200,
+                    http_status=nav_status,
                     html=html,
                     level_used=2,
                     proxy_used=proxy.key() if proxy else "none",

@@ -140,13 +140,31 @@ class Level3Fetcher:
                     html = await safe_content(page)
                 duration_ms = int((time.monotonic() - start) * 1000)
 
+                nav_status = nav_response.status if nav_response is not None else 200
+                # Round 43 — same as Level2Fetcher's _fetch_via_camoufox: a
+                # definitive 404 is still a 404 no matter how it's rendered,
+                # so it must not be silently accepted as successful content
+                # just because L3 is the last level with nowhere further to
+                # escalate to.
+                if nav_status == 404:
+                    return FetchResult(
+                        url=url,
+                        success=False,
+                        http_status=nav_status,
+                        html=html,
+                        level_used=3,
+                        proxy_used=proxy.key() if proxy else "none",
+                        duration_ms=duration_ms,
+                        failure_category=FailureCategory.NOT_FOUND,
+                        error_message=f"HTTP {nav_status} Not Found",
+                    )
                 return FetchResult(
                     url=url,
                     success=True,
                     # Real navigation status, not a hardcoded 200 — same
                     # rationale as Level2Fetcher's _fetch_via_camoufox
                     # (round 33).
-                    http_status=nav_response.status if nav_response is not None else 200,
+                    http_status=nav_status,
                     html=html,
                     level_used=3,
                     proxy_used=proxy.key() if proxy else "none",

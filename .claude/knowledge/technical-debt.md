@@ -32,6 +32,118 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 44)
+
+- **RESOLVED (round 44) — root-caused all 6 remaining failures from round
+  43's rerun; user-requested "robust and resilient solutions," plus an
+  explicit ask for an opinion on the circuit breaker's cooldown length.**
+
+  1. **New `FailureCategory.NOT_FOUND` — a definitive HTTP 404 is a
+     URL-level fact, not a domain-health signal.** Real worker logs showed
+     `sec.gov.ng`'s one URL in the batch returned a genuine 404
+     (`Fetched (404) <GET https://sec.gov.ng/...>`). Before this, L1
+     (`fetcher/level_1.py`) marked ANY non-2xx status `success=False` with
+     NO category at all (`failure_category=None`) — that fell through
+     `DLQ_ELIGIBLE_CATEGORIES` untouched, so it escalated needlessly
+     through L2 and L3 (each a wasted browser launch — a 404 page doesn't
+     start existing because a browser rendered it) AND penalized the
+     domain's circuit breaker exactly like a real proxy/network failure on
+     every one of those 3 attempts, even though a dead URL says nothing
+     about the domain's actual health. Separately, L2/L3
+     (`fetcher/level_2.py`/`level_3.py`) unconditionally returned
+     `success=True` for ANY completed navigation regardless of real HTTP
+     status except the codes in `ChallengeDetector.CHALLENGE_STATUS_CODES`
+     (403/429/5xx) — a 404 reaching L2/L3 would have been silently accepted
+     as "successful" content, the error page's HTML treated as real data.
+     Fixed: new `fetcher/_failure.py::classify_http_status()` maps 404 →
+     `NOT_FOUND` (401/403/405/410/429 → `DETECTION_BLOCK`, still escalates
+     normally — a real browser render can legitimately bypass basic
+     anti-bot blocking, unlike a 404); wired into all 3 of L1's fetch paths
+     (httpx, JA3, scrapling) and as an explicit pre-check at L2/L3's
+     Camoufox navigation site (before their existing unconditional
+     `success=True`). `NOT_FOUND` added to `worker.py`'s
+     `PERMANENT_FAILURE_CATEGORIES` (stops escalation, immediate DLQ, same
+     as `HOST_UNREACHABLE`) and to a new `CIRCUIT_EXEMPT_CATEGORIES` set
+     checked before `circuit_breaker.record_failure()` — the first category
+     ever exempted from circuit penalty. `core/retry.py`'s `RETRY_MATRIX`
+     gained a non-retryable entry, same as `HOST_UNREACHABLE`. Live-
+     verified: `sec.gov.ng` now returns `not_found` at L1 with zero
+     escalation and zero circuit-breaker impact.
+
+  2. **`classify_fetch_exception`'s marker-based DNS-failure matching was
+     mislabeling proxy-side DNS blips as permanent domain-dead facts.**
+     Round 43 fixed `HOST_UNREACHABLE` coming from `SSRFGuard`'s own
+     pre-flight check; this round found the OTHER path into that same
+     category was itself wrong. Every fetch path validates a URL through
+     `SSRFGuard.validate()` — an unproxied, direct DNS lookup — BEFORE
+     attempting the real (possibly proxied) request: `level_1.py`'s own
+     call at the top of `fetch()`, and L2/L3's `SSRFRouteGuard` on every
+     navigation/sub-request. So by the time a raw exception (not an
+     `SSRFBlockedError`) reaches `classify_fetch_exception`, SSRFGuard has
+     ALREADY proven this exact URL resolves via a direct lookup — a
+     subsequent `NS_ERROR_UNKNOWN_HOST`/`getaddrinfo` exception from the
+     real attempt can only be proxy- or network-side (e.g. a flaky free
+     proxy with broken DNS forwarding), never proof the domain itself is
+     dead. Live-caught: a `nairametrics.com` URL failed once with exactly
+     this signature while sibling `nairametrics.com` URLs succeeded in the
+     same job (nairametrics.com obviously isn't dead); retried alone, it
+     never failed with an unknown-host error again — first a genuine
+     `proxy_exhausted` on one attempt, then a genuine `not_found` (404) on
+     another, both real, both different from the original DNS error,
+     consistent with a transient proxy fluke rather than a domain fact.
+     Fixed: removed the `_HOST_UNREACHABLE_MARKERS` string-matching branch
+     entirely — `classify_fetch_exception` now falls through to the
+     caller's `default` (`NETWORK_TIMEOUT` for L1, `BROWSER_CRASH` for
+     L2/L3) for any non-`SSRFBlockedError` exception, both already
+     retryable and already wired into round 37's same-level fresh-proxy
+     retry. `HOST_UNREACHABLE` is now reachable ONLY via
+     `SSRFBlockedError.is_unresolvable` — a single, authoritative,
+     proxy-independent source of truth for "this domain is actually dead."
+
+  3. **Circuit breaker cooldown — explicit user ask for an opinion, on top
+     of the fix.** `crunchbase.com`/`cowrywise.com`/`sec.gov.ng` were all
+     still circuit-open at the start of this round from real (not stale —
+     round 43 already fixed the stale-contamination bug) failures earlier
+     the same day: `www.crunchbase.com` HTTP 403 (crunchbase is well known
+     for aggressive anti-bot blocking), `cowrywise.com` HTTP 405, plus
+     `sec.gov.ng`'s 404 (now separately fixed in #1 above, no longer
+     circuit-eligible). Assessment given to the user: `max_cooldown_seconds
+     =3600` (1hr) reads like it was calibrated for a much higher-stakes
+     circuit (e.g. a payments API) than "come back and try this scrape
+     target again" — a scraping job stalled an hour on a domain that's
+     likely fine within minutes is a heavy, disproportionate cost, and
+     `trip_count` never decaying meant a domain that tripped a handful of
+     times, then ran healthy for a long stretch, still got hit with the
+     FULL compounded exponential backoff on its next trip as if the
+     earlier trips were recent. Fixed: `max_cooldown_seconds` default cut
+     3600s→1200s (still 2 full exponential doublings — 10min→20min — before
+     capping, still enough to break a thundering-herd re-attack pattern,
+     per the class's own stated F-18 purpose); `trip_count` now written
+     with a TTL (`max_cooldown_seconds × 3`) so it decays after a
+     sustained quiet period instead of compounding forever.
+     `attempt_threshold`/`failure_threshold`/`cooldown_seconds` (the base,
+     pre-cap value) left untouched — narrower, lower-risk change than
+     redesigning the trip-decision math itself (see the still-open
+     `failure_threshold`-is-vestigial note from round 43). Live-verified
+     the most direct way possible: cleared the 3 domains' stale-by-old-
+     standard circuit state and re-attempted for real — `crunchbase.com`
+     succeeded at L3, `cowrywise.com` succeeded at L2, immediately, no
+     errors. Neither was ever actually unscrapeable; they were blocked by
+     the OLD circuit design's own overcorrection, not by the sites
+     themselves. `sec.gov.ng` correctly came back `not_found` (real 404,
+     not fixable, not a bug — see #1).
+
+  All 6 of round 43's rerun failures are now individually accounted for:
+  2 fixed-and-now-succeeding (`crunchbase.com`, `cowrywise.com`), 1
+  correctly-terminal-and-no-longer-wasteful (`sec.gov.ng`, 404), 1
+  correctly-terminal-and-honestly-labeled
+  (`nairametrics.com`'s one dead URL, 404 — was previously miscategorized
+  as a scarier-looking `host_unreachable`), 1 already-correct
+  (`nigeriafintechweek.com`, genuinely dead domain, confirmed via external
+  DNS-over-HTTPS in round 43), 0 remaining `proxy_exhausted` mislabeling.
+
+  876 passed, 100.00% coverage, ruff/mypy clean.
+
 ## Technical Debt / Open Threads (as of round 43)
 
 - **RESOLVED (round 43) — markdown RecursionError fixed for real, not just

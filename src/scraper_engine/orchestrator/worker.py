@@ -76,6 +76,12 @@ PERMANENT_FAILURE_CATEGORIES = frozenset(
         FailureCategory.SSRF_BLOCKED,
         FailureCategory.QUOTA_EXCEEDED,
         FailureCategory.HOST_UNREACHABLE,
+        # Round 43 — a definitive 404 will never succeed on retry or a
+        # different level, same reasoning as HOST_UNREACHABLE above. Without
+        # this, a genuine 404 escalated needlessly through every remaining
+        # level (each a wasted browser launch) before finally reaching the
+        # DLQ anyway.
+        FailureCategory.NOT_FOUND,
     }
 )
 TRANSIENT_FAILURE_CATEGORIES = frozenset(
@@ -85,6 +91,13 @@ TRANSIENT_FAILURE_CATEGORIES = frozenset(
     }
 )
 DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
+
+# Round 43 — categories that must NOT count against a domain's circuit
+# breaker. NOT_FOUND is a URL-level fact (this specific page doesn't exist),
+# not a domain- or proxy-level health signal — a domain with a handful of
+# dead/typo'd URLs in its batch shouldn't have its circuit tripped over it
+# the same way a real proxy/network/detection failure would.
+CIRCUIT_EXEMPT_CATEGORIES = frozenset({FailureCategory.NOT_FOUND})
 
 
 class Worker:
@@ -385,7 +398,8 @@ class Worker:
                             await on_result(result)
                         break
                     else:
-                        await self._circuit_breaker.record_failure(domain)
+                        if result.failure_category not in CIRCUIT_EXEMPT_CATEGORIES:
+                            await self._circuit_breaker.record_failure(domain)
                         if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
                             await self._dlq.enqueue(
                                 tenant_id,

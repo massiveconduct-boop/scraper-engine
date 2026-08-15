@@ -273,6 +273,53 @@ class TestWorker:
         assert worker._fetch_url.await_count == 1  # no escalation to L2/L3
 
     @pytest.mark.asyncio
+    async def test_not_found_dead_letters_without_escalation_or_circuit_penalty(
+        self, tenant, worker
+    ):
+        """Round 43 — a definitive 404 dead-letters immediately like
+        HOST_UNREACHABLE above (no fetcher/proxy/browser combination makes a
+        nonexistent page exist), but additionally must NOT count against the
+        domain's circuit breaker — it's a URL-level fact, not a domain- or
+        proxy-level health signal."""
+        not_found = FetchResult(
+            url="http://example.com/does-not-exist",
+            success=False,
+            level_used=1,
+            duration_ms=5,
+            failure_category=FailureCategory.NOT_FOUND,
+            error_message="HTTP 404 Not Found",
+        )
+        worker._fetch_url = AsyncMock(return_value=not_found)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com/does-not-exist")])
+
+        response = await worker.process_job(tenant, "job-404", request)
+        assert response.status == JobStatus.FAILED
+        worker._dlq.enqueue.assert_called_once()
+        assert worker._fetch_url.await_count == 1  # no escalation to L2/L3
+        worker._circuit_breaker.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dlq_eligible_non_exempt_failure_still_records_circuit_failure(
+        self, tenant, worker
+    ):
+        """Positive control for the exemption above — a real proxy-pool
+        failure (not circuit-exempt) must still penalize the domain's
+        circuit breaker as before."""
+        exhausted = FetchResult(
+            url="http://example.com/",
+            success=False,
+            level_used=3,
+            duration_ms=5,
+            failure_category=FailureCategory.PROXY_EXHAUSTED,
+            error_message="Proxy pool exhausted",
+        )
+        worker._fetch_url = AsyncMock(return_value=exhausted)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com/")])
+
+        await worker.process_job(tenant, "job-exhausted", request)
+        worker._circuit_breaker.record_failure.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_extract_domain(self, worker):
         assert worker._extract_domain("http://example.com/path") == "example.com"
         assert worker._extract_domain("https://sub.dom.com:8080/x") == "sub.dom.com"

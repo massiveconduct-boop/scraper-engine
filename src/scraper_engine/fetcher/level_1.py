@@ -14,6 +14,7 @@ import httpx
 
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
+from scraper_engine.fetcher._failure import classify_http_status
 
 from .result import FetchResult
 
@@ -119,6 +120,9 @@ class Level1Fetcher:
                     level_used=1,
                     proxy_used=proxy.key() if proxy else None,
                     duration_ms=duration_ms,
+                    failure_category=(
+                        None if success else classify_http_status(response.status_code)
+                    ),
                 )
         except httpx.TimeoutException:
             return FetchResult(
@@ -180,6 +184,7 @@ class Level1Fetcher:
                 level_used=1,
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                failure_category=None if success else classify_http_status(response.status_code),
             )
         except Exception:
             return None
@@ -220,6 +225,7 @@ class Level1Fetcher:
                 level_used=1,
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                failure_category=None if success else classify_http_status(response.status_code),
             )
         except Exception:
             return None

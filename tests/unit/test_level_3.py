@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from scraper_engine.core.exceptions import SSRFBlockedError
-from scraper_engine.core.models import Proxy, ProxyProtocol
+from scraper_engine.core.models import FailureCategory, Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 from scraper_engine.fetcher.level_3 import Level3Fetcher
@@ -110,6 +110,22 @@ class TestFetch:
 
         assert result.success is True
         assert result.http_status == 504
+
+    @pytest.mark.asyncio
+    async def test_navigation_404_marked_failure_not_found(self, monkeypatch):
+        """Round 43 — same fix as Level2Fetcher's identical test: a
+        definitive 404 must not be silently accepted as successful content
+        just because L3 is the last level with nowhere further to escalate."""
+        page = FakePage(nav_status=404)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level3Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is False
+        assert result.http_status == 404
+        assert result.failure_category == FailureCategory.NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

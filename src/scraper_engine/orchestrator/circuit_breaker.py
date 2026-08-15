@@ -18,6 +18,10 @@ class CircuitState(str, Enum):
     HALF_OPEN = "half_open"
 
 
+# Round 43 — see _open_circuit's trip_count TTL comment.
+_TRIP_COUNT_DECAY_MULTIPLIER = 3
+
+
 class CircuitBreaker:
     """3-state circuit breaker per domain, backed by Redis.
 
@@ -147,7 +151,19 @@ class CircuitBreaker:
         """Open the circuit with exponential backoff cooldown."""
         trip_raw = await self._get(self._key(domain, "trip_count"))
         trip_count = (int(trip_raw) if trip_raw else 0) + 1
-        await self._set(self._key(domain, "trip_count"), str(trip_count))
+        # Round 43 — trip_count TTL'd so it decays after a sustained quiet
+        # period, instead of compounding forever. Before this, a domain that
+        # tripped a handful of times, then ran healthy for days/weeks, still
+        # got hit with the FULL exponential backoff on its next trip — the
+        # counter had no memory of "that was a long time ago." TTL window is
+        # a multiple of max_cooldown_seconds so it only decays once a domain
+        # has genuinely been quiet well past its own longest possible
+        # cooldown, not mid-cycle while it's still actively recovering.
+        await self._set(
+            self._key(domain, "trip_count"),
+            str(trip_count),
+            ttl_seconds=self._max_cooldown_seconds * _TRIP_COUNT_DECAY_MULTIPLIER,
+        )
         # Global counter, not per-domain (round 25) — Redis has no cheap way to
         # enumerate every domain this breaker has ever seen, so a per-domain
         # scrape-time gauge isn't feasible. observability/metrics.py refreshes

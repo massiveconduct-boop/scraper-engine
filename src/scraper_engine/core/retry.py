@@ -55,6 +55,9 @@ RETRY_MATRIX: dict[FailureCategory, RetryStrategy] = {
     FailureCategory.HOST_UNREACHABLE: RetryStrategy(
         max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
     ),
+    FailureCategory.NOT_FOUND: RetryStrategy(
+        max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
+    ),
 }
 
 

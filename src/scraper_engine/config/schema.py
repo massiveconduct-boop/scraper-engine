@@ -131,7 +131,15 @@ class CircuitBreakerConfig(BaseModel):
     failure_threshold: float = 0.95
     attempt_threshold: int = 20
     cooldown_seconds: int = 600
-    max_cooldown_seconds: int = 3600
+    # Round 43 — reduced from 3600s (1hr). A scraping job stalled for an
+    # hour on a domain that's likely recovered within minutes is a heavy
+    # cost for a system whose job timeouts are already scaled in single-
+    # digit minutes per URL; 1hr was calibrated for a much higher-stakes
+    # circuit (e.g. a payments API) than "come back and try this domain
+    # again." 20 minutes still gives 2 full exponential doublings of
+    # meaningful backoff (10min -> 20min) before capping, still enough to
+    # break a thundering-herd re-attack pattern.
+    max_cooldown_seconds: int = 1200
     # Round 43 — how long a failure streak stays "live" before Redis expires
     # it. Without this, failures from one job (e.g. a crashed or hard-killed
     # run) sit forever and silently feed an unrelated later job's trip
