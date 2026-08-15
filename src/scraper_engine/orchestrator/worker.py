@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
+from scraper_engine.fetcher._failure import classify_http_status
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,17 @@ PERMANENT_FAILURE_CATEGORIES = frozenset(
         FailureCategory.SSRF_BLOCKED,
         FailureCategory.QUOTA_EXCEEDED,
         FailureCategory.HOST_UNREACHABLE,
-        # Round 43 — a definitive 404 will never succeed on retry or a
-        # different level, same reasoning as HOST_UNREACHABLE above. Without
-        # this, a genuine 404 escalated needlessly through every remaining
-        # level (each a wasted browser launch) before finally reaching the
-        # DLQ anyway.
+        # Round 43 gave 404 its own always-permanent, circuit-exempt
+        # NOT_FOUND on the assumption a definitive "not found" status could
+        # only mean a genuinely dead URL. Round 45 found that wrong — live-
+        # verified two of this deployment's own target domains return a 404-
+        # shaped response for what's actually a Cloudflare bot-management
+        # block, and the same URLs load fine in a real browser. 404 now
+        # escalates like any other block status (see
+        # ChallengeDetector.CHALLENGE_STATUS_CODES); NOT_FOUND is kept here
+        # only so any already-persisted historical DLQ/result rows using
+        # this category (from round 43-44) still resolve as non-retryable —
+        # nothing assigns it going forward.
         FailureCategory.NOT_FOUND,
     }
 )
@@ -91,13 +98,6 @@ TRANSIENT_FAILURE_CATEGORIES = frozenset(
     }
 )
 DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
-
-# Round 43 — categories that must NOT count against a domain's circuit
-# breaker. NOT_FOUND is a URL-level fact (this specific page doesn't exist),
-# not a domain- or proxy-level health signal — a domain with a handful of
-# dead/typo'd URLs in its batch shouldn't have its circuit tripped over it
-# the same way a real proxy/network/detection failure would.
-CIRCUIT_EXEMPT_CATEGORIES = frozenset({FailureCategory.NOT_FOUND})
 
 
 class Worker:
@@ -318,12 +318,40 @@ class Worker:
                         # JS-gated-shell half of this; this round for the
                         # challenge-page half). Browser levels render JS and already
                         # loop internally until solved or exhausted, so a genuine L2/
-                        # L3 success won't trip this; the final level accepts
-                        # whatever it got.
-                        if level < LEVELS[-1] and (
-                            result.is_challenge_page
-                            or self._challenge_detector.looks_javascript_gated(result.html or "")
-                        ):
+                        # L3 success usually won't trip this.
+                        still_looks_blocked = result.is_challenge_page or (
+                            self._challenge_detector.looks_javascript_gated(result.html or "")
+                        )
+                        if level < LEVELS[-1] and still_looks_blocked:
+                            continue
+                        # Round 45 — the final level used to unconditionally accept
+                        # "whatever it got," even a page that STILL looks blocked
+                        # after a real, JS-capable browser rendered it. Live-caught:
+                        # a genuine 404 error page (businessday.ng) was silently
+                        # persisted as 6KB of "successful" markdown for days,
+                        # because L3 had nowhere further to escalate to and so
+                        # accepted it as-is. A page that's still blocked/not-found
+                        # after the most capable fetcher's own real render is
+                        # actual evidence of a real problem — downgrade to a real
+                        # failure (mutating `result` in place, which
+                        # `last_level_result` already points at) and `continue`,
+                        # the same as any other per-level failure. Since this is
+                        # necessarily the final level (the non-final case already
+                        # `continue`d above), the for loop simply ends here,
+                        # reusing the EXISTING for/else "all levels exhausted"
+                        # fallback below to construct the real DLQ entry from
+                        # `last_level_result` — not duplicating that logic here.
+                        if still_looks_blocked:
+                            await self._circuit_breaker.record_failure(domain)
+                            result.success = False
+                            result.failure_category = (
+                                classify_http_status(result.http_status or 0)
+                                or FailureCategory.DETECTION_BLOCK
+                            )
+                            result.error_message = result.error_message or (
+                                f"Still blocked/not-found after final level "
+                                f"(http_status={result.http_status})"
+                            )
                             continue
                         if result.html:
                             # FetchResult.extracted was declared on the model and
@@ -398,8 +426,7 @@ class Worker:
                             await on_result(result)
                         break
                     else:
-                        if result.failure_category not in CIRCUIT_EXEMPT_CATEGORIES:
-                            await self._circuit_breaker.record_failure(domain)
+                        await self._circuit_breaker.record_failure(domain)
                         if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
                             await self._dlq.enqueue(
                                 tenant_id,

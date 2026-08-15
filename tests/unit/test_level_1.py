@@ -100,14 +100,19 @@ class TestPlainHttpxStatusClassification:
     failure_category instead of falling through untagged."""
 
     @pytest.mark.asyncio
-    async def test_404_classified_as_not_found(self, monkeypatch):
+    async def test_404_classified_as_detection_block(self, monkeypatch):
+        """Round 45 — a 404 from L1 (no JS, easily fingerprinted) is treated
+        the same as any other block status: worth a real browser's chance,
+        not an immediate, definitive failure. Live-caught: this exact
+        deployment's own target domains returned a 404-shaped response for
+        what was actually a Cloudflare bot-management block."""
         monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(404))
         fetcher = Level1Fetcher()
 
         result = await fetcher.fetch("http://example.com", TenantId("system"))
 
         assert result.success is False
-        assert result.failure_category == FailureCategory.NOT_FOUND
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
 
     @pytest.mark.asyncio
     async def test_403_classified_as_detection_block(self, monkeypatch):
@@ -171,8 +176,8 @@ class TestScraplingWiring:
         scrapling.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_scrapling_404_classified_as_not_found(self):
-        """Round 43 — the scrapling path's own status-based classification,
+    async def test_scrapling_404_classified_as_detection_block(self):
+        """Round 45 — the scrapling path's own status-based classification,
         same fix as plain httpx's in TestPlainHttpxStatusClassification."""
         scrapling = AsyncMock()
         scrapling.fetch.return_value = ScraplingResponse(
@@ -183,7 +188,7 @@ class TestScraplingWiring:
         result = await fetcher.fetch("http://example.com", TenantId("system"))
 
         assert result.success is False
-        assert result.failure_category == FailureCategory.NOT_FOUND
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
 
     @pytest.mark.asyncio
     async def test_follows_redirect_and_revalidates_ssrf(self):

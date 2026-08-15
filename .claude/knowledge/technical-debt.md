@@ -32,6 +32,107 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 45)
+
+- **RESOLVED (round 45) — round 44's "404 = definitively dead" assumption
+  was wrong; user caught it with real evidence.** User reported their own
+  browser loaded `nairametrics.com`/`sec.gov.ng` fine, directly
+  contradicting round 44's `NOT_FOUND` design, and asked to dig deeper
+  ("the problem could be from a place you don't suspect") plus look into
+  whether the 3 "went dead" domains were anti-bot detection.
+
+  **Root cause, confirmed live:** a bare/naive request (Python's default
+  urllib UA, no browser fingerprint) to `nairametrics.com` and
+  `techcabal.com` returned Cloudflare's own bot-management rejection body
+  — literally `error code: 1010` ("banned browser signature"), a
+  well-known Cloudflare code — not a real 404 at all. Round 44 assumed a
+  404 status was unambiguous ("no fetcher variant makes a page exist");
+  wrong — a hostile/defensive server can freely lie via status code, and a
+  WAF returning a disguised 404 instead of 403 is a known deliberate
+  anti-scraper tactic (discourages retry-tuning by not revealing
+  detection).
+
+  **Fix:** reverted round 44's special-cased `NOT_FOUND` (permanent,
+  circuit-exempt, no escalation) entirely.
+  - `fetcher/challenge_detector.py::CHALLENGE_STATUS_CODES` gained `404`
+    alongside the existing 403/429/500/502/503/504 — a 404 is now treated
+    exactly like every other block-status: worth a real browser's chance
+    to bypass. Also added `"error code: 1010"` to `CHALLENGE_SIGNATURES`
+    as a content-based backstop.
+  - `fetcher/_failure.py::classify_http_status` — 404 folded into the
+    existing `DETECTION_BLOCK` bucket (was a standalone `NOT_FOUND`
+    return); the function's contract is now uniformly "ambiguous, worth
+    escalating," never "definitely permanent."
+  - `fetcher/level_2.py`/`level_3.py` — removed round 44's explicit
+    early-return-on-404 (which bypassed `worker.py`'s centralized
+    challenge-detection entirely); both fetchers again report
+    `success=True` with the real status unconditionally, deferring to the
+    shared classification.
+  - `orchestrator/worker.py` — the REAL fix, closing a separate,
+    previously-undiscovered pre-existing gap: the final level (L3) used to
+    unconditionally accept "whatever it got" once `level == LEVELS[-1]`,
+    even a page that still looked blocked after a real, JS-capable browser
+    rendered it. This is exactly how `businessday.ng`'s genuine 404 error
+    page had been silently persisted as 6KB of "successful" markdown for
+    days before round 44 (see round-44 entry's discovery of this same
+    row). Now: if the final level's own render still looks
+    blocked/not-found (`is_challenge_page` or JS-gated), the result is
+    downgraded to a real failure in place (`result.success = False`,
+    `failure_category` from `classify_http_status(http_status)` falling
+    back to `DETECTION_BLOCK`), `record_failure` is called, and control
+    `continue`s — reusing the existing round-42 "all levels exhausted"
+    fallback path (keyed off `last_level_result`, which already points at
+    the same, now-mutated object) to construct the DLQ entry, rather than
+    duplicating that logic. `PERMANENT_FAILURE_CATEGORIES`/
+    `CIRCUIT_EXEMPT_CATEGORIES`'s `NOT_FOUND` special-casing removed
+    (`CIRCUIT_EXEMPT_CATEGORIES` mechanism retired entirely — nothing is
+    circuit-exempt anymore, since even a confirmed-after-full-escalation
+    404 turned out to be an unreliable enough signal to keep the
+    exemption). `FailureCategory.NOT_FOUND` kept in the enum and in
+    `PERMANENT_FAILURE_CATEGORIES`/`core/retry.py`'s `RETRY_MATRIX` purely
+    for backward-compat with already-persisted round 43-44 DB rows using
+    that string — nothing assigns it going forward.
+
+  **Live-verified against the exact 7 URLs in question** (fresh containers,
+  cache bypassed): `sec.gov.ng` → real 200 at L2. `techcabal.com` → real
+  200 at L2. `www.konga.com` → real 200 at L2. All 3 previously showed a
+  404-shaped result and are now confirmed recovered — the user's suspicion
+  was correct. `nairametrics.com`'s 2 specific dated-article URLs,
+  `punchng.com/topics/metro-news/`, and `businessday.ng`'s specific
+  article URL all still fail — but now confirmed via TWO independent
+  methods (the system's own real L3 Camoufox browser through a leased
+  proxy, AND a separate no-proxy direct check with a full realistic Chrome
+  header set) that these are genuine, real 404s from the origin server
+  itself (proper WordPress-generated 404 pages with real `CF-RAY`/cache
+  headers, 38-266KB of real markup — not a WAF stub). Each domain's own
+  homepage/other paths independently verified healthy (`nairametrics.com/`
+  → 200, 240KB; `punchng.com/` → repeatedly succeeded across multiple
+  historical runs) — only these specific stale deep-link paths are gone.
+  Very likely the user's own manual browser check hit a different URL on
+  these domains (the homepage, or a different/current article), not these
+  exact stale dated links — worth confirming with the user directly if
+  they have the specific working URL, since the evidence for these exact
+  paths being genuinely dead is now strong and cross-verified two
+  independent ways.
+
+  875 passed, 100.00% coverage, ruff/mypy clean.
+
+- **Monitoring-interval question (not a code fix — explained to the
+  user).** User asked why a 30-minute-interval status monitor needed to be
+  manually stopped instead of stopping itself on completion. It DOES
+  self-terminate (the polling loop's `if COMPLETED: break` ends the
+  script, which ends the Monitor watch) — but since it only *checks* once
+  per interval (`sleep 1800` between checks), there's up to a full interval
+  of detection latency between the job actually finishing and the monitor
+  next waking up to notice. When a manual status check (by the user or
+  Claude) discovers completion first, calling `TaskStop` just short-
+  circuits that wait rather than the monitor being unable to detect
+  completion on its own. Better pattern for future monitors: poll fast
+  internally (a few seconds) but only print/notify on either a fixed
+  interval elapsing OR reaching a terminal state — decouples "how often to
+  bother the user" from "how fast to detect completion," giving instant
+  detection without notification spam.
+
 ## Technical Debt / Open Threads (as of round 44)
 
 - **RESOLVED (round 44) — root-caused all 6 remaining failures from round

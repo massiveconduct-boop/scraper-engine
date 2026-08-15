@@ -57,8 +57,8 @@ async def test_uses_ja3_result_when_it_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ja3_404_classified_as_not_found(monkeypatch):
-    """Round 43 — the JA3 path's own status-based classification, same
+async def test_ja3_404_classified_as_detection_block(monkeypatch):
+    """Round 45 — the JA3 path's own status-based classification, same
     fix as plain httpx's in test_level_1.py."""
     session = AsyncMock()
     session.get.return_value = Ja3Response(status_code=404, text="<html>gone</html>", location=None)
@@ -68,7 +68,7 @@ async def test_ja3_404_classified_as_not_found(monkeypatch):
     result = await fetcher.fetch("http://example.com", TenantId("system"))
 
     assert result.success is False
-    assert result.failure_category == FailureCategory.NOT_FOUND
+    assert result.failure_category == FailureCategory.DETECTION_BLOCK
 
 
 @pytest.mark.asyncio

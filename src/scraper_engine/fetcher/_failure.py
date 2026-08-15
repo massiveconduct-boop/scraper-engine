@@ -50,35 +50,35 @@ def classify_fetch_exception(exc: BaseException, default: FailureCategory) -> Fa
     return default
 
 
-# Statuses that unambiguously mean "the site actively rejected/blocked this
-# specific request" rather than a network/proxy/timeout problem — worth a
-# real browser render (which can bypass basic bot detection), so unlike 404
-# below these still escalate normally. Kept separate from
-# ChallengeDetector.CHALLENGE_STATUS_CODES (403/429/5xx) — that set governs
-# whether a level-2/3 *rendered* page still looks blocked and needs another
-# level; this one governs L1's initial classification, which needs the
-# additional codes below (401/405/410) that a render can't help with any
-# more than 403 can't, but that also aren't "the URL doesn't exist."
-_DETECTION_BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 405, 410, 429})
+# Statuses that mean "the site actively rejected/blocked this specific
+# request" — worth a real browser's chance to bypass, so these still
+# escalate normally (governs L1's initial classification only; this
+# function's contract is "ambiguous, don't halt", not "definitely fine").
+#
+# Round 45 — 404 moved INTO this set, out of a standalone permanent
+# category. Live-caught: round 43 gave 404 its own NOT_FOUND category on
+# the assumption a definitive "not found" status could only mean a
+# genuinely dead URL — wrong. Verified live against this exact deployment's
+# real target domains: nairametrics.com and techcabal.com's "404" from a
+# bare/naive request was actually Cloudflare's bot-management rejection
+# ("error code: 1010" — banned browser signature), and the SAME URLs the
+# user confirmed load fine in a real browser. A 404 from L1 (no JS, easily
+# fingerprinted) is no more trustworthy than a 403 — both need a real
+# browser's chance before being believed. See
+# ChallengeDetector.CHALLENGE_STATUS_CODES and orchestrator/worker.py's
+# final-level confirmation check, which is where a 404 that's STILL present
+# after a real browser render finally becomes a genuine, permanent
+# NOT_FOUND — never from this function.
+_DETECTION_BLOCK_STATUSES: frozenset[int] = frozenset({401, 403, 404, 405, 410, 429})
 
 
 def classify_http_status(status_code: int) -> FailureCategory | None:
-    """Classify a definitively-non-2xx HTTP response status.
-
-    Returns None for anything not specifically classified here (e.g. a
-    5xx, already covered by ChallengeDetector.CHALLENGE_STATUS_CODES at the
-    browser levels) — callers should fall back to their own default in that
-    case, same contract as classify_fetch_exception.
-
-    404 is the one case that gets its own category (NOT_FOUND, not
-    DETECTION_BLOCK): live-caught (round 43) escalating a genuine 404
-    through L2/L3 and penalizing the domain's circuit breaker over it — a
-    definitively nonexistent URL will never start existing no matter which
-    fetcher, proxy, or browser renders it, so unlike a real block it says
-    nothing about the target's health.
+    """Classify a definitively-non-2xx HTTP response status as DETECTION_BLOCK
+    (still worth escalating to a real browser) or None (not specifically
+    classified here — e.g. a bare 5xx, already covered by
+    ChallengeDetector.CHALLENGE_STATUS_CODES at the browser levels; callers
+    fall back to their own default, same contract as classify_fetch_exception).
     """
-    if status_code == 404:
-        return FailureCategory.NOT_FOUND
     if status_code in _DETECTION_BLOCK_STATUSES:
         return FailureCategory.DETECTION_BLOCK
     return None

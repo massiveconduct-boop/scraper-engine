@@ -273,38 +273,42 @@ class TestWorker:
         assert worker._fetch_url.await_count == 1  # no escalation to L2/L3
 
     @pytest.mark.asyncio
-    async def test_not_found_dead_letters_without_escalation_or_circuit_penalty(
-        self, tenant, worker
-    ):
-        """Round 43 — a definitive 404 dead-letters immediately like
-        HOST_UNREACHABLE above (no fetcher/proxy/browser combination makes a
-        nonexistent page exist), but additionally must NOT count against the
-        domain's circuit breaker — it's a URL-level fact, not a domain- or
-        proxy-level health signal."""
-        not_found = FetchResult(
-            url="http://example.com/does-not-exist",
-            success=False,
+    async def test_404_escalates_through_all_levels_then_dead_letters(self, tenant, worker):
+        """Round 45 — a 404 is no longer treated as an immediate, definitive
+        failure (round 43 did that; wrong — see
+        ChallengeDetector.CHALLENGE_STATUS_CODES's round-45 comment). It now
+        escalates through every level like any other block status, and only
+        once the FINAL level's own result still looks blocked does it get
+        downgraded to a real failure and dead-lettered — proving both the
+        escalation (3 attempts, not 1) and the eventual DLQ."""
+        still_404 = FetchResult(
+            url="http://example.com/maybe-blocked",
+            success=True,
+            http_status=404,
+            html="<html>not found</html>",
             level_used=1,
             duration_ms=5,
-            failure_category=FailureCategory.NOT_FOUND,
-            error_message="HTTP 404 Not Found",
         )
-        worker._fetch_url = AsyncMock(return_value=not_found)
-        request = ScrapeRequest(urls=[HttpUrl("http://example.com/does-not-exist")])
+        worker._fetch_url = AsyncMock(return_value=still_404)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com/maybe-blocked")])
 
         response = await worker.process_job(tenant, "job-404", request)
         assert response.status == JobStatus.FAILED
+        assert worker._fetch_url.await_count == 3  # escalated through L1, L2, L3
         worker._dlq.enqueue.assert_called_once()
-        assert worker._fetch_url.await_count == 1  # no escalation to L2/L3
-        worker._circuit_breaker.record_failure.assert_not_called()
+        dlq_call = worker._dlq.enqueue.await_args
+        assert dlq_call.args[3] == FailureCategory.DETECTION_BLOCK
+        # Only the final level's still-blocked result is downgraded and
+        # penalized — L1/L2 looked like real navigations at the time
+        # (record_success fires whenever a fetcher reports success=True;
+        # only the challenge-detector check afterward decides whether to
+        # trust that), same pre-existing shape as 403/429/5xx escalation.
+        assert worker._circuit_breaker.record_failure.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_dlq_eligible_non_exempt_failure_still_records_circuit_failure(
-        self, tenant, worker
-    ):
-        """Positive control for the exemption above — a real proxy-pool
-        failure (not circuit-exempt) must still penalize the domain's
-        circuit breaker as before."""
+    async def test_dlq_eligible_failure_records_circuit_failure(self, tenant, worker):
+        """A real proxy-pool failure must still penalize the domain's
+        circuit breaker, same as before."""
         exhausted = FetchResult(
             url="http://example.com/",
             success=False,

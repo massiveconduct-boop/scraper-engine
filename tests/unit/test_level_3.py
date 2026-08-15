@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from scraper_engine.core.exceptions import SSRFBlockedError
-from scraper_engine.core.models import FailureCategory, Proxy, ProxyProtocol
+from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 from scraper_engine.fetcher.level_3 import Level3Fetcher
@@ -112,10 +112,14 @@ class TestFetch:
         assert result.http_status == 504
 
     @pytest.mark.asyncio
-    async def test_navigation_404_marked_failure_not_found(self, monkeypatch):
-        """Round 43 — same fix as Level2Fetcher's identical test: a
-        definitive 404 must not be silently accepted as successful content
-        just because L3 is the last level with nowhere further to escalate."""
+    async def test_navigation_404_reported_as_success_for_worker_to_classify(self, monkeypatch):
+        """Round 45 — same fix as Level2Fetcher's identical test: 404 is no
+        longer an immediate definitive failure here — worker.py's
+        centralized is_challenge_page check (404 now in
+        ChallengeDetector.CHALLENGE_STATUS_CODES) is what decides whether
+        the final level's own result still looks blocked and must be
+        downgraded, since a browser render can't be trusted to distinguish
+        a real 404 from a disguised anti-bot block on its own."""
         page = FakePage(nav_status=404)
         fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
         monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
@@ -123,9 +127,8 @@ class TestFetch:
 
         result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
 
-        assert result.success is False
+        assert result.success is True
         assert result.http_status == 404
-        assert result.failure_category == FailureCategory.NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

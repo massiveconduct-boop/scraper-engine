@@ -68,11 +68,13 @@ class TestClassifyFetchException:
 
 
 class TestClassifyHttpStatus:
-    def test_404_maps_to_not_found(self):
-        assert classify_http_status(404) == FailureCategory.NOT_FOUND
-
-    def test_401_403_405_410_429_map_to_detection_block(self):
-        for status in (401, 403, 405, 410, 429):
+    def test_401_403_404_405_410_429_map_to_detection_block(self):
+        """Round 45 — 404 folded into the same DETECTION_BLOCK bucket as
+        401/403/405/410/429: verified live that at least 2 of this
+        deployment's own target domains return a 404-shaped response for
+        an actual anti-bot block (Cloudflare), not a genuinely dead URL —
+        404 alone is no more trustworthy than 403."""
+        for status in (401, 403, 404, 405, 410, 429):
             assert classify_http_status(status) == FailureCategory.DETECTION_BLOCK
 
     def test_5xx_and_other_statuses_return_none(self):

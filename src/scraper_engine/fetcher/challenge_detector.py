@@ -35,12 +35,31 @@ class ChallengeDetector:
         # Challenge mirror + CDN interstitial page indicators
         "verifying your browser",
         "checking your browser",
+        # Round 45 — Cloudflare's own minimal bot-management rejection body
+        # ("error code: 1010" — JA3/browser-fingerprint banned, a handful of
+        # bytes with no other markup). Confirmed live against real target
+        # domains in this deployment's own batch (nairametrics.com,
+        # techcabal.com) — an L1 (non-JS, easily-fingerprinted) request gets
+        # this exact page, while a real browser does not.
+        "error code: 1010",
     ]
 
     # HTTP status codes that strongly indicate blocks/challenges. 500/502/504
     # added round 33 — a free proxy's own upstream dying produces exactly
-    # these, and previously wasn't in this set at all (only 503 was).
-    CHALLENGE_STATUS_CODES: set[int] = {403, 429, 500, 502, 503, 504}
+    # these, and previously wasn't in this set at all (only 503 was). 404
+    # added round 45 — live-caught: a definitive-looking 404 turned out, for
+    # at least 2 of 5 domains investigated, to be a WAF/anti-bot block
+    # disguised as "not found" (Cloudflare returning 403 with a
+    # "banned browser signature" body to a naive L1 request, but other
+    # target sites showed inconsistent block-vs-real-404 presentation
+    # depending on exact request fingerprint) rather than a genuinely dead
+    # page — real users confirmed the same URLs load fine in an actual
+    # browser. A 404 alone is no longer trustworthy enough to skip giving a
+    # real browser (L2/L3) a chance, same reasoning as 403/429/5xx above.
+    # See orchestrator/worker.py's final-level confirmation check for how a
+    # 404 that's STILL present after a real browser render gets treated as
+    # a genuine NOT_FOUND instead of silently accepted as content.
+    CHALLENGE_STATUS_CODES: set[int] = {403, 404, 429, 500, 502, 503, 504}
 
     # A gateway/proxy failure page (the proxy's own upstream connection
     # died — not the target blocking us) is not real content, same problem
