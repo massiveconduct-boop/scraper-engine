@@ -36,12 +36,22 @@ class CircuitBreaker:
         attempt_threshold: int = 20,
         cooldown_seconds: int = 600,
         max_cooldown_seconds: int = 3600,
+        failure_streak_ttl_seconds: int = 600,
     ) -> None:
         self._redis = redis
         self._failure_threshold = failure_threshold
         self._attempt_threshold = attempt_threshold
         self._cooldown_seconds = cooldown_seconds
         self._max_cooldown_seconds = max_cooldown_seconds
+        # Round 43 — live-caught: consecutive_failures/failure_window_attempts
+        # are never TTL'd, so a burst of failures from one job (a crashed run,
+        # a hard-killed timeout) sits in Redis indefinitely and silently feeds
+        # into a completely unrelated LATER job's trip decision — a domain can
+        # get circuit-tripped by failures from hours-old, already-abandoned
+        # attempts that have nothing to do with its current health. Expiring
+        # the streak counters after a quiet period means only a genuinely
+        # *recent* run of failures can trip the circuit.
+        self._failure_streak_ttl_seconds = failure_streak_ttl_seconds
 
     def _key(self, domain: str, suffix: str) -> str:
         return f"cb:{domain}:{suffix}"
@@ -50,8 +60,11 @@ class CircuitBreaker:
         result = await self._redis.get(key)
         return str(result) if result else None
 
-    async def _set(self, key: str, value: str) -> None:
-        await self._redis.set(key, value)
+    async def _set(self, key: str, value: str, ttl_seconds: int | None = None) -> None:
+        if ttl_seconds is not None:
+            await self._redis.set(key, value, ex=ttl_seconds)
+        else:
+            await self._redis.set(key, value)
 
     async def state(self, domain: str) -> CircuitState:
         """Return the current circuit state for a domain."""
@@ -85,13 +98,19 @@ class CircuitBreaker:
         return True
 
     async def record_success(self, domain: str) -> None:
-        """Record a successful request. Closes circuit if half-open."""
+        """Record a successful request. Closes circuit if half-open.
+
+        Any success — closed or half-open — breaks a failure streak. Before
+        round 43 only failure_window_attempts was reset outside the
+        half-open branch; consecutive_failures was left untouched despite
+        its name, so a stray success didn't actually reset "consecutive"
+        failures. Both must reset together or the two counters drift apart.
+        """
         current = await self.state(domain)
         if current == CircuitState.HALF_OPEN:
             await self._set(self._key(domain, "state"), CircuitState.CLOSED.value)
-            await self._set(self._key(domain, "consecutive_failures"), "0")
-            await self._set(self._key(domain, "failure_window_attempts"), "0")
 
+        await self._set(self._key(domain, "consecutive_failures"), "0")
         await self._set(self._key(domain, "failure_window_attempts"), "0")
 
     async def record_failure(self, domain: str) -> None:
@@ -108,8 +127,16 @@ class CircuitBreaker:
         attempts = (int(attempts_raw) if attempts_raw else 0) + 1
         failures = (int(failures_raw) if failures_raw else 0) + 1
 
-        await self._set(self._key(domain, "failure_window_attempts"), str(attempts))
-        await self._set(self._key(domain, "consecutive_failures"), str(failures))
+        await self._set(
+            self._key(domain, "failure_window_attempts"),
+            str(attempts),
+            ttl_seconds=self._failure_streak_ttl_seconds,
+        )
+        await self._set(
+            self._key(domain, "consecutive_failures"),
+            str(failures),
+            ttl_seconds=self._failure_streak_ttl_seconds,
+        )
 
         if attempts >= self._attempt_threshold:
             failure_rate = failures / attempts

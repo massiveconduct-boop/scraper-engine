@@ -22,6 +22,22 @@ class TestClassifyFetchException:
             == FailureCategory.SSRF_BLOCKED
         )
 
+    def test_ssrf_blocked_error_unresolvable_maps_to_host_unreachable(self):
+        """Live-caught: SSRFGuard raises SSRFBlockedError for a dead domain
+        too (see ssrf_guard.py::_resolve_hosts), not just a real block. That
+        must land on HOST_UNREACHABLE — a DNS failure, not a security
+        event — same as every other DNS-failure path this function
+        classifies below."""
+        exc = SSRFBlockedError(
+            url="https://dead-domain.example/",
+            host="dead-domain.example",
+            network="<unresolvable>",
+        )
+        assert (
+            classify_fetch_exception(exc, FailureCategory.NETWORK_TIMEOUT)
+            == FailureCategory.HOST_UNREACHABLE
+        )
+
     @pytest.mark.parametrize("marker", _HOST_UNREACHABLE_MARKERS)
     def test_dns_markers_map_to_host_unreachable(self, marker):
         exc = RuntimeError(f"connection failed: {marker} for target.example")

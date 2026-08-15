@@ -7,13 +7,35 @@ class ScraperEngineError(Exception):
 
 
 class SSRFBlockedError(ScraperEngineError):
-    """Raised when a URL resolves to a non-public network destination."""
+    """Raised either when a URL resolves to a non-public network destination
+    (a real SSRF block), or when it doesn't resolve at all (a dead domain).
+
+    These are deliberately the same exception type — both must abort the
+    same way, before any request is made — but they are NOT the same
+    failure for reporting purposes: one is a security block, the other is
+    just a bad/dead URL. `network="<unresolvable>"` is the sentinel the DNS
+    layer (ssrf_guard.py::_resolve_hosts) uses for the second case;
+    `is_unresolvable` lets callers (fetcher/_failure.py, api/routes.py)
+    route the two to distinct FailureCategory values (SSRF_BLOCKED vs.
+    HOST_UNREACHABLE) instead of a network failure being mislabeled as a
+    security event.
+    """
+
+    _UNRESOLVABLE_SENTINEL = "<unresolvable>"
 
     def __init__(self, url: str, host: str, network: str) -> None:
         self.url = url
         self.host = host
         self.network = network
-        super().__init__(f"SSRF blocked: {url} resolved to {host} in denied range {network}")
+        if network == self._UNRESOLVABLE_SENTINEL:
+            message = f"DNS resolution failed: {url} (host={host}) could not be resolved"
+        else:
+            message = f"SSRF blocked: {url} resolved to {host} in denied range {network}"
+        super().__init__(message)
+
+    @property
+    def is_unresolvable(self) -> bool:
+        return self.network == self._UNRESOLVABLE_SENTINEL
 
 
 class ProxyPoolExhaustedError(ScraperEngineError):

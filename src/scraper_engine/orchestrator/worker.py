@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
@@ -206,230 +209,280 @@ class Worker:
                     continue
 
             domain = self._extract_domain(url_str)
-            # Round 42 — tracks the most recent real FetchResult seen across
-            # the level loop below, so the for/else terminal branch can
-            # report the REAL last failure instead of fabricating one. See
-            # that branch's comment for the bug this closes.
-            last_level_result: FetchResult | None = None
+            # Round 42 — wraps the rest of this URL's fetch/extract/markdown
+            # pipeline in a try/except so an unexpected exception ANYWHERE in
+            # it (fetch dispatch, extraction, markdown conversion, DLQ/on_result
+            # bookkeeping) degrades to a single failed result for THIS url,
+            # never aborts the whole job and abandons every other URL still
+            # queued. Live-caught: a RecursionError inside markdownify()
+            # against one real, deeply-nested article page propagated all the
+            # way up through this method, out through orchestrator/tasks.py's
+            # _run_scrape_job, and crashed the entire job process — 4 URLs had
+            # already genuinely succeeded (and stayed persisted, since
+            # on_result already streamed them — round 29), but the remaining
+            # 47 in that batch were never even attempted. asyncio.CancelledError
+            # and KeyboardInterrupt are BaseException, not Exception, so
+            # mid-job cancellation (_is_cancelled above) and process shutdown
+            # keep propagating through this unaffected. `domain` is computed
+            # above, outside the try, since it's needed in the except handler
+            # too and _extract_domain() is a pure, effectively infallible
+            # urlparse call on an already-pydantic-validated HttpUrl.
+            try:
+                # Round 42 — tracks the most recent real FetchResult seen across
+                # the level loop below, so the for/else terminal branch can
+                # report the REAL last failure instead of fabricating one. See
+                # that branch's comment for the bug this closes.
+                last_level_result: FetchResult | None = None
 
-            for level in LEVELS:
-                if not await self._circuit_breaker.allow_request(domain):
-                    circuit_result = FetchResult(
+                for level in LEVELS:
+                    if not await self._circuit_breaker.allow_request(domain):
+                        circuit_result = FetchResult(
+                            url=url_str,
+                            success=False,
+                            level_used=level,
+                            duration_ms=0,
+                            failure_category=FailureCategory.CIRCUIT_OPEN,
+                            error_message=f"Circuit open for {domain}",
+                        )
+                        await self._dlq.enqueue(
+                            tenant_id,
+                            job_id,
+                            url_str,
+                            FailureCategory.CIRCUIT_OPEN,
+                            f"Circuit open for {domain}",
+                            level,
+                        )
+                        errors.append(f"Circuit open for {domain}")
+                        results.append(circuit_result)
+                        if on_result is not None:
+                            await on_result(circuit_result)
+                        break
+
+                    slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
+                    if slot_worker_id is None:
+                        await asyncio.sleep(1)
+                        continue
+
+                    try:
+                        await self._politeness.wait_if_needed(domain, tenant_id)
+                        result = await self._fetch_url(
+                            tenant_id, url_str, level, request.config_overrides
+                        )
+                    finally:
+                        await self._politeness.release_slot(domain, tenant_id, slot_worker_id)
+
+                    if result is None:
+                        continue
+
+                    last_level_result = result
+
+                    if result.success:
+                        await self._circuit_breaker.record_success(domain)
+                        # `FetchResult.is_challenge_page` was declared on the model,
+                        # persisted, and even gated dedup.py's caching decision, but
+                        # no fetcher ever actually set it — L1 in particular only
+                        # checks the HTTP status code (`success = status < 400`), so
+                        # a 200 response whose body is literally an unsolved
+                        # challenge/interstitial page (e.g. a JS proof-of-work gate)
+                        # was accepted as real content and never escalated. Classify
+                        # it here, once, centrally — same rationale as the
+                        # extraction/markdown wiring below — so every level's result
+                        # is labeled correctly regardless of which fetcher produced
+                        # it. short_page_is_suspect=False matches the convention
+                        # L2/L3's own internal solve-polling loops already use, so a
+                        # short-but-genuinely-solved page isn't misclassified.
+                        result.is_challenge_page = self._challenge_detector.is_challenge_page(
+                            result.html or "",
+                            result.http_status or 200,
+                            short_page_is_suspect=False,
+                        )
+                        # A JS-gated shell or an unsolved challenge page from a
+                        # non-final level is not real content — an HTTP-only L1
+                        # fetch of a SPA returns 200 with an empty mount point, and
+                        # an HTTP-only L1 fetch of a JS PoW challenge returns 200
+                        # with the interstitial itself. Escalate to a browser level
+                        # instead of caching either as success (round 15 for the
+                        # JS-gated-shell half of this; this round for the
+                        # challenge-page half). Browser levels render JS and already
+                        # loop internally until solved or exhausted, so a genuine L2/
+                        # L3 success won't trip this; the final level accepts
+                        # whatever it got.
+                        if level < LEVELS[-1] and (
+                            result.is_challenge_page
+                            or self._challenge_detector.looks_javascript_gated(result.html or "")
+                        ):
+                            continue
+                        if result.html:
+                            # FetchResult.extracted was declared on the model and
+                            # persisted by orchestrator/tasks.py, but nothing ever
+                            # populated it — AdaptiveSelector existed, fully
+                            # tested, with zero callers (round 28). Wired here,
+                            # once, so it applies uniformly regardless of which
+                            # level actually succeeded.
+                            from scraper_engine.fetcher.adaptive_selector import AdaptiveSelector
+
+                            schema = (
+                                request.config_overrides.extraction_schema
+                                if request.config_overrides
+                                else None
+                            )
+                            # extraction-engine is used only when both a real schema was
+                            # supplied AND EXTRACTION_ENGINE_BASE_URL is configured;
+                            # otherwise (and on any extraction-engine failure — it fails
+                            # soft, returning None rather than raising) this falls back
+                            # to today's exact AdaptiveSelector behavior unchanged.
+                            extracted = None
+                            if self._extraction_engine is not None and schema:
+                                extracted = await self._extraction_engine.extract(
+                                    result.html,
+                                    schema,
+                                    enable_smallmodel=(
+                                        request.config_overrides.extraction_enable_smallmodel
+                                        if request.config_overrides
+                                        else False
+                                    ),
+                                    enable_llm=(
+                                        request.config_overrides.extraction_enable_llm
+                                        if request.config_overrides
+                                        else False
+                                    ),
+                                )
+                            if extracted is None:
+                                extracted = await AdaptiveSelector().extract(
+                                    result.html, schema=schema
+                                )
+                            result.extracted = extracted
+                            # Markdown conversion (round 29) — same "wired once,
+                            # applies regardless of level" rationale as
+                            # extraction above. Previously only L1 ever produced
+                            # markdown (inline Firecrawl calls in
+                            # fetcher/level_1.py); centralizing here means a
+                            # page that had to escalate to L2/L3 still gets
+                            # clean markdown, not just raw HTML. markdown is its
+                            # own field on FetchResult, independent of
+                            # `extracted` — a caller who only wants the markdown
+                            # (e.g. to hand to their own extraction model) can
+                            # just read that field and ignore `extracted`.
+                            if self._firecrawl is not None:
+                                result.markdown = await self._firecrawl.convert_to_markdown(
+                                    result.html, url_str
+                                )
+                            else:
+                                # Firecrawl is opt-in (FIRECRAWL_API_KEY/
+                                # FIRECRAWL_BASE_URL) — without it, markdown used
+                                # to be left None entirely, so a caller with no
+                                # Firecrawl instance only ever got `extracted`
+                                # (title/body/links), not markdown. Converting
+                                # the HTML already in hand locally (round 33)
+                                # means markdown is populated unconditionally.
+                                from scraper_engine.services.markdown_fallback import (
+                                    html_to_markdown,
+                                )
+
+                                result.markdown = html_to_markdown(result.html)
+                        results.append(result)
+                        if on_result is not None:
+                            await on_result(result)
+                        break
+                    else:
+                        await self._circuit_breaker.record_failure(domain)
+                        if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
+                            await self._dlq.enqueue(
+                                tenant_id,
+                                job_id,
+                                url_str,
+                                result.failure_category,
+                                result.error_message or "",
+                                level,
+                            )
+                            errors.append(result.error_message or "DLQ")
+                            results.append(result)
+                            if on_result is not None:
+                                await on_result(result)
+                            break
+                else:
+                    # Round 42 — this branch used to hardcode
+                    # FailureCategory.PROXY_EXHAUSTED/"All fetch levels
+                    # exhausted" here regardless of why every level actually
+                    # failed. Live-caught: under dataimpulse.strategy=paid_only,
+                    # ProxyManager.get_proxy() is never even called (see
+                    # _fetch_with_proxy's paid_only branch) — real proxy-pool
+                    # exhaustion is structurally impossible — yet DLQ entries
+                    # still showed failure_category=proxy_exhausted,
+                    # error_message="All fetch levels exhausted" for every URL
+                    # that failed all 3 levels for ANY reason (a browser crash,
+                    # a network timeout, a detection block, anything not in
+                    # DLQ_ELIGIBLE_CATEGORIES, since those categories are
+                    # designed to fall through and escalate rather than break
+                    # early). That destroyed the real diagnostic signal and fed
+                    # proxy/dlq_reaper.py's PROXY_EXHAUSTED-specific auto-retry
+                    # gate (pool-health-based) an entry whose real cause often
+                    # had nothing to do with proxy pool health at all. Now uses
+                    # the real last attempt's category/message, tracked via
+                    # last_level_result above — falls back to the historical
+                    # label only in the one genuinely-unattempted case (every
+                    # level's politeness slot stayed busy, so `result` was
+                    # never assigned at all this URL).
+                    if last_level_result is not None:
+                        real_category = last_level_result.failure_category or (
+                            FailureCategory.PROXY_EXHAUSTED
+                        )
+                        real_message = (
+                            last_level_result.error_message or "All fetch levels exhausted"
+                        )
+                    else:
+                        real_category = FailureCategory.PROXY_EXHAUSTED
+                        real_message = (
+                            "All fetch levels exhausted without a single attempt "
+                            "(politeness slot never available)"
+                        )
+                    exhausted_result = FetchResult(
                         url=url_str,
                         success=False,
-                        level_used=level,
+                        level_used=LEVELS[-1],
                         duration_ms=0,
-                        failure_category=FailureCategory.CIRCUIT_OPEN,
-                        error_message=f"Circuit open for {domain}",
+                        failure_category=real_category,
+                        error_message=real_message,
                     )
                     await self._dlq.enqueue(
                         tenant_id,
                         job_id,
                         url_str,
-                        FailureCategory.CIRCUIT_OPEN,
-                        f"Circuit open for {domain}",
-                        level,
+                        real_category,
+                        real_message,
+                        LEVELS[-1],
                     )
-                    errors.append(f"Circuit open for {domain}")
-                    results.append(circuit_result)
+                    errors.append(real_message)
+                    results.append(exhausted_result)
                     if on_result is not None:
-                        await on_result(circuit_result)
-                    break
-
-                slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
-                if slot_worker_id is None:
-                    await asyncio.sleep(1)
-                    continue
-
-                try:
-                    await self._politeness.wait_if_needed(domain, tenant_id)
-                    result = await self._fetch_url(
-                        tenant_id, url_str, level, request.config_overrides
-                    )
-                finally:
-                    await self._politeness.release_slot(domain, tenant_id, slot_worker_id)
-
-                if result is None:
-                    continue
-
-                last_level_result = result
-
-                if result.success:
-                    await self._circuit_breaker.record_success(domain)
-                    # `FetchResult.is_challenge_page` was declared on the model,
-                    # persisted, and even gated dedup.py's caching decision, but
-                    # no fetcher ever actually set it — L1 in particular only
-                    # checks the HTTP status code (`success = status < 400`), so
-                    # a 200 response whose body is literally an unsolved
-                    # challenge/interstitial page (e.g. a JS proof-of-work gate)
-                    # was accepted as real content and never escalated. Classify
-                    # it here, once, centrally — same rationale as the
-                    # extraction/markdown wiring below — so every level's result
-                    # is labeled correctly regardless of which fetcher produced
-                    # it. short_page_is_suspect=False matches the convention
-                    # L2/L3's own internal solve-polling loops already use, so a
-                    # short-but-genuinely-solved page isn't misclassified.
-                    result.is_challenge_page = self._challenge_detector.is_challenge_page(
-                        result.html or "", result.http_status or 200, short_page_is_suspect=False
-                    )
-                    # A JS-gated shell or an unsolved challenge page from a
-                    # non-final level is not real content — an HTTP-only L1
-                    # fetch of a SPA returns 200 with an empty mount point, and
-                    # an HTTP-only L1 fetch of a JS PoW challenge returns 200
-                    # with the interstitial itself. Escalate to a browser level
-                    # instead of caching either as success (round 15 for the
-                    # JS-gated-shell half of this; this round for the
-                    # challenge-page half). Browser levels render JS and already
-                    # loop internally until solved or exhausted, so a genuine L2/
-                    # L3 success won't trip this; the final level accepts
-                    # whatever it got.
-                    if level < LEVELS[-1] and (
-                        result.is_challenge_page
-                        or self._challenge_detector.looks_javascript_gated(result.html or "")
-                    ):
-                        continue
-                    if result.html:
-                        # FetchResult.extracted was declared on the model and
-                        # persisted by orchestrator/tasks.py, but nothing ever
-                        # populated it — AdaptiveSelector existed, fully
-                        # tested, with zero callers (round 28). Wired here,
-                        # once, so it applies uniformly regardless of which
-                        # level actually succeeded.
-                        from scraper_engine.fetcher.adaptive_selector import AdaptiveSelector
-
-                        schema = (
-                            request.config_overrides.extraction_schema
-                            if request.config_overrides
-                            else None
-                        )
-                        # extraction-engine is used only when both a real schema was
-                        # supplied AND EXTRACTION_ENGINE_BASE_URL is configured;
-                        # otherwise (and on any extraction-engine failure — it fails
-                        # soft, returning None rather than raising) this falls back
-                        # to today's exact AdaptiveSelector behavior unchanged.
-                        extracted = None
-                        if self._extraction_engine is not None and schema:
-                            extracted = await self._extraction_engine.extract(
-                                result.html,
-                                schema,
-                                enable_smallmodel=(
-                                    request.config_overrides.extraction_enable_smallmodel
-                                    if request.config_overrides
-                                    else False
-                                ),
-                                enable_llm=(
-                                    request.config_overrides.extraction_enable_llm
-                                    if request.config_overrides
-                                    else False
-                                ),
-                            )
-                        if extracted is None:
-                            extracted = await AdaptiveSelector().extract(
-                                result.html, schema=schema
-                            )
-                        result.extracted = extracted
-                        # Markdown conversion (round 29) — same "wired once,
-                        # applies regardless of level" rationale as
-                        # extraction above. Previously only L1 ever produced
-                        # markdown (inline Firecrawl calls in
-                        # fetcher/level_1.py); centralizing here means a
-                        # page that had to escalate to L2/L3 still gets
-                        # clean markdown, not just raw HTML. markdown is its
-                        # own field on FetchResult, independent of
-                        # `extracted` — a caller who only wants the markdown
-                        # (e.g. to hand to their own extraction model) can
-                        # just read that field and ignore `extracted`.
-                        if self._firecrawl is not None:
-                            result.markdown = await self._firecrawl.convert_to_markdown(
-                                result.html, url_str
-                            )
-                        else:
-                            # Firecrawl is opt-in (FIRECRAWL_API_KEY/
-                            # FIRECRAWL_BASE_URL) — without it, markdown used
-                            # to be left None entirely, so a caller with no
-                            # Firecrawl instance only ever got `extracted`
-                            # (title/body/links), not markdown. Converting
-                            # the HTML already in hand locally (round 33)
-                            # means markdown is populated unconditionally.
-                            from scraper_engine.services.markdown_fallback import (
-                                html_to_markdown,
-                            )
-
-                            result.markdown = html_to_markdown(result.html)
-                    results.append(result)
-                    if on_result is not None:
-                        await on_result(result)
-                    break
-                else:
-                    await self._circuit_breaker.record_failure(domain)
-                    if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
-                        await self._dlq.enqueue(
-                            tenant_id,
-                            job_id,
-                            url_str,
-                            result.failure_category,
-                            result.error_message or "",
-                            level,
-                        )
-                        errors.append(result.error_message or "DLQ")
-                        results.append(result)
-                        if on_result is not None:
-                            await on_result(result)
-                        break
-            else:
-                # Round 42 — this branch used to hardcode
-                # FailureCategory.PROXY_EXHAUSTED/"All fetch levels
-                # exhausted" here regardless of why every level actually
-                # failed. Live-caught: under dataimpulse.strategy=paid_only,
-                # ProxyManager.get_proxy() is never even called (see
-                # _fetch_with_proxy's paid_only branch) — real proxy-pool
-                # exhaustion is structurally impossible — yet DLQ entries
-                # still showed failure_category=proxy_exhausted,
-                # error_message="All fetch levels exhausted" for every URL
-                # that failed all 3 levels for ANY reason (a browser crash,
-                # a network timeout, a detection block, anything not in
-                # DLQ_ELIGIBLE_CATEGORIES, since those categories are
-                # designed to fall through and escalate rather than break
-                # early). That destroyed the real diagnostic signal and fed
-                # proxy/dlq_reaper.py's PROXY_EXHAUSTED-specific auto-retry
-                # gate (pool-health-based) an entry whose real cause often
-                # had nothing to do with proxy pool health at all. Now uses
-                # the real last attempt's category/message, tracked via
-                # last_level_result above — falls back to the historical
-                # label only in the one genuinely-unattempted case (every
-                # level's politeness slot stayed busy, so `result` was
-                # never assigned at all this URL).
-                if last_level_result is not None:
-                    real_category = last_level_result.failure_category or (
-                        FailureCategory.PROXY_EXHAUSTED
-                    )
-                    real_message = last_level_result.error_message or "All fetch levels exhausted"
-                else:
-                    real_category = FailureCategory.PROXY_EXHAUSTED
-                    real_message = (
-                        "All fetch levels exhausted without a single attempt "
-                        "(politeness slot never available)"
-                    )
-                exhausted_result = FetchResult(
+                        await on_result(exhausted_result)
+            except Exception as exc:
+                logger.exception(
+                    "process_job_unexpected_url_failure job_id=%s url=%s",
+                    job_id,
+                    url_str,
+                )
+                await self._circuit_breaker.record_failure(domain)
+                crash_result = FetchResult(
                     url=url_str,
                     success=False,
                     level_used=LEVELS[-1],
                     duration_ms=0,
-                    failure_category=real_category,
-                    error_message=real_message,
+                    failure_category=FailureCategory.PARSE_ERROR,
+                    error_message=f"Unexpected error processing URL: {exc}",
                 )
                 await self._dlq.enqueue(
                     tenant_id,
                     job_id,
                     url_str,
-                    real_category,
-                    real_message,
+                    FailureCategory.PARSE_ERROR,
+                    crash_result.error_message or "",
                     LEVELS[-1],
                 )
-                errors.append(real_message)
-                results.append(exhausted_result)
+                errors.append(crash_result.error_message or "Unexpected error")
+                results.append(crash_result)
                 if on_result is not None:
-                    await on_result(exhausted_result)
+                    await on_result(crash_result)
 
         any_success = any(r.success for r in results)
         status = (

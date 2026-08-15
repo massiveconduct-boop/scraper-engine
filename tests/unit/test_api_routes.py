@@ -112,6 +112,26 @@ async def test_scrape_enqueues_after_persisting_job(wired_scrape_deps):
     assert call_args.args[0] == "scraper_engine.orchestrator.tasks.run_scrape_job"
     assert call_args.args[1] == "system"
     assert call_args.args[2] == resp["job_id"]
+    # Round 42 — small jobs keep the historical 600s floor.
+    assert call_args.kwargs["job_timeout"] == 600
+
+
+@pytest.mark.asyncio
+async def test_scrape_job_timeout_scales_with_url_count(wired_scrape_deps):
+    """Round 42 — live-caught: a real 51-URL job hit RQ's flat 600s job
+    timeout mid-run (~29s/URL observed against real free-pool proxies) and
+    was hard-killed, leaving scrape_jobs.status stuck at PROCESSING forever
+    since the kill bypasses the app's own cleanup code. job_timeout must
+    scale with how many URLs will actually be attempted."""
+    from scraper_engine.core.models import ScrapeRequest
+
+    pg, redis, queue = wired_scrape_deps
+    request = ScrapeRequest(urls=[f"http://example.com/{i}" for i in range(20)])
+
+    await scrape(request, x_api_key="sk-admin")
+
+    call_args = queue.enqueue.call_args
+    assert call_args.kwargs["job_timeout"] == 20 * 60
 
 
 @pytest.mark.asyncio
@@ -547,6 +567,45 @@ async def test_crawl_partial_ssrf_block_drops_blocked_seed_only(wired_scrape_dep
     )
     assert insert_result_call.args[3] == "http://169.254.169.254/"
     assert insert_result_call.args[5] == "ssrf_blocked"
+
+
+@pytest.mark.asyncio
+async def test_crawl_unresolvable_seed_persists_as_host_unreachable(wired_scrape_deps):
+    """Live-caught: SSRFGuard raises SSRFBlockedError for a dead domain too
+    (network="<unresolvable>"), not just a real block. The persisted
+    scrape_results row for a blocked seed must follow that distinction
+    (HOST_UNREACHABLE) instead of hardcoding ssrf_blocked for every
+    SSRFBlockedError, which would mislabel a dead domain as a security
+    event."""
+    from scraper_engine.core.exceptions import SSRFBlockedError
+    from scraper_engine.core.models import CrawlRequest
+
+    pg, redis, queue = wired_scrape_deps
+
+    async def _validate(url: str) -> None:
+        if "dead-domain" in url:
+            raise SSRFBlockedError(
+                url=url, host="dead-domain.example", network="<unresolvable>"
+            )
+
+    import scraper_engine.core.ssrf_guard as ssrf_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssrf_module.SSRFGuard, "validate", AsyncMock(side_effect=_validate))
+
+        request = CrawlRequest(
+            spider_name="titles",
+            start_urls=["http://example.com", "http://dead-domain.example"],
+        )
+        resp = await crawl(request, x_api_key="sk-admin")
+
+    assert resp["blocked_urls"] == 1
+
+    insert_result_call = next(
+        c for c in pg.execute.await_args_list if "INSERT INTO scrape_results" in c.args[1]
+    )
+    assert insert_result_call.args[3] == "http://dead-domain.example/"
+    assert insert_result_call.args[5] == "host_unreachable"
 
 
 @pytest.mark.asyncio

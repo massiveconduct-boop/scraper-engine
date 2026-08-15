@@ -249,7 +249,9 @@ class TestRetryEntry:
     @pytest.mark.asyncio
     async def test_bumps_counter_resets_status_and_reenqueues(self, tenant):
         pg = AsyncMock()
-        pg.fetchrow.return_value = {"job_id": "job-1"}  # UPDATE ... RETURNING succeeded
+        # UPDATE ... RETURNING succeeded; url_count=5 -> below the 600s
+        # floor (round 42's per-URL scaling), so job_timeout stays 600.
+        pg.fetchrow.return_value = {"job_id": "job-1", "url_count": 5}
         dlq = AsyncMock()
         queue = MagicMock()  # rq.Queue.enqueue is a sync call
         entry = make_entry(job_id="job-1")
@@ -265,6 +267,24 @@ class TestRetryEntry:
             "job-1",
         )
         assert call.kwargs["job_id"] == "job-1"
+        assert call.kwargs["job_timeout"] == 600
+
+    @pytest.mark.asyncio
+    async def test_reenqueue_timeout_scales_with_original_job_url_count(self, tenant):
+        """Round 42 — live-caught: a retried large batch re-runs
+        process_job over the ORIGINAL job's full URL list (cache-hit fast
+        path for already-succeeded URLs, but still visited), so it needs
+        the same per-URL timeout scaling as the initial POST /v1/scrape
+        enqueue, not the flat historical 600s ceiling."""
+        pg = AsyncMock()
+        pg.fetchrow.return_value = {"job_id": "job-big", "url_count": 51}
+        dlq = AsyncMock()
+        queue = MagicMock()
+        entry = make_entry(job_id="job-big")
+
+        await dlq_reaper._retry_entry(pg, dlq, tenant, entry, queue)
+
+        assert queue.enqueue.call_args.kwargs["job_timeout"] == 51 * 60
 
     @pytest.mark.asyncio
     async def test_skips_reenqueue_when_job_already_active(self, tenant):
@@ -291,7 +311,7 @@ class TestRetryEntry:
         wrong (it would just always return the same canned value either
         way)."""
         pg = AsyncMock()
-        pg.fetchrow.return_value = {"job_id": "job-3"}
+        pg.fetchrow.return_value = {"job_id": "job-3", "url_count": 1}
         dlq = AsyncMock()
         queue = MagicMock()
         entry = make_entry(job_id="job-3")

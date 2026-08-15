@@ -126,6 +126,7 @@ circuit_breaker:
   attempt_threshold: 20
   cooldown_seconds: 600
   max_cooldown_seconds: 3600
+  failure_streak_ttl_seconds: 600
 
 capsolver:
   # Per-tenant daily ceiling lives in the tenants.capsolver_daily_credit_ceiling

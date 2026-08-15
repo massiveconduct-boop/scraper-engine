@@ -258,6 +258,7 @@ async def _run_scrape(
         attempt_threshold=cfg.circuit_breaker.attempt_threshold,
         cooldown_seconds=cfg.circuit_breaker.cooldown_seconds,
         max_cooldown_seconds=cfg.circuit_breaker.max_cooldown_seconds,
+        failure_streak_ttl_seconds=cfg.circuit_breaker.failure_streak_ttl_seconds,
     )
     politeness = PolitenessController(
         redis.raw,

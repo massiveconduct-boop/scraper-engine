@@ -132,6 +132,11 @@ class CircuitBreakerConfig(BaseModel):
     attempt_threshold: int = 20
     cooldown_seconds: int = 600
     max_cooldown_seconds: int = 3600
+    # Round 43 — how long a failure streak stays "live" before Redis expires
+    # it. Without this, failures from one job (e.g. a crashed or hard-killed
+    # run) sit forever and silently feed an unrelated later job's trip
+    # decision. See orchestrator/circuit_breaker.py's constructor docstring.
+    failure_streak_ttl_seconds: int = 600
 
 
 class CapSolverConfig(BaseModel):

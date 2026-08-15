@@ -554,6 +554,50 @@ class TestWorker:
             "(politeness slot never available)"
         )
 
+    @pytest.mark.asyncio
+    async def test_process_job_unexpected_crash_in_one_url_does_not_abort_batch(
+        self, tenant, worker, monkeypatch
+    ):
+        """Round 42 — live-caught: a RecursionError inside markdownify()
+        against one real, deeply-nested article page propagated all the way
+        up through this method and crashed the ENTIRE job, abandoning every
+        other queued URL even though 4 earlier URLs had already genuinely
+        succeeded. Reproduced generically here (any unexpected exception
+        during post-fetch processing, not specifically RecursionError —
+        markdown_fallback.py has its own dedicated regression test for the
+        RecursionError case) to prove the containment is general, not a
+        markdown-specific patch."""
+        import scraper_engine.services.markdown_fallback as markdown_fallback_module
+
+        # Raises only on the first call (url 1) — url 2 must still convert
+        # normally, proving the crash didn't corrupt shared state.
+        flaky = MagicMock(side_effect=[RuntimeError("simulated post-fetch crash"), "ok markdown"])
+        monkeypatch.setattr(markdown_fallback_module, "html_to_markdown", flaky)
+
+        success_result = FetchResult(
+            url="unused", success=True, level_used=1, duration_ms=5, html="<p>content</p>"
+        )
+        worker._fetch_url = AsyncMock(return_value=success_result)
+        on_result = AsyncMock()
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://crashes.example.com"), HttpUrl("http://fine.example.com")]
+        )
+
+        response = await worker.process_job(
+            tenant, "job-crash-contained", request, on_result=on_result
+        )
+
+        # Both URLs were attempted — the crash on the first did not stop the second.
+        assert worker._fetch_url.await_count == 2
+        assert on_result.await_count == 2
+        crashed, fine = (c.args[0] for c in on_result.await_args_list)
+        assert crashed.success is False
+        assert crashed.failure_category == FailureCategory.PARSE_ERROR
+        assert "simulated post-fetch crash" in (crashed.error_message or "")
+        assert fine.success is True
+        # any_success=True (url 2) -> COMPLETED, matches existing partial-failure contract.
+        assert response.status == JobStatus.COMPLETED
+
 
 class TestFetchUrlDispatch:
     """Real `_fetch_url` dispatch — every existing test above stubs this

@@ -73,9 +73,16 @@ class TestAllowRequest:
 
 class TestRecordSuccess:
     @pytest.mark.asyncio
-    async def test_success_while_closed_resets_window_only(self, breaker, redis) -> None:
+    async def test_success_while_closed_resets_both_counters(self, breaker, redis) -> None:
+        """Round 43 — a success must break a failure streak: both
+        failure_window_attempts AND consecutive_failures reset, not just
+        the window. Before this fix, consecutive_failures survived an
+        ordinary closed-state success despite its name, letting failures
+        from before the success silently carry into the next streak."""
+        await redis.set("cb:closedok.com:consecutive_failures", "7")
         await breaker.record_success("closedok.com")
         assert await redis.get("cb:closedok.com:failure_window_attempts") == "0"
+        assert await redis.get("cb:closedok.com:consecutive_failures") == "0"
         assert await breaker.state("closedok.com") == CircuitState.CLOSED
 
     @pytest.mark.asyncio
@@ -113,6 +120,49 @@ class TestRecordFailure:
         for _ in range(10):
             await breaker.record_failure("blown.com")
         assert await breaker.state("blown.com") == CircuitState.OPEN
+
+
+class TestFailureStreakTtl:
+    """Round 43 — live-caught: consecutive_failures/failure_window_attempts
+    had no TTL, so failures from one job (a crashed run, a hard-killed
+    timeout) sat in Redis forever and silently fed an unrelated LATER job's
+    trip decision — confirmed in production Redis state where domains
+    showed trip_count/consecutive_failures far too high for the single
+    batch that reported them as circuit_open. Both streak keys must expire
+    after a quiet period so only recent failures count."""
+
+    @pytest.mark.asyncio
+    async def test_record_failure_sets_ttl_on_streak_keys(self, breaker, redis) -> None:
+        await breaker.record_failure("ttl.com")
+        assert await redis.ttl("cb:ttl.com:failure_window_attempts") > 0
+        assert await redis.ttl("cb:ttl.com:consecutive_failures") > 0
+
+    @pytest.mark.asyncio
+    async def test_stale_failure_streak_expires_independent_of_new_job(
+        self, redis
+    ) -> None:
+        """A short TTL simulates a failure streak going quiet — Redis
+        expiring the keys must mean a fresh failure afterward starts a new
+        streak from zero, not from wherever the old, stale streak left off."""
+        breaker = CircuitBreaker(
+            redis=redis,
+            failure_threshold=0.5,
+            attempt_threshold=10,
+            cooldown_seconds=1,
+            max_cooldown_seconds=60,
+            failure_streak_ttl_seconds=1,
+        )
+        for _ in range(9):  # one short of attempt_threshold — stays CLOSED
+            await breaker.record_failure("staleburst.com")
+        assert await breaker.state("staleburst.com") == CircuitState.CLOSED
+
+        import asyncio
+
+        await asyncio.sleep(1.2)  # let the streak TTL expire
+
+        await breaker.record_failure("staleburst.com")
+        assert await redis.get("cb:staleburst.com:failure_window_attempts") == "1"
+        assert await breaker.state("staleburst.com") == CircuitState.CLOSED
 
 
 class TestOpenCircuitBackoff:

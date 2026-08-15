@@ -32,7 +32,117 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 42)
+## Technical Debt / Open Threads (as of round 43)
+
+- **RESOLVED (round 43) — markdown RecursionError fixed for real, not just
+  contained; two mislabeled-failure bugs found and fixed while digging
+  into round 42's 40/52 rerun results, user-requested ("root-cause and fix
+  them too, one at a time, live verify each").**
+
+  1. **Markdown conversion now actually succeeds on deeply-nested real
+     pages instead of degrading to a plain-text fallback.** Round 42 only
+     caught the `RecursionError` crash (plain-text fallback on failure);
+     it never made the conversion succeed. Root cause, confirmed against
+     the crashing page's shape: framework-generated layout wrapper divs
+     (divitis) nested deep with zero markdown-relevant content of their
+     own. Fix (`services/markdown_fallback.py`): `_flatten_redundant_wrappers()`
+     collapses content-free single-child wrapper chains iteratively (an
+     explicit stack, never Python recursion — this pass itself can never
+     hit the recursion limit regardless of DOM depth) before handing the
+     tree to markdownify, so markdownify only recurses across
+     *meaningfully* nested tags. `_convert_with_large_stack()` is a second
+     layer for genuinely deep non-flattenable nesting: runs markdownify on
+     a dedicated thread with a much larger C stack (64MB) and a raised
+     recursion limit (10000, up from round 42's 4000) — raising the limit
+     alone risks a real uncatchable C-stack overflow instead of a
+     catchable `RecursionError`; the larger stack makes the higher limit
+     safe. The plain-text fallback is now a true last resort (verified via
+     a 60000-level pathological test), not the primary mechanism. Live-
+     verified via the full unit suite (9 tests incl. a deep-wrapper-chain
+     case that now converts fully with zero fallback warning logged, a
+     deep-non-flattenable case handled by the large-stack path, and the
+     pathological case still degrading gracefully).
+
+  2. **SSRF-guard mislabeling: a dead/unresolvable domain was reported as
+     `ssrf_blocked`, not `host_unreachable`.** Investigating the "1
+     SSRF-blocked" result (`nigeriafintechweek.com`) from round 42's
+     rerun — confirmed via Google's public DNS-over-HTTPS resolver
+     (Status 3 = NXDOMAIN) that the domain is genuinely dead, not
+     resolving to a private/denied range at all. Root cause:
+     `core/ssrf_guard.py::_resolve_hosts` raises `SSRFBlockedError` for
+     BOTH a real block (resolved to a denied network) AND a DNS
+     resolution failure (`socket.gaierror`), with the confusing message
+     "resolved to X in denied range \<unresolvable\>" — self-contradictory,
+     it never resolved. This silently defeated the codebase's own
+     already-built distinction: `HOST_UNREACHABLE` has existed since round
+     15 specifically for DNS/unresolvable-host failures, and
+     `fetcher/_failure.py::classify_fetch_exception` already special-cases
+     `SSRFBlockedError` — but unconditionally, so an unresolvable-host
+     rejection was indistinguishable from a real security block. Fixed:
+     `SSRFBlockedError` gained an `is_unresolvable` property (keyed off
+     the `network="<unresolvable>"` sentinel) and a corrected message;
+     `classify_fetch_exception` and the `/v1/crawl` blocked-seed
+     persistence path (`api/routes.py`, which had a second, independent
+     hardcoded `SSRF_BLOCKED` for every blocked seed) both now route
+     unresolvable hosts to `HOST_UNREACHABLE`. Zero retry-policy effect —
+     both categories already carry identical `RetryStrategy` entries
+     (non-retryable) in `core/retry.py` — this is a pure
+     correctness/observability fix. Live-verified against both routes
+     with the real dead domain: `/v1/scrape` and `/v1/crawl` both now
+     persist `host_unreachable` with the corrected message.
+
+  3. **Circuit breaker: stale cross-job failure accumulation + a counter-
+     reset asymmetry, not "protective mechanism working as designed."**
+     Investigating the 7 circuit_open failures (crunchbase.com,
+     cbn.gov.ng, sec.gov.ng, punchng.com, cowrywise.com) — a DB query
+     grouping round 42's rerun results by domain showed 4 of these 5
+     domains had **zero real fetch attempts in that job**, only
+     `circuit_open` short-circuit results: the circuits were already open
+     *before* the run started. Redis inspection confirmed why:
+     `consecutive_failures`/`failure_window_attempts` have no TTL, so a
+     burst of real failures from this session's own earlier crashed run
+     (the markdown RecursionError job) and hard-timeout-killed run sat in
+     Redis indefinitely and fed straight into this later, unrelated run's
+     trip decision (`trip_count` 2–5, `consecutive_failures` up to 30,
+     `cooldown_until` up to ~1hr out, since exponential backoff compounds
+     per trip with no decay). Separately, `record_success()` only reset
+     `consecutive_failures` on a half-open close, never on an ordinary
+     closed-state success, despite the field's own name — a real
+     correctness bug (though shown to have no effect on trip *timing*
+     itself, since `failure_window_attempts` only ever counts failures and
+     is fully reset by any success, so an evaluated window is always a
+     genuine unbroken failure streak; `failure_threshold`'s ratio is
+     effectively vestigial as currently designed — noted, not changed,
+     out of scope for this round). Fixed (`orchestrator/circuit_breaker.py`):
+     new `failure_streak_ttl_seconds` config (default 600s, wired through
+     `CircuitBreakerConfig`/`base.yaml` and both call sites —
+     `orchestrator/tasks.py`, `proxy/dlq_reaper.py`) TTLs the two streak
+     keys so a quiet domain's old failures expire instead of haunting
+     future jobs; `record_success()` now resets both counters
+     unconditionally. `trip_count`/`cooldown_until` deliberately left
+     alone — that's F-18's intentional repeated-trip backoff, not part of
+     this bug. Live-verified: `www.cbn.gov.ng` (naturally-expired
+     cooldown, stale `trip_count=2`/`consecutive_failures=30` from this
+     session's earlier crashed runs) recovered cleanly on a real
+     cache-bypassed fetch — state transitioned OPEN→HALF_OPEN→CLOSED with
+     both counters correctly zeroed.
+
+  4. **Genuine `proxy_exhausted` cases (nairametrics.com, legit.ng) —
+     verified NOT a bug.** Direct pool query: only 5 proxies pool-wide
+     meet L3's `min_score_level_3=90` threshold, 24 meet L2's `70`, out of
+     553 total — both tier-fallbacks (`allow_tier2_fallback_for_tier3`,
+     `allow_tier1_fallback_for_tier2`) already enabled. `_select_candidate`'s
+     SQL-side exclusion and `_is_banned`'s per-(tenant, domain, proxy) 1hr
+     ban are both working as designed; round 42's real-message fix
+     already reports this accurately ("Proxy pool exhausted", not a
+     fabricated category). This is genuine free-tier top-tier supply
+     scarcity, already mitigated as far as reasonable at zero cost; the
+     only further lever is round 40's opt-in paid gateway (DataImpulse),
+     intentionally off by default. No code change made — confirmed
+     working as intended, not accepted at face value.
+
+  Full suite: 869 passed, 3 skipped, 100.00% coverage, ruff/mypy clean
+  throughout, after each of the 4 fixes individually and combined.
 
 - **RESOLVED (round 42) — "proxy_exhausted" root-caused to ground truth,
   user-requested ("taken care of once and for all").** Two stacked bugs,

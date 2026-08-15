@@ -29,8 +29,16 @@ _HOST_UNREACHABLE_MARKERS: tuple[str, ...] = (
 
 def classify_fetch_exception(exc: BaseException, default: FailureCategory) -> FailureCategory:
     """Return HOST_UNREACHABLE for DNS/unknown-host errors, SSRF_BLOCKED for a
-    guard rejection (initial request or a redirect hop), else `default`."""
+    guard rejection (initial request or a redirect hop), else `default`.
+
+    SSRFGuard raises SSRFBlockedError for two different situations — a real
+    block (resolved to a denied network) and an unresolvable host (dead
+    domain, no DNS record) — see exceptions.py::SSRFBlockedError. Only the
+    first is actually SSRF_BLOCKED; the second belongs with every other
+    DNS-failure path below, not lumped in with real security blocks."""
     if isinstance(exc, SSRFBlockedError):
+        if exc.is_unresolvable:
+            return FailureCategory.HOST_UNREACHABLE
         return FailureCategory.SSRF_BLOCKED
     msg = str(exc)
     if any(marker in msg for marker in _HOST_UNREACHABLE_MARKERS):

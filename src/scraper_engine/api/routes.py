@@ -39,6 +39,24 @@ _TERMINAL_STATUSES = frozenset(
 _SCRAPE_JOB_TIMEOUT_SECONDS = 600
 _CRAWL_JOB_TIMEOUT_SECONDS = 1800  # bulk crawls run longer than a bounded scrape job
 
+# Round 42 — a flat 600s ceiling silently killed real batches once they grew
+# past roughly 15-20 URLs. Live-caught: a real 51-URL research_agent job
+# (free-pool proxies, L1->L2->L3 escalation, orchestrator/worker.py's
+# per-URL loop runs sequentially, not concurrently) was still only 21/51
+# through at the 10-minute mark (~29s/URL observed) when RQ's own hard job
+# timeout force-killed the process mid-run. Because the kill is a hard
+# termination (RQ's own watchdog, not a Python exception the app code can
+# catch), _run_scrape_job never got to run its own failure-path cleanup —
+# the scrape_jobs.status row was left stuck at PROCESSING forever even
+# though RQ's own registry correctly recorded the job as failed. Scaling
+# the timeout by URL count (floor at the historical 600s, so small jobs are
+# unaffected) closes the root cause; 60s/URL is a deliberately generous
+# per-URL budget — L2Fetcher.TIMEOUT_SECONDS alone is 40s, and a single URL
+# can retry across up to 3 escalation levels plus one same-level proxy
+# retry each (orchestrator/worker.py's _SAME_LEVEL_PROXY_RETRIES) — better
+# to let a large batch legitimately run long than truncate it again.
+_PER_URL_TIMEOUT_SECONDS = 60
+
 
 def _validate_uuid(value: str, name: str = "id") -> str:
     """Raise 422 if value is not a valid UUID."""
@@ -188,7 +206,9 @@ async def scrape(
                 str(tenant_id),
                 job_id,
                 job_id=job_id,
-                job_timeout=_SCRAPE_JOB_TIMEOUT_SECONDS,
+                job_timeout=max(
+                    _SCRAPE_JOB_TIMEOUT_SECONDS, valid_count * _PER_URL_TIMEOUT_SECONDS
+                ),
             )
 
     return {
@@ -322,9 +342,20 @@ async def crawl(
         # once the escalation pipeline itself rejects them — these would
         # otherwise vanish with zero trace in GET /v1/jobs/{id}. Persist a
         # result row for each directly, matching the same failure shape
-        # (FailureCategory.SSRF_BLOCKED, level_used=0 — blocked before any
-        # level/spider ever ran).
+        # (level_used=0 — blocked before any level/spider ever ran).
+        #
+        # SSRFGuard raises SSRFBlockedError for two different situations — a
+        # real block and an unresolvable/dead domain (see
+        # exceptions.py::SSRFBlockedError) — so the category must follow
+        # `is_unresolvable`, same as fetcher/_failure.py's
+        # classify_fetch_exception, rather than hardcoding SSRF_BLOCKED for
+        # both.
         for blocked_exc in blocked:
+            category = (
+                FailureCategory.HOST_UNREACHABLE
+                if blocked_exc.is_unresolvable
+                else FailureCategory.SSRF_BLOCKED
+            )
             await _storage_pg.execute(
                 tenant_id,
                 """INSERT INTO scrape_results
@@ -333,7 +364,7 @@ async def crawl(
                 job_id,
                 blocked_exc.url,
                 str(blocked_exc),
-                FailureCategory.SSRF_BLOCKED.value,
+                category.value,
             )
 
         if _queue is not None:

@@ -49,6 +49,10 @@ from scraper_engine.storage.redis_client import RedisClient
 logger = logging.getLogger(__name__)
 
 _SCRAPE_JOB_TIMEOUT_SECONDS = 600
+# Round 42 — same per-URL scaling constant as api/routes.py's
+# _PER_URL_TIMEOUT_SECONDS (kept as a separate constant, not a shared
+# import, to avoid a daemon-module -> API-module dependency for one int).
+_PER_URL_TIMEOUT_SECONDS = 60
 # Round 42 — BROWSER_CRASH/NETWORK_TIMEOUT joined this reaper-local list
 # (deliberately NOT orchestrator/worker.py's own TRANSIENT_FAILURE_CATEGORIES,
 # which also feeds DLQ_ELIGIBLE_CATEGORIES and gates early-break-vs-escalate
@@ -181,19 +185,27 @@ async def _retry_entry(
         tenant,
         """UPDATE scrape_jobs SET status = 'PENDING', updated_at = NOW()
            WHERE job_id = $1::uuid AND status NOT IN ('PENDING', 'PROCESSING', 'CANCELLED')
-           RETURNING job_id""",
+           RETURNING job_id, array_length(urls, 1) AS url_count""",
         entry.job_id,
     )
     if row is None:
         # Job is already PENDING/PROCESSING/COMPLETED/CANCELLED for some
         # other reason — don't re-enqueue a duplicate rq job on top of it.
         return
+    # Round 42 — same scaling as api/routes.py's POST /v1/scrape enqueue.
+    # A retry re-runs process_job over the ORIGINAL job's full URL list
+    # (already-succeeded URLs hit the CACHE_TTL_DAYS cache fast path, but
+    # the loop still visits every one of them), so a large original batch
+    # needs the same generous per-URL budget here, not the flat historical
+    # ceiling — otherwise a retried large job hits the exact same hard-kill
+    # / stuck-at-PROCESSING failure mode this round root-caused.
+    url_count = row["url_count"] or 1
     queue.enqueue(
         "scraper_engine.orchestrator.tasks.run_scrape_job",
         str(tenant),
         entry.job_id,
         job_id=entry.job_id,
-        job_timeout=_SCRAPE_JOB_TIMEOUT_SECONDS,
+        job_timeout=max(_SCRAPE_JOB_TIMEOUT_SECONDS, url_count * _PER_URL_TIMEOUT_SECONDS),
     )
     logger.info(
         "dlq_auto_retry job_id=%s url=%s category=%s attempt=%d",
@@ -270,6 +282,7 @@ async def run(config: AppConfig | None = None, stop: asyncio.Event | None = None
         attempt_threshold=cfg.circuit_breaker.attempt_threshold,
         cooldown_seconds=cfg.circuit_breaker.cooldown_seconds,
         max_cooldown_seconds=cfg.circuit_breaker.max_cooldown_seconds,
+        failure_streak_ttl_seconds=cfg.circuit_breaker.failure_streak_ttl_seconds,
     )
     queue = build_queue(cfg.storage.redis_url)
 
