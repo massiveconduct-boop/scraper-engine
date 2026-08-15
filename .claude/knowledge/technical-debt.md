@@ -32,7 +32,124 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 46)
+
+- **RESOLVED (round 46) — full accounting of all 12 detection_block
+  failures, prompted by user directly asking "you said you fixed 3, what
+  happened to the other nine?" after an initial partial report.**
+
+  All 12 individually re-verified live (not sampled/pattern-matched):
+
+  - **5 FIXED** — false positive in our OWN `ChallengeDetector` (below):
+    `businessday.ng/category/markets/`, `businessday.ng` gdp-projection
+    article, `nairametrics.com` opay article, `nairametrics.com/category/
+    exclusives/economy/`, `premiumtimesng.com/category/business`.
+  - **3 GENUINELY DEAD** — real 404, independently confirmed by the user
+    in their own browser: `businessday.ng` mtn-vs-airtel article,
+    `nairametrics.com` kuda-bank-comparison, `nairametrics.com`
+    gtco-vs-zenith-bank comparison.
+  - **2 STILL BLOCKED** — 403 both before and after the Camoufox
+    upgrade below: `crunchbase.com/organization/flutterwave`,
+    `cbn.gov.ng/out/2023/ccd/fintech-regulatory-framework.pdf`.
+  - **2 NOW SUCCEED** — `crunchbase.com/organization/paystack` and
+    `cbn.gov.ng/out/2024/ccd/consumer-protection-regulations.pdf` both
+    returned 200 (level 2) on re-check. This directly contradicts this
+    entry's original "IP-reputation block" framing below, which assumed
+    a domain-level block — same two domains produced one success + one
+    block each. Corrected conclusion: the block is not deterministic per
+    domain, it's per-request/per-proxy — whichever proxy the pool leased
+    for that specific attempt. Confirms the root cause is still proxy
+    reputation (not fixable via browser fingerprint), but the free pool
+    clearly CAN succeed against these domains some of the time, it's not
+    a hard wall.
+
+  **False positive found and fixed.** `ChallengeDetector.CHALLENGE_SIGNATURES`
+  had two bare, overly-generic terms: `"interstitial"` and `"g-recaptcha"`.
+  Confirmed live against 3 real, currently-succeeding target pages: a
+  `nairametrics.com` article's 200-status, real-content page still got
+  flagged "blocked" because the string `"interstitial"` matched Google Ad
+  Manager's own standard `googletag.defineOutOfPageSlot(...,
+  'interstitial')` ad-slot naming — ordinary ad-tech boilerplate on any
+  ad-monetized publisher, nothing to do with bot detection. Same pattern
+  on `businessday.ng` (literally commented `/* Interstitial */` in its own
+  GPT setup). A `premiumtimesng.com` page similarly got flagged because
+  `"g-recaptcha"` matched a normal comment-form widget's CSS class —
+  reCAPTCHA is legitimately embedded on countless ordinary pages for
+  unrelated forms; its presence anywhere in a 470KB page says nothing
+  about whether THIS request was blocked. Fixed: both signatures removed
+  (not scoped down — no evidence the vendor-specific signatures already
+  present, cf-*/datadome/akamai-*/captcha-delivery/the literal Cloudflare
+  rejection text, need the help). Live-verified: all 3 URLs now succeed
+  cleanly at L1.
+
+  **Camoufox anti-detection upgrade — verified against real docs (Context7
+  /daijro/camoufox), not guessed.** Our `CamoufoxWrapper` only ever passed
+  `geoip`/`humanize`/`headless`/`proxy` to `AsyncCamoufox()`. Two real,
+  documented, currently-unused options found: `fingerprint_preset=True`
+  (Camoufox's own docs explicitly recommend this for Firefox 149+ — we run
+  152 — since it samples a REAL, captured browser fingerprint out of 312
+  bundled presets instead of a synthetic/statistically-generated one) and
+  `os=` (pins the fingerprint's claimed OS). Deliberately did NOT randomize
+  `os` across windows/macos/linux — Camoufox's own "Known Limitations" doc
+  explicitly warns the opposite is counterproductive: impersonating a
+  different OS than the actual host creates a detectable mismatch between
+  OS-level and JS-fingerprint-level signals, which is itself a strong bot
+  indicator; every worker here runs Linux (Docker), so `os="linux"` keeps
+  the fingerprint honest rather than impersonating an OS this deployment
+  never actually runs. Verified the installed camoufox package (not just
+  docs) actually accepts both kwargs before shipping. Wired through
+  `CamoufoxConfig` → `BrowserPool` → `CamoufoxWrapper` (both launch call
+  sites: primary and the geoip-fallback retry), defaults on so it applies
+  everywhere Camoufox is used without needing call-site changes.
+
+  **Result on the 2 genuine remaining blocks — see corrected full
+  accounting above.** `crunchbase.com/organization/flutterwave` and
+  `cbn.gov.ng`'s 2023 PDF still return 403 even at L3 with the improved
+  fingerprint. Not a failure of this round's fix — these are very likely
+  IP-reputation-based blocks (crunchbase is well known for aggressive,
+  network-layer scraper detection; a free/public proxy IP is plausibly
+  already flagged in commercial IP-reputation databases regardless of how
+  convincing the browser fingerprint is). No amount of browser-fingerprint
+  tuning fixes a proxy IP that's already known-bad — the only real lever
+  for that gap is proxy quality, which is what round 40's opt-in paid
+  rotating gateway (DataImpulse) already exists for, currently off by
+  default. Not enabled this round — a cost/business tradeoff, not a code
+  fix. But per the corrected accounting above, this is NOT a hard
+  per-domain wall — the same two domains' other URLs succeeded on a
+  different proxy lease, so it's intermittent, tied to which proxy gets
+  used per-request.
+
+  877 passed, 100.00% coverage, ruff/mypy clean.
+
 ## Technical Debt / Open Threads (as of round 45)
+
+- **OPEN, NOT URGENT — `orchestrator/worker.py::process_job` processes a
+  job's URLs strictly sequentially, zero intra-job concurrency.** User
+  asked why each full-batch rerun takes so long; root-caused, not yet
+  fixed — user explicitly wants the scraper correct and stable first,
+  before any architectural/performance work. `process_job`'s main loop is
+  a plain `for url in request.urls:` with no `asyncio.gather`/concurrent
+  dispatch of any kind — every URL runs its full L1→L2→L3 escalation
+  ladder to completion before the next URL starts. Real timing evidence
+  from a live 52-URL run: URL 1 (L1, plain HTTP) 0.6s; URL 2 (escalated to
+  L2) 20.5s; URL 3 (escalated to L3) 272s (4.5 minutes) for that one URL
+  alone. At that pace a 52-URL batch easily runs 45-90+ minutes. The
+  underlying infrastructure already has capacity for concurrency that
+  goes unused this way: `PolitenessController` supports up to
+  `default_concurrency=2` simultaneous fetches per domain,
+  `core.budget.BROWSER_SEMAPHORE` allows up to 8 concurrent browser
+  instances process-wide — but the orchestration loop never spawns
+  concurrent tasks to exploit either. One real complication for a future
+  fix: Botasaurus fetches hold `core.budget.XVFB_LOCK` (a process-wide
+  `asyncio.Lock`) for their entire launch→navigate→close duration
+  (deliberate round-41 crash-prevention trade-off), so Botasaurus-heavy
+  work wouldn't parallelize even with concurrent dispatch — only L1 and
+  Camoufox-only (non-Botasaurus) work would benefit directly. A real fix
+  would also need to handle: circuit-breaker/DLQ writes and `results`/
+  `errors` list mutation becoming concurrent-safe, `_is_cancelled`'s
+  mid-job cancellation check working correctly against in-flight
+  concurrent tasks, and a sensible concurrency cap (matching the existing
+  semaphore/politeness limits, not unbounded).
 
 - **RESOLVED (round 45) — round 44's "404 = definitively dead" assumption
   was wrong; user caught it with real evidence.** User reported their own

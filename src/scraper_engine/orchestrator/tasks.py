@@ -282,6 +282,8 @@ async def _run_scrape(
         humanize=cfg.camoufox.humanize,
         headless_mode=cfg.camoufox.headless_mode,
         max_total_instances=cfg.camoufox.max_total_instances,
+        fingerprint_preset=cfg.camoufox.fingerprint_preset,
+        os=cfg.camoufox.os,
     )
     await browser_pool.start()
     # One BotasaurusPool per job too (round 26), same rationale and lifetime

@@ -48,6 +48,8 @@ camoufox:
   humanize: 1.5
   headless_mode: virtual
   max_total_instances: 8  # measured per-instance RSS: ~80MB (Camoufox v152, virtual headless)
+  fingerprint_preset: true  # real captured fingerprints, officially recommended for FF149+
+  os: linux  # matches the real host OS — see schema.py's CamoufoxConfig docstring
 
 # Round 26: Botasaurus capability upgrade — every field verified against the
 # real installed botasaurus/botasaurus_driver source (see config/schema.py's

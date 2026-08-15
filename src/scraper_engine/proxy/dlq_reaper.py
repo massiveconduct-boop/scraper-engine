@@ -52,7 +52,10 @@ _SCRAPE_JOB_TIMEOUT_SECONDS = 600
 # Round 42 — same per-URL scaling constant as api/routes.py's
 # _PER_URL_TIMEOUT_SECONDS (kept as a separate constant, not a shared
 # import, to avoid a daemon-module -> API-module dependency for one int).
-_PER_URL_TIMEOUT_SECONDS = 60
+# Round 46 — bumped 60->120 alongside api/routes.py's constant; same root
+# cause (60s/URL never actually covered L1+L2+L3's own 120s timeout sum),
+# same fix, kept in sync manually since these stay deliberately separate.
+_PER_URL_TIMEOUT_SECONDS = 120
 # Round 42 — BROWSER_CRASH/NETWORK_TIMEOUT joined this reaper-local list
 # (deliberately NOT orchestrator/worker.py's own TRANSIENT_FAILURE_CATEGORIES,
 # which also feeds DLQ_ELIGIBLE_CATEGORIES and gates early-break-vs-escalate

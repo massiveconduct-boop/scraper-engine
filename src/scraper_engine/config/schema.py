@@ -51,6 +51,23 @@ class CamoufoxConfig(BaseModel):
     humanize: float = Field(default=1.5, ge=0.0, le=5.0)
     headless_mode: str = "virtual"
     max_total_instances: int = 8
+    # Round 46 — verified against Camoufox's own docs (Context7
+    # /daijro/camoufox): for Firefox 149+ (we run 152), the library's own
+    # README/docs explicitly recommend fingerprint_preset=True — it samples
+    # a REAL, captured browser fingerprint (312 real presets bundled for
+    # our version) instead of a synthetic/statistically-generated one,
+    # officially described as more convincing evasion. `os` is pinned to
+    # "linux" (not randomized to windows/macos) because Camoufox's own
+    # "Known Limitations" doc explicitly warns the opposite is
+    # counterproductive: "it is recommended to run Camoufox on the OS that
+    # matches the fingerprint profile... the per-context patches are
+    # designed to make each context appear as a different person on the
+    # same OS, not to impersonate a different OS" — every worker here runs
+    # Linux (Docker), so a Windows/macOS fingerprint would create exactly
+    # the OS-level/JS-fingerprint mismatch that advanced bot detection
+    # looks for.
+    fingerprint_preset: bool = True
+    os: str = "linux"
 
 
 class BotasaurusConfig(BaseModel):

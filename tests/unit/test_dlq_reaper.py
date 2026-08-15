@@ -284,7 +284,7 @@ class TestRetryEntry:
 
         await dlq_reaper._retry_entry(pg, dlq, tenant, entry, queue)
 
-        assert queue.enqueue.call_args.kwargs["job_timeout"] == 51 * 60
+        assert queue.enqueue.call_args.kwargs["job_timeout"] == 51 * 120
 
     @pytest.mark.asyncio
     async def test_skips_reenqueue_when_job_already_active(self, tenant):

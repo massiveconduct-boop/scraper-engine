@@ -433,6 +433,10 @@ class TestCamoufoxWrapperGeoipFallback:
         assert result is fake_context
         camoufox_ctor.assert_called_once()
         assert camoufox_ctor.call_args.kwargs["geoip"] is True
+        # Round 46 — real fingerprint presets + host-OS-matched os=, per
+        # Camoufox's own docs (see config/schema.py::CamoufoxConfig).
+        assert camoufox_ctor.call_args.kwargs["fingerprint_preset"] is True
+        assert camoufox_ctor.call_args.kwargs["os"] == "linux"
 
     @pytest.mark.asyncio
     async def test_launch_falls_back_without_geoip_on_invalid_ip(self, tenant, caplog):
@@ -458,6 +462,9 @@ class TestCamoufoxWrapperGeoipFallback:
         assert camoufox_ctor.call_count == 2
         assert camoufox_ctor.call_args_list[0].kwargs["geoip"] is True
         assert camoufox_ctor.call_args_list[1].kwargs["geoip"] is False
+        for call in camoufox_ctor.call_args_list:
+            assert call.kwargs["fingerprint_preset"] is True
+            assert call.kwargs["os"] == "linux"
 
     @pytest.mark.asyncio
     async def test_launch_reraises_invalid_ip_when_geoip_already_disabled(self, tenant):

@@ -57,6 +57,8 @@ class BrowserPool:
         humanize: float = 1.5,
         headless_mode: str = "virtual",
         max_total_instances: int | None = None,
+        fingerprint_preset: bool = True,
+        os: str = "linux",
     ) -> None:
         self._tenant_id = tenant_id
         self._prewarm_count = prewarm_count
@@ -65,6 +67,8 @@ class BrowserPool:
         self._geoip = geoip
         self._humanize = humanize
         self._headless_mode = headless_mode
+        self._fingerprint_preset = fingerprint_preset
+        self._os = os
         # Validated in start(), not here — this is a ceiling on the shared
         # core.budget.BROWSER_SEMAPHORE, not something this pool enforces
         # itself, so a mismatch is only meaningful once we actually try to
@@ -93,6 +97,8 @@ class BrowserPool:
                 geoip=self._geoip,
                 humanize=self._humanize,
                 headless_mode=self._headless_mode,
+                fingerprint_preset=self._fingerprint_preset,
+                os=self._os,
             )
             ctx = await wrapper.__aenter__()
             self._active_wrappers.append(wrapper)
@@ -174,6 +180,8 @@ class BrowserPool:
             geoip=self._geoip,
             humanize=self._humanize,
             headless_mode=self._headless_mode,
+            fingerprint_preset=self._fingerprint_preset,
+            os=self._os,
         )
         self._active_wrappers.append(wrapper)
         ctx = await wrapper.__aenter__()

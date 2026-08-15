@@ -32,6 +32,38 @@ class TestIsChallengePage:
         # a short solved-marker page as still-a-challenge
         assert CD.is_challenge_page(tiny, 200, short_page_is_suspect=False) is False
 
+    def test_google_ad_manager_interstitial_ad_slot_not_flagged(self):
+        """Round 46 — live-caught: bare "interstitial" false-positived on a
+        real, live nairametrics.com/businessday.ng article page's Google Ad
+        Manager boilerplate — a completely ordinary ad-slot type, not an
+        anti-bot interstitial. Exact real-world snippet."""
+        html = (
+            "<html><body><article>"
+            + ("Real published article text discussing the news event. " * 40)
+            + "</article><script>"
+            "if (anchorSlot) { anchorSlot.addService(googletag.pubads()); }"
+            "/* Interstitial */"
+            "const interstitialSlot = googletag.defineOutOfPageSlot("
+            "'/1234/site', googletag.enums.OutOfPageFormat.INTERSTITIAL);"
+            "</script></body></html>"
+        )
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is False
+
+    def test_embedded_recaptcha_widget_for_unrelated_form_not_flagged(self):
+        """Round 46 — live-caught: bare "g-recaptcha" false-positived on a
+        real, live premiumtimesng.com page whose comment-form widget uses
+        reCAPTCHA — unrelated to whether the article content itself was
+        blocked. Exact real-world snippet (a CSS rule referencing the
+        widget's class name)."""
+        html = (
+            "<html><head><style>"
+            ".dark_mode_switch{position:relative}.g-recaptcha{margin-bottom:15px}"
+            "</style></head><body><article>"
+            + ("Real published article text discussing the news event. " * 40)
+            + "</article></body></html>"
+        )
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is False
+
 
 class TestGatewayErrorPages:
     """Round 33: a free proxy's own upstream dying used to slip through as

@@ -50,12 +50,15 @@ _CRAWL_JOB_TIMEOUT_SECONDS = 1800  # bulk crawls run longer than a bounded scrap
 # the scrape_jobs.status row was left stuck at PROCESSING forever even
 # though RQ's own registry correctly recorded the job as failed. Scaling
 # the timeout by URL count (floor at the historical 600s, so small jobs are
-# unaffected) closes the root cause; 60s/URL is a deliberately generous
-# per-URL budget — L2Fetcher.TIMEOUT_SECONDS alone is 40s, and a single URL
-# can retry across up to 3 escalation levels plus one same-level proxy
-# retry each (orchestrator/worker.py's _SAME_LEVEL_PROXY_RETRIES) — better
-# to let a large batch legitimately run long than truncate it again.
-_PER_URL_TIMEOUT_SECONDS = 60
+# unaffected) closes the root cause. Round 46 — round 42's 60s/URL still
+# wasn't enough: a real 51-URL job hit the resulting 3060s ceiling and got
+# hard-killed again mid-run. 60s/URL didn't actually cover a single URL's
+# own worst case — L1+L2+L3's own per-level timeouts alone sum to 120s
+# (base.yaml: 20+40+60), before counting retries
+# (orchestrator/worker.py's _SAME_LEVEL_PROXY_RETRIES) at all. Bumped to
+# 120s/URL, matching that real sum instead of a smaller number that never
+# actually bounded the worst case it was meant to cover.
+_PER_URL_TIMEOUT_SECONDS = 120
 
 
 def _validate_uuid(value: str, name: str = "id") -> str:

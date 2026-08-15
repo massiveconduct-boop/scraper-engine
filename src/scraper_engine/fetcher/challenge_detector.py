@@ -17,16 +17,34 @@ class ChallengeDetector:
     reCAPTCHA, hCaptcha, custom WAF challenge pages).
     """
 
-    # Known challenge indicators — matched case-insensitively in HTML body
+    # Known challenge indicators — matched case-insensitively in HTML body.
+    #
+    # Round 46 — live-caught: "interstitial" and "g-recaptcha" (bare, no
+    # vendor prefix) were false-positiving on completely legitimate, real
+    # 200-status article pages. "interstitial" matched Google Ad Manager's
+    # own standard "Interstitial" ad-slot naming
+    # (`googletag.defineOutOfPageSlot(..., 'interstitial')`) — ordinary
+    # ad-tech boilerplate on any ad-monetized publisher site, confirmed on
+    # both nairametrics.com and businessday.ng. "g-recaptcha" matched a
+    # normal comment-form reCAPTCHA widget's CSS class on
+    # premiumtimesng.com — reCAPTCHA is legitimately embedded on countless
+    # ordinary pages for unrelated forms; its mere presence anywhere in a
+    # 470KB page says nothing about whether THIS request was blocked. A
+    # raw substring search across a whole page (which can be hundreds of
+    # KB of real content) is inherently fragile for generic terms — a real
+    # anti-bot challenge page is still caught by the vendor-specific
+    # signatures below (cf-*, datadome, akamai-*, captcha-delivery, the
+    # literal Cloudflare rejection text) plus the short-page/status-code
+    # heuristics elsewhere in this class, none of which have shown a false
+    # positive. Removed rather than scoped down — no evidence they add
+    # coverage the vendor-specific signatures don't already provide.
     CHALLENGE_SIGNATURES: list[str] = [
         "cf-browser-verification",
         "cf-challenge-running",
-        "g-recaptcha",
         "h-captcha",
         "datadome",
         "akamai-bot-manager",
         "_challenge",
-        "interstitial",
         "captcha-delivery",
         "attention required",
         "please verify you are a human",

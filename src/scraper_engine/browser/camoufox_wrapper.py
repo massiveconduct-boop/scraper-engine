@@ -49,6 +49,8 @@ class CamoufoxWrapper:
         geoip: bool = True,
         humanize: float = 1.5,
         headless_mode: str = "virtual",
+        fingerprint_preset: bool = True,
+        os: str = "linux",
     ) -> None:
         self.proxy = proxy
         self.tenant_id = tenant_id
@@ -57,6 +59,8 @@ class CamoufoxWrapper:
         self._geoip = geoip
         self._humanize = humanize
         self._headless_mode = headless_mode
+        self._fingerprint_preset = fingerprint_preset
+        self._os = os
         self._browser: Any = None
         self._context: Any | None = None
         self._isolated_ctx: Any | None = None
@@ -119,6 +123,8 @@ class CamoufoxWrapper:
             humanize=self._humanize,
             headless=self._headless_mode,
             proxy=proxy_config,
+            fingerprint_preset=self._fingerprint_preset,
+            os=self._os,
         )
         # Round 41 — serialize just the Xvfb-spinup moment against a
         # concurrent Botasaurus launch (or a still-in-flight teardown of a
@@ -140,6 +146,8 @@ class CamoufoxWrapper:
                     humanize=self._humanize,
                     headless=self._headless_mode,
                     proxy=proxy_config,
+                    fingerprint_preset=self._fingerprint_preset,
+                    os=self._os,
                 )
                 return await self._browser.__aenter__()
 

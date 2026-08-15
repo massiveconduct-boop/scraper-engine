@@ -131,7 +131,7 @@ async def test_scrape_job_timeout_scales_with_url_count(wired_scrape_deps):
     await scrape(request, x_api_key="sk-admin")
 
     call_args = queue.enqueue.call_args
-    assert call_args.kwargs["job_timeout"] == 20 * 60
+    assert call_args.kwargs["job_timeout"] == 20 * 120
 
 
 @pytest.mark.asyncio
