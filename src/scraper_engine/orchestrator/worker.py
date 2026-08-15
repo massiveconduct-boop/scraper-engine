@@ -206,6 +206,11 @@ class Worker:
                     continue
 
             domain = self._extract_domain(url_str)
+            # Round 42 — tracks the most recent real FetchResult seen across
+            # the level loop below, so the for/else terminal branch can
+            # report the REAL last failure instead of fabricating one. See
+            # that branch's comment for the bug this closes.
+            last_level_result: FetchResult | None = None
 
             for level in LEVELS:
                 if not await self._circuit_breaker.allow_request(domain):
@@ -246,6 +251,8 @@ class Worker:
 
                 if result is None:
                     continue
+
+                last_level_result = result
 
                 if result.success:
                     await self._circuit_breaker.record_success(domain)
@@ -370,23 +377,56 @@ class Worker:
                             await on_result(result)
                         break
             else:
+                # Round 42 — this branch used to hardcode
+                # FailureCategory.PROXY_EXHAUSTED/"All fetch levels
+                # exhausted" here regardless of why every level actually
+                # failed. Live-caught: under dataimpulse.strategy=paid_only,
+                # ProxyManager.get_proxy() is never even called (see
+                # _fetch_with_proxy's paid_only branch) — real proxy-pool
+                # exhaustion is structurally impossible — yet DLQ entries
+                # still showed failure_category=proxy_exhausted,
+                # error_message="All fetch levels exhausted" for every URL
+                # that failed all 3 levels for ANY reason (a browser crash,
+                # a network timeout, a detection block, anything not in
+                # DLQ_ELIGIBLE_CATEGORIES, since those categories are
+                # designed to fall through and escalate rather than break
+                # early). That destroyed the real diagnostic signal and fed
+                # proxy/dlq_reaper.py's PROXY_EXHAUSTED-specific auto-retry
+                # gate (pool-health-based) an entry whose real cause often
+                # had nothing to do with proxy pool health at all. Now uses
+                # the real last attempt's category/message, tracked via
+                # last_level_result above — falls back to the historical
+                # label only in the one genuinely-unattempted case (every
+                # level's politeness slot stayed busy, so `result` was
+                # never assigned at all this URL).
+                if last_level_result is not None:
+                    real_category = last_level_result.failure_category or (
+                        FailureCategory.PROXY_EXHAUSTED
+                    )
+                    real_message = last_level_result.error_message or "All fetch levels exhausted"
+                else:
+                    real_category = FailureCategory.PROXY_EXHAUSTED
+                    real_message = (
+                        "All fetch levels exhausted without a single attempt "
+                        "(politeness slot never available)"
+                    )
                 exhausted_result = FetchResult(
                     url=url_str,
                     success=False,
                     level_used=LEVELS[-1],
                     duration_ms=0,
-                    failure_category=FailureCategory.PROXY_EXHAUSTED,
-                    error_message="All fetch levels exhausted",
+                    failure_category=real_category,
+                    error_message=real_message,
                 )
                 await self._dlq.enqueue(
                     tenant_id,
                     job_id,
                     url_str,
-                    FailureCategory.PROXY_EXHAUSTED,
-                    "All fetch levels exhausted",
+                    real_category,
+                    real_message,
                     LEVELS[-1],
                 )
-                errors.append("All levels exhausted")
+                errors.append(real_message)
                 results.append(exhausted_result)
                 if on_result is not None:
                     await on_result(exhausted_result)

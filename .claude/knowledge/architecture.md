@@ -461,6 +461,57 @@ entirely — the warning is now cosmetic noise, not a failure mode.
 
 ---
 
+## proxy_exhausted Mislabeling + browser_sessions Schema Regression (Round 42)
+
+User-requested ("taken care of once and for all"): two stacked bugs behind
+every `proxy_exhausted` DLQ entry, neither one about proxy supply.
+
+**Bug 1 — terminal-failure mislabeling.** `orchestrator/worker.py::
+process_job`'s per-URL `for level in LEVELS: ... else:` loop fabricated
+`PROXY_EXHAUSTED`/"All fetch levels exhausted" whenever all 3 levels
+failed for ANY reason not in `DLQ_ELIGIBLE_CATEGORIES` — which by design
+(round 37) is most real proxy-adjacent failures (`BROWSER_CRASH`,
+`NETWORK_TIMEOUT`), since those categories are meant to escalate rather
+than DLQ early. Proven live under `dataimpulse.strategy=paid_only`, where
+`ProxyManager.get_proxy()` is structurally never called — yet
+`proxy_exhausted` still appeared. Fixed: the branch now tracks
+`last_level_result` and reports its real category/message; falls back to
+the old label only when literally no level was ever attempted (every
+politeness slot stayed busy). `proxy/dlq_reaper.py` gained its own
+(separate from `worker.py`'s `TRANSIENT_FAILURE_CATEGORIES`, which also
+gates early-break-vs-escalate) transient list covering `BROWSER_CRASH`/
+`NETWORK_TIMEOUT` too, same tier-health eligibility check as
+`PROXY_EXHAUSTED`.
+
+**Bug 2 — the real failure the mislabeling hid.** Fixing bug 1 exposed
+every remaining terminal failure as `browser_crash / column
+"storage_state" does not exist`. Root cause: migration 002 fixed
+`browser_sessions`' columns (`domain`/`storage_state`/`last_used_at`/
+`expires_at`, matching `browser/session_state.py`), but migrations
+004/005/007 each redefine `create_tenant_schema()` wholesale and each
+copy-pasted the *original* broken 001 shape — silently reverting 002's
+fix every time. Every live tenant schema on this deployment had the
+broken shape (verified directly, 100% affected). Invisible in practice
+because `BrowserPool.lease()`'s `session_mgr.save()` call swallows its
+own exception (warning-only), and `retention_reaper.py` already
+defensively swallows per-tenant schema drift — only
+`SessionStateManager.load()` (called unconditionally by `BrowserPool.
+acquire()` on any Camoufox cold-start for a not-yet-warm domain,
+effectively every first L3 attempt per domain per job) was unguarded,
+and its crash is exactly what bug 1 was mislabeling. Fixed: new migration
+`008_fix_browser_sessions_schema_regression.py` — restores the correct
+`browser_sessions` block in `create_tenant_schema()` and drops+recreates
+every existing tenant schema's table to match (safe: no schema under the
+broken shape could have held real data, since both read and write paths
+failed identically against it).
+
+Live-verified together: the same URLs that previously crashed with
+`storage_state` errors under `paid_only` now complete successfully, zero
+`storage_state` errors in logs, zero new DLQ entries. Full narrative,
+every detail: `.claude/knowledge/technical-debt.md`'s round-42 entry.
+
+---
+
 ## Browser Pool
 
 > **CORRECTION (round 25) — wired into production; supersedes the round-24

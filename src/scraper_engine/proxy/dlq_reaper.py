@@ -2,19 +2,25 @@
 """Auto-retries transient DLQ entries once their underlying condition has
 cleared (round 34).
 
-orchestrator/worker.py's TRANSIENT_FAILURE_CATEGORIES (PROXY_EXHAUSTED,
-CIRCUIT_OPEN) describe failures that resolve once *external* state changes —
-unlike PERMANENT_FAILURE_CATEGORIES, retrying them isn't futile, it just has
-to wait for the right moment. Before this, a DLQ'd job sat there forever
+This module's own _TRANSIENT_CATEGORIES (PROXY_EXHAUSTED, CIRCUIT_OPEN,
+and — round 42 — BROWSER_CRASH, NETWORK_TIMEOUT) describe failures that
+resolve once *external* state changes — unlike orchestrator/worker.py's
+PERMANENT_FAILURE_CATEGORIES, retrying them isn't futile, it just has to
+wait for the right moment. Before round 34, a DLQ'd job sat there forever
 until a human noticed and manually retried it; there was no automated path
-at all (storage/dlq.py's old `retry()` had zero callers).
+at all (storage/dlq.py's old `retry()` had zero callers). Deliberately its
+own list, not worker.py's TRANSIENT_FAILURE_CATEGORIES — that set also
+feeds worker.py's DLQ_ELIGIBLE_CATEGORIES, which gates whether a mid-
+escalation failure breaks early instead of trying the next level; this
+reaper only ever sees entries that already exhausted every level, so its
+own eligibility set can be broader without touching escalation behavior.
 
 This is a poll-driven check against current state (proxy/pool_health.py's
-persisted per-tier state for PROXY_EXHAUSTED, CircuitBreaker.state() for
-CIRCUIT_OPEN) rather than a push-only trigger — the same belt-and-suspenders
-choice proxy/harvester_daemon.py's kick watcher makes, for the same reason:
-a push signal can be missed on daemon restart, a poll against current truth
-can't be.
+persisted per-tier state for PROXY_EXHAUSTED/BROWSER_CRASH/NETWORK_TIMEOUT,
+CircuitBreaker.state() for CIRCUIT_OPEN) rather than a push-only trigger —
+the same belt-and-suspenders choice proxy/harvester_daemon.py's kick
+watcher makes, for the same reason: a push signal can be missed on daemon
+restart, a poll against current truth can't be.
 """
 
 from __future__ import annotations
@@ -43,7 +49,26 @@ from scraper_engine.storage.redis_client import RedisClient
 logger = logging.getLogger(__name__)
 
 _SCRAPE_JOB_TIMEOUT_SECONDS = 600
-_TRANSIENT_CATEGORIES = [FailureCategory.PROXY_EXHAUSTED, FailureCategory.CIRCUIT_OPEN]
+# Round 42 — BROWSER_CRASH/NETWORK_TIMEOUT joined this reaper-local list
+# (deliberately NOT orchestrator/worker.py's own TRANSIENT_FAILURE_CATEGORIES,
+# which also feeds DLQ_ELIGIBLE_CATEGORIES and gates early-break-vs-escalate
+# inside the per-level loop there — adding these categories to THAT set would
+# stop a mid-escalation BROWSER_CRASH/NETWORK_TIMEOUT from ever reaching L2/L3
+# at all, the opposite of round 37's intent). This list only controls which
+# terminal (all-levels-exhausted) DLQ entries the reaper considers for
+# auto-retry, once worker.py's for/else branch stopped mislabeling every such
+# entry as PROXY_EXHAUSTED and started reporting the real last-level failure
+# (see that branch's comment). BROWSER_CRASH/NETWORK_TIMEOUT are exactly the
+# categories _PROXY_RETRYABLE_CATEGORIES already documents as proxy-
+# attributable, not page/content issues — the same reasoning that justifies a
+# same-level retry there justifies this reaper auto-retrying them too, once
+# the relevant tier's pool health recovers (see _is_eligible below).
+_TRANSIENT_CATEGORIES = [
+    FailureCategory.PROXY_EXHAUSTED,
+    FailureCategory.CIRCUIT_OPEN,
+    FailureCategory.BROWSER_CRASH,
+    FailureCategory.NETWORK_TIMEOUT,
+]
 
 
 def _domain(url: str) -> str:
@@ -56,12 +81,15 @@ async def _is_eligible(
     circuit_breaker: CircuitBreaker,
     tier_config: ProxyTierConfig,
 ) -> bool:
-    """PROXY_EXHAUSTED is eligible once its tier (level_attempted maps 1:1 to
-    a proxy/pool_health.py tier) is no longer DEGRADED/CRITICAL. CIRCUIT_OPEN
-    is eligible once the breaker has fully closed for that domain — checked
-    via the pure-read state() rather than allow_request(), which would
-    itself consume a HALF_OPEN probe slot meant for real traffic, not the
-    reaper's own bookkeeping.
+    """PROXY_EXHAUSTED, BROWSER_CRASH, and NETWORK_TIMEOUT (round 42 — the
+    latter two joined this check once worker.py's for/else terminal branch
+    stopped mislabeling every all-levels-exhausted failure as
+    PROXY_EXHAUSTED, see _TRANSIENT_CATEGORIES above) are eligible once
+    their tier (level_attempted maps 1:1 to a proxy/pool_health.py tier) is
+    no longer DEGRADED/CRITICAL. CIRCUIT_OPEN is eligible once the breaker
+    has fully closed for that domain — checked via the pure-read state()
+    rather than allow_request(), which would itself consume a HALF_OPEN
+    probe slot meant for real traffic, not the reaper's own bookkeeping.
 
     Round 37 — level_attempted==3 checks tier 2's health instead when
     allow_tier2_fallback_for_tier3 is enabled, not tier 3's own. Live-caught:
@@ -89,7 +117,17 @@ async def _is_eligible(
     the new tier-1 fallback."""
     from scraper_engine.proxy.pool_health import PoolHealthState
 
-    if entry.failure_category == FailureCategory.PROXY_EXHAUSTED:
+    if entry.failure_category in (
+        FailureCategory.PROXY_EXHAUSTED,
+        # Round 42 — same tier-health check as PROXY_EXHAUSTED. These
+        # reach the DLQ only via worker.py's for/else terminal branch
+        # (every level failed, non-DLQ-eligible category at each), and
+        # _PROXY_RETRYABLE_CATEGORIES already treats them as proxy-
+        # attributable rather than target/content issues — a recovered
+        # tier is exactly the condition that makes a retry plausible.
+        FailureCategory.BROWSER_CRASH,
+        FailureCategory.NETWORK_TIMEOUT,
+    ):
         check_tier = entry.level_attempted
         if entry.level_attempted == 3 and tier_config.allow_tier2_fallback_for_tier3:
             check_tier = 2

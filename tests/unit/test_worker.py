@@ -496,7 +496,14 @@ class TestWorker:
     async def test_process_job_calls_on_result_for_exhausted_levels(self, tenant, worker):
         """All 3 levels exhausted with a retryable failure category — the
         for/else branch synthesizes its own FetchResult (round 29) since
-        none of the individual level attempts produced one worth keeping."""
+        none of the individual level attempts produced one worth keeping.
+
+        Round 42 — the synthesized result now carries the REAL last
+        attempt's category/message (NETWORK_TIMEOUT/"timed out" here, since
+        every level failed the same way in this test) instead of a
+        hardcoded PROXY_EXHAUSTED/"All fetch levels exhausted" — that
+        fabricated label was live-caught masking every kind of terminal
+        failure (see worker.py's for/else comment)."""
         timeout_failure = FetchResult(
             url="http://example.com",
             success=False,
@@ -517,8 +524,35 @@ class TestWorker:
         assert worker._fetch_url.await_count == 3  # L1, L2, L3 all attempted
         on_result.assert_awaited_once()
         exhausted = on_result.await_args.args[0]
+        assert exhausted.failure_category == FailureCategory.NETWORK_TIMEOUT
+        assert exhausted.error_message == "timed out"
+
+    @pytest.mark.asyncio
+    async def test_process_job_exhausted_levels_falls_back_when_no_attempt_made(
+        self, tenant, worker, monkeypatch
+    ):
+        """Round 42 edge case — if every level's politeness slot stays busy,
+        `_fetch_url` is never even called, so there's no real result to
+        report. The historical PROXY_EXHAUSTED/"All fetch levels exhausted"
+        label is still correct here — genuinely nothing was ever attempted."""
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("scraper_engine.orchestrator.worker.asyncio.sleep", sleep_mock)
+        worker._politeness.acquire_slot = AsyncMock(return_value=None)
+        worker._fetch_url = AsyncMock()
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-no-attempt", request, on_result=on_result)
+
+        assert response.status == JobStatus.FAILED
+        worker._fetch_url.assert_not_awaited()
+        on_result.assert_awaited_once()
+        exhausted = on_result.await_args.args[0]
         assert exhausted.failure_category == FailureCategory.PROXY_EXHAUSTED
-        assert exhausted.error_message == "All fetch levels exhausted"
+        assert exhausted.error_message == (
+            "All fetch levels exhausted without a single attempt "
+            "(politeness slot never available)"
+        )
 
 
 class TestFetchUrlDispatch:

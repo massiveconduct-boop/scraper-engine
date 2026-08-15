@@ -32,7 +32,115 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 41)
+## Technical Debt / Open Threads (as of round 42)
+
+- **RESOLVED (round 42) — "proxy_exhausted" root-caused to ground truth,
+  user-requested ("taken care of once and for all").** Two stacked bugs,
+  neither one actually a proxy-supply problem:
+  1. **Mislabeling bug.** `orchestrator/worker.py::process_job`'s per-URL
+     level loop (`for level in LEVELS: ... else:`) fabricated
+     `failure_category=PROXY_EXHAUSTED, error_message="All fetch levels
+     exhausted"` in its `else:` branch whenever all 3 levels failed for
+     ANY reason not in `DLQ_ELIGIBLE_CATEGORIES` (i.e. any category
+     round 37 designed to escalate rather than DLQ early — BROWSER_CRASH,
+     NETWORK_TIMEOUT, DETECTION_BLOCK, CAPTCHA_TRIGGERED, PARSE_ERROR).
+     Proven live: reproduced under `dataimpulse.strategy=paid_only`,
+     where `_fetch_with_proxy`'s `if strategy == "paid_only":` branch
+     skips `ProxyManager.get_proxy()` entirely — a real
+     `ProxyPoolExhaustedError` is structurally impossible there — yet
+     `retestclient.dead_letter_queue` still showed
+     `failure_category=proxy_exhausted, error_message="All fetch levels
+     exhausted"` for every URL that failed all 3 levels. A DB query
+     across this deployment's DLQ history confirmed every single entry
+     with that exact message was this bug, not real exhaustion (the
+     genuine path's message is "Proxy pool exhausted", distinct and
+     rarer — 6 of 17 historical rows).
+
+     Fixed: `process_job` now tracks `last_level_result` (the most recent
+     real `FetchResult` seen across the level loop) and the for/else
+     branch reports ITS real `failure_category`/`error_message` instead
+     of a fabricated one — falls back to the historical label only in the
+     one genuinely-unattempted case (every level's politeness slot stayed
+     busy, so no fetch was ever tried). Also extended
+     `proxy/dlq_reaper.py`'s own, separate `_TRANSIENT_CATEGORIES` list
+     (not `orchestrator/worker.py`'s `TRANSIENT_FAILURE_CATEGORIES`,
+     which also feeds `DLQ_ELIGIBLE_CATEGORIES` and gates early-break-vs-
+     escalate inside the per-level loop — adding to THAT set would have
+     broken round 37's escalate-first design) to include BROWSER_CRASH/
+     NETWORK_TIMEOUT, using the same tier-health eligibility check
+     PROXY_EXHAUSTED already had, since `_PROXY_RETRYABLE_CATEGORIES`
+     already documents those two as proxy-attributable, not page/content
+     issues. Test updates: `test_worker.py`'s
+     `test_process_job_calls_on_result_for_exhausted_levels` now asserts
+     the real category is preserved (was asserting the bug as correct
+     behavior); added
+     `test_process_job_exhausted_levels_falls_back_when_no_attempt_made`
+     for the genuine no-attempt edge case.
+
+  2. **The real bug the mislabeling had been hiding.** Fixing (1)
+     immediately surfaced every remaining terminal failure as
+     `browser_crash / column "storage_state" does not exist`. Root-caused
+     to a schema regression: migration 002 fixed `browser_sessions`'
+     columns to match what `browser/session_state.py` actually reads/
+     writes (`domain`, `storage_state`, `last_used_at`, `expires_at`),
+     but migrations 004, 005, and 007 each redefine
+     `create_tenant_schema()` wholesale (`CREATE OR REPLACE FUNCTION`,
+     full body, to add their own unrelated columns/tables) and each one's
+     `browser_sessions` block was copy-pasted from the *original* 001
+     definition (`session_id, state, created_at, updated_at`), not 002's
+     fix — silently reverting it every time one of them ran. By 007 (the
+     function actually installed once migrations reach head), any tenant
+     schema created afterward gets the broken table back. Verified via
+     `\d <schema>.browser_sessions` against every live tenant schema on
+     this deployment (`retestclient`, `research_agent`, 5×
+     `g05tenant_N`) — **100% had the broken shape**, none had 002's fix,
+     confirming this isn't a partial/edge-case regression.
+
+     This had been completely invisible in practice: `browser/pool.py::
+     BrowserPool.lease()`'s `session_mgr.save()` call on the success path
+     is wrapped in a bare `try/except Exception` that only logs a
+     warning (never re-raises), and `proxy/retention_reaper.py`'s
+     expired-session cleanup already anticipated schema drift and
+     swallows per-tenant failures with only a log line (its own docstring
+     literally names "a tenant created before a later migration reshaped
+     browser_sessions" as an anticipated scenario). Only
+     `SessionStateManager.load()` — called unconditionally by
+     `BrowserPool.acquire()` on any Camoufox cold-start for a domain not
+     already warm in that job's pool, i.e. effectively every first L3
+     attempt per domain per job, and any L2 attempt whose Botasaurus
+     first-try failed and fell back to Camoufox — was unguarded, and its
+     crash is exactly what bug (1) above was mislabeling as
+     `proxy_exhausted` the whole time. This plausibly explains a
+     meaningful share of the L3-reliability investigation across rounds
+     33/38/39 — every one of those investigations was working against a
+     background rate of silent, unrelated `storage_state` crashes
+     indistinguishable from genuine proxy exhaustion in the DLQ.
+
+     Fixed: new migration `008_fix_browser_sessions_schema_regression.py`
+     — redefines `create_tenant_schema()` with the correct
+     `browser_sessions` block restored (identical to 007's current
+     definition otherwise), then loops over every existing tenant schema
+     (same `pg_namespace`-scan pattern 007's own backfill already used)
+     and drops+recreates each one's `browser_sessions` table to the
+     correct shape. DROP+recreate (not a data-preserving ALTER) is safe
+     here specifically because no schema under the broken shape could
+     have ever held real, readable data — both save() and load() fail
+     identically against a mismatched column set, so nothing was ever
+     successfully persisted to lose. Live-applied to this deployment
+     (`docker compose build migrate && docker compose run --rm
+     migrate`), confirmed via `\d` that every tenant schema now has the
+     correct shape (alembic_version: 008).
+
+  **Live-verified end to end, both fixes together:** re-ran the exact
+  same nairametrics.com category-page URLs that previously crashed with
+  `storage_state` errors (masked as `proxy_exhausted`) under
+  `dataimpulse.strategy=paid_only` — all now complete successfully
+  (`success=true`, `failure_category=None`), zero `storage_state`/
+  `UndefinedColumnError` anywhere in worker logs, zero new DLQ entries
+  across the verification jobs. 856 passed, 100% coverage, ruff+mypy
+  clean. Config reverted to shipped default (`dataimpulse.enabled:
+  false`) after verification, matching the established round 40/41
+  pattern.
 
 - **RESOLVED (round 41) — root-caused and fixed the round-40 Xvfb
   display-contention crash.** Full root cause, fix, and live-verification
