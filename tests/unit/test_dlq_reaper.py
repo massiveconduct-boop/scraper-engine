@@ -138,6 +138,71 @@ class TestIsEligible:
         assert checked_tiers == [2]
 
     @pytest.mark.asyncio
+    async def test_level2_checks_tier1_when_fallback_enabled(self, monkeypatch):
+        """Round 39 — same substitution as round 37's level-3/tier-2 case,
+        one tier down: allow_tier1_fallback_for_tier2 changes what a
+        level-2 lease actually depends on."""
+        redis = AsyncMock()
+        cb = AsyncMock()
+        tier_config = ProxyTierConfig(allow_tier1_fallback_for_tier2=True)
+        checked_tiers = []
+
+        async def fake_pool_current_state(redis_arg, tier):
+            checked_tiers.append(tier)
+            return PoolHealthState.HEALTHY
+
+        monkeypatch.setattr(
+            "scraper_engine.proxy.dlq_reaper.pool_current_state", fake_pool_current_state
+        )
+        entry = make_entry(category=FailureCategory.PROXY_EXHAUSTED, level_attempted=2)
+
+        assert await dlq_reaper._is_eligible(entry, redis, cb, tier_config) is True
+        assert checked_tiers == [1]
+
+    @pytest.mark.asyncio
+    async def test_level2_checks_tier2_when_fallback_disabled(self, monkeypatch):
+        """Default config (fallback off) — unchanged behavior, tier 2's own
+        health still gates a level-2 exhaustion's retry eligibility."""
+        redis = AsyncMock()
+        cb = AsyncMock()
+        tier_config = ProxyTierConfig(allow_tier1_fallback_for_tier2=False)
+        checked_tiers = []
+
+        async def fake_pool_current_state(redis_arg, tier):
+            checked_tiers.append(tier)
+            return PoolHealthState.HEALTHY
+
+        monkeypatch.setattr(
+            "scraper_engine.proxy.dlq_reaper.pool_current_state", fake_pool_current_state
+        )
+        entry = make_entry(category=FailureCategory.PROXY_EXHAUSTED, level_attempted=2)
+
+        assert await dlq_reaper._is_eligible(entry, redis, cb, tier_config) is True
+        assert checked_tiers == [2]
+
+    @pytest.mark.asyncio
+    async def test_level3_exhaustion_unaffected_by_tier1_fallback_flag(self, monkeypatch):
+        """allow_tier1_fallback_for_tier2 is level-2-specific — a level-3
+        exhaustion must not be affected by it, only by its own
+        allow_tier2_fallback_for_tier3 flag."""
+        redis = AsyncMock()
+        cb = AsyncMock()
+        tier_config = ProxyTierConfig(allow_tier1_fallback_for_tier2=True)
+        checked_tiers = []
+
+        async def fake_pool_current_state(redis_arg, tier):
+            checked_tiers.append(tier)
+            return PoolHealthState.HEALTHY
+
+        monkeypatch.setattr(
+            "scraper_engine.proxy.dlq_reaper.pool_current_state", fake_pool_current_state
+        )
+        entry = make_entry(category=FailureCategory.PROXY_EXHAUSTED, level_attempted=3)
+
+        assert await dlq_reaper._is_eligible(entry, redis, cb, tier_config) is True
+        assert checked_tiers == [3]
+
+    @pytest.mark.asyncio
     async def test_circuit_open_eligible_when_breaker_closed(self):
         redis = AsyncMock()
         cb = AsyncMock()

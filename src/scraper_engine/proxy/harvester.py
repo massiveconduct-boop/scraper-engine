@@ -25,7 +25,7 @@ import httpx
 
 from scraper_engine.core.models import AnonymityLevel, AsnClass, ProxyProtocol
 from scraper_engine.proxy.net_probe import tcp_probe
-from scraper_engine.proxy.scoring import ScoringEngine
+from scraper_engine.proxy.scoring import ScoringEngine, compute_success_rate
 
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
@@ -92,16 +92,41 @@ def _to_asn_class(raw: str) -> AsnClass:
     return AsnClass.UNKNOWN
 
 
-def _score_first_validation(
-    latency_ms: int | None, anonymity: AnonymityLevel, asn: AsnClass
+def _score_validation(
+    latency_ms: int | None,
+    anonymity: AnonymityLevel,
+    asn: AsnClass,
+    success_rate: float | None,
 ) -> float:
-    """Score a proxy's first-ever validation — success_rate=None since no
-    real usage history exists yet (see scoring.py's compute_score docstring
-    for why this must not default to a guessed value). Real usage-driven
-    recomputation happens later via ProxyManager.mark_success/mark_failure."""
+    """Score a fresh judge-validation reading.
+
+    success_rate must be None only for a proxy genuinely new to the pool —
+    pass the real compute_success_rate() of its existing global_success_count/
+    global_failure_count for anything already in proxy_pool. Round 39: this
+    was hardcoded to None for EVERY call, including re-harvesting an
+    ip:port free proxy lists keep relisting, and promote_tcp_only()
+    re-checking a proxy that had already earned real failures — since
+    success_rate=None takes the "no track record" scoring branch (see
+    scoring.py's compute_score docstring), which redistributes weight away
+    from success_rate entirely, a fresh-but-history-blind score often came
+    out well above a proxy's true decayed score. `_scrape_one`'s ON
+    CONFLICT DO UPDATE used to take GREATEST(old, new) specifically so a
+    noisy single bad reading couldn't drag a proven proxy down — but with
+    success_rate always None, GREATEST let that same history-blind score
+    silently ratchet a properly-decayed score back UP every re-harvest,
+    undoing ProxyManager.mark_failure's real-time penalties, AND kept
+    resetting last_validated to NOW() on every re-harvest, which starved
+    health_monitor's oldest-last_validated-first correction query from
+    ever reaching the row. Confirmed live: proxies with double-digit real
+    failure counts carrying scores that only matched the zero-track-record
+    formula, unchanged across multiple re-harvests after this fix landed,
+    until GREATEST itself was also removed in favor of an unconditional
+    overwrite — now that this reading's success_rate is real, the fresh
+    score already reflects the truth and doesn't need protecting from
+    itself."""
     return ScoringEngine().compute_score(
         latency_ms=latency_ms,
-        success_rate=None,
+        success_rate=success_rate,
         anonymity=anonymity,
         asn=asn,
         last_validated_seconds_ago=0,
@@ -273,7 +298,22 @@ class ProxyHarvester:
             is_valid, anonymity, latency_ms = await self._http_validate(ip, port, protocol)
             if is_valid:
                 asn = _to_asn_class(await self._classifier.classify(ip))
-                score = _score_first_validation(latency_ms, anonymity, asn)
+                existing = await self._pg.fetchrow(
+                    tenant,
+                    """SELECT global_success_count, global_failure_count
+                       FROM proxy_pool WHERE ip = $1 AND port = $2 AND protocol = $3""",
+                    ip,
+                    port,
+                    protocol,
+                )
+                success_rate = (
+                    compute_success_rate(
+                        existing["global_success_count"], existing["global_failure_count"]
+                    )
+                    if existing is not None
+                    else None
+                )
+                score = _score_validation(latency_ms, anonymity, asn, success_rate)
             else:
                 asn = AsnClass.UNKNOWN
                 score = SCORE_TCP_ONLY
@@ -284,13 +324,10 @@ class ProxyHarvester:
                            (ip, port, protocol, anonymity_level, asn_class, response_time_ms, reliability_score)
                        VALUES ($1,$2,$3,$4,$5,$6,$7)
                        ON CONFLICT (ip, port, protocol) DO UPDATE SET
-                         reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
-                         anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
-                         asn_class = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.asn_class ELSE proxy_pool.asn_class END,
-                         response_time_ms = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.response_time_ms ELSE proxy_pool.response_time_ms END,
+                         reliability_score = EXCLUDED.reliability_score,
+                         anonymity_level = EXCLUDED.anonymity_level,
+                         asn_class = EXCLUDED.asn_class,
+                         response_time_ms = EXCLUDED.response_time_ms,
                          last_validated = NOW()""",
                     ip,
                     port,
@@ -511,20 +548,32 @@ asyncio.run(main())"""
                 )
                 if not is_valid:
                     continue
-                score = _score_first_validation(latency_ms, anonymity, asn_class)
+                existing = await self._pg.fetchrow(
+                    tenant,
+                    """SELECT global_success_count, global_failure_count
+                       FROM proxy_pool WHERE ip = $1 AND port = $2 AND protocol = $3""",
+                    ip,
+                    port,
+                    protocol.value,
+                )
+                success_rate = (
+                    compute_success_rate(
+                        existing["global_success_count"], existing["global_failure_count"]
+                    )
+                    if existing is not None
+                    else None
+                )
+                score = _score_validation(latency_ms, anonymity, asn_class, success_rate)
                 await self._pg.execute(
                     tenant,
                     """INSERT INTO proxy_pool
                            (ip, port, protocol, anonymity_level, asn_class, response_time_ms, reliability_score)
                        VALUES ($1,$2,$3,$4,$5,$6,$7)
                        ON CONFLICT (ip, port, protocol) DO UPDATE SET
-                         reliability_score = GREATEST(proxy_pool.reliability_score, EXCLUDED.reliability_score),
-                         anonymity_level = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.anonymity_level ELSE proxy_pool.anonymity_level END,
-                         asn_class = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.asn_class ELSE proxy_pool.asn_class END,
-                         response_time_ms = CASE WHEN EXCLUDED.reliability_score > proxy_pool.reliability_score
-                           THEN EXCLUDED.response_time_ms ELSE proxy_pool.response_time_ms END,
+                         reliability_score = EXCLUDED.reliability_score,
+                         anonymity_level = EXCLUDED.anonymity_level,
+                         asn_class = EXCLUDED.asn_class,
+                         response_time_ms = EXCLUDED.response_time_ms,
                          last_validated = NOW()""",
                     ip,
                     port,
@@ -553,7 +602,8 @@ asyncio.run(main())"""
             tenant = TenantId("system")
         rows = await self._pg.fetch(
             tenant,
-            """SELECT ip, port, protocol FROM proxy_pool
+            """SELECT ip, port, protocol, global_success_count, global_failure_count
+               FROM proxy_pool
                WHERE reliability_score < 40
                ORDER BY last_promotion_attempt_at ASC NULLS FIRST
                LIMIT $1""",
@@ -565,7 +615,10 @@ asyncio.run(main())"""
             is_valid, anonymity, latency_ms = await self._http_validate(ip, port, protocol)
             if is_valid:
                 asn = _to_asn_class(await self._classifier.classify(ip))
-                score = _score_first_validation(latency_ms, anonymity, asn)
+                success_rate = compute_success_rate(
+                    row["global_success_count"], row["global_failure_count"]
+                )
+                score = _score_validation(latency_ms, anonymity, asn, success_rate)
                 await self._pg.execute(
                     tenant,
                     """UPDATE proxy_pool

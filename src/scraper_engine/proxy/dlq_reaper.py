@@ -77,13 +77,24 @@ async def _is_eligible(
     mechanism round 34 built to heal transient proxy exhaustion, for
     exactly the deployment shape (free-proxy-only) this repo already runs
     in. Checking tier 2 instead reflects what actually gates a retry's
-    success under this config."""
+    success under this config.
+
+    Round 39 — same substitution, one tier down: level_attempted==2 checks
+    tier 1's health instead when allow_tier1_fallback_for_tier2 is enabled.
+    Same live shape as round 37 but for tier 2 this time — the round-39
+    scoring fixes that corrected years of inflated reliability_score values
+    back to their real, honest ones also dropped tier 2's real supply
+    below critical_below_count, so tier 2's raw pool_health now sits
+    CRITICAL regardless of whether a level-2 lease actually succeeds via
+    the new tier-1 fallback."""
     from scraper_engine.proxy.pool_health import PoolHealthState
 
     if entry.failure_category == FailureCategory.PROXY_EXHAUSTED:
         check_tier = entry.level_attempted
         if entry.level_attempted == 3 and tier_config.allow_tier2_fallback_for_tier3:
             check_tier = 2
+        elif entry.level_attempted == 2 and tier_config.allow_tier1_fallback_for_tier2:
+            check_tier = 1
         pool_state = await pool_current_state(redis, check_tier)
         return pool_state == PoolHealthState.HEALTHY
     if entry.failure_category == FailureCategory.CIRCUIT_OPEN:

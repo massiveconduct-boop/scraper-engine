@@ -118,9 +118,40 @@ class HealthMonitor:
         for row, (is_valid, anonymity, asn, latency_ms) in checked:
             ip, port = row["ip"], row["port"]
             if is_valid:
+                # Counts come from a fresh RETURNING here, not the batch `rows`
+                # snapshot fetched at the top of check_all — that snapshot can be
+                # seconds-to-minutes stale by the time this per-proxy validate+
+                # classify finishes, during which real lease traffic's
+                # mark_success/mark_failure can move global_success_count /
+                # global_failure_count. Scoring off the stale snapshot and then
+                # writing last means this write silently clobbers those
+                # real-time updates back to a stale value — confirmed live:
+                # proxies with double-digit real failure counts still showing
+                # scores that only match compute_score()'s zero-track-record
+                # branch. Narrowing to a single read-then-write (mirroring
+                # mark_success/mark_failure's own accepted two-round-trip
+                # pattern) shrinks the race to the same already-accepted window
+                # instead of a whole validate+classify cycle.
+                fresh = await self._pg.fetchrow(
+                    system_tenant,
+                    """
+                    UPDATE proxy_pool
+                    SET anonymity_level = $1, asn_class = $2, response_time_ms = $3,
+                        last_validated = NOW()
+                    WHERE ip = $4 AND port = $5
+                    RETURNING global_success_count, global_failure_count
+                    """,
+                    anonymity.value,
+                    asn.value,
+                    latency_ms,
+                    ip,
+                    port,
+                )
+                if fresh is None:
+                    continue
                 success_rate = compute_success_rate(
-                    row["global_success_count"],
-                    row["global_failure_count"],
+                    fresh["global_success_count"],
+                    fresh["global_failure_count"],
                 )
                 score = ScoringEngine().compute_score(
                     latency_ms=latency_ms,
@@ -131,15 +162,7 @@ class HealthMonitor:
                 ).total
                 await self._pg.execute(
                     system_tenant,
-                    """
-                    UPDATE proxy_pool
-                    SET anonymity_level = $1, asn_class = $2, response_time_ms = $3,
-                        reliability_score = $4, last_validated = NOW()
-                    WHERE ip = $5 AND port = $6
-                    """,
-                    anonymity.value,
-                    asn.value,
-                    latency_ms,
+                    "UPDATE proxy_pool SET reliability_score = $1 WHERE ip = $2 AND port = $3",
                     score,
                     ip,
                     port,

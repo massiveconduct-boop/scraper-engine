@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from scraper_engine.proxy.net_probe import http_probe, lease_preflight, tcp_probe
+from scraper_engine.proxy.net_probe import _LEASE_CHECK_URLS, http_probe, lease_preflight, tcp_probe
 
 
 class FakeResponse:
@@ -110,6 +110,51 @@ class TestHttpProbe:
         with patch(
             "scraper_engine.proxy.net_probe.httpx.AsyncClient", return_value=client
         ):
+            result = await http_probe("1.2.3.4", 8080, "HTTP")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_second_judge_when_first_fails(self):
+        """Round 39 — a single flaky judge must not false-negative an
+        otherwise-working proxy. First judge raises, second returns 200 ->
+        overall result is still True, and the third judge is never tried."""
+
+        class PerUrlClient:
+            def __init__(self):
+                self.urls_tried = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                self.urls_tried.append(url)
+                if url == _LEASE_CHECK_URLS[0]:
+                    raise ConnectionError("first judge down")
+                return FakeResponse(status_code=200)
+
+        client = PerUrlClient()
+        with patch("scraper_engine.proxy.net_probe.httpx.AsyncClient", return_value=client):
+            result = await http_probe("1.2.3.4", 8080, "HTTP")
+        assert result is True
+        assert client.urls_tried == list(_LEASE_CHECK_URLS[:2])
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_every_judge_fails(self):
+        class AlwaysFailClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                raise ConnectionError("down")
+
+        client = AlwaysFailClient()
+        with patch("scraper_engine.proxy.net_probe.httpx.AsyncClient", return_value=client):
             result = await http_probe("1.2.3.4", 8080, "HTTP")
         assert result is False
 

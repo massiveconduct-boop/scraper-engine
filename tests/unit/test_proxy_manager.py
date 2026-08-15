@@ -168,6 +168,28 @@ class TestProxyManager:
         assert "3.3.3.3:8080" in second_call_args[-1]  # excluded on retry
 
     @pytest.mark.asyncio
+    async def test_candidate_query_orders_track_record_before_score(self, tenant):
+        """Round 39 — a proxy with zero real usage history can legitimately
+        outscore a proven one (scoring.py's compute_score() redistributes
+        weight away from success_rate when there's no track record yet),
+        but free proxies churn dead within minutes of being harvested — a
+        same-moment liveness probe found the real top-20-by-score
+        candidates 0/20 alive, every one untested, while proven proxies
+        scattered through the score range were mostly alive. Lease-time
+        selection must try proxies with a real track record first."""
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = []
+        pm = ProxyManager(redis=redis, pg=pg)
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=1, domain="example.com")
+
+        query = pg.fetch.await_args_list[0].args[1]
+        assert "ORDER BY (global_success_count > 0) DESC, reliability_score DESC" in query
+
+    @pytest.mark.asyncio
     async def test_exhausted_when_all_candidates_stay_banned(self, tenant):
         """Every candidate found across MAX_ATTEMPTS retries is domain-banned
         (never None) — the loop must fall through and raise after exhausting
@@ -272,6 +294,31 @@ class TestProxyManager:
         new_score = pg.execute.await_args.args[2]  # (tenant_id, sql, score, ip, port)
         assert 0.0 <= new_score <= 100.0
         assert new_score < 40.0
+
+    @pytest.mark.asyncio
+    async def test_mark_failure_ban_domain_false_skips_ban(self, tenant):
+        """Round 39 — the lease-time preflight failure path passes
+        ban_domain=False: preflight checks a third-party judge, not the
+        real target domain, so failing it says nothing domain-specific and
+        must not lock the proxy out of that domain for an hour. Score
+        recomputation must still happen either way."""
+        redis = AsyncMock()
+        pg = AsyncMock()
+        pg.fetchrow.return_value = {
+            "anonymity_level": "transparent",
+            "asn_class": "unknown",
+            "response_time_ms": 500,
+            "global_success_count": 0,
+            "global_failure_count": 3,
+            "last_validated": datetime.now(UTC),
+        }
+        pm = ProxyManager(redis=redis, pg=pg)
+
+        await pm.mark_failure(tenant, "1.2.3.4", 8080, "example.com", ban_domain=False)
+
+        redis.set.assert_not_awaited()
+        pg.fetchrow.assert_awaited_once()
+        pg.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_mark_failure_no_matching_row_is_a_noop(self, tenant):
@@ -385,6 +432,107 @@ class TestTier2FallbackForTier3:
         pg.fetch.assert_awaited_once()  # no fallback retry attempted
 
 
+class TestTier1FallbackForTier2:
+    """Round 39: allow_tier1_fallback_for_tier2 — same single-hop pattern as
+    TestTier2FallbackForTier3 above, one tier down. Added after round 39's
+    scoring-race/GREATEST-ratchet fixes corrected inflated reliability_score
+    values back to their real, honest ones pool-wide, which dropped tier 2's
+    real supply below critical_below_count and starved a live production
+    job (see config/base.yaml's proxy_tiers section)."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default_stays_exhausted_when_no_tier2_proxy(self, tenant):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = []  # no proxy scores >= 70
+        pm = ProxyManager(redis=redis, pg=pg)  # default ProxyTierConfig()
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=2, domain="example.com")
+
+    @pytest.mark.asyncio
+    async def test_enabled_falls_back_to_tier1_proxy_when_tier2_empty(self, tenant):
+        tier1_proxy = Proxy(
+            id=1, ip="7.7.7.7", port=8080, protocol=ProxyProtocol.HTTP, reliability_score=45.0
+        )
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        # First call (min_score=70) finds nothing; the fallback retry
+        # (min_score=40) finds the tier-1-caliber proxy.
+        pg.fetch.side_effect = [[], [_proxy_row(tier1_proxy)]]
+        pm = ProxyManager(
+            redis=redis,
+            pg=pg,
+            tier_config=ProxyTierConfig(allow_tier1_fallback_for_tier2=True),
+            probe=AsyncMock(return_value=True),
+        )
+
+        lease = await pm.get_proxy(tenant, level=2, domain="example.com")
+
+        assert lease.proxy.ip == "7.7.7.7"
+        assert pg.fetch.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_enabled_prefers_real_tier2_proxy_when_available(self, tenant):
+        """The fallback must never skip searching for a genuine tier-2
+        proxy first — only tried after that search comes up empty."""
+        tier2_proxy = Proxy(
+            id=1, ip="9.9.9.9", port=8080, protocol=ProxyProtocol.HTTP, reliability_score=75.0
+        )
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = [_proxy_row(tier2_proxy)]
+        pm = ProxyManager(
+            redis=redis,
+            pg=pg,
+            tier_config=ProxyTierConfig(allow_tier1_fallback_for_tier2=True),
+            probe=AsyncMock(return_value=True),
+        )
+
+        lease = await pm.get_proxy(tenant, level=2, domain="example.com")
+
+        assert lease.proxy.ip == "9.9.9.9"
+        pg.fetch.assert_awaited_once()  # never needed the fallback retry
+
+    @pytest.mark.asyncio
+    async def test_enabled_stays_exhausted_when_no_proxy_at_any_tier(self, tenant):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = []  # empty at both min_score=70 and min_score=40
+        pm = ProxyManager(
+            redis=redis,
+            pg=pg,
+            tier_config=ProxyTierConfig(allow_tier1_fallback_for_tier2=True),
+        )
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=2, domain="example.com")
+        assert pg.fetch.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fallback_does_not_apply_to_level_3(self, tenant):
+        """The config flag is explicitly tier2-specific — level 3 exhausting
+        must not trigger this fallback, even with the flag enabled (it has
+        its own separate allow_tier2_fallback_for_tier3 flag)."""
+        redis = AsyncMock()
+        redis.get.return_value = None
+        pg = AsyncMock()
+        pg.fetch.return_value = []
+        pm = ProxyManager(
+            redis=redis,
+            pg=pg,
+            tier_config=ProxyTierConfig(allow_tier1_fallback_for_tier2=True),
+        )
+
+        with pytest.raises(ProxyPoolExhaustedError):
+            await pm.get_proxy(tenant, level=3, domain="example.com")
+        pg.fetch.assert_awaited_once()  # no fallback retry attempted
+
+
 class TestPreflightProbe:
     """Round 37 — before a candidate is leased, a fast preflight (TCP
     connect + one lightweight HTTP round trip, see net_probe.py) must
@@ -409,7 +557,10 @@ class TestPreflightProbe:
         lease = await pm.get_proxy(tenant, level=1, domain="example.com")
 
         assert lease.proxy.ip == "1.1.1.1"  # 3.3.3.3 failed preflight, skipped
-        pm.mark_failure.assert_awaited_once_with(tenant, "3.3.3.3", 8080, "example.com")
+        # ban_domain=False (round 39) — preflight failure is domain-agnostic
+        pm.mark_failure.assert_awaited_once_with(
+            tenant, "3.3.3.3", 8080, "example.com", ban_domain=False
+        )
         assert probe.await_count == 2
 
     @pytest.mark.asyncio

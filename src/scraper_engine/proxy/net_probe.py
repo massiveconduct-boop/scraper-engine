@@ -20,14 +20,27 @@ import httpx
 # passed proxies that then failed those with a CONNECT tunnel error,
 # caught live (round 37): "Unable to connect to proxy ... Tunnel
 # connection failed: 400 Bad Request" from Camoufox's own geoip dial,
-# despite the proxy passing an HTTP-only preflight moments earlier. Also
-# deliberately NOT harvester.py's full JUDGE_URLS retry list —
-# _http_validate there is documented as unsuitable for a request-path hot
-# loop ("this only runs from already-bounded-concurrency contexts... never
-# a request-path hot loop"); this is a lighter, purpose-built check for
-# exactly that hot loop, with no anonymity classification and no
-# multi-URL retry.
-_LEASE_CHECK_URL = "https://httpbingo.org/ip"
+# despite the proxy passing an HTTP-only preflight moments earlier.
+#
+# Round 39 — three HTTPS judges, not one, first success wins. A single
+# judge with no fallback (httpbingo.org alone, previously) meant that
+# site's own transient flakiness/rate-limiting looked identical to the
+# proxy being dead, false-negativing genuinely-working proxies straight
+# into mark_failure — the same category of bug harvester.py's own
+# multi-judge JUDGE_URLS already guards against, just not mirrored here
+# yet. Still deliberately NOT a straight reuse of harvester.py's
+# JUDGE_URLS: those are plain-HTTP (wrong protocol for this specific
+# check, see above) and that whole loop is documented as unsuitable for a
+# request-path hot loop; these are HTTPS equivalents of the same three
+# hosts, kept to a small, purpose-built list with no anonymity
+# classification. Worst case per candidate grows from one judge's timeout
+# to up to three (first-success-wins, so the common case — any judge
+# healthy — is unaffected).
+_LEASE_CHECK_URLS: tuple[str, ...] = (
+    "https://httpbingo.org/ip",
+    "https://api.ipify.org?format=json",
+    "https://postman-echo.com/ip",
+)
 
 
 async def tcp_probe(ip: str, port: int, timeout: float = 2.0) -> bool:
@@ -61,14 +74,27 @@ async def http_probe(ip: str, port: int, protocol: str, timeout: float = 4.0) ->
     L2-caliber / 5 L3-caliber pool back to 0/0 within about 75 minutes of
     real traffic — every one of the 5 original L3 proxies had 0 recorded
     successes and 3-11 preflight-driven failures, judge-latencies of
-    607-3242ms."""
+    607-3242ms.
+
+    Round 39 — tries every URL in _LEASE_CHECK_URLS, first 200 wins,
+    instead of a single judge with no fallback. One flaky/rate-limited
+    judge previously looked identical to a dead proxy — a real, working
+    proxy that just happened to hit that judge's own bad moment got
+    false-negatived straight into mark_failure, same failure shape as the
+    too-tight-timeout bug this docstring already documents above."""
     proxy_url = f"{protocol.lower()}://{ip}:{port}"
     try:
         async with httpx.AsyncClient(
             proxy=proxy_url, timeout=timeout, follow_redirects=False
         ) as client:
-            resp = await client.get(_LEASE_CHECK_URL)
-            return resp.status_code == 200
+            for check_url in _LEASE_CHECK_URLS:
+                try:
+                    resp = await client.get(check_url)
+                    if resp.status_code == 200:
+                        return True
+                except Exception:
+                    continue
+            return False
     except Exception:
         return False
 
@@ -77,20 +103,26 @@ async def lease_preflight(ip: str, port: int, protocol: str, timeout: float = 4.
     """Combined check run before a proxy is leased for a real fetch: cheap
     TCP reject first (catches the dominant ConnectTimeout/ConnectError
     failure mode fast — a refused/unroutable connection fails in
-    milliseconds regardless of the timeout ceiling), then one real HTTP
+    milliseconds regardless of the timeout ceiling), then a real HTTP
     round trip only if the TCP check passed (catches the smaller "connects
-    but doesn't forward" residual). Worst case per candidate is bounded
-    (2 * timeout) instead of the full browser navigation timeout a bad
-    lease used to cost.
+    but doesn't forward" residual).
 
     Default raised 2.0s -> 4.0s, see http_probe's docstring for the live
-    evidence. Worst case across ProxyManager.MAX_ATTEMPTS=5 candidates is
-    now 5*2*4.0=40s (was 20s) — still a large improvement over round 37's
-    original problem (a single bad lease costing a full 40-60s browser
-    navigation timeout with NO preflight at all), just a smaller safety
-    margin than before. Accepted trade-off: correctly-scored-but-moderately
-    -slow real proxies actually getting a fair chance matters more here
-    than shaving the worst-case exhaustion path by a few seconds."""
+    evidence behind that. Round 39 raised http_probe from one judge to
+    three (first-success-wins) — worst case per candidate is now bounded
+    at (1 + 3) * timeout = 20.0s (was 2*4.0=8.0s), only hit if TCP
+    connects but every one of three independent judges simultaneously
+    times out for this specific proxy; the common cases (proxy dead at
+    TCP, or the first judge answers) are unaffected. Worst case across
+    ProxyManager.MAX_ATTEMPTS=10 candidates is now up to 200s — large in
+    the theoretical worst case, but that worst case requires the rare
+    triple-judge-timeout on every single one of 10 candidates; the
+    practical case (round 37's original problem: a single bad lease
+    costing a full 40-60s browser navigation timeout with NO preflight at
+    all) is what this bounds, and still does. Accepted trade-off:
+    correctly-scored-but-moderately-slow real proxies, and proxies whose
+    only problem is one flaky judge, actually getting a fair chance
+    matters more here than shaving the theoretical worst case."""
     if not await tcp_probe(ip, port, timeout):
         return False
     return await http_probe(ip, port, protocol, timeout)

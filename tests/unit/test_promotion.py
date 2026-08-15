@@ -60,6 +60,8 @@ class TestProxyPromotionJob:
                     "port": 3128,
                     "protocol": "HTTP",
                     "promotion_attempts": 0,
+                    "global_success_count": 0,
+                    "global_failure_count": 0,
                 },
             ]
         )
@@ -133,6 +135,8 @@ class TestProxyPromotionJob:
                     "port": 3128,
                     "protocol": "HTTP",
                     "promotion_attempts": 0,
+                    "global_success_count": 0,
+                    "global_failure_count": 0,
                 },
             ]
         )

@@ -18,7 +18,8 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING
 
-from scraper_engine.proxy.harvester import _score_first_validation, _to_asn_class
+from scraper_engine.proxy.harvester import _score_validation, _to_asn_class
+from scraper_engine.proxy.scoring import compute_success_rate
 
 if TYPE_CHECKING:
     import asyncpg
@@ -71,7 +72,8 @@ class ProxyPromotionJob:
         """Execute one promotion cycle. Returns counts keyed by outcome."""
         async with self._pg.acquire(self._tenant) as conn:
             candidates = await conn.fetch(
-                """SELECT id, ip, port, protocol, promotion_attempts
+                """SELECT id, ip, port, protocol, promotion_attempts,
+                          global_success_count, global_failure_count
                    FROM proxy_pool
                    WHERE reliability_score < 40
                      AND promotion_attempts < $1
@@ -100,7 +102,10 @@ class ProxyPromotionJob:
                 new_attempts = row["promotion_attempts"] + 1
                 if is_valid:
                     asn = _to_asn_class(await self._classifier.classify(row["ip"]))
-                    score = _score_first_validation(latency_ms, anonymity, asn)
+                    success_rate = compute_success_rate(
+                        row["global_success_count"], row["global_failure_count"]
+                    )
+                    score = _score_validation(latency_ms, anonymity, asn, success_rate)
                     await conn.execute(
                         """UPDATE proxy_pool
                            SET reliability_score = $1,

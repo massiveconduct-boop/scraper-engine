@@ -77,7 +77,13 @@ class FakeProc:
 
 @pytest.fixture
 def pg():
-    return AsyncMock()
+    m = AsyncMock()
+    # Default: no existing row found (genuinely new proxy) — most tests here
+    # exercise first-time discovery, not re-harvest of an already-tracked
+    # proxy. Tests that DO care about an existing track record override
+    # m.fetchrow.return_value explicitly.
+    m.fetchrow.return_value = None
+    return m
 
 
 @pytest.fixture
@@ -230,7 +236,13 @@ class TestPromoteTcpOnly:
         from scraper_engine.core.tenant import TenantId
 
         pg.fetch.return_value = [
-            {"ip": "1.2.3.4", "port": 3128, "protocol": "HTTP"},
+            {
+                "ip": "1.2.3.4",
+                "port": 3128,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,
+            },
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         h._http_validate = AsyncMock(
@@ -277,7 +289,14 @@ class TestPromoteTcpOnly:
         from scraper_engine.core.tenant import TenantId
 
         pg.fetch.return_value = [
-            {"ip": f"10.0.0.{i}", "port": 3128, "protocol": "HTTP"} for i in range(3)
+            {
+                "ip": f"10.0.0.{i}",
+                "port": 3128,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,
+            }
+            for i in range(3)
         ]
         h = ProxyHarvester(pg=pg, asn_classifier=classifier)
         h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
@@ -285,6 +304,33 @@ class TestPromoteTcpOnly:
         assert promoted == 3
         fetch_args = pg.fetch.call_args
         assert fetch_args[0][2] == 3  # limit value in query
+
+    @pytest.mark.asyncio
+    async def test_promotion_scores_from_real_track_record_not_none(self, pg, classifier):
+        """Round 39: promote_tcp_only had NO GREATEST() safety net at all —
+        a plain UPDATE. Scoring a re-check with success_rate=None (ignoring
+        the row's real global_success_count/global_failure_count, already
+        in hand from the batch SELECT) could bump a proxy that's genuinely
+        below 40 because of real failures back up to a near-ceiling score,
+        undoing ProxyManager.mark_failure's real-time decay entirely."""
+        from scraper_engine.core.models import AnonymityLevel
+        from scraper_engine.core.tenant import TenantId
+
+        pg.fetch.return_value = [
+            {
+                "ip": "1.2.3.4",
+                "port": 3128,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 17,
+            },
+        ]
+        h = ProxyHarvester(pg=pg, asn_classifier=classifier)
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
+        promoted = await h.promote_tcp_only(limit=5, tenant=TenantId("system"))
+        assert promoted == 1
+        score = pg.execute.call_args[0][2]
+        assert score < 60, f"expected a low score reflecting 0/17 real track record, got {score}"
 
     @pytest.mark.asyncio
     async def test_defaults_to_system_tenant_when_none_given(self, pg, classifier):
@@ -381,6 +427,33 @@ class TestScrapeOneReal:
             n = await h._scrape_one("geonode", "http://x", "geonode_json", 10, pg, client)
         assert n == 1
         pg.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reharvest_scores_from_real_track_record_not_none(self, pg, classifier):
+        """Round 39: re-harvesting an ip:port free lists keep relisting must
+        score it using its REAL accumulated success/failure history, not
+        success_rate=None. Confirmed live: proxies with double-digit real
+        failure counts still carried scores matching the zero-track-record
+        formula, because every re-harvest recomputed with success_rate=None
+        and the ON CONFLICT clause's GREATEST(old, new) let that
+        history-blind score silently ratchet the real, decayed score back
+        up. A proxy with 0 successes / 17 failures must score low, not the
+        near-ceiling value a fresh, no-history reading would produce."""
+        from scraper_engine.core.models import AnonymityLevel
+
+        pg.fetchrow.return_value = {
+            "global_success_count": 0,
+            "global_failure_count": 17,
+        }
+        h = ProxyHarvester(pg=pg, asn_classifier=classifier)
+        resp = FakeResponse(text="1.2.3.4:8080")
+        client = FakeHttpClient(resp=resp)
+        h._http_validate = AsyncMock(return_value=(True, AnonymityLevel.ELITE, 50))
+        with patch("scraper_engine.proxy.harvester.tcp_probe", AsyncMock(return_value=True)):
+            n = await h._scrape_one("src", "http://x", "ip_port", 10, pg, client)
+        assert n == 1
+        score = pg.execute.await_args.args[-1]
+        assert score < 60, f"expected a low score reflecting 0/17 real track record, got {score}"
 
     @pytest.mark.asyncio
     async def test_tcp_probe_failure_skips_proxy(self, pg, classifier):

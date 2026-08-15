@@ -2,9 +2,14 @@
 """Proxy selection from our own scored, persisted pool.
 
 State transitions (per proxy, per domain):
-  AVAILABLE → BANNED_FOR_DOMAIN (on failure, TTL 1h) → AVAILABLE (on TTL expiry)
+  AVAILABLE → BANNED_FOR_DOMAIN (on a real fetch failure against that
+    domain, TTL 1h) → AVAILABLE (on TTL expiry)
 
-Global reliability_score decays independently of domain-specific bans.
+Global reliability_score decays independently of domain-specific bans. A
+failed lease-time preflight (checks a third-party judge, not the real
+domain — see mark_failure's docstring) decays score the same way but does
+NOT set a domain ban (round 39) — that failure says nothing about this
+domain specifically.
 """
 
 from __future__ import annotations
@@ -45,7 +50,16 @@ HARVEST_KICK_CHANNEL = "proxy:events:exhausted"
 class ProxyManager:
     """Select a proxy from the persisted, scored pool for a given (level, domain)."""
 
-    MAX_ATTEMPTS: int = 5
+    # Round 39 — raised 5->10. Live-caught: with allow_tier1_fallback_for_tier2
+    # enabled, a level-2 lease now has genuinely hundreds of tier-1-caliber
+    # candidates to try (previously only the handful of real tier-2-caliber
+    # ones), but 5 attempts still exhausted against a real research_agent job
+    # even with the fallback firing — each failed candidate only costs a fast
+    # preflight (net_probe.py::lease_preflight, round 37), not a full fetch
+    # timeout, so doubling the attempt budget is cheap relative to the job's
+    # own 600s timeout (orchestrator/tasks.py) and meaningfully raises the
+    # odds of finding one real working proxy against a low-hit-rate free pool.
+    MAX_ATTEMPTS: int = 10
 
     def __init__(
         self,
@@ -79,13 +93,19 @@ class ProxyManager:
             2: cfg.min_score_level_2,
             3: cfg.min_score_level_3,
         }.get(level, 50.0)
-        # Config-gated stopgap for free-only proxy sources where L3's own
-        # ceiling can be structurally unreachable (round 33) — tried once,
-        # lazily, only if a real tier-3-caliber proxy search below comes up
-        # empty. Never skips searching for a genuine tier-3 proxy first.
-        fallback_score = (
-            cfg.min_score_level_2 if level == 3 and cfg.allow_tier2_fallback_for_tier3 else None
-        )
+        # Config-gated stopgap for free-only proxy sources where a tier's own
+        # ceiling can be genuinely scarce (round 33 for tier 3; round 39 adds
+        # the same single-hop pattern for tier 2) — tried once, lazily, only
+        # if a real same-tier-caliber proxy search below comes up empty.
+        # Never skips searching for a genuine same-tier proxy first, and
+        # never chains two hops (a tier-3 fallback doesn't cascade further
+        # into tier 1) — same bounded-risk shape as the original.
+        fallback_tier: int | None = None
+        fallback_score: float | None = None
+        if level == 3 and cfg.allow_tier2_fallback_for_tier3:
+            fallback_tier, fallback_score = 2, cfg.min_score_level_2
+        elif level == 2 and cfg.allow_tier1_fallback_for_tier2:
+            fallback_tier, fallback_score = 1, cfg.min_score_level_1
         fallback_used = False
         seen: set[str] = set()
 
@@ -95,7 +115,9 @@ class ProxyManager:
                 fallback_used = True
                 tier_min_score = fallback_score
                 logger.warning(
-                    "proxy_tier3_fallback_to_tier2 domain=%s tenant=%s min_score=%.1f",
+                    "proxy_tier%d_fallback_to_tier%d domain=%s tenant=%s min_score=%.1f",
+                    level,
+                    fallback_tier,
                     domain,
                     tenant_id,
                     tier_min_score,
@@ -127,12 +149,14 @@ class ProxyManager:
             # never actually forward traffic (caught by the HTTP layer).
             # Without this, either case costs the caller a full 40-60s
             # browser navigation timeout instead of failing in low single
-            # digit seconds. Treated exactly like a real fetch failure
+            # digit seconds. Treated like a real fetch failure for scoring
             # (mark_failure) so a proxy that keeps failing preflight decays
             # out of the pool the same way one that keeps failing real
-            # fetches does.
+            # fetches does — but ban_domain=False, since preflight checks a
+            # third-party judge, not this domain (see mark_failure's
+            # docstring, round 39).
             if not await self._probe(proxy.ip, proxy.port, proxy.protocol.value):
-                await self.mark_failure(tenant_id, proxy.ip, proxy.port, domain)
+                await self.mark_failure(tenant_id, proxy.ip, proxy.port, domain, ban_domain=False)
                 continue
 
             return ProxyLease(proxy=proxy, tenant_id=tenant_id)
@@ -193,14 +217,31 @@ class ProxyManager:
             port,
         )
 
-    async def mark_failure(self, tenant_id: TenantId, ip: str, port: int, domain: str) -> None:
+    async def mark_failure(
+        self, tenant_id: TenantId, ip: str, port: int, domain: str, ban_domain: bool = True
+    ) -> None:
         """Ban proxy for domain (TTL 1h) and recompute global reliability score.
 
         See mark_success's docstring for why this is now formula-driven
         instead of a flat -10.
-        """
-        ban_key = f"proxy_ban:{tenant_id}:{domain}:{ip}:{port}"
-        await self._redis.set(tenant_id, ban_key, "1", ttl=3600)
+
+        Round 39 — ban_domain=False for the lease-time preflight call site
+        (this module's own get_proxy() loop, on a failed lease_preflight).
+        Preflight checks connectivity to a third-party judge
+        (net_probe.py::_LEASE_CHECK_URLS), never the real target domain —
+        a proxy failing it says nothing about that domain specifically, so
+        banning it FOR that domain for a full hour was wrong: it locks the
+        proxy out of exactly the domain it happened to be tried against
+        when it was momentarily down, even after the proxy recovers (free
+        proxies churn back alive within minutes, live-measured this
+        session), while every OTHER domain remains free to try it again
+        immediately. The real fetch-failure call site
+        (orchestrator/worker.py::_fetch_with_proxy) keeps the default —
+        that failure genuinely happened against the real domain, so a
+        domain-specific ban is the correct signal there."""
+        if ban_domain:
+            ban_key = f"proxy_ban:{tenant_id}:{domain}:{ip}:{port}"
+            await self._redis.set(tenant_id, ban_key, "1", ttl=3600)
 
         row = await self._pg.fetchrow(
             tenant_id,
@@ -269,6 +310,28 @@ class ProxyManager:
         same domain exhausted in ~1 attempt despite 50+ score-eligible
         proxies existing overall. Excluding in SQL means each attempt's
         LIMIT 20 is a genuinely fresh, not-yet-tried slice.
+
+        Round 39 — ORDER BY leads with "has a real track record" before
+        score. scoring.py's compute_score() intentionally gives a proxy
+        with NO usage history yet (global_success_count=global_failure_count=0)
+        a score built purely from its one-time judge-validation reading
+        (latency/anonymity/ASN), which can legitimately exceed a PROVEN
+        proxy's score — that's correct for promotion/tier classification,
+        where "no data yet" must not be punished. But it's wrong for
+        LEASE-TIME ordering specifically: free proxies churn dead within
+        minutes of being harvested, so a same-moment liveness probe of the
+        real top-20-by-score candidates found 0/20 alive — every one had
+        zero track record, average score 57.7 vs 46.5 for proxies with a
+        real track record pool-wide, and a same-moment broader probe (n=80,
+        score>=40) found the alive ones scattered 42.9-66.9 with no
+        correlation to score, while the untested crop at the very top was
+        uniformly dead. A proxy that has actually forwarded real traffic
+        before, even imperfectly, is a better bet than one that merely
+        looked good on a single judge round-trip and has never been used —
+        so proven proxies are tried before untested ones, both still
+        ordered by score within their own bucket, and untested ones remain
+        reachable once proven ones run out (never excluded, just
+        deprioritized) so they still get their first real trial.
         """
         rows = await self._pg.fetch(
             tenant_id,
@@ -277,7 +340,7 @@ class ProxyManager:
             FROM proxy_pool
             WHERE reliability_score >= $1
               AND NOT (ip || ':' || port = ANY($2::text[]))
-            ORDER BY reliability_score DESC
+            ORDER BY (global_success_count > 0) DESC, reliability_score DESC
             LIMIT 20
             """,
             min_score,

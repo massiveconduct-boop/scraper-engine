@@ -23,7 +23,13 @@ def pg():
         }
     ]
     pg.execute.return_value = "DELETE 0"
-    pg.fetchrow.return_value = {"n": 1}
+
+    async def default_fetchrow(_tenant, query, *_params):
+        if "RETURNING global_success_count" in query:
+            return {"global_success_count": 0, "global_failure_count": 0}
+        return {"n": 1}
+
+    pg.fetchrow.side_effect = default_fetchrow
     return pg
 
 
@@ -62,11 +68,87 @@ class TestHealthMonitor:
         ):
             await hm.check_all()
         update_call = next(
-            c for c in pg.execute.await_args_list if "SET anonymity_level" in c.args[1]
+            c for c in pg.fetchrow.await_args_list if "SET anonymity_level" in c.args[1]
         )
         assert update_call.args[2] == AnonymityLevel.ELITE.value
         assert update_call.args[3] == AsnClass.RESIDENTIAL.value
         assert update_call.args[4] == 40
+        score_call = next(
+            c
+            for c in pg.execute.await_args_list
+            if "SET reliability_score" in c.args[1]
+        )
+        assert isinstance(score_call.args[2], float)
+
+    @pytest.mark.asyncio
+    async def test_check_all_rescores_from_fresh_counts_not_stale_batch_snapshot(
+        self, pg, redis
+    ):
+        """Round 39: the `rows` snapshot fetched once at the top of check_all
+        can go stale during the per-proxy validate+classify I/O — real
+        mark_success/mark_failure traffic can move global_success_count/
+        global_failure_count in that window. Confirmed live: proxies with
+        double-digit real failure counts still carried scores that only
+        matched compute_score()'s zero-track-record branch, because the
+        write used the stale snapshot instead of the row's current state.
+        Scoring must re-read counts fresh right before the write."""
+        pg.fetch.return_value = [
+            {
+                "ip": "1.2.3.4",
+                "port": 8080,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,  # stale: batch snapshot has no track record
+            }
+        ]
+
+        async def fetchrow_with_real_failures(_tenant, query, *_params):
+            if "RETURNING global_success_count" in query:
+                return {"global_success_count": 0, "global_failure_count": 17}
+            return {"n": 1}
+
+        pg.fetchrow.side_effect = fetchrow_with_real_failures
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            await hm.check_all()
+        score_call = next(
+            c
+            for c in pg.execute.await_args_list
+            if "SET reliability_score" in c.args[1]
+        )
+        # success_rate=0/17 must cap the score well below the ~97 the stale
+        # zero-track-record snapshot would have produced.
+        assert score_call.args[2] < 60
+
+    @pytest.mark.asyncio
+    async def test_check_all_skips_row_deleted_before_rescore_write(self, pg, redis):
+        """A proxy can be deleted (e.g. the end-of-cycle `reliability_score <= 0`
+        sweep from a concurrent cycle, or a DLQ/pruning path) between the batch
+        `rows` read and this row's RETURNING write landing — the UPDATE...
+        RETURNING then matches nothing. Must skip cleanly, not crash on a
+        None `fresh` row."""
+
+        async def fetchrow_returns_none_for_returning(_tenant, query, *_params):
+            if "RETURNING global_success_count" in query:
+                return None
+            return {"n": 1}
+
+        pg.fetchrow.side_effect = fetchrow_returns_none_for_returning
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            result = await hm.check_all()
+        assert result["validated"] == 0
+        assert not any(
+            "SET reliability_score" in c.args[1] for c in pg.execute.await_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_check_all_downgrades(self, pg, redis):
