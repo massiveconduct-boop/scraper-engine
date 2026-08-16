@@ -197,6 +197,19 @@ class JobStatusResponse(BaseModel):
     partial_failure: bool = False
 
 
+class JobSummaryResponse(BaseModel):
+    """Lightweight per-job shape for GET /v1/jobs (round 56) — deliberately
+    excludes `results`/`error`, which require the scrape_results join
+    JobStatusResponse's single-job route already pays for; a list endpoint
+    doing that per row would be an N+1 query."""
+
+    job_id: str
+    status: JobStatus
+    url_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class DeadLetterEntryResponse(BaseModel):
     """API-facing shape of storage.dlq.DeadLetterEntry (a dataclass, not a
     BaseModel, so FastAPI needs a serializable response model)."""

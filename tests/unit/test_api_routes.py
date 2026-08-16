@@ -20,7 +20,11 @@ from scraper_engine.api.routes import (
     crawl,
     get_job,
     get_job_dlq,
+    get_quota,
     health,
+    list_dlq,
+    list_jobs,
+    list_webhook_events,
     register_routes,
     scrape,
 )
@@ -909,6 +913,285 @@ async def test_get_job_dlq_invalid_api_key_401(wired_deps):
 
     with pytest.raises(HTTPException) as ei:
         await get_job_dlq(str(uuid.uuid4()), x_api_key="sk-bad")
+    assert ei.value.status_code == 401
+
+
+# ── GET /v1/jobs (round 56) ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_returns_paginated_summaries(wired_deps):
+    from datetime import UTC, datetime
+
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    wired_deps.fetch.return_value = [
+        {
+            "job_id": jid,
+            "status": "COMPLETED",
+            "urls": ["https://example.com", "https://example.org"],
+            "created_at": now,
+            "updated_at": now,
+        }
+    ]
+
+    result = await list_jobs(x_api_key="sk-admin")
+
+    assert result["count"] == 1
+    assert result["limit"] == 50
+    assert result["offset"] == 0
+    job = result["jobs"][0]
+    assert job.job_id == str(jid)
+    assert job.status == JobStatus.COMPLETED
+    assert job.url_count == 2
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_passes_status_limit_offset_to_query(wired_deps):
+    wired_deps.fetch.return_value = []
+
+    await list_jobs(x_api_key="sk-admin", status="FAILED", limit=10, offset=20)
+
+    args = wired_deps.fetch.call_args.args
+    # args: (tenant_id, query, status, limit, offset)
+    assert args[2] == "FAILED"
+    assert args[3] == 10
+    assert args[4] == 20
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_invalid_status_422():
+    with pytest.raises(HTTPException) as ei:
+        await list_jobs(x_api_key="sk-admin", status="NOT_A_STATUS")
+    assert ei.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_limit_out_of_range_422():
+    with pytest.raises(HTTPException) as ei:
+        await list_jobs(x_api_key="sk-admin", limit=501)
+    assert ei.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_negative_offset_422():
+    with pytest.raises(HTTPException) as ei:
+        await list_jobs(x_api_key="sk-admin", offset=-1)
+    assert ei.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_returns_empty_when_pg_not_initialized(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "system"
+    monkeypatch.setattr(deps, "_tenant_resolver", resolver)
+    monkeypatch.setattr(deps, "_storage_pg", None)
+
+    result = await list_jobs(x_api_key="sk-admin")
+
+    assert result == {"jobs": [], "limit": 50, "offset": 0, "count": 0}
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_service_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await list_jobs(x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_invalid_api_key_401(wired_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await list_jobs(x_api_key="sk-bad")
+    assert ei.value.status_code == 401
+
+
+# ── GET /v1/dlq (round 56) ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_returns_tenant_wide_entries(wired_deps, monkeypatch):
+    from datetime import UTC, datetime
+
+    from scraper_engine.core.models import FailureCategory
+    from scraper_engine.storage.dlq import DeadLetterEntry
+
+    jid = str(uuid.uuid4())
+    entry = DeadLetterEntry(
+        id=1,
+        job_id=jid,
+        tenant_id="system",
+        url="http://example.com",
+        failure_category=FailureCategory.PROXY_EXHAUSTED,
+        error_message="All fetch levels exhausted",
+        level_attempted=3,
+        auto_retry_count=0,
+        enqueued_at=datetime.now(UTC),
+        dead_at=datetime.now(UTC),
+    )
+    list_mock = AsyncMock(return_value=[entry])
+    monkeypatch.setattr("scraper_engine.storage.dlq.DeadLetterQueue.list_for_tenant", list_mock)
+
+    result = await list_dlq(x_api_key="sk-admin")
+
+    assert len(result) == 1
+    assert result[0].job_id == jid
+    # job_id kwarg must stay unset (tenant-wide mode), not scoped to one job.
+    assert list_mock.call_args.kwargs.get("job_id") is None
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_passes_limit_offset(wired_deps, monkeypatch):
+    list_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("scraper_engine.storage.dlq.DeadLetterQueue.list_for_tenant", list_mock)
+
+    await list_dlq(x_api_key="sk-admin", limit=10, offset=5)
+
+    assert list_mock.call_args.kwargs["limit"] == 10
+    assert list_mock.call_args.kwargs["offset"] == 5
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_limit_out_of_range_422():
+    with pytest.raises(HTTPException) as ei:
+        await list_dlq(x_api_key="sk-admin", limit=0)
+    assert ei.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_returns_empty_list_when_pg_not_initialized(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "system"
+    monkeypatch.setattr(deps, "_tenant_resolver", resolver)
+    monkeypatch.setattr(deps, "_storage_pg", None)
+
+    result = await list_dlq(x_api_key="sk-admin")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_service_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await list_dlq(x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_list_dlq_invalid_api_key_401(wired_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await list_dlq(x_api_key="sk-bad")
+    assert ei.value.status_code == 401
+
+
+# ── GET /v1/quota (round 56) ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_quota_returns_remaining_and_limit(wired_scrape_deps):
+    pg, redis, _queue = wired_scrape_deps
+    pg.fetchrow.return_value = {"quota_daily_limit": 5000}
+    redis.get.return_value = "42"
+
+    result = await get_quota(x_api_key="sk-admin")
+
+    assert result["tenant"] == "system"
+    assert result["daily_limit"] == 5000
+    assert result["used"] == 42
+    assert result["remaining"] == 5000 - 42
+    assert result["resets_in_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_get_quota_falls_back_to_default_limit_when_tenant_row_missing(
+    wired_scrape_deps,
+):
+    from scraper_engine.core.quota import QuotaManager
+
+    pg, redis, _queue = wired_scrape_deps
+    pg.fetchrow.return_value = None
+    redis.get.return_value = None
+
+    result = await get_quota(x_api_key="sk-admin")
+
+    assert result["daily_limit"] == QuotaManager.DEFAULT_DAILY_LIMIT
+    assert result["used"] == 0
+    assert result["remaining"] == QuotaManager.DEFAULT_DAILY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_get_quota_storage_not_initialized_503(wired_deps, monkeypatch):
+    monkeypatch.setattr(deps, "_storage_redis", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await get_quota(x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_quota_service_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await get_quota(x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_quota_invalid_api_key_401(wired_scrape_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await get_quota(x_api_key="sk-bad")
+    assert ei.value.status_code == 401
+
+
+# ── GET /v1/webhook-events (round 56) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_webhook_events_returns_types_and_schema(wired_deps):
+    result = await list_webhook_events(x_api_key="sk-admin")
+
+    assert "job.completed" in result["event_types"]
+    assert "job.partial_failure" in result["event_types"]
+    assert "proxy_pool.degraded" in result["event_types"]
+    schema = result["payload_schema"]
+    assert "event_type" in schema["properties"]
+    assert "payload" in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_list_webhook_events_service_not_initialized_503(monkeypatch):
+    monkeypatch.setattr(deps, "_tenant_resolver", None)
+
+    with pytest.raises(HTTPException) as ei:
+        await list_webhook_events(x_api_key="sk-admin")
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_list_webhook_events_invalid_api_key_401(wired_deps):
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    deps._tenant_resolver.resolve.side_effect = AuthenticationError("bad key")
+
+    with pytest.raises(HTTPException) as ei:
+        await list_webhook_events(x_api_key="sk-bad")
     assert ei.value.status_code == 401
 
 

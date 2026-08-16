@@ -4,9 +4,13 @@
 Endpoints:
   POST   /v1/scrape        — single/multi-URL scrape (SSRF-guarded, quota-checked)
   POST   /v1/crawl         — bulk Scrapy crawl for target sets >500 URLs
+  GET    /v1/jobs          — list jobs for the calling tenant (round 56)
   GET    /v1/jobs/{id}     — job status from live DB
   GET    /v1/jobs/{id}/dlq — raw dead-letter detail for a job
   DELETE /v1/jobs/{id}     — cancel a PENDING/PROCESSING job
+  GET    /v1/dlq           — tenant-wide dead-letter listing (round 56)
+  GET    /v1/quota         — remaining daily quota for the calling tenant (round 56)
+  GET    /v1/webhook-events — webhook event taxonomy + payload schema (round 56)
   GET    /v1/health        — composite health check
 """
 
@@ -26,6 +30,7 @@ from scraper_engine.core.models import (
     FetchResult,
     JobStatus,
     JobStatusResponse,
+    JobSummaryResponse,
     ScrapeRequest,
 )
 
@@ -71,6 +76,24 @@ def _validate_uuid(value: str, name: str = "id") -> str:
             detail=f"Invalid {name}: '{value}' is not a valid UUID",
         ) from None
     return value
+
+
+_MAX_PAGE_LIMIT = 500
+
+
+def _validate_pagination(limit: int, offset: int) -> None:
+    """Raise 422 on out-of-range limit/offset (round 56). Deliberately plain
+    int params with manual validation rather than FastAPI's `Query(...)`
+    marker — every test in this module calls route functions directly
+    (bypassing FastAPI's DI), and a `Query(...)` default is never resolved
+    to its plain value outside that DI path (same class of gotcha already
+    noted on ScrapeRequest's idempotency_key Header() default above)."""
+    if not (1 <= limit <= _MAX_PAGE_LIMIT):
+        raise HTTPException(
+            status_code=422, detail=f"limit must be between 1 and {_MAX_PAGE_LIMIT}"
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be >= 0")
 
 
 @router.post("/scrape")
@@ -430,6 +453,61 @@ async def crawl(
     }
 
 
+@router.get("/jobs")
+async def list_jobs(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, object]:
+    """List jobs for the calling tenant (round 56) — schema-per-tenant search_path
+    (see PostgresClient.acquire) already scopes this to the caller's own jobs,
+    same as GET /v1/jobs/{job_id}. `limit` caps at 500, matching ScrapeRequest's
+    existing per-request URL cap, so one tenant can't force an unbounded scan."""
+    from scraper_engine.api.dependencies import _storage_pg, _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+
+    _validate_pagination(limit, offset)
+    if status is not None:
+        try:
+            JobStatus(status)
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid status: '{status}'"
+            ) from None
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        tenant_id = await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    if _storage_pg is None:
+        return {"jobs": [], "limit": limit, "offset": offset, "count": 0}
+
+    rows = await _storage_pg.fetch(
+        tenant_id,
+        """SELECT job_id, status, urls, created_at, updated_at FROM scrape_jobs
+           WHERE ($1::text IS NULL OR status = $1)
+           ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
+        status,
+        limit,
+        offset,
+    )
+    jobs = [
+        JobSummaryResponse(
+            job_id=str(r["job_id"]),
+            status=JobStatus(r["status"]),
+            url_count=len(r["urls"]),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+    return {"jobs": jobs, "limit": limit, "offset": offset, "count": len(jobs)}
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(
     job_id: str,
@@ -558,6 +636,122 @@ async def get_job_dlq(
         )
         for e in entries
     ]
+
+
+@router.get("/dlq")
+async def list_dlq(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    limit: int = 100,
+    offset: int = 0,
+) -> list[DeadLetterEntryResponse]:
+    """Tenant-wide dead-letter listing (round 56) — DeadLetterQueue.list_for_tenant
+    already supports a `job_id=None` "everything currently dead for this tenant"
+    mode (used internally by ops tooling and the dlq_size Prometheus gauge); this
+    route is the caller-facing sibling of GET /v1/jobs/{job_id}/dlq, which only
+    covers one job at a time and requires already knowing its id."""
+    from scraper_engine.api.dependencies import _storage_pg, _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+    from scraper_engine.storage.dlq import DeadLetterQueue
+
+    _validate_pagination(limit, offset)
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        tenant_id = await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    if _storage_pg is None:
+        return []
+
+    entries = await DeadLetterQueue(_storage_pg).list_for_tenant(
+        tenant_id, limit=limit, offset=offset
+    )
+    return [
+        DeadLetterEntryResponse(
+            job_id=e.job_id,
+            url=e.url,
+            failure_category=e.failure_category,
+            error_message=e.error_message,
+            level_attempted=e.level_attempted,
+            auto_retry_count=e.auto_retry_count,
+            enqueued_at=e.enqueued_at,
+            dead_at=e.dead_at,
+        )
+        for e in entries
+    ]
+
+
+@router.get("/quota")
+async def get_quota(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> dict[str, object]:
+    """Remaining daily quota for the calling tenant (round 56) — QuotaManager
+    already tracks this (core/quota.py), it was just never exposed; callers
+    previously only found out their limit by hitting a 429. Same daily-limit
+    lookup query and same None-falls-back-to-DEFAULT_DAILY_LIMIT behavior as
+    POST /v1/scrape's quota check."""
+    from scraper_engine.api.dependencies import _storage_pg, _storage_redis, _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+    from scraper_engine.core.quota import QuotaManager, seconds_until_quota_reset
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        tenant_id = await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    if _storage_pg is None or _storage_redis is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    daily_limit = None
+    row = await _storage_pg.fetchrow(
+        tenant_id,
+        "SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1",
+        str(tenant_id),
+    )
+    if row is not None:
+        daily_limit = row["quota_daily_limit"]
+
+    effective_limit = daily_limit or QuotaManager.DEFAULT_DAILY_LIMIT
+    manager = QuotaManager(redis=_storage_redis, daily_limit=daily_limit)
+    used = await manager.current_usage(tenant_id)
+    remaining = await manager.remaining(tenant_id)
+    return {
+        "tenant": str(tenant_id),
+        "daily_limit": effective_limit,
+        "used": used,
+        "remaining": remaining,
+        "resets_in_seconds": seconds_until_quota_reset(),
+    }
+
+
+@router.get("/webhook-events")
+async def list_webhook_events(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> dict[str, object]:
+    """Webhook event taxonomy + payload schema (round 56) — a caller wiring up
+    a webhook receiver had no way to discover WebhookEventType's values or
+    WebhookEvent's shape (orchestrator/webhook_events.py) short of reading this
+    repo's source. Pure static reflection, no DB/Redis touch — same auth
+    posture as every other /v1 route, but nothing tenant-specific to fail on."""
+    from scraper_engine.api.dependencies import _tenant_resolver
+    from scraper_engine.core.exceptions import AuthenticationError
+    from scraper_engine.orchestrator.webhook_events import WebhookEvent, WebhookEventType
+
+    if _tenant_resolver is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        await _tenant_resolver.resolve(x_api_key)
+    except AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid API key") from None
+
+    return {
+        "event_types": [e.value for e in WebhookEventType],
+        "payload_schema": WebhookEvent.model_json_schema(),
+    }
 
 
 @router.delete("/jobs/{job_id}")
