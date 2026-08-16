@@ -541,17 +541,50 @@ class TestCamoufoxWrapperGeoipFallback:
         assert result is fake_context
         assert camoufox_ctor.call_count == 2
         assert camoufox_ctor.call_args_list[0].kwargs["fingerprint_preset"] is True
-        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is False
+        # Round 51 — must be None, not False: verified against the actual
+        # installed camoufox/utils.py::launch_options, whose preset branch
+        # is guarded by `is not None`, not truthiness. False satisfies
+        # `is not None` exactly like True and draws another real preset
+        # from the same pool — a no-op against this exact crash. Only None
+        # reaches the true BrowserForge synthetic path.
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
         for call in camoufox_ctor.call_args_list:
             assert call.kwargs["geoip"] is True
 
     @pytest.mark.asyncio
-    async def test_launch_reraises_webgl_error_when_fingerprint_preset_already_disabled(
+    async def test_launch_falls_back_even_when_fingerprint_preset_starts_disabled(
         self, tenant
     ):
-        """Defensive: fingerprint_preset=False means no pinned vendor/
-        renderer is ever passed to sample_webgl, so this shouldn't fire in
-        practice — but if it somehow does, there's no further fallback."""
+        """Round 51 — a caller-supplied fingerprint_preset=False is exactly
+        as exposed to the webgl_data.db gap as True (camoufox's `is not
+        None` check treats them identically), so the retry guard must not
+        use fingerprint_preset's own value as the "already tried" marker —
+        it must still get one real fallback attempt (to None) here."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, fingerprint_preset=False)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["fingerprint_preset"] is False
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
+
+    @pytest.mark.asyncio
+    async def test_launch_reraises_webgl_error_when_fallback_already_spent(self, tenant):
+        """Defensive: once the fingerprint fallback has actually been used
+        (fingerprint_preset=None) and the same gap fires again, there's no
+        further fallback — must re-raise, not loop forever."""
         from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 
         failing_instance = MagicMock()
@@ -567,7 +600,8 @@ class TestCamoufoxWrapperGeoipFallback:
         ):
             await wrapper._launch_with_geoip_fallback()
 
-        camoufox_ctor.assert_called_once()
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
 
     @pytest.mark.asyncio
     async def test_launch_unrelated_value_error_propagates_without_fallback(self, tenant):
@@ -619,7 +653,7 @@ class TestCamoufoxWrapperGeoipFallback:
         assert result is fake_context
         assert camoufox_ctor.call_count == 3
         assert camoufox_ctor.call_args_list[2].kwargs["geoip"] is False
-        assert camoufox_ctor.call_args_list[2].kwargs["fingerprint_preset"] is False
+        assert camoufox_ctor.call_args_list[2].kwargs["fingerprint_preset"] is None
 
     @pytest.mark.asyncio
     async def test_launch_includes_credentials_when_proxy_has_them(self, tenant):

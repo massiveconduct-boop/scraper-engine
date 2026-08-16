@@ -106,8 +106,22 @@ class CamoufoxWrapper:
     # 400", "NVIDIA Corporation"/"NVIDIA GeForce 8800 GTX" — both old,
     # under-covered real hardware). A random (no pinned vendor/renderer)
     # WebGL sample can never raise this — it only ever draws from rows
-    # that provably exist — so fingerprint_preset=False is a real, working
-    # degradation, not a guess.
+    # that provably exist.
+    #
+    # Round 51 CORRECTION — round 49's retry set fingerprint_preset=False,
+    # which does NOT reach the no-vendor/renderer path above. Verified
+    # against the actual installed camoufox/utils.py::launch_options: its
+    # preset branch is guarded by `elif fingerprint_preset is not None:`,
+    # not truthiness — False satisfies `is not None` exactly like True, so
+    # it draws another random REAL preset from the same 312-preset pool and
+    # can independently hit the same webgl_data.db gap. Live-caught doing
+    # exactly that the same day as round 50's "fix": job
+    # 05d720cc-3933-437c-a262-1f6559d05d7e crashed on retry with a second
+    # colliding vendor/renderer ("Mesa"/"GeForce 8800 GTX") after the first
+    # attempt's fallback had already fired. The only sentinel that actually
+    # skips the preset branch is None — confirmed via camoufox/
+    # fingerprints.py's from_browserforge, which calls sample_webgl(os) with
+    # no vendor/renderer, matching the safe path this comment always meant.
     _WEBGL_DATA_GAP_MARKERS = ("No WebGL data found", "combination not valid for")
 
     async def _launch_with_geoip_fallback(self) -> Any:
@@ -121,9 +135,12 @@ class CamoufoxWrapper:
           demonstrably reaches real target sites fine can still fail all 6
           of those specific, unrelated services — doesn't mean the proxy
           is dead. Retries with geoip=False.
-        - The WebGL data-gap ValueError above (round 49). Retries with
-          fingerprint_preset=False (Camoufox's default synthetic/
-          BrowserForge fingerprint generation, unaffected by this gap).
+        - The WebGL data-gap ValueError above (round 49, sentinel corrected
+          round 51). Retries with fingerprint_preset=None — the only value
+          that actually reaches camoufox's default synthetic/BrowserForge
+          fingerprint generation, unaffected by this gap. False looks like
+          "off" but isn't: camoufox/utils.py checks `is not None`, so False
+          still samples another real preset from the same pool.
 
         Either fallback preserves the fetch (with reduced anti-detection
         fidelity for this one session — invariant §1.1.2's fingerprint/geoip
@@ -145,7 +162,18 @@ class CamoufoxWrapper:
                 proxy_config["password"] = self.proxy.password
 
         geoip = self._geoip
-        fingerprint_preset = self._fingerprint_preset
+        fingerprint_preset: bool | None = self._fingerprint_preset
+        # Round 51 — tracked separately from `fingerprint_preset`'s own
+        # value. Before, the retry guard was `if not fingerprint_preset:
+        # raise` — but camoufox's launch_options() treats ANY non-None
+        # value (True or False) identically (`is not None` check, not
+        # truthiness), so a caller-supplied fingerprint_preset=False starts
+        # this loop already exposed to the exact same webgl_data.db gap as
+        # True. Using the value itself as the "already tried" marker would
+        # deny that starting state its one legitimate retry. This flag
+        # tracks "have we already spent the fallback", independent of
+        # whatever value fingerprint_preset started at.
+        fingerprint_fallback_used = False
         for _attempt in range(3):
             self._browser = AsyncCamoufox(  # type: ignore[no-untyped-call]  # 3rd-party, untyped
                 geoip=geoip,
@@ -174,7 +202,7 @@ class CamoufoxWrapper:
                     geoip = False
                     continue
                 except ValueError as exc:
-                    if not fingerprint_preset or not any(
+                    if fingerprint_fallback_used or not any(
                         marker in str(exc) for marker in self._WEBGL_DATA_GAP_MARKERS
                     ):
                         raise
@@ -183,7 +211,8 @@ class CamoufoxWrapper:
                         "error=%s",
                         exc,
                     )
-                    fingerprint_preset = False
+                    fingerprint_preset = None
+                    fingerprint_fallback_used = True
                     continue
         # Unreachable in practice — each of the 3 iterations either returns
         # or continues after spending one of the two one-time fallbacks;

@@ -32,6 +32,102 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 51)
+
+- **RESOLVED (round 51) — round 49/50's WebGL-gap fallback was a no-op:
+  `fingerprint_preset=False` behaves identically to `True` in the actual
+  installed camoufox package, so the "fixed" job could still crash on
+  retry.** User asked to dig into the 23 remaining failures from round 50's
+  33-URL batch (timeout/detection_block), fix anything that was genuinely
+  our own misconfiguration, and leave genuinely unfixable target blocks
+  alone.
+
+  **Evidence gathered first, before touching anything** (operating rule
+  #1): queried `research_agent`'s real production data (last 24h, 2140
+  rows, 90% success). Failure breakdown: `detection_block` 135,
+  `circuit_open` 28, `host_unreachable` 15, `not_found` 11,
+  `proxy_exhausted` 10, `browser_crash` 10 — **zero `NETWORK_TIMEOUT` rows**,
+  so no evidence any configured timeout is too tight. `detection_block`
+  domain breakdown (level_used=3, survived to the real-browser final level
+  and still blocked): facebook.com, instagram.com, crunchbase.com,
+  forbes.com, researchgate.net, similarweb.com, allaboutcookies.org,
+  nairametrics.com, businessday.ng — exactly the aggressive-anti-bot/
+  IP-reputation properties round 46 already concluded are not fixable via
+  Camoufox/Botasaurus config. `circuit_open` cluster on techtrend.africa
+  (10 hits) traced to its own history: tripped, cooled down, self-recovered
+  same day — round 44's TTL-decay design working as intended, not a bug.
+
+  **The real bug, found live**: `docker compose logs` for TODAY (not a
+  replayed batch) showed job `05d720cc-3933-437c-a262-1f6559d05d7e`
+  (17:23:53 UTC) crash the ENTIRE job with the exact same
+  `ValueError: No WebGL data found for vendor "Mesa" and renderer
+  "GeForce 8800 GTX, or similar"` round 49/50 claimed to have fixed —
+  post-round-50, same day. Root-caused against the actual installed
+  `camoufox/utils.py::launch_options`: its preset-sampling branch is
+  `elif fingerprint_preset is not None:`, not a truthiness check —
+  `False is not None` is `True`, so passing `fingerprint_preset=False` (what
+  round 49's retry did) draws another random REAL preset from the same
+  312-preset pool and can independently hit the same webgl_data.db gap.
+  Confirmed directly against the real installed package (not a guess):
+  `launch_options(fingerprint_preset=False, ...)` calls `sample_webgl('lin',
+  'Intel', 'Intel(R) HD Graphics, or similar')` — a pinned vendor/renderer,
+  exactly the crash surface; `launch_options(fingerprint_preset=None, ...)`
+  calls `sample_webgl('lin')` alone — genuinely safe, matching what round
+  49's comment always assumed `False` would do.
+
+  **Fix** (`browser/camoufox_wrapper.py::_launch_with_geoip_fallback`):
+  retry now sets `fingerprint_preset = None`, not `False`. Also fixed a
+  second, adjacent bug in the same function found while correcting the
+  first: the retry guard used `fingerprint_preset`'s own value as the
+  "already tried the fallback" marker (`if not fingerprint_preset: raise`)
+  — but since a caller-supplied `fingerprint_preset=False` is exactly as
+  exposed to this crash as `True` (same `is not None` check), that guard
+  would have denied a `False`-starting launch its one legitimate retry.
+  Replaced with an explicit `fingerprint_fallback_used` flag, independent
+  of whatever value `fingerprint_preset` started at. Not currently
+  reachable in production (`config/base.yaml` always sets
+  `fingerprint_preset: true`), but a real correctness fix in the same
+  function, same session, directly adjacent — not scope creep.
+
+  5 tests updated/added in `TestCamoufoxWrapperGeoipFallback`
+  (`tests/unit/test_browser.py`) — existing tests mocked `AsyncCamoufox`
+  entirely and asserted only the wrapper's own internal state transitions,
+  which is exactly why the bug escaped detection (the mock never exercised
+  camoufox's real `is not None` branching). New
+  `test_launch_falls_back_even_when_fingerprint_preset_starts_disabled`
+  covers the second bug; `test_launch_reraises_webgl_error_when_fallback_
+  already_spent` covers genuine exhaustion. 896 passed, 100% coverage,
+  ruff/mypy --strict clean.
+
+  **Live-verified against the real installed camoufox package** (not
+  mocks, not a replayed batch — round 50's mistake): (1) confirmed directly
+  that `launch_options(fingerprint_preset=False, ...)` really does call
+  `sample_webgl` with a pinned vendor/renderer while `fingerprint_preset=
+  None` does not; (2) rebuilt and redeployed all 4 containers sharing the
+  image (api/worker-l1/l2/l3); (3) inside the freshly-deployed worker-l1,
+  monkeypatched `camoufox.utils.get_random_preset` to force the exact
+  Intel combo that crashed a job live today, called the real
+  `CamoufoxWrapper._launch_with_geoip_fallback()` directly, and asserted
+  `get_random_preset` is NOT called a second time on retry (would raise if
+  it were) — launch succeeded, returned a real
+  `playwright.async_api.Browser`, `get_random_preset` called exactly once.
+  This is the verification round 50 skipped (it only replayed the same
+  33-URL batch and took an absence of crashes as proof) — this round proves
+  the retry path itself, against the real dependency, not just absence of
+  symptoms on one sample.
+
+  **Investigated and deliberately NOT changed** (evidence said no, not
+  guessed): no timeout value anywhere (L1/L2/L3 `timeout_seconds`,
+  `networkidle_timeout_ms`, the 120s/URL job ceiling, webhook timeout,
+  circuit breaker cooldown) — zero `NETWORK_TIMEOUT` failures in 24h of
+  real traffic, nothing to fix. No Camoufox/Botasaurus anti-detection
+  config change — current settings already reflect round 26/46's
+  docs-verified hardening, and the dominant `detection_block` failures are
+  on IP-reputation-gated properties round 46 already established aren't
+  fingerprint-fixable. No circuit breaker tuning — techtrend.africa's
+  circuit-open cluster today was the existing TTL-decay design recovering
+  correctly on its own.
+
 ## Technical Debt / Open Threads (as of round 50)
 
 - **RESOLVED (round 50) — `fingerprint_preset=True` (round 46) could crash
