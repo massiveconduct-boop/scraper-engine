@@ -285,7 +285,6 @@ async def _run_scrape(
         fingerprint_preset=cfg.camoufox.fingerprint_preset,
         os=cfg.camoufox.os,
     )
-    await browser_pool.start()
     # One BotasaurusPool per job too (round 26), same rationale and lifetime
     # as browser_pool above — reuses one live Botasaurus driver across
     # same-domain URLs in a crawl job instead of relaunching per URL. See
@@ -299,7 +298,15 @@ async def _run_scrape(
         _persist_one_result below."""
         await _persist_one_result(pg, s3, tenant_id, job_id, result, dlq)
 
+    # Round 51 — browser_pool.start() moved inside this try/finally. It used
+    # to run before the block, so a raise from it (e.g. the prewarm_count
+    # vs max_total_instances misconfiguration check) skipped
+    # browser_pool.shutdown() entirely, since that shutdown only runs in
+    # this finally. start() itself no longer raises on a per-instance
+    # launch failure (browser/pool.py round 51), but keeping this ordering
+    # correct for the config-check case that legitimately still can.
     try:
+        await browser_pool.start()
         worker = Worker(
             redis=redis,
             circuit_breaker=circuit_breaker,

@@ -89,6 +89,30 @@ class BrowserPool:
                 f"max_total_instances ({self._max_total_instances}) — prewarming "
                 "would block waiting on core.budget.BROWSER_SEMAPHORE"
             )
+        # Round 51 — a single prewarm instance's launch failure (any
+        # exception: a third-party data gap camoufox_wrapper's own bounded
+        # fallback couldn't absorb, an Xvfb race, a transient resource
+        # blip — anything, known or not) used to propagate straight out of
+        # this method, which crashed the ENTIRE job before any URL was even
+        # attempted (this method runs outside process_job's per-URL
+        # try/except) and, if a later prewarm slot failed after an earlier
+        # one had already launched successfully, leaked that earlier
+        # browser process too — start() raising meant orchestrator/
+        # tasks.py's browser_pool.shutdown() (in its try/finally) was never
+        # reached, since that finally only wraps the code *after*
+        # `await browser_pool.start()`, not the call itself. Live-audited
+        # against 33 real historical full-job crashes (all showed the same
+        # "0 results for any URL" signature), several predating the WebGL
+        # fix entirely — this class of failure was never actually specific
+        # to WebGL, that was just the most recent instance of it.
+        #
+        # Fix: prewarming is documented (class docstring) as "purely a
+        # latency optimization, not a concurrency control" — acquire()
+        # already launches a fresh instance on-demand whenever the pool is
+        # empty, so a prewarm slot that fails to launch should degrade to
+        # "not prewarmed," never to "job aborted." Each slot's failure is
+        # caught, logged, and skipped; a completely empty pool (all slots
+        # failed) is a valid, already-handled end state, not an error.
         for i in range(self._prewarm_count):
             wrapper = CamoufoxWrapper(
                 proxy=None,
@@ -100,7 +124,19 @@ class BrowserPool:
                 fingerprint_preset=self._fingerprint_preset,
                 os=self._os,
             )
-            ctx = await wrapper.__aenter__()
+            try:
+                ctx = await wrapper.__aenter__()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "browser_pool_prewarm_instance_failed index=%d tenant=%s — "
+                    "skipping this slot, pool degrades to on-demand launch",
+                    i,
+                    self._tenant_id,
+                    exc_info=True,
+                )
+                continue
             self._active_wrappers.append(wrapper)
             await self._pool.put((ctx, wrapper, time.monotonic()))
         self._started = True

@@ -32,6 +32,87 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 52)
+
+- **RESOLVED (round 52) — BrowserPool.start()'s prewarm loop had zero fault
+  tolerance for ANY single instance's launch failure, not just the WebGL
+  gap round 51 fixed; this was the real, general shape of the crash class,
+  and it predates the WebGL bug entirely.** User asked to dig deeper into
+  the crash log, especially the most recent crash, and fix root causes
+  robustly and resiliently.
+
+  **Audited all 33 real historical full-job crashes** (`research_agent.
+  scrape_jobs` WHERE status='FAILED' AND zero rows in `scrape_results` —
+  the "0 results for any URL" signature that only a `BrowserPool.start()`
+  crash outside `process_job`'s per-URL try/except can produce), spanning
+  2026-08-11 through 2026-08-16. Tried to recover each one's original
+  exception for independent confirmation: worker container logs were gone
+  (containers were recreated by round 51's redeploy, no external log
+  persistence configured in `docker-compose.yml`); checked Redis's
+  `rq:job:*` hashes directly (still present, TTL ~360 days) but this rq
+  deployment doesn't persist `exc_info` as a hash field even for a job
+  crashed minutes earlier in the same session — confirmed empty for both
+  an old and the freshly-crashed job, so this wasn't an expiry issue, just
+  not persisted. Raw per-job forensics for the 32 older crashes is
+  genuinely unrecoverable now.
+
+  Given that, several of the 33 (`e2130263` 2026-08-11, `a590ccce`
+  2026-08-12, `8a5fa64f` 2026-08-14) predate round 46's introduction of
+  `fingerprint_preset` entirely — they cannot be the WebGL bug, since the
+  code path that bug lives in didn't exist yet. This means the WebGL gap
+  was never the actual root cause of this crash *class* — it was just the
+  most recent specific trigger of a structural gap that was already there:
+  `BrowserPool.start()`'s prewarm loop (`for i in range(self._prewarm_
+  count): ctx = await wrapper.__aenter__()`) let ANY exception from ANY
+  single prewarm instance's launch propagate straight out of `start()`,
+  which crashed the whole job before any URL was attempted, regardless of
+  what caused that one instance to fail — WebGL data gap, an Xvfb race, a
+  transient resource blip, or something not yet seen. Also found a second-
+  order bug while reading the surrounding code: `orchestrator/tasks.py`'s
+  `await browser_pool.start()` ran BEFORE the `try/finally` that calls
+  `browser_pool.shutdown()`, so if a later prewarm slot failed after an
+  earlier one had already launched successfully, that earlier browser
+  process leaked (never closed) on top of the job crashing.
+
+  **Fix, not a patch on top of round 51's**: `browser/pool.py::start()`
+  now catches any exception per prewarm slot, logs a warning
+  (`browser_pool_prewarm_instance_failed`) with the slot index and full
+  traceback, and skips that slot instead of raising — matching the class's
+  own docstring, which already documented prewarming as "purely a latency
+  optimization, not a concurrency control": `acquire()` already builds a
+  fresh instance on-demand whenever the pool has nothing pooled, so a
+  slot that fails to prewarm should degrade to "not prewarmed," never to
+  "job aborted." A completely empty pool (every slot failed) is treated as
+  a valid end state, not an error — confirmed `acquire()` still works
+  fine afterward (below). Separately, moved `browser_pool.start()` inside
+  `orchestrator/tasks.py`'s existing try/finally so `shutdown()` always
+  runs, closing the leak-on-partial-failure gap too. The one case that
+  legitimately should still raise from `start()` — `prewarm_count >
+  max_total_instances`, a real misconfiguration, not a per-instance
+  failure — still does, and still raises before any launch is attempted,
+  so there's nothing to clean up in that case.
+
+  3 new tests in `TestBrowserPool` (`tests/unit/test_browser.py`):
+  one failing slot among several is skipped and the rest still prewarm;
+  every slot failing degrades to zero without raising; the
+  misconfiguration check still raises and still short-circuits before any
+  launch attempt. 899 passed, 100% coverage, ruff/mypy --strict clean.
+
+  **Live-verified against the real deployed code** (rebuilt + force-
+  recreated all 4 containers — a plain `docker compose up -d` after the
+  build did not actually pick up the new image on this host, had to add
+  `--force-recreate`; confirmed via the container's image digest matching
+  the freshly built one before proceeding): inside the redeployed
+  worker-l1, monkeypatched `CamoufoxWrapper.__aenter__` to fail on the
+  first prewarm slot with a generic `RuntimeError` (deliberately NOT the
+  WebGL shape, to prove this fix isn't just a second special-case) —
+  `start()` completed without raising, 1 of 2 slots prewarmed. Separately
+  forced BOTH slots to fail — `start()` still completed without raising,
+  0 active wrappers, and a follow-up `acquire()` call still succeeded,
+  returning a real live `playwright.async_api.BrowserContext` — proving
+  the on-demand fallback this fix relies on genuinely works, not just
+  that the crash is silenced.
+
 ## Technical Debt / Open Threads (as of round 51)
 
 - **RESOLVED (round 51) — round 49/50's WebGL-gap fallback was a no-op:

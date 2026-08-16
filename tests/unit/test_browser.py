@@ -208,6 +208,61 @@ class TestBrowserPool:
         fake_wrapper.__aexit__.assert_not_awaited()  # NOT destroyed
         assert pool._pool.qsize() == 1  # mismatched wrapper stayed pooled
 
+    async def test_start_skips_failed_prewarm_slot_and_continues(self, tenant):
+        """Round 51 — audited 33 real historical full-job crashes, all with
+        the same "0 results for any URL" signature: BrowserPool.start()'s
+        prewarm loop used to let ANY single instance's launch failure (not
+        just the WebGL data-gap camoufox_wrapper.py's own fallback already
+        handles) propagate straight out of start(), aborting the whole job
+        before any URL was attempted. Prewarming is documented as "purely a
+        latency optimization" (class docstring) — acquire() already
+        launches fresh on-demand when the pool is empty, so one slot's
+        failure must be skipped, not fatal."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            good_ctx_1, good_ctx_2 = object(), object()
+            good_1 = MagicMock()
+            good_1.__aenter__ = AsyncMock(return_value=good_ctx_1)
+            failing = MagicMock()
+            failing.__aenter__ = AsyncMock(side_effect=RuntimeError("launch boom"))
+            good_2 = MagicMock()
+            good_2.__aenter__ = AsyncMock(return_value=good_ctx_2)
+            mock_cw.side_effect = [good_1, failing, good_2]
+
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=3)
+            await pool.start()  # must not raise
+
+        assert pool._started is True
+        assert len(pool._active_wrappers) == 2
+        assert pool._pool.qsize() == 2
+
+    async def test_start_survives_every_prewarm_slot_failing(self, tenant):
+        """Degrades all the way to zero hot instances rather than crashing
+        the job — acquire() building fresh on-demand is the documented
+        fallback for exactly this case."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            failing = MagicMock()
+            failing.__aenter__ = AsyncMock(side_effect=RuntimeError("launch boom"))
+            mock_cw.return_value = failing
+
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=2)
+            await pool.start()  # must not raise
+
+        assert pool._started is True
+        assert pool._active_wrappers == []
+        assert pool._pool.qsize() == 0
+
+    async def test_start_still_raises_on_prewarm_count_misconfiguration(self, tenant):
+        """The prewarm_count > max_total_instances check is a real
+        misconfiguration, not a per-instance launch failure — must still
+        raise, and must raise before attempting any launch (nothing to
+        clean up)."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=5, max_total_instances=2)
+            with pytest.raises(ValueError, match="exceeds"):
+                await pool.start()
+
+        mock_cw.assert_not_called()
+
 
 class TestSessionIsolation:
     """Session load/save wired into CamoufoxWrapper constructor + lease() boundary.
