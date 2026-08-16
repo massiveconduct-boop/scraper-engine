@@ -93,6 +93,14 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   binary in CI — but fully exercised locally where Camoufox is real).
   ruff/mypy clean.
 
+  **Live-confirmed by research_agent** (peer session, real production
+  retraffic, same-day): re-ran the identical 33-URL batch that hit the
+  crash 3/3 times before this fix — 0 WebGL crashes this run. Successful
+  scrapes went from 2/33 to 10/33 on the same batch (the remaining 23
+  failures were ordinary timeout/detection_block, not this bug). Real
+  external confirmation the fix works, not just unit tests + local
+  reproduction.
+
 ## Technical Debt / Open Threads (as of round 49)
 
 - **RESOLVED (round 49) — `free_first` only fell back to the paid gateway
