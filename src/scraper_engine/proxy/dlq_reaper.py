@@ -228,15 +228,31 @@ async def _reap_tenant(
     cfg: DlqReaperConfig,
     tier_config: ProxyTierConfig,
 ) -> int:
+    """Round 54 — one combined `list_retryable(tenant, _TRANSIENT_CATEGORIES,
+    ..., limit=batch_size_per_tenant)` call used to select the batch's
+    entries globally oldest-first across ALL categories, not per category.
+    Live-caught against real research_agent data: 19 identical CIRCUIT_OPEN
+    entries for the same test URL (dead since 2026-08-13, never eligible —
+    that domain's circuit never actually recovers because nothing real
+    ever hits it again) permanently occupied every one of the batch's 20
+    slots, every single cycle, since they're always the oldest. Real
+    BROWSER_CRASH/PROXY_EXHAUSTED/NETWORK_TIMEOUT/CIRCUIT_OPEN entries for
+    actual domains — some plausibly eligible right then (tier pool state
+    was HEALTHY) — never even got checked; `periodic_dlq_reap_cycle:
+    retried=0` for 10+ consecutive real cycles was the live symptom, not a
+    coincidence. Querying each category separately, each with its own full
+    `batch_size_per_tenant` budget, means one category's backlog (however
+    large, however permanently stuck) can never starve the others."""
     dlq = DeadLetterQueue(pg)
-    candidates = await dlq.list_retryable(
-        tenant, _TRANSIENT_CATEGORIES, cfg.max_auto_retries, limit=cfg.batch_size_per_tenant
-    )
     retried = 0
-    for entry in candidates:
-        if await _is_eligible(entry, redis, circuit_breaker, tier_config):
-            await _retry_entry(pg, dlq, tenant, entry, queue)
-            retried += 1
+    for category in _TRANSIENT_CATEGORIES:
+        candidates = await dlq.list_retryable(
+            tenant, [category], cfg.max_auto_retries, limit=cfg.batch_size_per_tenant
+        )
+        for entry in candidates:
+            if await _is_eligible(entry, redis, circuit_breaker, tier_config):
+                await _retry_entry(pg, dlq, tenant, entry, queue)
+                retried += 1
     return retried
 
 

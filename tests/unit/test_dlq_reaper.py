@@ -334,9 +334,18 @@ class TestReapTenant:
         eligible = make_entry(job_id="job-eligible")
         ineligible = make_entry(job_id="job-ineligible")
 
+        dlq_instance = AsyncMock()
+
+        async def fake_list_retryable(tenant_arg, categories, max_retries, limit):
+            # Round 54 — one category's candidates only, matching the real
+            # per-category call shape now that starvation is fixed.
+            if categories == [dlq_reaper._TRANSIENT_CATEGORIES[0]]:
+                return [eligible, ineligible]
+            return []
+
+        dlq_instance.list_retryable = fake_list_retryable
         monkeypatch.setattr(
-            "scraper_engine.proxy.dlq_reaper.DeadLetterQueue",
-            lambda pg: AsyncMock(list_retryable=AsyncMock(return_value=[eligible, ineligible])),
+            "scraper_engine.proxy.dlq_reaper.DeadLetterQueue", lambda pg: dlq_instance
         )
 
         async def fake_is_eligible(entry, redis_arg, cb_arg, tier_config_arg):
@@ -356,6 +365,63 @@ class TestReapTenant:
 
         assert count == 1
         assert retried_jobs == ["job-eligible"]
+
+    @pytest.mark.asyncio
+    async def test_one_categorys_backlog_does_not_starve_another(self, tenant, monkeypatch):
+        """Round 54 — live-caught: 19 identical stale CIRCUIT_OPEN entries
+        for the same never-retried test URL permanently occupied every
+        slot of a single combined oldest-first batch, so real
+        BROWSER_CRASH/PROXY_EXHAUSTED entries for actual domains never
+        even got checked (periodic_dlq_reap_cycle: retried=0 for 10+
+        consecutive real cycles). Each category must get its own query, so
+        a saturated one can't block the others."""
+        redis = AsyncMock()
+        cb = AsyncMock()
+        queue = MagicMock()
+        cfg = DlqReaperConfig(max_auto_retries=3, batch_size_per_tenant=20)
+
+        stale_circuit_open = [
+            make_entry(job_id=f"stale-{i}", category=dlq_reaper._TRANSIENT_CATEGORIES[1])
+            for i in range(19)
+        ]
+        real_browser_crash = make_entry(
+            job_id="real-crash", category=dlq_reaper._TRANSIENT_CATEGORIES[2]
+        )
+
+        dlq_instance = AsyncMock()
+
+        async def fake_list_retryable(tenant_arg, categories, max_retries, limit):
+            if categories == [dlq_reaper._TRANSIENT_CATEGORIES[1]]:  # CIRCUIT_OPEN
+                return stale_circuit_open
+            if categories == [dlq_reaper._TRANSIENT_CATEGORIES[2]]:  # BROWSER_CRASH
+                return [real_browser_crash]
+            return []
+
+        dlq_instance.list_retryable = fake_list_retryable
+        monkeypatch.setattr(
+            "scraper_engine.proxy.dlq_reaper.DeadLetterQueue", lambda pg: dlq_instance
+        )
+
+        # The stale circuit-open entries never actually become eligible
+        # (their circuit never recovers — nothing real ever hits that
+        # domain again); the real browser-crash entry's tier is healthy.
+        async def fake_is_eligible(entry, redis_arg, cb_arg, tier_config_arg):
+            return entry.job_id == "real-crash"
+
+        monkeypatch.setattr("scraper_engine.proxy.dlq_reaper._is_eligible", fake_is_eligible)
+        retried_jobs = []
+
+        async def fake_retry_entry(pg_arg, dlq_arg, tenant_arg, entry_arg, queue_arg):
+            retried_jobs.append(entry_arg.job_id)
+
+        monkeypatch.setattr("scraper_engine.proxy.dlq_reaper._retry_entry", fake_retry_entry)
+
+        pg = AsyncMock()
+        tier_config = ProxyTierConfig()
+        count = await dlq_reaper._reap_tenant(pg, redis, cb, queue, tenant, cfg, tier_config)
+
+        assert count == 1
+        assert retried_jobs == ["real-crash"]
 
 
 class TestReapCycle:
