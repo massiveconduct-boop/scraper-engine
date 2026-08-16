@@ -32,6 +32,36 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 47)
+
+- **RESOLVED (round 47) — DataImpulse paid-gateway `enabled`/`strategy`
+  were the only hardcoded, non-overridable settings in the whole config
+  file; a consuming service couldn't turn the gateway on at all.**
+  Reported by a developer on `research_agent` (a separate service that
+  calls this one over HTTP): its container has no bind-mounted source and
+  no visibility into this repo's `docker-compose.yml`, so it can't edit
+  scraper_engine's code or compose file directly — DataImpulse credentials
+  were already reaching the container via env (`.env`'s `env_file:`
+  passthrough, `docker-compose.yml`), but `config/base.yaml`'s
+  `dataimpulse.enabled: false` / `strategy: free_only` were literal YAML
+  values, not `${VAR}` placeholders — every other setting in that file
+  already used the `${VAR:default}` pattern (`storage.database_url`,
+  `s3.*`, `observability.otlp_endpoint`, `ops_webhook_url`), these two
+  were the sole exception. No amount of container env could reach them
+  short of editing the YAML and rebuilding the image, which a
+  source-blind consumer structurally can't do. Fixed: both fields now
+  read `${DATAIMPULSE_ENABLED:false}` / `${DATAIMPULSE_STRATEGY:free_only}`
+  (`config/base.yaml`, `config/schema.py::DataImpulseConfig` docstring
+  updated to match). Live-verified via `load_config()` directly: unset env
+  → `enabled=False, strategy='free_only'` (unchanged default, confirming
+  no behavior regression); `DATAIMPULSE_ENABLED=true` +
+  `DATAIMPULSE_STRATEGY=paid_only` → `enabled=True, strategy='paid_only'`
+  actually took effect, no rebuild. `.env.example` gained a full
+  DataImpulse section (previously had none at all — a separate
+  documentation gap on top of the config one) explaining credentials
+  alone don't turn anything on, `DATAIMPULSE_ENABLED` is the real switch.
+  877 passed, 100.00% coverage, ruff/mypy clean.
+
 ## Technical Debt / Open Threads (as of round 46)
 
 - **RESOLVED (round 46) — full accounting of all 12 detection_block

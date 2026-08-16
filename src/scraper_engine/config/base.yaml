@@ -114,9 +114,23 @@ proxy_tiers:
 # config/schema.py::DataImpulseConfig and proxy/paid_gateway.py. Credentials
 # (DATAIMPULSE_PROXY_HOST/DATAIMPULSE_PORT/DATAIMPULSE_USERNAME/
 # DATAIMPULSE_PASSWORD) are read from the environment directly, never here.
+#
+# Round 47 — enabled/strategy moved to ${VAR:default} placeholders (same
+# pattern every other setting on this page already uses). Before this,
+# these two were the only literal, non-overridable values in the whole
+# file — a caller who wanted the paid gateway on had no way to turn it on
+# short of editing this YAML and rebuilding the image. Consuming services
+# (e.g. research_agent) that only set container env vars, with no source
+# bind-mount and no visibility into this repo's compose file, were stuck
+# even though DataImpulse credentials were already reaching the container
+# via env. Now DATAIMPULSE_ENABLED=true/DATAIMPULSE_STRATEGY=paid_only (or
+# free_first) in the api/worker containers' env is enough — no image
+# rebuild, no file edit. loader.py's env-var resolution runs on raw
+# strings; pydantic's default (non-strict) bool validation accepts
+# "true"/"false" case-insensitively for the `enabled` field.
 dataimpulse:
-  enabled: false
-  strategy: free_only  # free_only | paid_only | free_first
+  enabled: "${DATAIMPULSE_ENABLED:false}"
+  strategy: "${DATAIMPULSE_STRATEGY:free_only}"  # free_only | paid_only | free_first
 
 politeness:
   default_concurrency: 2

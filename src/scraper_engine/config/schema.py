@@ -279,7 +279,15 @@ class DataImpulseConfig(BaseModel):
     gateway itself and orchestrator/worker.py::_fetch_with_proxy for the
     strategy branch. Host/port/credentials are deliberately NOT here — same
     split as CapSolverConfig: tuning lives in config, secrets are read
-    directly via os.environ.get() in the provider's own factory function."""
+    directly via os.environ.get() in the provider's own factory function.
+
+    Round 47 — both fields below are ${VAR:default} placeholders in
+    base.yaml (DATAIMPULSE_ENABLED / DATAIMPULSE_STRATEGY), not literal
+    values, so a deployment can flip this purely via container env — no
+    source edit, no image rebuild. Fixes a real gap: a consuming service
+    with credentials already reaching its container via env had no way to
+    actually turn the gateway on, since this was previously the one
+    hardcoded, non-overridable setting in the whole config file."""
 
     enabled: bool = False
     # free_only: unchanged today's behavior. paid_only: L2/L3 skip the scored
