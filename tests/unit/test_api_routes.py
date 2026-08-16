@@ -135,6 +135,55 @@ async def test_scrape_job_timeout_scales_with_url_count(wired_scrape_deps):
 
 
 @pytest.mark.asyncio
+async def test_scrape_enqueue_failure_marks_job_failed_not_orphaned_pending(wired_scrape_deps):
+    """Round 54 — live-caught: 17 real research_agent jobs stuck at PENDING
+    for days, none with a matching rq:job:* Redis key, because the INSERT
+    above and .enqueue() below are two separate operations — a transient
+    Redis error here used to leave the row committed as PENDING with
+    nothing ever actually queued, invisible to both the caller (who just
+    saw a 500) and stuck_job_reaper (which only looked at PROCESSING).
+    Must now mark the row FAILED and tell the caller plainly."""
+    from scraper_engine.core.models import ScrapeRequest
+
+    pg, redis, queue = wired_scrape_deps
+    queue.enqueue.side_effect = RuntimeError("redis connection reset")
+    request = ScrapeRequest(urls=["http://example.com"])
+
+    with pytest.raises(HTTPException) as ei:
+        await scrape(request, x_api_key="sk-admin")
+
+    assert ei.value.status_code == 503
+    update_call = next(
+        c
+        for c in pg.execute.await_args_list
+        if "UPDATE scrape_jobs SET status" in c.args[1]
+    )
+    assert update_call.args[2] == JobStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_crawl_enqueue_failure_marks_job_failed_not_orphaned_pending(wired_scrape_deps):
+    """Same fix as the /v1/scrape case above, applied to /v1/crawl's own
+    separate enqueue call site."""
+    from scraper_engine.core.models import CrawlRequest
+
+    pg, redis, queue = wired_scrape_deps
+    queue.enqueue.side_effect = RuntimeError("redis connection reset")
+    request = CrawlRequest(spider_name="titles", start_urls=["http://example.com"])
+
+    with pytest.raises(HTTPException) as ei:
+        await crawl(request, x_api_key="sk-admin")
+
+    assert ei.value.status_code == 503
+    update_call = next(
+        c
+        for c in pg.execute.await_args_list
+        if "UPDATE scrape_jobs SET status" in c.args[1]
+    )
+    assert update_call.args[2] == JobStatus.FAILED.value
+
+
+@pytest.mark.asyncio
 async def test_crawl_enqueues_with_crawl_job_type(wired_scrape_deps):
     from scraper_engine.core.models import CrawlRequest
 

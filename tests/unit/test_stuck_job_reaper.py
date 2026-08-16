@@ -97,6 +97,59 @@ class TestReconcileTenant:
         pg.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_reconciles_pending_job_rq_never_enqueued(self, tenant, cfg, monkeypatch):
+        """Round 54 — a PENDING row whose enqueue() call raised (transient
+        Redis error, or the process dying between the INSERT and the
+        enqueue) never gets an rq job record at all. Must be reconciled the
+        same as a hard-killed PROCESSING job, not left invisible forever."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = [{"job_id": "pending-job-1", "webhook_url": None}]
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value=None))
+
+        reconciled, still_processing = await stuck_job_reaper._reconcile_tenant(
+            pg, redis, tenant, cfg
+        )
+
+        assert reconciled == 1
+        assert still_processing == 0
+
+    @pytest.mark.asyncio
+    async def test_leaves_genuinely_queued_pending_job_alone(self, tenant, cfg, monkeypatch):
+        """A PENDING row that WAS actually enqueued (rq shows it queued,
+        legitimately waiting under real backlog) must not be touched — only
+        a row rq has no record of, or reports terminal, is reconcilable."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = [{"job_id": "pending-job-1", "webhook_url": None}]
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="queued"))
+
+        reconciled, still_processing = await stuck_job_reaper._reconcile_tenant(
+            pg, redis, tenant, cfg
+        )
+
+        assert reconciled == 0
+        assert still_processing == 1
+        pg.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_query_covers_both_pending_and_processing_grace_windows(
+        self, tenant, cfg, monkeypatch
+    ):
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = []
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value=None))
+
+        await stuck_job_reaper._reconcile_tenant(pg, redis, tenant, cfg)
+
+        query_args = pg.fetch.await_args.args
+        assert query_args[2] == JobStatus.PROCESSING.value
+        assert query_args[3] == stuck_job_reaper._STALE_PROCESSING_GRACE_SECONDS
+        assert query_args[4] == JobStatus.PENDING.value
+        assert query_args[5] == stuck_job_reaper._STALE_PENDING_GRACE_SECONDS
+
+    @pytest.mark.asyncio
     async def test_dispatches_webhook_when_configured(self, tenant, cfg, monkeypatch):
         pg = AsyncMock()
         redis = AsyncMock()

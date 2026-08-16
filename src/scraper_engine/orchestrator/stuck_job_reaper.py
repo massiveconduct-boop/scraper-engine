@@ -1,6 +1,6 @@
 # orchestrator/stuck_job_reaper.py
 """Long-running supervisor that reconciles scrape_jobs rows stuck at
-PROCESSING forever (round 52).
+PROCESSING (round 52) or PENDING (round 54) forever.
 
 Root cause (confirmed against the real installed rq 2.10 source, not
 guessed): rq enforces job_timeout via an in-process SIGALRM
@@ -33,6 +33,25 @@ for that job_id, and reconciles our DB (firing the tenant's webhook
 through the same durable-outbox path tasks.py itself uses) whenever rq's
 bookkeeping disagrees with ours.
 
+Round 54 — while digging deeper into research_agent's logs the same way,
+found a second, distinct stuck-forever shape: 17 real jobs stuck at
+PENDING, some for 5+ days, none with a matching `rq:job:*` Redis key at
+all. Root cause: `api/routes.py`'s job INSERT and its `_queue.enqueue()`
+call are two separate operations, not one transaction — a transient Redis
+error (or anything else raising) between them left the row committed as
+PENDING with nothing ever actually queued, invisible to this reaper
+before this round (which only ever looked at PROCESSING) and to the
+caller, who'd just see a 500 with no way to know whether the job existed.
+`api/routes.py` now catches that exception at the source and marks the
+row FAILED immediately going forward (see its own round-54 comment); this
+reaper's broadened PENDING sweep is the defense-in-depth half — it also
+catches the case a try/except at the API layer structurally cannot: the
+process getting killed at the exact instant between the INSERT committing
+and the enqueue call running. Same reconciliation logic as PROCESSING
+handles this correctly already (rq has no record at all of a job that was
+never enqueued, which is already one of the two conditions this reaper
+treats as reconcilable) — only the SQL candidate query needed to widen.
+
 ``python -m scraper_engine.orchestrator.stuck_job_reaper`` is the entry
 point docker-compose.yml's stuck-job-reaper program (docker/
 supervisord.conf) runs.
@@ -61,7 +80,13 @@ SWEEP_INTERVAL_SECONDS = 60
 # again the moment it finishes — a genuinely fast job could legitimately
 # still be inside this window. Only reconcile rows well past ordinary
 # completion time; never touch a row that might just be mid-flight.
-_STALE_GRACE_SECONDS = 120
+_STALE_PROCESSING_GRACE_SECONDS = 120
+# PENDING rows can legitimately sit longer under real queue backlog (3
+# workers pulling from one shared queue) before a worker even starts them
+# — more generous than the PROCESSING grace above, which only needs to
+# tolerate the time between a worker picking a job up and its first DB
+# write, not an entire wait-in-line.
+_STALE_PENDING_GRACE_SECONDS = 300
 _RQ_TERMINAL_STATUSES = {"failed", "finished", "stopped", "canceled"}
 
 
@@ -83,9 +108,12 @@ async def _reconcile_tenant(
     rows = await pg.fetch(
         tenant,
         """SELECT job_id, webhook_url FROM scrape_jobs
-           WHERE status = $1 AND updated_at < NOW() - make_interval(secs => $2)""",
+           WHERE (status = $1 AND updated_at < NOW() - make_interval(secs => $2))
+              OR (status = $3 AND updated_at < NOW() - make_interval(secs => $4))""",
         JobStatus.PROCESSING.value,
-        _STALE_GRACE_SECONDS,
+        _STALE_PROCESSING_GRACE_SECONDS,
+        JobStatus.PENDING.value,
+        _STALE_PENDING_GRACE_SECONDS,
     )
     reconciled = 0
     still_processing = 0

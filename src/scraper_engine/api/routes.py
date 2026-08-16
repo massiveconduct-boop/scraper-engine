@@ -204,15 +204,40 @@ async def scrape(
         )
 
         if _queue is not None:
-            _queue.enqueue(
-                "scraper_engine.orchestrator.tasks.run_scrape_job",
-                str(tenant_id),
-                job_id,
-                job_id=job_id,
-                job_timeout=max(
-                    _SCRAPE_JOB_TIMEOUT_SECONDS, valid_count * _PER_URL_TIMEOUT_SECONDS
-                ),
-            )
+            # Round 54 — this INSERT and the enqueue below are two separate
+            # operations, not one transaction. Before this fix, a transient
+            # Redis blip here (or any other exception from .enqueue()) left
+            # the row already committed as PENDING with no corresponding rq
+            # job ever created — invisible to stuck_job_reaper (which only
+            # ever looked at PROCESSING) and to the caller, who'd just see a
+            # 500 and have no way to know whether the job existed. Live-
+            # found: 17 real research_agent jobs stuck at PENDING for days,
+            # none with a matching rq:job:* Redis key. Fail loud and clean
+            # instead: mark the row FAILED so it's not silently orphaned,
+            # and tell the caller plainly that nothing was queued.
+            try:
+                _queue.enqueue(
+                    "scraper_engine.orchestrator.tasks.run_scrape_job",
+                    str(tenant_id),
+                    job_id,
+                    job_id=job_id,
+                    job_timeout=max(
+                        _SCRAPE_JOB_TIMEOUT_SECONDS, valid_count * _PER_URL_TIMEOUT_SECONDS
+                    ),
+                )
+            except Exception:
+                logger.exception("scrape_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
+                await _storage_pg.execute(
+                    tenant_id,
+                    "UPDATE scrape_jobs SET status = $1, updated_at = NOW() "
+                    "WHERE job_id = $2::uuid",
+                    JobStatus.FAILED.value,
+                    job_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Failed to enqueue job — no work was queued, safe to retry",
+                ) from None
 
     return {
         "job_id": job_id,
@@ -371,13 +396,30 @@ async def crawl(
             )
 
         if _queue is not None:
-            _queue.enqueue(
-                "scraper_engine.orchestrator.tasks.run_scrape_job",
-                str(tenant_id),
-                job_id,
-                job_id=job_id,
-                job_timeout=_CRAWL_JOB_TIMEOUT_SECONDS,
-            )
+            # Round 54 — same fix as /v1/scrape above: enqueue isn't atomic
+            # with the INSERT above it, so a transient Redis error here must
+            # not leave this row permanently PENDING with nothing queued.
+            try:
+                _queue.enqueue(
+                    "scraper_engine.orchestrator.tasks.run_scrape_job",
+                    str(tenant_id),
+                    job_id,
+                    job_id=job_id,
+                    job_timeout=_CRAWL_JOB_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("crawl_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
+                await _storage_pg.execute(
+                    tenant_id,
+                    "UPDATE scrape_jobs SET status = $1, updated_at = NOW() "
+                    "WHERE job_id = $2::uuid",
+                    JobStatus.FAILED.value,
+                    job_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Failed to enqueue job — no work was queued, safe to retry",
+                ) from None
 
     return {
         "job_id": job_id,

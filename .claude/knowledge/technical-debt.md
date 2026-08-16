@@ -32,6 +32,60 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 54)
+
+- **RESOLVED (round 54, deploy pending) — 17 real research_agent jobs
+  stuck at `scrape_jobs.status = PENDING` forever, going back to
+  2026-08-09, none with a matching `rq:job:*` Redis key at all.** User
+  asked to keep digging the log for more issues; found this while
+  checking whether research_agent had any active jobs before redeploying
+  round 53's fix (their answer: yes, one running — so this round's fix is
+  tested and committed but its deploy is held pending their go-ahead,
+  matching explicit user instruction not to rebuild/restart containers
+  mid-job).
+
+  **Root cause**: `api/routes.py`'s `POST /v1/scrape` and `POST /v1/crawl`
+  each INSERT the `scrape_jobs` row, then separately call
+  `_queue.enqueue(...)` — two operations, not one transaction, with no
+  error handling around the second. A transient Redis error (or the
+  process dying at exactly that moment) between them left the row already
+  committed as PENDING with nothing ever actually queued — invisible to
+  the caller (who'd just see an unexplained 500) and to round 52's
+  `stuck_job_reaper` (which only ever looked at PROCESSING). Confirmed via
+  Redis: sampled several of the 17 stuck job_ids, zero had any
+  `rq:job:*` hash — proof they were never enqueued, not that rq lost
+  track of them later.
+
+  **Fix, two layers**:
+  1. `api/routes.py` — both enqueue call sites now catch the exception,
+     mark the just-inserted row `FAILED` immediately, and return a clean
+     `503` telling the caller nothing was queued and it's safe to retry —
+     closes the forward-going gap at the source.
+  2. `orchestrator/stuck_job_reaper.py` — broadened to also sweep stale
+     `PENDING` rows (own, more generous 300s grace vs PROCESSING's 120s,
+     since a real queue backlog across 3 shared workers can legitimately
+     leave a job PENDING longer than the time between a worker picking a
+     job up and its first DB write). No new reconciliation logic needed —
+     rq reporting no record at all of a job was already one of the two
+     conditions the existing per-row check treats as reconcilable; only
+     the SQL candidate query needed to widen. This is the defense-in-depth
+     half: it also catches the one case a try/except at the API layer
+     structurally cannot — the process getting killed at the exact instant
+     between the INSERT committing and the enqueue call running.
+
+  5 new tests: `tests/unit/test_api_routes.py` (enqueue failure marks
+  FAILED + 503, both endpoints), `tests/unit/test_stuck_job_reaper.py`
+  (PENDING-never-enqueued reconciled, genuinely-queued PENDING left alone,
+  both grace windows passed correctly to the query). 917 passed, 100%
+  coverage, ruff/mypy --strict clean.
+
+  **Not yet live-verified / not yet deployed** — code is committed and
+  fully unit-tested, but a real research_agent job (`8bf56e2c`) was
+  actively PROCESSING when this was ready to ship. Per explicit user
+  instruction, held the rebuild+redeploy and asked research_agent directly
+  whether it was safe to proceed rather than guessing from job staleness
+  alone. See `.wolf/STATUS.md` Next phase for current status of that ask.
+
 ## Technical Debt / Open Threads (as of round 53)
 
 - **RESOLVED (round 53) — 16 real research_agent jobs, including their
