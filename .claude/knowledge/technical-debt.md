@@ -32,6 +32,58 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 55)
+
+- **RESOLVED (round 55) — `dlq_reaper` starved indefinitely: one
+  category's stale backlog permanently blocked every other category from
+  ever being checked, real production impact confirmed.** User said
+  "proceed" after round 54 shipped; continued sweeping for more real
+  issues rather than declaring done. Found it by checking whether
+  `dlq_reaper` (round 34's auto-retry daemon) was actually working post-
+  deploy: `periodic_dlq_reap_cycle: retried=0` for 10+ consecutive real
+  1-minute cycles, despite 616 real DLQ entries across all 4 transient
+  categories (`PROXY_EXHAUSTED` 338, `DETECTION_BLOCK`-adjacent categories
+  excluded — DLQ only holds `_TRANSIENT_CATEGORIES`, `CIRCUIT_OPEN` 76,
+  `BROWSER_CRASH` 12, plus others) and tier pool health showing tier 1/2
+  `HEALTHY` (tier 3 `CRITICAL`, the already-understood free-pool ceiling).
+
+  **Root cause**: `_reap_tenant` selected its entire batch with ONE
+  combined query — `list_retryable(tenant, _TRANSIENT_CATEGORIES, ...,
+  limit=batch_size_per_tenant)`, oldest-`dead_at`-first across all 4
+  categories at once. Directly queried the actual oldest 20 candidates the
+  reaper would fetch: 19 of them were the identical `CIRCUIT_OPEN` entry
+  for the same URL (`https://example.com/a`, obviously test-fixture
+  traffic, not a real target — dead since 2026-08-13), plus one real
+  `CIRCUIT_OPEN` entry for imf.org. That fake URL's circuit never
+  recovers (nothing real ever hits it again to close the breaker), so
+  `_is_eligible` always returns `False` for all 19 — and since they're
+  always the oldest rows, they occupy literally every slot of every
+  cycle's batch, forever. Real `PROXY_EXHAUSTED`/`BROWSER_CRASH`/
+  `NETWORK_TIMEOUT` entries for actual domains — several plausibly
+  eligible right then, given tier 1/2 health — never even got fetched,
+  let alone checked. `_is_eligible` itself was correct the whole time;
+  the bug was purely in candidate selection never reaching real entries.
+
+  **Fix**: `_reap_tenant` now calls `list_retryable` once PER category,
+  each with its own full `batch_size_per_tenant` budget, instead of one
+  shared query across all four. However large or however permanently
+  stuck one category's backlog is, it can no longer prevent the others
+  from being checked every cycle. 2 tests updated/added in
+  `tests/unit/test_dlq_reaper.py::TestReapTenant` — the existing
+  eligibility test adapted to per-category calls, plus a new test
+  reproducing the exact live shape (19 stale same-URL entries in one
+  category, one real entry in another, confirming the real entry still
+  gets retried). 918 passed, 100% coverage, ruff/mypy --strict clean.
+
+  **Live-verified against real production data**: rebuilt and force-
+  recreated all 4 containers (confirmed no research_agent job was
+  in-flight first — this deploy didn't need to interrupt anything, unlike
+  round 54's). First post-deploy cycle: `retried=30` (was `0` every cycle
+  before this fix) — including real, previously-silently-stuck
+  research_agent domains (`nairametrics.com`, `matrixbcg.com`) now
+  actually re-attempting. Second cycle a minute later: also `retried=30`
+  (more of the real backlog working through, not a fluke single spike).
+
 ## Technical Debt / Open Threads (as of round 54)
 
 - **RESOLVED (round 54) — 17 real research_agent jobs
