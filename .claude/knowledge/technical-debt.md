@@ -32,6 +32,67 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 50)
+
+- **RESOLVED (round 50) — `fingerprint_preset=True` (round 46) could crash
+  an ENTIRE job on a real fingerprint pick whose WebGL vendor/renderer
+  camoufox's own separate data table doesn't cover.** Reported by
+  `research_agent` (peer session) with concrete evidence: job
+  `c1541d20-a33d-4a48-a3bc-8b04eac27d69` (8 URLs, all came back
+  `url_missing_from_results` — the job errored before producing a single
+  result) crashed with `ValueError: No WebGL data found for vendor "Intel
+  Open Source Technology Center" and renderer "Intel(R) HD Graphics 400,
+  or similar"` at `camoufox/webgl/sample.py:50`. A second vendor/renderer
+  (`NVIDIA Corporation`/`NVIDIA GeForce 8800 GTX`) hit the same code path
+  as a contained per-URL DLQ entry instead (job `67c4cd15`), and a third
+  (`Mesa`/`Radeon HD 5850`) was reported in a same-day follow-up — three
+  distinct real combos across two runs, confirming this is a real
+  percentage of the fingerprint pool, not a rare edge case.
+
+  **Root-caused against the actual installed camoufox source, not
+  guessed**: `fingerprint_preset=True` samples a random REAL captured
+  fingerprint from camoufox's 312-preset bundle
+  (`fingerprint-presets-v150.json`); when that preset already carries a
+  pinned `(vendor, renderer)`, `camoufox/utils.py`'s `launch_options()`
+  passes it straight to `camoufox/webgl/sample.py::sample_webgl(os,
+  vendor, renderer)` to fetch ADDITIONAL WebGL parameters from a
+  SEPARATE, smaller SQLite table (`webgl_data.db`) — and some real
+  presets' vendor/renderer simply isn't a row in that table at all,
+  raising a bare `ValueError`. Confirmed the no-vendor/no-renderer path
+  (`sample_webgl(os)` alone, used when no preset is active) can never hit
+  this — it only randomly samples among rows that provably exist. A
+  genuine gap between camoufox's own two internal datasets, not something
+  our config controls or misconfigured.
+
+  **Fix — same pattern as round 37's `InvalidIP` geoip fallback**:
+  `CamoufoxWrapper._launch_with_geoip_fallback()` (`browser/
+  camoufox_wrapper.py`) now retries with `fingerprint_preset=False`
+  (Camoufox's default synthetic/BrowserForge generation, unaffected by
+  this specific gap) on a `ValueError` matching this shape (message-
+  scoped, so an unrelated `ValueError` still propagates immediately, not
+  masked). Restructured the whole function into a bounded 3-attempt loop
+  so `InvalidIP` and the WebGL gap can each be spent at most once and can
+  stack in the same launch (e.g. `InvalidIP` on attempt 1, WebGL gap on
+  the geoip-disabled retry, succeeding on attempt 3 with both disabled) —
+  previously the geoip fallback was a single hardcoded one-shot retry
+  with no room for a second, different failure type.
+
+  This was a fatal gap specifically for `BrowserPool.start()`'s prewarm
+  loop (`browser/pool.py`), which launches instances OUTSIDE
+  `process_job`'s per-URL try/except — a crash there kills the whole RQ
+  job before any URL is even attempted, exactly matching the
+  `url_missing_from_results` symptom. A lease-time cold-start crash (mid-
+  job) was already correctly contained to a single DLQ'd URL by the
+  existing per-URL try/except — that half was never broken.
+
+  5 new tests (`TestCamoufoxWrapperGeoipFallback` in `tests/unit/
+  test_browser.py`): successful fallback, defensive re-raise when
+  `fingerprint_preset` is already `False`, an unrelated `ValueError`
+  propagating unmasked, and both fallbacks stacking in one launch. 895
+  passed (`browser/` not part of the 100% CI gate — no real Firefox
+  binary in CI — but fully exercised locally where Camoufox is real).
+  ruff/mypy clean.
+
 ## Technical Debt / Open Threads (as of round 49)
 
 - **RESOLVED (round 49) — `free_first` only fell back to the paid gateway

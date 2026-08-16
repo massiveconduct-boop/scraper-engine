@@ -509,6 +509,119 @@ class TestCamoufoxWrapperGeoipFallback:
         camoufox_ctor.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_launch_falls_back_without_fingerprint_preset_on_webgl_data_gap(
+        self, tenant, caplog
+    ):
+        """Round 49 — live-caught: fingerprint_preset=True samples a real
+        captured fingerprint whose (vendor, renderer) isn't covered by
+        camoufox's separate webgl_data.db lookup table
+        (camoufox/webgl/sample.py::sample_webgl, verified against the
+        actual installed package source) — a genuine gap between camoufox's
+        two internal datasets, not something our config controls. Before
+        this, it crashed the ENTIRE job (BrowserPool.start()'s prewarm loop
+        runs outside process_job's per-URL try/except)."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError(
+                'No WebGL data found for vendor "Intel Open Source Technology Center" '
+                'and renderer "Intel(R) HD Graphics 400, or similar"'
+            )
+        )
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["fingerprint_preset"] is True
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is False
+        for call in camoufox_ctor.call_args_list:
+            assert call.kwargs["geoip"] is True
+
+    @pytest.mark.asyncio
+    async def test_launch_reraises_webgl_error_when_fingerprint_preset_already_disabled(
+        self, tenant
+    ):
+        """Defensive: fingerprint_preset=False means no pinned vendor/
+        renderer is ever passed to sample_webgl, so this shouldn't fire in
+        practice — but if it somehow does, there's no further fallback."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, fingerprint_preset=False)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(ValueError, match="No WebGL data found"),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_unrelated_value_error_propagates_without_fallback(self, tenant):
+        """A ValueError that isn't the WebGL-data-gap shape must not
+        trigger the fallback — proves the message-match is scoped, not a
+        blanket "retry on any ValueError" that would mask unrelated bugs."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=ValueError("some unrelated error"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(ValueError, match="some unrelated error"),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_across_both_invalid_ip_and_webgl_gap(self, tenant):
+        """Both fallbacks can stack in one launch — InvalidIP on the first
+        attempt, then a WebGL data-gap on the retry, succeeding on the
+        third attempt with both geoip and fingerprint_preset disabled."""
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        first = MagicMock()
+        first.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        second = MagicMock()
+        second.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        third = MagicMock()
+        third.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[first, second, third])
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 3
+        assert camoufox_ctor.call_args_list[2].kwargs["geoip"] is False
+        assert camoufox_ctor.call_args_list[2].kwargs["fingerprint_preset"] is False
+
+    @pytest.mark.asyncio
     async def test_launch_includes_credentials_when_proxy_has_them(self, tenant):
         """Round 40 — a paid-gateway Proxy (proxy/paid_gateway.py) carries
         username/password; the launch's proxy dict must forward them
