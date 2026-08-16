@@ -34,7 +34,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ## Technical Debt / Open Threads (as of round 54)
 
-- **RESOLVED (round 54, deploy pending) — 17 real research_agent jobs
+- **RESOLVED (round 54) — 17 real research_agent jobs
   stuck at `scrape_jobs.status = PENDING` forever, going back to
   2026-08-09, none with a matching `rq:job:*` Redis key at all.** User
   asked to keep digging the log for more issues; found this while
@@ -79,12 +79,26 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   both grace windows passed correctly to the query). 917 passed, 100%
   coverage, ruff/mypy --strict clean.
 
-  **Not yet live-verified / not yet deployed** — code is committed and
-  fully unit-tested, but a real research_agent job (`8bf56e2c`) was
-  actively PROCESSING when this was ready to ship. Per explicit user
-  instruction, held the rebuild+redeploy and asked research_agent directly
-  whether it was safe to proceed rather than guessing from job staleness
-  alone. See `.wolf/STATUS.md` Next phase for current status of that ask.
+  **Deploy held, then live-verified, per explicit user instruction not to
+  interrupt research_agent's in-flight job.** Asked research_agent
+  directly rather than guessing from job staleness alone; they confirmed
+  their job, offered to wait for their own client-side timeout (~11 min)
+  or proceed immediately (their client treats a cut job the same as any
+  timeout — logs it, retries next pass, no real harm either way). Chose to
+  wait for the clean option since it cost nothing; watched the job
+  complete, then found they'd already started a new one (a continuous
+  4-batch run with no natural gap) — asked again, they said proceed
+  regardless, cutting one is harmless. Deployed. **Live-verified real
+  production reconciliation is broader than initially scoped**: the very
+  first sweep cycle (fires immediately on daemon startup, before the
+  first 60s sleep) reconciled all 17 research_agent PENDING rows AND 14
+  more from a completely different tenant (`retestclient`) with the exact
+  same signature (`rq_status=None`) — confirming this was a general,
+  tenant-agnostic gap in `/v1/scrape`/`/v1/crawl`, not something specific
+  to research_agent's usage pattern. `research_agent.scrape_jobs` status
+  breakdown immediately after: `COMPLETED=534, FAILED=132, PROCESSING=2`
+  (the 2 being research_agent's own legitimately-still-running continuous
+  batch) — zero `PENDING` anywhere.
 
 ## Technical Debt / Open Threads (as of round 53)
 
