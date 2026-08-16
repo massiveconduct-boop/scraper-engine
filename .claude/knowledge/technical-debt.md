@@ -32,6 +32,81 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 53)
+
+- **RESOLVED (round 53) — 16 real research_agent jobs, including their
+  most recent run, were stuck at `scrape_jobs.status = PROCESSING`
+  forever, invisible to any exception handler in this codebase.** User
+  asked what other crashes exist with full root-cause detail, and
+  specifically what happened in research_agent's most recent run — traced
+  it to job `d9c84d2c-8d42-4584-8075-0bb3291e55f4` (8 URLs, several on the
+  known detection_block-heavy list: thecable.ng, forums.tomsguide.com,
+  allaboutcookies.org, forbes.com — no webhook configured, so
+  research_agent was polling `GET /v1/jobs/{id}` and never got a terminal
+  status).
+
+  **Root-caused against the actual installed `rq` 2.10 source, not
+  guessed.** rq enforces `job_timeout` via an in-process SIGALRM
+  (`UnixSignalDeathPenalty`) inside the forked "work horse" subprocess
+  running `orchestrator/tasks.py::_run_scrape_job` — that raises a
+  catchable `JobTimeoutException` (confirmed: it subclasses `Exception`),
+  which `_run_scrape_job`'s own `except Exception:` block (added rounds
+  31/32) is meant to catch and mark `FAILED`. But `Worker.
+  monitor_work_horse` — running in the PARENT process — has its own
+  second-tier safety net: if the horse hasn't actually exited within
+  `job.timeout + 60s` of that (plausible here: Camoufox/Playwright/Xvfb
+  subprocess waits can hold execution inside a C-level call a Python
+  signal can't interrupt until it returns), the parent sends a real
+  `SIGKILL` to the horse directly (`kill_horse()`). A SIGKILL can't be
+  caught by anything running inside that process — `_run_scrape_job`'s
+  except/finally never runs. Checked whether registering rq's `on_failure`
+  callback would have closed this gap instead: traced
+  `Worker.handle_job_failure` (the path the PARENT takes after a SIGKILL)
+  and confirmed it never calls `job.execute_failure_callback` — that only
+  fires from inside `perform_job`'s in-process except block, the exact
+  path that's already bypassed. So `on_failure` would not have helped
+  here. Live confirmation this is exactly what happened to all 16 stuck
+  jobs: each one's rq Redis hash already showed `status=failed` with an
+  **empty** `worker_name` (the parent-kill signature — a normal in-process
+  failure always populates it) and an `ended_at` roughly `job.timeout +
+  60s` after `started_at` (`d9c84d2c` specifically: started 18:03:42,
+  ended 18:20:42 — 1020s against a 960s timeout).
+
+  **Fix — new reconciliation daemon**, `orchestrator/stuck_job_reaper.py`,
+  same `core/periodic.py::run_periodic` supervisor shape as
+  `webhook_sweeper.py`/`dlq_reaper.py`: every 60s, finds `scrape_jobs` rows
+  stuck at `PROCESSING` for more than 120s (never touches a row that might
+  legitimately still be mid-flight), cross-checks rq's own Redis-side
+  `status` field for that job_id (the one source of truth a hard SIGKILL
+  can't corrupt — the parent's `handle_job_failure` still runs, just not
+  the in-process callback), and reconciles our DB to `FAILED` — firing the
+  tenant's webhook through the same durable-outbox path
+  (`_dispatch_job_webhook`) `tasks.py` itself already uses — whenever rq
+  reports a terminal status (`failed`/`finished`/`stopped`/`canceled`) or
+  has no record of the job at all anymore (an expired `failure_ttl` is
+  treated the same as confirmed-terminal: PROCESSING-forever is a worse
+  outcome than reconciling on that assumption). Wired into
+  `docker/supervisord.conf` as a 4th self-healing daemon (`stuck-job-
+  reaper`) alongside `proxy-harvester`/`dlq-reaper`/`webhook-sweeper`;
+  `docker-compose.yml`/`Dockerfile` comments updated to match (3→4
+  daemons).
+
+  16 new tests (`tests/unit/test_stuck_job_reaper.py`) — reconciliation on
+  a confirmed-terminal rq status, on a vanished rq record, leaving a
+  genuinely-still-running job alone, webhook dispatch (and its failure not
+  blocking the DB reconciliation that already happened), multi-tenant
+  sweep isolation, daemon lifecycle. 912 passed, 100% coverage, ruff/mypy
+  --strict clean.
+
+  **Live-verified against real production data, not a synthetic
+  reproduction**: rebuilt and force-recreated all 4 containers, confirmed
+  `stuck-job-reaper` running under `supervisorctl status`, then watched
+  its actual first live sweep cycle reconcile all 16 real stuck
+  `research_agent` jobs in one pass (`periodic_stuck_job_reap_cycle:
+  reconciled=16 still_processing=0`), including `d9c84d2c` — confirmed via
+  direct query afterward: `scrape_jobs WHERE status='PROCESSING'` returns
+  zero rows tenant-wide.
+
 ## Technical Debt / Open Threads (as of round 52)
 
 - **RESOLVED (round 52) — BrowserPool.start()'s prewarm loop had zero fault

@@ -1,8 +1,9 @@
 services:
-  # Runs the api process plus the 3 self-healing daemons (proxy-harvester,
-  # dlq-reaper, webhook-sweeper) together under supervisord (see
-  # docker/supervisord.conf) -- one container to start instead of 4
-  # separate services an operator has to remember to bring up. Each daemon
+  # Runs the api process plus the 4 self-healing daemons (proxy-harvester,
+  # dlq-reaper, webhook-sweeper, stuck-job-reaper) together under
+  # supervisord (see docker/supervisord.conf) -- one container to start
+  # instead of 5 separate services an operator has to remember to bring
+  # up. Each daemon
   # crash-restarts independently; `restart: unless-stopped` + the
   # healthcheck below are the last-resort recovery if supervisord itself dies.
   api:

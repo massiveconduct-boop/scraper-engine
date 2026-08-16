@@ -114,8 +114,8 @@ RUN pip install --no-cache-dir --no-deps .
 ENV PYTHONUNBUFFERED=1
 ENV APP_ENV=production
 EXPOSE 8000 9090
-# supervisord runs api + the 3 self-healing daemons (proxy-harvester,
-# dlq-reaper, webhook-sweeper) together as one container — see
+# supervisord runs api + the 4 self-healing daemons (proxy-harvester,
+# dlq-reaper, webhook-sweeper, stuck-job-reaper) together as one container — see
 # docker/supervisord.conf. worker-l1/l2/l3 and migrate override this CMD
 # via their own `command:` in docker-compose.yml, so they're unaffected.
 # Copied to supervisorctl's default config search path (rather than left
