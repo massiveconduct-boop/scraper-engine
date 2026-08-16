@@ -32,7 +32,49 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 47)
+## Technical Debt / Open Threads (as of round 48)
+
+- **RESOLVED (round 48) — audited the rest of `config/base.yaml` for the
+  same "hardcoded literal, no env override" bug round 47 fixed for
+  DataImpulse; found and fixed 2 more real matches, judged the rest
+  low-value/higher-risk and left them alone.** User asked "what other
+  parts of the codebase need the same thing... we need to expose features
+  to users" after round 47.
+
+  **Fixed — same pattern, same fix:**
+  - `levels.level_2.capsolver_enabled` / `levels.level_3.capsolver_enabled`
+    — literal `true`, gated whether CAPTCHA-solving (real spend,
+    `CAPSOLVER_API_KEY`'s $1.00/day ceiling per BD-03) ran at all, with no
+    way to turn it off short of a rebuild. Both now read a single shared
+    `${CAPSOLVER_ENABLED:true}` placeholder (one on/off decision across
+    both levels — no known case for wanting L2 on, L3 off independently).
+  - `botasaurus.l1_ja3_client_enabled` — literal `false`, a real opt-in
+    feature (brand-new L1 JA3-fingerprint code path, no live-traffic
+    validation yet per its own docstring) with no way to opt in short of a
+    rebuild. Now `${BOTASAURUS_L1_JA3_CLIENT_ENABLED:false}`.
+  - Live-verified via `load_config()`: unset env keeps both unchanged
+    defaults (`capsolver_enabled=True` x2, `l1_ja3_client_enabled=False`);
+    setting `CAPSOLVER_ENABLED=false` + `BOTASAURUS_L1_JA3_CLIENT_ENABLED=
+    true` actually flipped both, no rebuild. `.env.example` documents both.
+    877 passed, 100.00% coverage, ruff/mypy clean.
+
+  **Deliberately NOT converted — judgment call, not oversight.** The rest
+  of `base.yaml` (`politeness.*`, `circuit_breaker.*`,
+  `proxy_tiers.allow_tier*_fallback_for_tier*`/`*_below_count`,
+  `pgbouncer.*`, `session_retention.*`, `dlq_reaper.*`,
+  `observability.metrics_enabled`/`tracing_enabled`,
+  `ssrf_guard.additional_denied_cidrs`) are internal reliability/ops
+  tuning knobs, not capability toggles — they don't share round 47/48's
+  actual bug pattern (a real feature or spend decision, gated behind a
+  literal a caller legitimately wants to flip). They also carry real
+  misconfiguration risk if exposed to an external caller who doesn't know
+  this system's internals — e.g. an aggressively low
+  `circuit_breaker.cooldown_seconds` or `pgbouncer.max_client_conn` set by
+  a well-meaning but uninformed caller could degrade or break the shared
+  pool for every tenant, not just that caller's own jobs. If a real need
+  for one of these to be externally tunable shows up, treat it the same
+  way as `DataImpulseConfig`/`capsolver_enabled` — a scoped, individually
+  justified env override, not a blanket conversion of the whole file.
 
 - **RESOLVED (round 47) — DataImpulse paid-gateway `enabled`/`strategy`
   were the only hardcoded, non-overridable settings in the whole config

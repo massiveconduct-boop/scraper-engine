@@ -15,6 +15,10 @@ class LevelConfig(BaseModel):
     engine: Literal["scrapling", "camoufox", "botasaurus+camoufox"]
     proxy_tier_min_score: float
     timeout_seconds: int
+    # Round 47 — base.yaml's level_2/level_3 values are now a shared
+    # ${CAPSOLVER_ENABLED:true} placeholder, not a hardcoded literal: this
+    # gates real spend (CapSolver's $1.00/day ceiling), and a source-blind
+    # consuming service had no way to turn it off without a rebuild.
     capsolver_enabled: bool = False
     # L2/L3 wait strategy — config-driven, not hardcoded (round 12.1)
     goto_wait_until: str = "load"
@@ -82,6 +86,12 @@ class BotasaurusConfig(BaseModel):
     max_retry defaults to 0 (off) to keep today's single-attempt behavior
     unless explicitly opted into. l1_ja3_client_enabled defaults to False —
     a brand-new L1 code path with no live-traffic validation yet.
+
+    Round 47 — l1_ja3_client_enabled is now a base.yaml ${VAR:default}
+    placeholder (BOTASAURUS_L1_JA3_CLIENT_ENABLED), same fix as
+    DataImpulseConfig/LevelConfig.capsolver_enabled below: a
+    source-blind consuming service couldn't opt into this without a
+    rebuild.
     """
 
     bypass_cloudflare: bool = True

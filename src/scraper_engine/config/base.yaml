@@ -24,7 +24,13 @@ levels:
     engine: botasaurus+camoufox
     proxy_tier_min_score: 70.0
     timeout_seconds: 40
-    capsolver_enabled: true
+    # Round 47 — same fix as dataimpulse below: this gates real spend
+    # (CAPSOLVER_API_KEY has a $1.00/day hard ceiling, config/schema.py's
+    # CapSolverConfig) and was one more hardcoded, non-overridable literal
+    # a source-blind consumer couldn't flip without a rebuild. Shared
+    # across both levels (one on/off decision, not per-level) since
+    # there's no known case for wanting L2 on and L3 off independently.
+    capsolver_enabled: "${CAPSOLVER_ENABLED:true}"
     goto_wait_until: "domcontentloaded"
     networkidle_timeout_ms: 5000
     max_total_wait_ms: 15000
@@ -35,7 +41,7 @@ levels:
     engine: camoufox
     proxy_tier_min_score: 90.0
     timeout_seconds: 60
-    capsolver_enabled: true
+    capsolver_enabled: "${CAPSOLVER_ENABLED:true}"
     goto_wait_until: "load"
     post_load_fixed_wait_ms: 10000
     max_total_wait_ms: 30000
@@ -62,7 +68,9 @@ botasaurus:
   random_sleep_enabled: true
   hashed_fingerprint: true
   max_retry: 0
-  l1_ja3_client_enabled: false
+  # Round 47 — same fix as capsolver_enabled/dataimpulse above: was a
+  # hardcoded literal, no way to opt in without a rebuild.
+  l1_ja3_client_enabled: "${BOTASAURUS_L1_JA3_CLIENT_ENABLED:false}"
 
 proxy_harvester:
   sources:
