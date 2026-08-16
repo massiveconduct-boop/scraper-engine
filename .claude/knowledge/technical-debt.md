@@ -143,6 +143,23 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
   891 passed, 100.00% coverage, ruff/mypy clean.
 
+  **Live-verified for real against real production infrastructure**
+  (`DATAIMPULSE_ENABLED=true`, `DATAIMPULSE_STRATEGY=free_first` set in
+  `.env`, containers rebuilt+redeployed, migration 009 applied): a 3-URL
+  `crunchbase.com` batch under `research_agent`'s real tenant/API key —
+  `organization/kuda-technologies` and `organization/flutterwave` both
+  show `proxy_source=paid_gateway, failure_category=detection_block` in
+  `scrape_results` — proving the free-pool attempt hit a direct
+  `DETECTION_BLOCK` at the final level, the gateway retry actually fired,
+  and (crunchbase still blocked even the gateway attempt — that domain
+  evidently needs more than clean IP reputation, e.g. real browser-
+  fingerprint/behavioral checks, not something proxy quality alone fixes).
+  `organization/paystack` in the same batch succeeded via the free pool
+  alone (`proxy_source=pool`) — consistent with round 46's already-
+  established non-determinism for these targets (proxy-luck-dependent,
+  not a hard per-domain wall). This is the first real end-to-end proof the
+  fallback logic executes in production, not just under mocks.
+
 ## Technical Debt / Open Threads (as of round 48)
 
 - **RESOLVED (round 48) — audited the rest of `config/base.yaml` for the
