@@ -1267,6 +1267,106 @@ class TestGatewayFallbackOnFailure:
             await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
 
     @pytest.mark.asyncio
+    async def test_direct_fetcher_detection_block_at_final_level_retries_via_gateway(
+        self, tenant, worker
+    ):
+        """The real-world case live-verifying this round surfaced: a clean
+        403 (fetcher/_failure.py::classify_http_status) makes the FETCHER
+        itself report success=False, failure_category=DETECTION_BLOCK
+        directly — a different shape than round 45's "success=True but
+        content still looks blocked" case. The original version of this
+        retry only checked inside the `if result.success:` branch and never
+        fired for this shape at all. Real crunchbase.com/organization/
+        flutterwave fails exactly this way."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        direct_block = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=5,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message="blocked",
+            proxy_source="pool",
+        )
+        rescued = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            http_status=200,
+            html="<html>real content</html>",
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(
+            side_effect=[direct_block, direct_block, direct_block, rescued]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-direct-block-rescue", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None
+        assert response.results[0].success is True
+        assert response.results[0].proxy_source == "paid_gateway"
+        last_call = worker._fetch_url.await_args_list[-1]
+        assert last_call.kwargs["force_gateway"] is True
+
+    @pytest.mark.asyncio
+    async def test_direct_fetcher_detection_block_gateway_retry_also_fails(self, tenant, worker):
+        """Same shape, but the gateway retry doesn't rescue it either —
+        proves the DLQ still gets the real category via the for/else
+        exhausted-levels branch, with proxy_source carried through instead
+        of silently dropped."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        direct_block_pool = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=5,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message="blocked",
+            proxy_source="pool",
+        )
+        direct_block_gateway = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=5,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message="blocked",
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                direct_block_pool,
+                direct_block_pool,
+                direct_block_pool,
+                direct_block_gateway,
+            ]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-direct-block-still-fails", request)
+
+        assert response.status == JobStatus.FAILED
+        assert response.results is not None
+        assert response.results[0].success is False
+        assert response.results[0].failure_category == FailureCategory.DETECTION_BLOCK
+        # proxy_source carried forward from last_level_result into the
+        # for/else branch's constructed exhausted_result, not dropped.
+        assert response.results[0].proxy_source == "paid_gateway"
+        # exactly one retry — the gateway-sourced failure must not trigger
+        # a second gateway attempt.
+        assert worker._fetch_url.await_count == 4
+
+    @pytest.mark.asyncio
     async def test_still_blocked_gateway_retry_itself_fails(self, tenant, worker):
         """The gateway retry can also come back as a real fetch failure
         (not just still-content-blocked) — must still be treated as

@@ -71,6 +71,34 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
     attempted first (bounded — `proxy_source != "paid_gateway"` guard
     prevents a second retry on a result that already came from the
     gateway, e.g. via the circuit-open path above) before conceding.
+    **Same-day correction**: the first version of this only checked
+    inside the `if result.success:` branch — covering round 45's
+    "success=True but content still looks blocked" shape, but missing the
+    more common real shape entirely: `fetcher/_failure.py::
+    classify_http_status` makes the FETCHER itself report
+    `success=False, failure_category=DETECTION_BLOCK` directly for a
+    clean 401/403/404/405/410/429, which takes the OUTER `else:` branch
+    and never touched the retry at all. Live-caught verifying this round
+    against a real `crunchbase.com/organization/flutterwave` job: it
+    failed as a direct `DETECTION_BLOCK`, not a content-disguised block,
+    so the original retry never fired for the exact domain this round was
+    supposed to help with. Restructured: the retry decision now runs
+    ONCE, before branching on `result.success`, checking either shape
+    (`failure_category == DETECTION_BLOCK` OR `success and
+    is_challenge_page(...)`) — the existing success/failure branches
+    below then evaluate whatever `result` is after the (possible) retry,
+    unchanged otherwise. Also found and fixed a second, older, pre-
+    existing gap while diagnosing this: the `for/else` "all levels
+    exhausted" branch (round 42) constructs a fresh `exhausted_result`
+    from only `failure_category`/`error_message`, silently dropping
+    `http_status`/`proxy_used`/`proxy_source` from the real last attempt
+    — fixed `proxy_source` specifically (needed to verify this round's
+    fix at all); `http_status`/`proxy_used` were already being dropped
+    before round 49 and are left as a separately-flagged, not-fixed-here
+    gap. New migration `009_scrape_results_proxy_source.py` persists
+    `proxy_source` (previously in-memory-only on `FetchResult`, making the
+    whole fallback unverifiable after the fact — also only discovered by
+    trying to verify this round live).
 
   **Bounded concurrent URL processing.** `process_job`'s `for url in
   request.urls:` loop (root-caused round 45, deferred per an explicit
@@ -113,7 +141,7 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   `free_first` is explicitly opted into; revisit only if real usage shows
   runaway cost, not preemptively.
 
-  889 passed, 100.00% coverage, ruff/mypy clean.
+  891 passed, 100.00% coverage, ruff/mypy clean.
 
 ## Technical Debt / Open Threads (as of round 48)
 

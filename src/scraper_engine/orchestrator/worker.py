@@ -366,6 +366,54 @@ class Worker:
 
                     last_level_result = result
 
+                    # Round 49 — one gateway retry before conceding a
+                    # final-level block, evaluated BEFORE branching on
+                    # result.success so it covers both real shapes a block
+                    # takes: a fetcher-level failure (success=False,
+                    # failure_category=DETECTION_BLOCK — a definitive
+                    # 401/403/404/405/410/429, see fetcher/_failure.py's
+                    # classify_http_status) and a success=True result whose
+                    # CONTENT still looks like a challenge page (round 45's
+                    # original gap; is_challenge_page's own first check is
+                    # also status-code-based, so this second clause also
+                    # catches a browser-reported "success" carrying a block
+                    # status). Missing the first shape was a real gap live-
+                    # verifying this round against a real crunchbase.com
+                    # 403 — that domain fails as a clean fetcher-level
+                    # DETECTION_BLOCK, never as a success=True challenge
+                    # page, so the original (success-branch-only) version
+                    # of this retry never fired for it at all. Only at the
+                    # final level (retrying a non-final level's block is
+                    # pointless — it's about to escalate anyway) and never
+                    # on a result that already came from the gateway (one
+                    # extra attempt per URL per level, never a second).
+                    if (
+                        level == LEVELS[-1]
+                        and self._gateway_fallback_eligible
+                        and result.proxy_source != "paid_gateway"
+                        and (
+                            result.failure_category == FailureCategory.DETECTION_BLOCK
+                            or (
+                                result.success
+                                and self._challenge_detector.is_challenge_page(
+                                    result.html or "",
+                                    result.http_status or 200,
+                                    short_page_is_suspect=False,
+                                )
+                            )
+                        )
+                    ):
+                        gateway_result = await self._fetch_url(
+                            tenant_id,
+                            url_str,
+                            level,
+                            request.config_overrides,
+                            force_gateway=True,
+                        )
+                        if gateway_result is not None:
+                            result = gateway_result
+                            last_level_result = result
+
                     if result.success:
                         await self._circuit_breaker.record_success(domain)
                         # `FetchResult.is_challenge_page` was declared on the model,
@@ -418,48 +466,6 @@ class Worker:
                         # reusing the EXISTING for/else "all levels exhausted"
                         # fallback below to construct the real DLQ entry from
                         # `last_level_result` — not duplicating that logic here.
-                        # Round 49 — one gateway retry before conceding, under
-                        # the same eligibility as the circuit-open fallback
-                        # above. `level == LEVELS[-1]` here is always true
-                        # given how this branch is reached (the line above
-                        # already `continue`d the non-final case) — kept
-                        # explicit as a safety belt, not relied on
-                        # implicitly. proxy_source guard prevents retrying a
-                        # result that was ALREADY a gateway attempt (e.g.
-                        # this level got here via the circuit-open fallback)
-                        # — one extra attempt per URL per level, never a
-                        # second.
-                        if (
-                            still_looks_blocked
-                            and self._gateway_fallback_eligible
-                            and level == LEVELS[-1]
-                            and result.proxy_source != "paid_gateway"
-                        ):
-                                gateway_result = await self._fetch_url(
-                                    tenant_id,
-                                    url_str,
-                                    level,
-                                    request.config_overrides,
-                                    force_gateway=True,
-                                )
-                                if gateway_result is not None:
-                                    result = gateway_result
-                                    last_level_result = result
-                                    if result.success:
-                                        result.is_challenge_page = (
-                                            self._challenge_detector.is_challenge_page(
-                                                result.html or "",
-                                                result.http_status or 200,
-                                                short_page_is_suspect=False,
-                                            )
-                                        )
-                                        still_looks_blocked = result.is_challenge_page or (
-                                            self._challenge_detector.looks_javascript_gated(
-                                                result.html or ""
-                                            )
-                                        )
-                                    else:
-                                        still_looks_blocked = True
                         if still_looks_blocked:
                             await self._circuit_breaker.record_failure(domain)
                             result.success = False
@@ -603,6 +609,14 @@ class Worker:
                         duration_ms=0,
                         failure_category=real_category,
                         error_message=real_message,
+                        # Round 49 — carried forward so a DLQ'd/exhausted
+                        # result stays traceable to whether the last real
+                        # attempt went through the free pool or the paid
+                        # gateway, instead of silently dropping it the way
+                        # this branch already drops http_status/proxy_used.
+                        proxy_source=(
+                            last_level_result.proxy_source if last_level_result else None
+                        ),
                     )
                     await self._dlq.enqueue(
                         tenant_id,
