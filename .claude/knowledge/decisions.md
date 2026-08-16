@@ -2565,3 +2565,48 @@ called fully reliable — see `technical-debt.md`'s open Xvfb-collision
 thread. 858 passed, 100.00% coverage (verified in a clean shell with no
 env vars set, matching CI), ruff/mypy clean. Full detail:
 `technical-debt.md`'s round-40 entry.
+
+---
+
+## Decision: New Paginated Routes Use Plain `int` Params, Not FastAPI's `Query(...)`
+
+**Date:** 2026-08-17 | **Round:** 56
+
+**What:** `api/routes.py`'s new `GET /v1/jobs` and `GET /v1/dlq` (and any
+future paginated route in this file) validate `limit`/`offset` with a
+shared `_validate_pagination(limit: int, offset: int) -> None` helper
+(next to the existing `_validate_uuid()`), raising `HTTPException(422,
+...)` manually — not FastAPI's `Query(default, ge=..., le=...)` marker.
+
+**Why:** `Query(50, ge=1, le=500)` as a Python default value is only ever
+resolved to its plain `50` by FastAPI's dependency-injection layer when
+the endpoint runs through a real ASGI request. Every route function in
+`api/routes.py` is also called directly from unit tests
+(`tests/unit/test_api_routes.py`) — `await list_jobs(x_api_key="sk-admin")`
+— which bypasses that DI layer entirely, so `limit` would be the literal
+`Query(50)` sentinel object, not `50`. First test run of `GET /v1/jobs`
+failed with `assert Query(50) == 50`. This is the same class of gotcha
+already noted on `ScrapeRequest.idempotency_key`'s `Header()` default
+(round 29's comment in the same test file) — a project-wide pattern now,
+not a one-off.
+
+**Tradeoffs:** Loses FastAPI's automatic OpenAPI-doc generation for the
+`ge`/`le` constraint (it'd show up in `/docs` for free with `Query()`).
+Gains: routes stay callable and testable as plain async functions without
+standing up a full ASGI test client for every unit test, matching every
+other route in this file (none of which use FastAPI's `Query`/`Body`
+markers either — this decision keeps that consistent rather than
+introducing the one exception).
+
+**Alternatives considered:** Use `Query()` and switch all direct-call unit
+tests to go through `fastapi.testclient.TestClient` instead (rejected —
+would mean rewriting the entire existing `test_api_routes.py` suite's
+calling convention for one new route, far more invasive than the problem
+warrants). Resolve `Query()` defaults manually inside the route body via
+`if isinstance(limit, Query): limit = 50` (rejected — fragile, couples
+route logic to FastAPI's internal marker type instead of just not using
+the marker).
+
+**Status:** Active. Applies to `list_jobs()` and `list_dlq()`
+(`api/routes.py`); should be followed by any future paginated route added
+to this file. Full detail: `technical-debt.md`'s round-56 entry.

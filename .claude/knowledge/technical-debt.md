@@ -32,6 +32,175 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 56)
+
+- **CLOSED (round 56) — 5 read-only capabilities existed server-side but
+  were never exposed to callers like `research_agent` via API/CLI.** User
+  asked what was still unexposed to consumers; audit of `api/routes.py`
+  vs. what already existed in `storage/`/`core/` found:
+
+  1. No job-list endpoint (`scrape_jobs` table has everything needed, no
+     route reads it in bulk).
+  2. No quota-visibility endpoint — `QuotaManager.remaining()`/
+     `current_usage()` (`core/quota.py`) existed since early rounds, never
+     called by any route; callers only found their limit by hitting a 429.
+  3. No tenant-wide DLQ listing — `DeadLetterQueue.list_for_tenant()`'s
+     `job_id=None` mode (`storage/dlq.py`) already existed, used
+     internally by ops tooling and the `dlq_size` Prometheus gauge, but
+     only the job-scoped `GET /v1/jobs/{job_id}/dlq` was routed.
+  4. No caller-facing webhook-event/payload-schema reference —
+     `orchestrator/webhook_events.py`'s `WebhookEventType`/`WebhookEvent`
+     taxonomy (round 34) was internal-only; a dev wiring a webhook
+     receiver had to read source.
+  5. CLI was ops-only (`serve`/`worker`/`harvest`/`reap`/`check`/
+     `create-tenant`, all talking directly to Postgres/Redis) — no
+     caller-facing way to exercise the API without curl.
+
+  User approved implementing all 5, explicitly as 4 independently-shipped
+  phases rather than one bundled diff, grouping only where scope/
+  triviality was genuinely shared (a formal plan was written and approved
+  via plan mode before any file was touched, per explicit user
+  instruction to "take great care not to introduce new bugs... or break
+  already existing functionality throughout the entire system").
+
+  **Phase A — `GET /v1/jobs` + `GET /v1/quota`** (`api/routes.py`,
+  `core/models.py`). `list_jobs()`: tenant-scoped via the existing
+  schema-per-tenant `search_path` mechanism (`PostgresClient.acquire()`),
+  optional `status` filter validated via `JobStatus(status)` (422 on a bad
+  value), `limit`/`offset` capped/floor-checked by a new
+  `_validate_pagination()` helper. Returns a new lightweight
+  `JobSummaryResponse` (job_id/status/url_count/created_at/updated_at) —
+  deliberately excludes `results`/`error`, which would need the
+  `scrape_results` join `get_job`'s single-job route already pays for; a
+  list endpoint doing that per row would be an N+1 query. `get_quota()`:
+  same daily-limit lookup query `POST /v1/scrape`/`POST /v1/crawl` already
+  run (`SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1`),
+  fed into `QuotaManager` to compute `used`/`remaining`, plus
+  `seconds_until_quota_reset()` (already existed, used by the 429 path's
+  `Retry-After` header, now also surfaced directly).
+
+  **Real bug caught building Phase A**: `Query(50, ge=1, le=500)` (FastAPI's
+  parameter-constraint marker) is never resolved to its plain value when a
+  route function is called directly — and every test in
+  `tests/unit/test_api_routes.py` calls route functions directly,
+  bypassing FastAPI's dependency-injection layer entirely (same class of
+  gotcha already documented on `ScrapeRequest`'s `idempotency_key`
+  `Header()` default, see round 29's comment in that test file). First
+  test run failed with `assert Query(50) == 50`. Fixed by switching to
+  plain `int` params and a new shared `_validate_pagination(limit, offset)`
+  helper next to `_validate_uuid()`, raising 422 manually instead of
+  relying on `Query()`'s built-in `ge`/`le`. This is now the pattern any
+  future paginated route in this file should follow.
+
+  A second, unrelated slip during the same edit: an `Edit` replacement
+  accidentally orphaned `_validate_uuid()`'s `return value` line (matched
+  text ended right before it), which silently broke that function's `->
+  str` contract with no test catching it at first because no caller
+  actually uses `_validate_uuid()`'s return value today — caught by
+  `mypy --strict` (missing-return path), not by the test suite. Fixed by
+  restoring the line. Worth remembering: a route helper with an unused
+  return value is exactly the kind of regression tests won't catch —
+  `mypy --strict` did the real work here.
+
+  **Phase B — `GET /v1/dlq`** (`api/routes.py`). Near-identical sibling of
+  `get_job_dlq`, minus the `job_id` path param, calling
+  `DeadLetterQueue.list_for_tenant(tenant_id, limit=limit, offset=offset)`
+  with `job_id` left at its existing `None` default (the tenant-wide
+  branch already existed and was already exercised by ops tooling — this
+  route is the first caller-facing thing to exercise it). Same
+  `_storage_pg is None -> return []` convention as `get_job_dlq` (not the
+  503-on-missing-storage convention Phase A's routes use) — kept
+  consistent with its direct sibling rather than unified across the file.
+
+  **Phase C — `GET /v1/webhook-events`** (`api/routes.py`). Pure static
+  reflection — `[e.value for e in WebhookEventType]` +
+  `WebhookEvent.model_json_schema()`. No DB/Redis touch; same auth-key
+  check as every other route (consistency of auth posture across `/v1/*`
+  chosen over carving out an unauthenticated exception for something
+  harmless — nothing tenant-specific to fail on, but the key still has to
+  resolve).
+
+  **Phase D — `scraper-engine api` CLI subcommand group**
+  (`cli/entrypoint.py`, new `tests/unit/test_cli_entrypoint.py` — no CLI
+  test file existed before this round). `api scrape`/`jobs`/`job`/`quota`/
+  `dlq`, each a thin synchronous `httpx.Client` call against the routes
+  above (plus the pre-existing `GET /v1/jobs/{job_id}`) — deliberately not
+  a second implementation of any request-shaping/validation logic, purely
+  a curl replacement. `--base-url` (default `http://localhost:8000`),
+  `--api-key` (falls back to `$SCRAPER_ENGINE_API_KEY`). Non-2xx response
+  or missing key both `sys.exit(1)`, matching `_check_health()`'s existing
+  exit-code convention. `cli/` is outside `pyproject.toml`'s
+  `[tool.coverage.run].source`/`.report.include` lists, so this phase
+  wasn't coverage-gate-blocking, but got real tests anyway (argument
+  dispatch shape per subcommand, missing-key and non-2xx paths, client
+  always closed even on error) since correctness still matters where
+  coverage isn't enforced.
+
+  **Deliberately not done**: did not extract a shared helper for the
+  tenant daily-quota-limit lookup query, even though `GET /v1/quota`
+  duplicates it a third time (`POST /v1/scrape` and `POST /v1/crawl`
+  already each have their own copy) — refactoring the two already-working
+  call sites for DRY was judged not worth the regression risk on a task
+  explicitly scoped to "don't break existing functionality." Same
+  reasoning as round 48's decision to leave most of `base.yaml` untouched
+  outside its actual bug pattern.
+
+  **Live-verified**: unit suite alone after each phase (61 → 67 → 70
+  passed as Phases A/B/C landed), `ruff check` and `mypy --strict` clean
+  after every phase. Full gate rerun with real `docker compose up -d
+  postgres redis pgbouncer` infra after all 4 phases: `pytest tests/unit/
+  tests/integration/ tests/chaos/ --cov=src/scraper_engine
+  --cov-fail-under=100` → **952 passed, 3 skipped (pre-existing
+  Camoufox/CAPTCHA live-test skips, not new), 0 failed, 100.00% coverage**
+  (3920 statements, 0 missed). Also live-verified the real `main()`
+  argparse tree (not a hand-rolled duplicate) via `scraper-engine api
+  --help` and `scraper-engine api jobs --help`, both printing the correct
+  subcommand/flag tree with exit code 0.
+
+- **OPEN, NOT YET INVESTIGATED (round 56) — `success=True` sometimes
+  returns a rendered browser/proxy-level error page as `content`, not the
+  real page.** Reported via cross-session message by a peer Claude session
+  working on `research_agent` (a sibling HTTP caller), who found it while
+  diagnosing an accuracy drop in their own downstream model — turned out
+  to be a data-quality issue on the scraping side, not their model.
+  Concrete examples from their scrape cache: a Chromium `DNS_PROBE`/
+  connection-reset internal error page (`myanimelist.net` URL), an
+  `ERR_EMPTY_RESPONSE` page (`allaboutcookies.org`), and what looks like
+  the proxy layer's own "No internet... something wrong with the proxy
+  server" error rendered as page content (`slickdeals.net`) — all three
+  stored with `success=True` as if they were real scraped pages.
+  Explicitly distinct from the already-understood real-404-content case
+  (several nairametrics/businessday/mordorintelligence/worldbank/ifc URLs
+  in the same report, where the target site's own genuine 404 page came
+  back — that's round 45's deliberate design decision that a real 404 is
+  "a successful scrape of a page that says 404," not a bug, and the peer
+  session explicitly did not flag it as one).
+
+  **Suspected, UNCONFIRMED root cause**: `ChallengeDetector`'s detection
+  is status-code + known-signature based (`CHALLENGE_STATUS_CODES`,
+  interstitial/challenge string matching — see round 45/46 history above).
+  A Chromium-internal error-page UI (the browser's own "This site can't be
+  reached" / "This page isn't working" chrome, not a response from the
+  target server at all) most likely renders with `http_status=200` from
+  the browser's perspective and contains none of the known challenge
+  signatures, so it would sail through both checks undetected. This has
+  NOT been verified against the actual fetcher/challenge_detector code
+  this round — it's the peer session's plausible read plus a first-glance
+  plausibility check, not a confirmed diagnosis.
+
+  **Explicitly deferred** — user chose "finish Phase A-D first, then
+  triage" when asked how to sequence this against the in-flight round-56
+  work; this entry exists so the next session doesn't have to rediscover
+  the report. Do not treat this as investigated, root-caused, or fixed.
+  Next step for whoever picks this up: confirm the `http_status`/response
+  shape Camoufox/Botasaurus actually produce for a Chromium-internal error
+  page (live repro against one of the three example URLs above would
+  settle it), then decide whether the fix belongs in
+  `fetcher/challenge_detector.py` (treat it as a new detectable failure
+  signature) or somewhere earlier in the fetch path (detect the browser's
+  own navigation-error state directly, e.g. via Playwright's response
+  object, before it ever gets treated as content).
+
 ## Technical Debt / Open Threads (as of round 55)
 
 - **RESOLVED (round 55) — `dlq_reaper` starved indefinitely: one
