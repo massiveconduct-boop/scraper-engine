@@ -107,6 +107,12 @@ class FetchResult(BaseModel):
     failure_category: FailureCategory | None = None
     error_message: str | None = None
     proxy_used: str | None = None
+    # Round 49 — which proxy source actually served this attempt. None means
+    # no proxy-bearing level ever ran (e.g. a pure L1 HTTP fetch, or a cache
+    # hit). Lets orchestrator/worker.py's gateway-fallback logic tell "this
+    # result already came from the paid gateway" apart from "this came from
+    # the free pool" without re-deriving it from proxy_used's raw string.
+    proxy_source: Literal["pool", "paid_gateway"] | None = None
     html_snapshot_url: str | None = None
     from_cache: bool = False
     duration_ms: int

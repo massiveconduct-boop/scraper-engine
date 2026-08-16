@@ -152,6 +152,16 @@ class PolitenessConfig(BaseModel):
     default_concurrency: int = 2
     default_delay_seconds: float = 5.0
     slot_ttl_seconds: int = 120
+    # Round 49 — orchestrator/worker.py::Worker.process_job's per-job URL
+    # dispatch semaphore size. Was strictly sequential before this (root
+    # cause of slow large-batch job runs, round 45). Deliberately below
+    # core.budget.BROWSER_SEMAPHORE's size (8) so one job doesn't already
+    # saturate the whole worker process's browser budget on its own —
+    # this bounds "how many URLs from THIS job are in flight at once,"
+    # BROWSER_SEMAPHORE separately bounds "how many live browsers exist in
+    # this process across every job," and a concurrent task simply queues
+    # on BROWSER_SEMAPHORE once this job's own budget is saturated.
+    max_concurrent_urls_per_job: int = 5
 
 
 class CircuitBreakerConfig(BaseModel):

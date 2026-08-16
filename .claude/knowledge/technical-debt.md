@@ -32,6 +32,89 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 49)
+
+- **RESOLVED (round 49) — `free_first` only fell back to the paid gateway
+  on total pool exhaustion, not on the two failure modes a real consuming
+  service actually hits; separately, `process_job`'s zero-concurrency URL
+  loop (round 45, deliberately deferred) is now fixed too.** Triggered by
+  a cross-session report from `research_agent` (a sibling service, peer
+  Claude session hitting this API over HTTP): real batches scoring 0-7/33,
+  dominated by `detection_block` and `circuit_open`, plus
+  `scraper_engine_job_timeout`. User: "free proxies stay default, fall
+  back to residential when free is exhausted OR failing" — traced the real
+  code and confirmed `free_first` (round 40) only covered "exhausted"
+  (`ProxyPoolExhaustedError`), never "failing."
+
+  **Gateway fallback on failure, not just exhaustion.** Added
+  `FetchResult.proxy_source: Literal["pool", "paid_gateway"] | None`
+  (`core/models.py`) so callers can tell which source served a result, and
+  a `force_gateway: bool = False` param on `_fetch_url`/`_fetch_with_proxy`
+  that skips the strategy branch entirely and leases the gateway directly.
+  Two new `process_job` branches build on it, both gated on a new
+  `Worker._gateway_fallback_eligible` property (`strategy=="free_first"
+  and enabled` — a property, not a value cached at `__init__`, matching
+  how `_fetch_with_proxy` already re-reads `self._config.dataimpulse`
+  fresh every call rather than snapshotting it):
+  - **Circuit open**: previously an immediate `CIRCUIT_OPEN` DLQ before
+    any proxy was even touched. Now, under `free_first`, level 1 (which
+    never leases a proxy at all — HTTP-only, no gateway path to force it
+    through) is skipped straight to level 2 instead of DLQ'd; levels 2/3
+    force the fetch through the gateway instead of failing outright. A
+    domain's circuit reflects FREE-pool failure history specifically —
+    the gateway is a structurally different network path that history
+    says nothing about, and it's available immediately, not after a
+    cooldown. `free_only`/`paid_only`/gateway-not-configured keep the
+    exact prior behavior (regression-tested).
+  - **Still blocked after final level**: previously downgraded straight to
+    `DETECTION_BLOCK`. Now, under `free_first`, one gateway retry is
+    attempted first (bounded — `proxy_source != "paid_gateway"` guard
+    prevents a second retry on a result that already came from the
+    gateway, e.g. via the circuit-open path above) before conceding.
+
+  **Bounded concurrent URL processing.** `process_job`'s `for url in
+  request.urls:` loop (root-caused round 45, deferred per an explicit
+  "correctness first" instruction — now in scope since the user asked to
+  fix everything research_agent reported) is now dispatched concurrently
+  via `asyncio.Semaphore(config.politeness.max_concurrent_urls_per_job)`
+  (new field, default 5) + `asyncio.gather`. Verified safe to parallelize
+  before changing anything: `PolitenessController` and `CircuitBreaker`
+  are already Redis-atomic per-domain; `core.budget.BROWSER_SEMAPHORE`
+  already caps live browser instances process-wide regardless of
+  in-flight URL-task count; `_persist_one_result`
+  (`orchestrator/tasks.py`) is a self-contained per-URL INSERT with no
+  shared job-level counters. `results` is pre-sized and filled by
+  original index so `results[i]` still matches `request.urls[i]` despite
+  tasks completing out of order. Cancellation checks a shared in-memory
+  flag before each task's real work starts, falling back to a real DB
+  check only if not already known-cancelled — live-tested (not just
+  reasoned about) that this fast path actually gets hit under concurrent
+  dispatch, not just under sequential execution.
+
+  **Test surprise worth recording**: expected 2 existing multi-URL tests
+  (order-dependent `AsyncMock(side_effect=[...])` lists) to break under
+  concurrent dispatch and need fixing. They didn't — empirically verified
+  that `asyncio.gather`-dispatched tasks built entirely from `AsyncMock`
+  calls with no real I/O never actually yield to the scheduler mid-task
+  (an awaited `AsyncMock` call resolves without a genuine suspension
+  point), so they still complete in creation order in practice. Real
+  concurrency (proven via a task that does `await asyncio.sleep(...)`,
+  which DOES yield) needed dedicated new tests instead — see
+  `TestConcurrentUrlProcessing` in `tests/unit/test_worker.py`.
+
+  **Deliberately not changed**: `paid_only`'s own circuit-gating (it's
+  also blocked by an open circuit today, even though it never touches the
+  free pool, so a circuit tripped by free-pool history gates a strategy
+  that never used the free pool at all) — a real latent inconsistency,
+  but not what was reported and not touched this round; noted here for
+  whoever picks it up next. Also no new spend cap on the broadened
+  fallback — bounded to one extra gateway attempt per URL per trigger
+  (mirrors the existing same-level-retry bounding), only active when
+  `free_first` is explicitly opted into; revisit only if real usage shows
+  runaway cost, not preemptively.
+
+  889 passed, 100.00% coverage, ruff/mypy clean.
+
 ## Technical Debt / Open Threads (as of round 48)
 
 - **RESOLVED (round 48) — audited the rest of `config/base.yaml` for the

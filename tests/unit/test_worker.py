@@ -1,6 +1,7 @@
 # tests/unit/test_worker.py
 """Worker state machine tests — escalation logic with mocks."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1169,6 +1170,378 @@ class TestDataImpulseStrategy:
 
         with pytest.raises(RuntimeError, match="free_first"):
             await worker._fetch_url(tenant, "http://example.com", 2)
+
+
+class TestGatewayFallbackOnFailure:
+    """Round 49 — free_first previously only fell back to the paid gateway
+    on ProxyPoolExhaustedError (total free-pool exhaustion). It did nothing
+    for a domain whose circuit is open (rejected before any proxy lease is
+    even attempted) or a result that's still blocked after the final
+    level's own real render — the two failure modes a real consuming
+    service (research_agent) actually reported hitting. These tests cover
+    the new force_gateway primitive and the two process_job branches built
+    on it."""
+
+    @staticmethod
+    def _gateway_proxy() -> Proxy:
+        return Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_gateway_skips_free_pool_and_tags_proxy_source(
+        self, tenant, worker, monkeypatch
+    ):
+        """force_gateway=True must bypass the strategy branch entirely —
+        it's meaningful even when dataimpulse.strategy is still free_only,
+        since the caller (process_job) has already made the fallback
+        decision; _fetch_with_proxy shouldn't re-derive it."""
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=self._gateway_proxy()),
+        )
+        expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=expected)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        assert result is not None
+        assert result.proxy_source == "paid_gateway"
+        pm_instance.get_proxy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_normal_pool_fetch_tags_proxy_source_pool(self, tenant, worker, monkeypatch):
+        pool_proxy = MagicMock(ip="1.2.3.4", port=8080, source="pool")
+        lease = ProxyLease(proxy=pool_proxy, tenant_id=tenant)
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(return_value=lease)
+        pm_instance.mark_success = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        expected = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch = AsyncMock(return_value=expected)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=fake_fetcher),
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result is not None
+        assert result.proxy_source == "pool"
+
+    @pytest.mark.asyncio
+    async def test_force_gateway_raises_when_gateway_misconfigured(
+        self, tenant, worker, monkeypatch
+    ):
+        """Same defense-in-depth as the existing paid_only/free_first
+        misconfiguration tests above — force_gateway=True must never
+        silently fall back to the free pool if the gateway turns out not
+        to be configured after all."""
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", MagicMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=MagicMock())
+        )
+
+        with pytest.raises(RuntimeError, match="force_gateway"):
+            await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+    @pytest.mark.asyncio
+    async def test_still_blocked_gateway_retry_itself_fails(self, tenant, worker):
+        """The gateway retry can also come back as a real fetch failure
+        (not just still-content-blocked) — must still be treated as
+        "still blocked" and fall through to the normal downgrade, not
+        crash or silently treat a failed result as success."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        blocked_result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            html="<html>please verify you are a human</html>",
+            http_status=200,
+            proxy_source="pool",
+        )
+        gateway_failure = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=5,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+            error_message="gateway timed out",
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(
+            side_effect=[blocked_result, blocked_result, blocked_result, gateway_failure]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-gateway-retry-fails", request)
+
+        assert response.status == JobStatus.FAILED
+        assert response.results is not None
+        assert response.results[0].success is False
+
+    @pytest.mark.asyncio
+    async def test_circuit_open_free_first_routes_level2_through_gateway(self, tenant, worker):
+        """Circuit open at level 1 (no gateway path there) skips straight
+        to level 2, where free_first + an open circuit forces the fetch
+        through the gateway instead of an immediate CIRCUIT_OPEN DLQ."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        worker._circuit_breaker.allow_request.return_value = False
+        gateway_result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=5,
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(return_value=gateway_result)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-circuit-gateway", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None
+        assert response.results[0].proxy_source == "paid_gateway"
+        # level 1 never actually calls _fetch_url (no gateway path to force
+        # it through) — the only real attempt is level 2, forced.
+        worker._fetch_url.assert_awaited_once_with(
+            tenant, "http://example.com/", 2, None, force_gateway=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_circuit_open_free_only_keeps_immediate_dlq(self, tenant, worker):
+        """Regression guard — the default strategy (free_only) must keep
+        the exact prior behavior: immediate CIRCUIT_OPEN DLQ, no fetch
+        attempted at all, not even at level 2."""
+        worker._circuit_breaker.allow_request.return_value = False
+        worker._fetch_url = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-circuit-no-gateway", request)
+
+        assert response.status == JobStatus.FAILED
+        worker._fetch_url.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_still_blocked_final_level_retries_via_gateway_and_rescues(
+        self, tenant, worker
+    ):
+        """Final-level result still looks blocked (challenge page) — under
+        free_first, one gateway retry is attempted before conceding; here
+        the gateway attempt comes back clean and rescues the URL."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        blocked_result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            html="<html>please verify you are a human</html>",
+            http_status=200,
+            proxy_source="pool",
+        )
+        rescued_result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            html="<html>real content</html>",
+            http_status=200,
+            proxy_source="paid_gateway",
+        )
+        # Level 1, level 2 both non-final and blocked -> escalate. Level 3
+        # (final) is attempted twice: the normal initial call (still
+        # blocked), then the forced-gateway retry (rescued).
+        worker._fetch_url = AsyncMock(
+            side_effect=[blocked_result, blocked_result, blocked_result, rescued_result]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-rescue", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert response.results is not None
+        assert response.results[0].success is True
+        assert response.results[0].html == "<html>real content</html>"
+        # last call is the forced-gateway retry at the final level
+        last_call = worker._fetch_url.await_args_list[-1]
+        assert last_call.kwargs["force_gateway"] is True
+
+    @pytest.mark.asyncio
+    async def test_still_blocked_final_level_gateway_retry_also_fails(self, tenant, worker):
+        """Gateway retry doesn't help either — falls through to the normal
+        DETECTION_BLOCK downgrade, same as before this round, just one
+        extra attempt first."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        blocked_result = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            html="<html>please verify you are a human</html>",
+            http_status=200,
+            proxy_source="pool",
+        )
+        still_blocked_via_gateway = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            duration_ms=5,
+            html="<html>please verify you are a human</html>",
+            http_status=200,
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                blocked_result,
+                blocked_result,
+                blocked_result,
+                still_blocked_via_gateway,
+            ]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-still-blocked", request)
+
+        assert response.status == JobStatus.FAILED
+        assert response.results is not None
+        assert response.results[0].success is False
+        assert response.results[0].failure_category == FailureCategory.DETECTION_BLOCK
+
+    @pytest.mark.asyncio
+    async def test_still_blocked_no_double_gateway_retry(self, tenant, worker):
+        """A result that already came from the gateway (e.g. this level was
+        reached via the circuit-open fallback) must not be retried a
+        second time even if it's still blocked — one extra attempt per URL
+        per level, never a second."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        worker._circuit_breaker.allow_request.return_value = False
+        already_gateway_blocked = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=5,
+            html="<html>please verify you are a human</html>",
+            http_status=200,
+            proxy_source="paid_gateway",
+        )
+        worker._fetch_url = AsyncMock(return_value=already_gateway_blocked)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-no-double-retry", request)
+
+        # One call per level attempted (level 1 skipped, so levels 2 and 3
+        # each call once, forced by the open circuit) — never a second call
+        # at the same level for the still-blocked retry.
+        assert worker._fetch_url.await_count == 2
+
+
+class TestConcurrentUrlProcessing:
+    """Round 49 — process_job's per-URL loop was strictly sequential
+    (root-caused round 45 as the reason large batches took far longer than
+    the shared browser/proxy budget required — a real research_agent
+    complaint, `scraper_engine_job_timeout`). Now dispatched concurrently,
+    bounded by config.politeness.max_concurrent_urls_per_job."""
+
+    @pytest.mark.asyncio
+    async def test_urls_actually_run_concurrently(self, tenant, worker):
+        """Proves real overlap, not just that the job still works — tracks
+        how many _fetch_url calls are simultaneously in flight."""
+        active = 0
+        peak = 0
+
+        async def fake_fetch_url(*args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return FetchResult(url=str(args[1]), success=True, level_used=1, duration_ms=1)
+
+        worker._fetch_url = AsyncMock(side_effect=fake_fetch_url)
+        request = ScrapeRequest(urls=[HttpUrl(f"http://example{i}.com") for i in range(4)])
+
+        response = await worker.process_job(tenant, "job-concurrent", request)
+
+        assert response.status == JobStatus.COMPLETED
+        assert peak > 1
+
+    @pytest.mark.asyncio
+    async def test_result_order_matches_input_order_despite_completion_order(
+        self, tenant, worker
+    ):
+        """First URL is the slow one — if ordering were completion-order
+        instead of input-order, it would land last in `results`."""
+
+        async def fake_fetch_url(_tenant, url, _level, _overrides, **_kwargs):
+            delay = 0.03 if "slow" in str(url) else 0.0
+            await asyncio.sleep(delay)
+            return FetchResult(url=str(url), success=True, level_used=1, duration_ms=1)
+
+        worker._fetch_url = AsyncMock(side_effect=fake_fetch_url)
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://slow.example.com"), HttpUrl("http://fast.example.com")]
+        )
+
+        response = await worker.process_job(tenant, "job-order", request)
+
+        assert response.results is not None
+        assert response.results[0].url == "http://slow.example.com/"
+        assert response.results[1].url == "http://fast.example.com/"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_mid_job_skips_remaining_dispatch_without_extra_db_calls(
+        self, tenant, worker
+    ):
+        """Once any task observes cancellation, every other queued task must
+        take the in-memory fast path (cancelled_state check) rather than
+        each re-querying the DB — proves the fast path is actually reached,
+        not just that cancellation eventually works."""
+        worker._pg.fetchrow = AsyncMock(return_value={"status": JobStatus.CANCELLED.value})
+        worker._fetch_url = AsyncMock()
+        request = ScrapeRequest(
+            urls=[HttpUrl(f"http://example{i}.com") for i in range(5)]
+        )
+
+        response = await worker.process_job(tenant, "job-cancelled", request)
+
+        assert response.status == JobStatus.CANCELLED
+        worker._fetch_url.assert_not_awaited()
+        # Only ONE real DB round-trip for the whole job — every task after
+        # the first that observes cancellation took the in-memory fast
+        # path (cancelled_state["value"]) instead of calling fetchrow again.
+        assert worker._pg.fetchrow.await_count == 1
 
 
 class TestDataImpulseStartupValidation:

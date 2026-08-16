@@ -21,6 +21,8 @@ from scraper_engine.fetcher._failure import classify_http_status
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from pydantic import HttpUrl
+
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
     from scraper_engine.browser.pool import BrowserPool
     from scraper_engine.config.schema import AppConfig
@@ -186,6 +188,24 @@ class Worker:
 
         self._extraction_engine = build_extraction_engine_client()
 
+    @property
+    def _gateway_fallback_eligible(self) -> bool:
+        """Round 49 — whether process_job's circuit-open and
+        still-looks-blocked branches may force a level through the paid
+        gateway. Gated on strategy=="free_first" specifically (not
+        paid_only, which already uses the gateway for every attempt with no
+        fallback decision to make, and not free_only, which has no gateway
+        to fall back to). A property, not a value cached at __init__ time,
+        for the same reason _fetch_with_proxy already re-reads
+        self._config.dataimpulse fresh on every call instead of snapshotting
+        it once — self._config is mutable for the life of this Worker
+        instance. Safe to trust `enabled` alone here without re-checking
+        build_gateway_proxy() — __init__'s fail-fast check above already
+        guarantees it's configured whenever enabled is True."""
+        return (
+            self._config.dataimpulse.enabled and self._config.dataimpulse.strategy == "free_first"
+        )
+
     async def process_job(
         self,
         tenant_id: TenantId,
@@ -201,25 +221,56 @@ class Worker:
         to Postgres/S3 as it lands, instead of batching everything until the
         whole job finishes. This is also what makes real per-URL progress
         and mid-job cancellation possible (see _is_cancelled below)."""
-        results: list[FetchResult] = []
         errors: list[str] = []
-        cancelled = False
         bypass_cache = bool(request.config_overrides and request.config_overrides.bypass_cache)
+        # Round 49 — was a strictly sequential `for url in request.urls:`
+        # loop; every URL's full L1->L2->L3 escalation ran to completion
+        # before the next one started, which made large batches take far
+        # longer than the shared browser/proxy budget actually required
+        # (root-caused round 45, deferred until now per an explicit
+        # "correctness first" instruction, now in scope). Dispatched
+        # concurrently below, bounded by max_concurrent_urls_per_job.
+        # PolitenessController and CircuitBreaker are already Redis-atomic
+        # per-domain (safe under concurrent callers, including across
+        # different jobs, not just within one), and core.budget.
+        # BROWSER_SEMAPHORE already caps live browser instances
+        # process-wide regardless of how many URL-tasks are in flight — a
+        # concurrent task just queues on that semaphore instead of on this
+        # one sequential Python loop. `results` is pre-sized and filled by
+        # original index so a caller indexing `results[i]` against
+        # `request.urls[i]` keeps working even though tasks no longer
+        # complete in input order.
+        results: list[FetchResult | None] = [None] * len(request.urls)
+        cancelled_state = {"value": False}
+        semaphore = asyncio.Semaphore(self._config.politeness.max_concurrent_urls_per_job)
 
-        for url in request.urls:
+        async def _dispatch_one_url(index: int, url: HttpUrl) -> None:
+            async with semaphore:
+                await _process_one_url(index, url)
+
+        async def _process_one_url(index: int, url: HttpUrl) -> None:
             url_str = str(url)
 
+            # Checked once per task, right after this task's semaphore slot
+            # comes free — same cooperative granularity the old "checked
+            # before starting the next loop iteration" gave, just per-task
+            # instead of per-iteration. The in-memory flag lets every other
+            # already-queued task skip its own DB round-trip once any one
+            # task has observed cancellation; in-flight tasks that already
+            # passed this check are allowed to finish, same as before.
+            if cancelled_state["value"]:
+                return
             if await self._is_cancelled(tenant_id, job_id):
-                cancelled = True
-                break
+                cancelled_state["value"] = True
+                return
 
             if not bypass_cache:
                 cached = await self._check_cache(tenant_id, url_str)
                 if cached is not None:
-                    results.append(cached)
+                    results[index] = cached
                     if on_result is not None:
                         await on_result(cached)
-                    continue
+                    return
 
             domain = self._extract_domain(url_str)
             # Round 42 — wraps the rest of this URL's fetch/extract/markdown
@@ -248,7 +299,21 @@ class Worker:
                 last_level_result: FetchResult | None = None
 
                 for level in LEVELS:
-                    if not await self._circuit_breaker.allow_request(domain):
+                    circuit_open = not await self._circuit_breaker.allow_request(domain)
+                    # Round 49 — an open circuit reflects FREE-pool failure
+                    # history for this domain (record_success/record_failure
+                    # below fire regardless of proxy source, but under
+                    # free_only/paid_only every attempt IS the free pool or
+                    # the gateway respectively, so historically "circuit
+                    # open" and "free pool failing" were the same thing).
+                    # Under free_first specifically, that conflation is
+                    # wrong: the gateway is a structurally different network
+                    # path a domain's free-proxy-driven circuit trip says
+                    # nothing about, and it's available right now, not after
+                    # a cooldown. free_only/paid_only/gateway-not-configured
+                    # keep the exact prior behavior: immediate CIRCUIT_OPEN
+                    # DLQ, no attempt made.
+                    if circuit_open and not self._gateway_fallback_eligible:
                         circuit_result = FetchResult(
                             url=url_str,
                             success=False,
@@ -266,10 +331,18 @@ class Worker:
                             level,
                         )
                         errors.append(f"Circuit open for {domain}")
-                        results.append(circuit_result)
+                        results[index] = circuit_result
                         if on_result is not None:
                             await on_result(circuit_result)
                         break
+                    # Level 1 never leases a proxy through _fetch_with_proxy
+                    # at all (see _fetch_url docstring) — there's no gateway
+                    # path to force it through. Under free_first with the
+                    # circuit open, skip straight to level 2 (where the
+                    # gateway attempt below CAN apply) instead of either
+                    # DLQ'ing outright or pretending L1 has a gateway mode.
+                    if circuit_open and level == 1:
+                        continue
 
                     slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
                     if slot_worker_id is None:
@@ -279,7 +352,11 @@ class Worker:
                     try:
                         await self._politeness.wait_if_needed(domain, tenant_id)
                         result = await self._fetch_url(
-                            tenant_id, url_str, level, request.config_overrides
+                            tenant_id,
+                            url_str,
+                            level,
+                            request.config_overrides,
+                            force_gateway=circuit_open,
                         )
                     finally:
                         await self._politeness.release_slot(domain, tenant_id, slot_worker_id)
@@ -341,6 +418,48 @@ class Worker:
                         # reusing the EXISTING for/else "all levels exhausted"
                         # fallback below to construct the real DLQ entry from
                         # `last_level_result` — not duplicating that logic here.
+                        # Round 49 — one gateway retry before conceding, under
+                        # the same eligibility as the circuit-open fallback
+                        # above. `level == LEVELS[-1]` here is always true
+                        # given how this branch is reached (the line above
+                        # already `continue`d the non-final case) — kept
+                        # explicit as a safety belt, not relied on
+                        # implicitly. proxy_source guard prevents retrying a
+                        # result that was ALREADY a gateway attempt (e.g.
+                        # this level got here via the circuit-open fallback)
+                        # — one extra attempt per URL per level, never a
+                        # second.
+                        if (
+                            still_looks_blocked
+                            and self._gateway_fallback_eligible
+                            and level == LEVELS[-1]
+                            and result.proxy_source != "paid_gateway"
+                        ):
+                                gateway_result = await self._fetch_url(
+                                    tenant_id,
+                                    url_str,
+                                    level,
+                                    request.config_overrides,
+                                    force_gateway=True,
+                                )
+                                if gateway_result is not None:
+                                    result = gateway_result
+                                    last_level_result = result
+                                    if result.success:
+                                        result.is_challenge_page = (
+                                            self._challenge_detector.is_challenge_page(
+                                                result.html or "",
+                                                result.http_status or 200,
+                                                short_page_is_suspect=False,
+                                            )
+                                        )
+                                        still_looks_blocked = result.is_challenge_page or (
+                                            self._challenge_detector.looks_javascript_gated(
+                                                result.html or ""
+                                            )
+                                        )
+                                    else:
+                                        still_looks_blocked = True
                         if still_looks_blocked:
                             await self._circuit_breaker.record_failure(domain)
                             result.success = False
@@ -421,7 +540,7 @@ class Worker:
                                 )
 
                                 result.markdown = html_to_markdown(result.html)
-                        results.append(result)
+                        results[index] = result
                         if on_result is not None:
                             await on_result(result)
                         break
@@ -437,7 +556,7 @@ class Worker:
                                 level,
                             )
                             errors.append(result.error_message or "DLQ")
-                            results.append(result)
+                            results[index] = result
                             if on_result is not None:
                                 await on_result(result)
                             break
@@ -494,7 +613,7 @@ class Worker:
                         LEVELS[-1],
                     )
                     errors.append(real_message)
-                    results.append(exhausted_result)
+                    results[index] = exhausted_result
                     if on_result is not None:
                         await on_result(exhausted_result)
             except Exception as exc:
@@ -521,11 +640,20 @@ class Worker:
                     LEVELS[-1],
                 )
                 errors.append(crash_result.error_message or "Unexpected error")
-                results.append(crash_result)
+                results[index] = crash_result
                 if on_result is not None:
                     await on_result(crash_result)
 
-        any_success = any(r.success for r in results)
+        await asyncio.gather(*(_dispatch_one_url(i, u) for i, u in enumerate(request.urls)))
+
+        cancelled = cancelled_state["value"]
+        # None entries are URLs a task returned from early on (cancellation
+        # observed before any real work started) — never appended to
+        # `errors` either, so filtering them out here keeps `results` and
+        # `errors` consistent with what actually ran, same as the old
+        # sequential loop's `break`-before-append behavior.
+        final_results = [r for r in results if r is not None]
+        any_success = any(r.success for r in final_results)
         status = (
             JobStatus.CANCELLED
             if cancelled
@@ -544,7 +672,7 @@ class Worker:
             job_id=job_id,
             status=status,
             progress=1.0,
-            results=results if results else None,
+            results=final_results if final_results else None,
             error="; ".join(errors) if errors else None,
             partial_failure=partial_failure,
         )
@@ -606,8 +734,14 @@ class Worker:
         url: str,
         level: int,
         overrides: ConfigOverrides | None = None,
+        force_gateway: bool = False,
     ) -> FetchResult | None:
-        """Dispatch fetch to the appropriate level fetcher."""
+        """Dispatch fetch to the appropriate level fetcher.
+
+        force_gateway (round 49): only meaningful for level 2/3 — level 1
+        never leases a proxy through _fetch_with_proxy at all (L1 is
+        HTTP-only and doesn't participate in the free/paid proxy decision),
+        so it's accepted here but ignored for level == 1."""
         if level == 1:
             from scraper_engine.fetcher.factory import build_level1_fetcher
 
@@ -629,7 +763,7 @@ class Worker:
                 )
 
             return await self._fetch_with_proxy(
-                tenant_id, url, level, overrides, self._pg, _build_l2
+                tenant_id, url, level, overrides, self._pg, _build_l2, force_gateway=force_gateway
             )
         elif level == 3:
             from scraper_engine.core.exceptions import PostgresClientMissingError
@@ -646,7 +780,7 @@ class Worker:
                 )
 
             return await self._fetch_with_proxy(
-                tenant_id, url, level, overrides, self._pg, _build_l3
+                tenant_id, url, level, overrides, self._pg, _build_l3, force_gateway=force_gateway
             )
         return None
 
@@ -658,6 +792,7 @@ class Worker:
         overrides: ConfigOverrides | None,
         pg: PostgresClient,
         build_fetcher: Callable[[], Any],
+        force_gateway: bool = False,
     ) -> FetchResult:
         """Shared L2/L3 lease-fetch-score cycle, with a bounded same-level
         retry (round 37, see _PROXY_RETRYABLE_CATEGORIES/
@@ -668,7 +803,14 @@ class Worker:
         `pg` is passed explicitly (not read from self._pg) so the caller's
         `if self._pg is None: raise` guard narrows it to non-None across
         the function boundary — mypy can't carry that narrowing through a
-        separate method call on `self._pg` directly."""
+        separate method call on `self._pg` directly.
+
+        force_gateway (round 49): used by process_job's circuit-open and
+        still-looks-blocked gateway-fallback branches to force this one
+        attempt through the paid gateway regardless of `strategy` — the
+        caller has already decided a free-pool attempt isn't appropriate
+        (circuit open) or didn't work (still blocked after a real render),
+        not something this method re-derives."""
         from scraper_engine.core.exceptions import ProxyPoolExhaustedError
         from scraper_engine.proxy.lease import ProxyLease
         from scraper_engine.proxy.manager import ProxyManager
@@ -686,7 +828,14 @@ class Worker:
 
         for _attempt in range(_SAME_LEVEL_PROXY_RETRIES + 1):
             lease: ProxyLease
-            if strategy == "paid_only":
+            if force_gateway:
+                gateway_proxy = build_gateway_proxy()
+                if gateway_proxy is None:
+                    raise RuntimeError(
+                        "force_gateway=True but DataImpulse gateway is not configured"
+                    )
+                lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+            elif strategy == "paid_only":
                 # Skips pm.get_proxy() entirely — the scored free pool never
                 # enters the picture for this level under paid_only. Bad
                 # config was already caught at Worker.__init__ time, so a
@@ -723,6 +872,7 @@ class Worker:
                 result: FetchResult = await fetcher.fetch(
                     url, tenant_id, proxy=lease.proxy, overrides=overrides
                 )
+                result.proxy_source = lease.proxy.source
                 # A paid-gateway lease has no proxy_pool row (see
                 # proxy/paid_gateway.py) — mark_success/mark_failure would be
                 # a harmless no-op UPDATE either way, but gating on source

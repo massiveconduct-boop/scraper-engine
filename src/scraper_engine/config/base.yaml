@@ -144,6 +144,7 @@ politeness:
   default_concurrency: 2
   default_delay_seconds: 5.0
   slot_ttl_seconds: 120
+  max_concurrent_urls_per_job: 5
 
 circuit_breaker:
   failure_threshold: 0.95
