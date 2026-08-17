@@ -87,6 +87,8 @@ class BotasaurusWrapper:
         use_random_sleep: bool = True,
         hashed_fingerprint: bool = True,
         max_retry: int = 0,
+        block_images: bool = False,
+        block_images_and_css: bool = False,
     ) -> None:
         self.config: dict[str, object] = dict(config or {})
         self._bypass_cloudflare = bypass_cloudflare
@@ -96,6 +98,8 @@ class BotasaurusWrapper:
         self._use_random_sleep = use_random_sleep
         self._hashed_fingerprint = hashed_fingerprint
         self._max_retry = max_retry
+        self._block_images = block_images
+        self._block_images_and_css = block_images_and_css
 
     async def fetch_html(
         self,
@@ -165,6 +169,8 @@ class BotasaurusWrapper:
             "tiny_profile": self._tiny_profile and session_id is not None,
             "remove_default_browser_check_argument": self._remove_default_browser_check_argument,
             "close_on_crash": self._close_on_crash,
+            "block_images": self._block_images,
+            "block_images_and_css": self._block_images_and_css,
         }
         if self._max_retry > 0:
             decorator_kwargs["max_retry"] = self._max_retry

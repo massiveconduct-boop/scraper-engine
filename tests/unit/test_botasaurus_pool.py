@@ -231,3 +231,30 @@ class TestBotasaurusPool:
             )
         autoscroll.assert_not_called()
         assert html == "<html>reused</html>"
+
+    @pytest.mark.asyncio
+    async def test_block_images_kwargs_forwarded_when_enabled(self):
+        """Round 59 — real botasaurus_driver.Driver kwargs, opt-in via
+        BotasaurusConfig, default False (unset by default)."""
+        pool = BotasaurusPool(
+            tenant_id=TENANT,
+            config=BotasaurusConfig(block_images=True, block_images_and_css=True),
+        )
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert driver_cls.call_args.kwargs["block_images"] is True
+        assert driver_cls.call_args.kwargs["block_images_and_css"] is True
+
+    @pytest.mark.asyncio
+    async def test_block_images_kwargs_false_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert driver_cls.call_args.kwargs["block_images"] is False
+        assert driver_cls.call_args.kwargs["block_images_and_css"] is False

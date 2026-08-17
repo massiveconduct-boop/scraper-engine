@@ -155,6 +155,17 @@ class TestBotasaurusWrapper:
         assert captured["remove_default_browser_check_argument"] is True
         assert captured["close_on_crash"] is True
         assert "max_retry" not in captured  # 0 (off) means omitted, not sent as 0
+        assert captured["block_images"] is False
+        assert captured["block_images_and_css"] is False
+
+    def test_block_images_kwargs_forwarded_when_enabled(self):
+        """Round 59 — real botasaurus_driver.Driver kwargs, opt-in."""
+        wrapper = BotasaurusWrapper(block_images=True, block_images_and_css=True)
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert captured["block_images"] is True
+        assert captured["block_images_and_css"] is True
 
     def test_tiny_profile_enabled_only_when_profile_present(self):
         wrapper = BotasaurusWrapper()

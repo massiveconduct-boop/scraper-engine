@@ -148,6 +148,8 @@ class BotasaurusPool:
             # profile") otherwise) — see fetcher/botasaurus_wrapper.py's same gate.
             "tiny_profile": cfg.tiny_profile and session_id is not None,
             "remove_default_browser_check_argument": cfg.remove_default_browser_check_argument,
+            "block_images": cfg.block_images,
+            "block_images_and_css": cfg.block_images_and_css,
         }
         if cfg.hashed_fingerprint and session_id is not None:
             kwargs["user_agent"] = UserAgent.HASHED

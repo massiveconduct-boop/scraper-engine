@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry import trace
 
 from scraper_engine.config.loader import load_config
-from scraper_engine.core.budget import configure_budget
+from scraper_engine.core.budget import configure_budget, resolve_browser_max_total_instances
 from scraper_engine.core.models import (
     ConfigOverrides,
     FetchResult,
@@ -58,7 +58,11 @@ logger = logging.getLogger(__name__)
 _bootstrap_cfg = load_config()
 bootstrap_observability(_bootstrap_cfg.observability)
 configure_budget(
-    browser_max_total_instances=_bootstrap_cfg.camoufox.max_total_instances,
+    browser_max_total_instances=resolve_browser_max_total_instances(
+        _bootstrap_cfg.camoufox.max_total_instances,
+        enabled=_bootstrap_cfg.camoufox.ram_aware_concurrency_enabled,
+        average_ram_per_instance_gb=_bootstrap_cfg.camoufox.ram_aware_avg_instance_gb,
+    ),
     capsolver_max_concurrent_solves=_bootstrap_cfg.capsolver.max_concurrent_solves,
 )
 

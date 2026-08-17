@@ -56,6 +56,11 @@ camoufox:
   max_total_instances: 8  # measured per-instance RSS: ~80MB (Camoufox v152, virtual headless)
   fingerprint_preset: true  # real captured fingerprints, officially recommended for FF149+
   os: linux  # matches the real host OS — see schema.py's CamoufoxConfig docstring
+  # Round 59 — opt-in RAM-aware concurrency cap, see schema.py's
+  # CamoufoxConfig docstring for the calc_max_parallel_browsers()
+  # reasoning. Env-overridable, same fix as l1_ja3_client_enabled below.
+  ram_aware_concurrency_enabled: "${RAM_AWARE_CONCURRENCY_ENABLED:false}"
+  ram_aware_avg_instance_gb: 0.8  # measured 2026-08-17, see schema.py comment
 
 # Round 26: Botasaurus capability upgrade — every field verified against the
 # real installed botasaurus/botasaurus_driver source (see config/schema.py's
@@ -71,6 +76,10 @@ botasaurus:
   # Round 47 — same fix as capsolver_enabled/dataimpulse above: was a
   # hardcoded literal, no way to opt in without a rebuild.
   l1_ja3_client_enabled: "${BOTASAURUS_L1_JA3_CLIENT_ENABLED:false}"
+  # Round 59 — real botasaurus_driver.Driver kwargs, see schema.py's
+  # BotasaurusConfig docstring. Env-overridable, same reasoning.
+  block_images: "${BOTASAURUS_BLOCK_IMAGES:false}"
+  block_images_and_css: "${BOTASAURUS_BLOCK_IMAGES_AND_CSS:false}"
 
 proxy_harvester:
   sources:

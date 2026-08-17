@@ -53,6 +53,49 @@ CAPSOLVER_CONCURRENCY = asyncio.Semaphore(10)
 XVFB_LOCK = asyncio.Lock()
 
 
+def resolve_browser_max_total_instances(
+    configured_max: int,
+    *,
+    enabled: bool,
+    average_ram_per_instance_gb: float,
+) -> int:
+    """Round 59 — RAM-aware ceiling for BROWSER_SEMAPHORE, answering a real
+    constraint observed on this project's own dev host (swap sitting at
+    7.5/8GB used with near-zero free margin).
+
+    Returns `configured_max` unchanged when `enabled` is False (the
+    default) — zero botasaurus/psutil dependency on that path. When
+    enabled, delegates to botasaurus's own `calc_max_parallel_browsers()`
+    (reads `psutil.virtual_memory().available`), passing `configured_max`
+    as its own `max` param — this can only REDUCE the ceiling below the
+    static config value when the host is genuinely short on RAM right now,
+    never raise it above, so enabling this can't regress an
+    already-tuned deployment.
+
+    `average_ram_per_instance_gb` should reflect the heavier of the two
+    engines sharing BROWSER_SEMAPHORE (Botasaurus's headful Chromium via
+    Xvfb, not Camoufox's lighter headless Firefox) — see
+    config/schema.py::CamoufoxConfig.ram_aware_avg_instance_gb's comment
+    for the measured value this project calibrates against.
+
+    Called once at process startup by configure_budget()'s caller
+    (orchestrator/tasks.py) — same "resize once, before any fetch begins"
+    contract configure_budget() itself already documents; this does not
+    re-evaluate RAM mid-process.
+    """
+    if not enabled:
+        return configured_max
+    from botasaurus.calc_max_parallel_browsers import calc_max_parallel_browsers
+
+    return int(
+        calc_max_parallel_browsers(
+            average_ram_per_instance=average_ram_per_instance_gb,
+            min=1,
+            max=configured_max,
+        )
+    )
+
+
 def configure_budget(
     *, browser_max_total_instances: int, capsolver_max_concurrent_solves: int
 ) -> None:

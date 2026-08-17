@@ -106,6 +106,8 @@ def build_level2_fetcher(
             use_random_sleep=bconf.random_sleep_enabled,
             hashed_fingerprint=bconf.hashed_fingerprint,
             max_retry=bconf.max_retry,
+            block_images=bconf.block_images,
+            block_images_and_css=bconf.block_images_and_css,
         )
         if "botasaurus" in lvl.engine
         else None

@@ -32,7 +32,123 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 58)
+## Technical Debt / Open Threads (as of round 59)
+
+- **IMPLEMENTED (round 59) — 2 of round 57's 6 backlog Botasaurus feature
+  items: RAM-aware `BROWSER_SEMAPHORE` concurrency, and `block_images`/
+  `block_images_and_css`.** User asked to pick backlog item(s) to
+  implement; picked these 2 on engineering judgment.
+
+  **RAM-aware concurrency**: new `core/budget.py::
+  resolve_browser_max_total_instances(configured_max, *, enabled,
+  average_ram_per_instance_gb) -> int`. `enabled=False` (default) returns
+  `configured_max` unchanged, zero botasaurus/psutil dependency on that
+  path. `enabled=True` delegates to botasaurus's own already-installed
+  `calc_max_parallel_browsers()` (reads
+  `psutil.virtual_memory().available`, formula `(available_gb - 0.8) /
+  average_ram_per_instance`, clamped to `[min, max]`), passing
+  `configured_max` as its own `max` param — this can only REDUCE the
+  ceiling below the static config value, never raise it, so enabling it
+  can't regress an already-tuned deployment. Wired into
+  `orchestrator/tasks.py`'s existing module-level bootstrap (the
+  `configure_budget()` call) — same "resize once at process startup"
+  contract that already existed, no new timing complexity. New config:
+  `CamoufoxConfig.ram_aware_concurrency_enabled: bool = False` (opt-in,
+  same convention as `l1_ja3_client_enabled` — new/unvalidated-in-
+  production capability) and `CamoufoxConfig.ram_aware_avg_instance_gb:
+  float = 0.8`.
+
+  The `0.8` figure is real measured evidence, not a guess. Launched one
+  real headful Botasaurus/Chromium instance on this project's dev host
+  (`headless=False, enable_xvfb_virtual_display=True` — the exact shape
+  production uses) and measured its full process-tree RSS (main +
+  renderer/GPU/utility subprocesses) by diffing chromium-named PIDs
+  before vs after the launch. A first attempt scanning all chromium-named
+  PIDs system-wide *without* diffing wrongly picked up ~200 unrelated
+  leftover/orphaned chromium processes already running on this shared
+  host from past unrelated test activity (noted, not cleaned up or
+  investigated further this round — logged as a methodology lesson in
+  `.wolf/cerebrum.md`: measure by before/after PID diff, never scan-by-
+  name alone on a shared host). The diffed measurement: exactly 10 new
+  PIDs, 804.7MB (~0.79GB) total RSS. Deliberately NOT Camoufox's own
+  already-documented 80.1MB headless figure (`core/budget.py`'s existing
+  "Measured 2026-07-22" comment) — `BROWSER_SEMAPHORE` is shared across
+  both Camoufox and Botasaurus (confirmed in `budget.py`'s own docstring),
+  and Botasaurus runs headful via Xvfb, so it's the heavier of the two
+  engines sharing that one semaphore; calibrating against the heavier
+  figure is the conservative, correct choice — the lighter Camoufox
+  figure would let the calculator overestimate safe concurrency for the
+  also-semaphore-gated Botasaurus path.
+
+  **`block_images`/`block_images_and_css`**: real
+  `botasaurus_driver.Driver` constructor kwargs (verified against the
+  installed `botasaurus_driver` 4.0.93 source: `driver.py`'s
+  `Driver.__init__` accepts both; `core/browser.py` lines 199-202
+  confirmed they're applied independently via separate CDP
+  `Network.setBlockedURLs` calls — `block_images_and_css` is not a
+  superset flag, no validation needed between them). New config:
+  `BotasaurusConfig.block_images: bool = False`,
+  `BotasaurusConfig.block_images_and_css: bool = False` (opt-in —
+  blocking images/CSS can break sites whose content or lazy-load/JS
+  behavior depends on them). Wired into both real-navigation Botasaurus
+  paths: `fetcher/botasaurus_wrapper.py` (`BotasaurusWrapper.__init__`
+  gained the two params, sent unconditionally in `_botasaurus_fetch`'s
+  `decorator_kwargs`, same style as `close_on_crash`) and
+  `browser/botasaurus_pool.py` (`_new_driver_fetch`'s `kwargs` dict,
+  sourced directly from `self._config` — no wrapper constructor change
+  needed there). `fetcher/factory.py::build_level2_fetcher` updated to
+  pass both fields through. Both new `base.yaml` entries are
+  env-overridable (`${BOTASAURUS_BLOCK_IMAGES:false}`,
+  `${BOTASAURUS_BLOCK_IMAGES_AND_CSS:false}`,
+  `${RAM_AWARE_CONCURRENCY_ENABLED:false}`), same round-47 convention as
+  `l1_ja3_client_enabled` — a source-blind consuming service can opt in
+  without a rebuild.
+
+  **Explicitly not picked this round**, on engineering judgment, remain
+  open backlog: human-mode mouse simulation (bigger design surface —
+  where to invoke it, how much simulated movement is "enough" without
+  slowing every fetch), `extensions` kwarg (needs a real extension
+  artifact to load, none chosen), `lang` kwarg (separate locale-spoofing
+  concern, kept out to stay focused), raw CDP network events (already
+  flagged "not urgent, future hardening" since round 57's own recon).
+
+  **Tests**: 3 new in `tests/unit/test_budget.py`
+  (`TestResolveBrowserMaxTotalInstances` — disabled path never
+  imports/calls `calc_max_parallel_browsers`, enabled path calls it with
+  the right args and returns its result coerced to `int`). 1 new + 1
+  extended in `tests/unit/test_botasaurus_wrapper.py` (default-False
+  assertions added to the existing
+  `test_anti_detection_kwargs_present_by_default`, new
+  `test_block_images_kwargs_forwarded_when_enabled` for the True case). 2
+  new in `tests/unit/test_botasaurus_pool.py` (`Driver` kwargs true/false
+  cases via `driver_cls.call_args.kwargs`).
+
+  **Verification**: 900 unit tests passed (up from 894), 100% coverage on
+  every gated file touched (`core/budget.py`, `orchestrator/tasks.py`,
+  `fetcher/factory.py`, `fetcher/botasaurus_wrapper.py` — `browser/` stays
+  excluded from the coverage gate per `pyproject.toml`'s already-
+  documented reason). `ruff` clean. `mypy` matching CI's exact invocation
+  (`src/... --ignore-missing-imports`) — 0 errors, 0 new vs
+  `tools/mypy-baseline.txt`.
+
+  **Live-verified with 2 real checks, not mocked**: (1) a real
+  Botasaurus/Chromium launch with `block_images=True` against
+  `https://www.python.org/` — confirmed the page's one real `<img>` tag
+  (`python-logo.png`) was present in the DOM
+  (`document.images.length === 1`) but never actually loaded
+  (`naturalWidth` stayed `0`), proving the CDP-level block is real, not
+  just that the kwarg was accepted. (2) a real, non-mocked call to
+  `resolve_browser_max_total_instances(100, enabled=True,
+  average_ram_per_instance_gb=0.8)` on this actual host returned `15`,
+  matching the exact formula against `psutil.virtual_memory().available`'s
+  real reading (13.37GB) at that moment; with `configured_max=8` it
+  correctly clamped to `8` (never exceeds the static ceiling) even though
+  this host's psutil-reported "available" RAM was generous (13GB,
+  counting reclaimable cache) despite swap sitting at 7.5/8GB used —
+  worth being precise that on this particular host at this moment, the
+  feature validates correctly end-to-end but doesn't currently reduce
+  anything, since psutil's "available" metric and raw swap usage are
+  different signals.
 
 - **RESOLVED (round 58) — Botasaurus's fetch path never autoscrolled,
   silently dropping lazy-load/infinite-scroll content.** Round 57's

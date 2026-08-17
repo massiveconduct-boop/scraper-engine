@@ -55,6 +55,25 @@ class CamoufoxConfig(BaseModel):
     humanize: float = Field(default=1.5, ge=0.0, le=5.0)
     headless_mode: str = "virtual"
     max_total_instances: int = 8
+    # Round 59 — RAM-aware concurrency cap (core/budget.py::
+    # resolve_browser_max_total_instances). Default off: a brand-new,
+    # unvalidated-in-production capability that changes semaphore sizing
+    # from a live runtime reading instead of a static number, same
+    # opt-in-by-default convention as l1_ja3_client_enabled above. Can
+    # only ever REDUCE max_total_instances at runtime, never raise it
+    # above this configured ceiling.
+    ram_aware_concurrency_enabled: bool = False
+    # Measured 2026-08-17 (this session): one real headful Botasaurus/
+    # Chromium launch (headless=False, enable_xvfb_virtual_display=True —
+    # the exact shape production uses), full process tree (main + renderer/
+    # GPU/utility subprocesses, isolated via before/after PID diff) =
+    # 804.7MB RSS (~0.79GB), rounded up slightly for margin. Deliberately
+    # NOT Camoufox's own measured 80.1MB headless figure (see
+    # core/budget.py's "Measured 2026-07-22" comment) — BROWSER_SEMAPHORE
+    # is shared across both engines, and Botasaurus (headful, via Xvfb) is
+    # the heavier of the two, so calibrating against it is the
+    # conservative choice.
+    ram_aware_avg_instance_gb: float = 0.8
     # Round 46 — verified against Camoufox's own docs (Context7
     # /daijro/camoufox): for Firefox 149+ (we run 152), the library's own
     # README/docs explicitly recommend fingerprint_preset=True — it samples
@@ -102,6 +121,14 @@ class BotasaurusConfig(BaseModel):
     hashed_fingerprint: bool = True
     max_retry: int = 0
     l1_ja3_client_enabled: bool = False
+    # Round 59 — real botasaurus_driver.Driver kwargs (verified against the
+    # installed 4.0.93 source: core/browser.py applies them independently,
+    # block_images_and_css is not a superset flag). Default off: blocking
+    # images/CSS can break sites whose content or lazy-load/JS behavior
+    # depends on them, so this is opt-in, not a default-on "free win" like
+    # bypass_cloudflare above.
+    block_images: bool = False
+    block_images_and_css: bool = False
 
 
 class ProxyHarvesterConfig(BaseModel):

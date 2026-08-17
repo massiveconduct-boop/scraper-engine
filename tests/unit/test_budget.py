@@ -6,11 +6,11 @@ never exercises (it always sets a fixed ceiling, which short-circuits before
 ever touching `pg`).
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from scraper_engine.core.budget import CapSolverBudget
+from scraper_engine.core.budget import CapSolverBudget, resolve_browser_max_total_instances
 from scraper_engine.core.tenant import TenantId
 
 
@@ -87,3 +87,39 @@ class TestGetCeiling:
         remaining = await budget.remaining(tenant)
 
         assert remaining == 2.0
+
+
+class TestResolveBrowserMaxTotalInstances:
+    """Round 59 — RAM-aware BROWSER_SEMAPHORE ceiling."""
+
+    def test_disabled_returns_configured_max_unchanged(self) -> None:
+        with patch(
+            "botasaurus.calc_max_parallel_browsers.calc_max_parallel_browsers"
+        ) as calc:
+            result = resolve_browser_max_total_instances(
+                8, enabled=False, average_ram_per_instance_gb=0.8
+            )
+        assert result == 8
+        calc.assert_not_called()
+
+    def test_enabled_delegates_to_calc_max_parallel_browsers(self) -> None:
+        with patch(
+            "botasaurus.calc_max_parallel_browsers.calc_max_parallel_browsers",
+            return_value=3,
+        ) as calc:
+            result = resolve_browser_max_total_instances(
+                8, enabled=True, average_ram_per_instance_gb=0.8
+            )
+        assert result == 3
+        calc.assert_called_once_with(average_ram_per_instance=0.8, min=1, max=8)
+
+    def test_enabled_result_is_coerced_to_int(self) -> None:
+        with patch(
+            "botasaurus.calc_max_parallel_browsers.calc_max_parallel_browsers",
+            return_value=4.0,
+        ):
+            result = resolve_browser_max_total_instances(
+                8, enabled=True, average_ram_per_instance_gb=0.8
+            )
+        assert result == 4
+        assert isinstance(result, int)
