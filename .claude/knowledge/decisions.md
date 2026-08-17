@@ -2610,3 +2610,60 @@ the marker).
 **Status:** Active. Applies to `list_jobs()` and `list_dlq()`
 (`api/routes.py`); should be followed by any future paginated route added
 to this file. Full detail: `technical-debt.md`'s round-56 entry.
+
+---
+
+## Decision: Botasaurus Navigation Failure Reuses `BROWSER_CRASH`, No New `FailureCategory`
+
+**Date:** 2026-08-17 | **Round:** 57
+
+**What:** The fix for Botasaurus/Chromium silently returning its own
+internal network-error interstitial as `success=True` content
+(`browser/_botasaurus_nav_check.py::raise_if_navigation_failed()`) raises
+a new `BotasaurusNavigationError` — a plain `Exception` subclass — rather
+than introducing a new `FailureCategory` enum value. It flows through
+`classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH)`, the exact
+default `level_2.py`/`level_3.py`'s outer exception handlers already use
+for any browser-level operational failure.
+
+**Why:** `BROWSER_CRASH` is already semantically correct — the browser
+genuinely failed to load the real page — and already has fully correct,
+battle-tested handling: `_PROXY_ATTRIBUTABLE_CATEGORIES` (round 37) treats
+it as proxy-attributable and triggers a same-level fresh-proxy retry
+before escalating; the circuit breaker, DLQ eligibility, and
+`proxy/dlq_reaper.py`'s auto-retry all already classify it correctly as
+transient/retryable. A new category would have meant touching
+`DLQ_ELIGIBLE_CATEGORIES`, `TRANSIENT_FAILURE_CATEGORIES`,
+`dlq_reaper.py`'s own separate category list, and possibly a migration —
+real blast radius across already-working, already-tested machinery for a
+failure mode that behaves identically to an existing one in every way
+that matters (proxy-attributable, retryable, escalates on repeat
+failure). The distinguishing detail the user asked for ("say exactly what
+it is") lives in `error_message` instead — `BotasaurusNavigationError`'s
+message names the specific `chrome-error://` state — which every existing
+consumer of that field (DLQ entries, `GET /v1/jobs/{id}/dlq`, round 56's
+`GET /v1/dlq`, structured logs) already surfaces, no new plumbing needed.
+
+**Trade-offs:** A DLQ entry or dashboard filtering strictly on
+`failure_category=browser_crash` cannot distinguish "Botasaurus hit
+Chromium's own error page" from any other browser-crash-shaped failure
+(e.g. a real Xvfb/display crash) without also reading `error_message`.
+Accepted — the category taxonomy's job is retry/circuit-breaker/DLQ
+*behavior*, which is genuinely identical for both; the human/diagnostic
+distinction belongs in the message text, not a proliferation of
+categories that would otherwise need its own retry-eligibility rule
+threaded through every category-keyed list in the codebase.
+
+**Alternatives considered:** A new `FailureCategory.BROWSER_NAVIGATION_ERROR`
+(rejected — see blast-radius reasoning above; also would need its own
+correct placement in `_PROXY_ATTRIBUTABLE_CATEGORIES`/
+`TRANSIENT_FAILURE_CATEGORIES`/`dlq_reaper.py`'s list to behave right,
+duplicating `BROWSER_CRASH`'s existing correct behavior for no semantic
+gain). Detecting the failure via the rendered interstitial's text instead
+of `driver.current_url` (rejected as the *primary* mechanism, kept as
+defense-in-depth in `ChallengeDetector` — Chromium's error-page heading/
+body text is locale-dependent; `current_url`'s `chrome-error://` scheme is
+not, and covers the whole `net::ERR_*` failure class with one check
+instead of enumerating wordings).
+
+**Status:** Active. Full detail: `technical-debt.md`'s round-57 entry.

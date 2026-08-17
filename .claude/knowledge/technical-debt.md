@@ -32,6 +32,161 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 57)
+
+- **RESOLVED (round 57) — Botasaurus silently returned Chromium's own
+  internal network-error interstitial as `success=True` real content.**
+  Root-caused the browser-error-page bug a peer Claude session
+  (`research_agent`) flagged last round via cross-session message (logged
+  below as round 56's OPEN item). User's explicit requirement this round:
+  `success=True` must mean a genuinely real successful scrape and nothing
+  else, every non-success outcome must be reported as exactly what it is,
+  the system must be hardened against every variant of this failure class
+  (not just the 3 reported examples), and no resources wasted processing
+  content already known to be garbage.
+
+  **Root cause, confirmed by reading both this repo's code and the actual
+  installed `botasaurus_driver` package source (`.venv/lib/python3.12/
+  site-packages/botasaurus_driver/driver.py`), not inferred from wording**:
+  `Driver.get()`/`google_get()` (line 2219) wrap a raw CDP `Page.navigate`
+  and only poll for `document.readyState` — they never inspect or raise on
+  a navigation failure. Chrome's DevTools Protocol does not raise a Python
+  exception for a network-level failure (DNS, connection reset, empty
+  response, proxy failure); Chromium instead silently renders its own
+  `chrome-error://chromewebdata/` interstitial as if it were a normal
+  page, and `driver.get()` returns as if nothing went wrong.
+  `driver.page_html` then IS that interstitial's HTML — indistinguishable
+  from real content to anything that doesn't specifically check for it.
+  Confirmed present in **exactly 2 call sites**, both fixed the same way:
+  `fetcher/botasaurus_wrapper.py::_botasaurus_fetch()`'s inner `_fetch()`
+  (Level 2's one-shot Botasaurus attempt) and
+  `browser/botasaurus_pool.py::_new_driver_fetch()` (the same-domain
+  driver-reuse pool's fresh-driver path).
+
+  Every existing downstream safety net was individually verified to
+  structurally miss this failure class — this was a real, previously
+  uncovered gap, not overlap with anything already fixed:
+  `level_2.py::_fetch_via_botasaurus`'s only check,
+  `ChallengeDetector.is_challenge_page()`, is called with `status_code`
+  hardcoded to `200` (Botasaurus's API exposes no real navigation status
+  at all) and `short_page_is_suspect=False`. `CHALLENGE_STATUS_CODES` is
+  moot (status hardcoded). `CHALLENGE_SIGNATURES` (cf-*, datadome, akamai,
+  h-captcha, etc.) has nothing to do with Chromium's own UI chrome.
+  `_looks_like_gateway_error` (round 33) requires a literal 3-digit `5xx`
+  number in the text — Chromium's interstitials never show an HTTP status
+  number at all (`net::ERR_EMPTY_RESPONSE` is Chromium-internal, not an
+  HTTP status), so the regex structurally cannot match.
+  `_FIREFOX_PLAINTEXT_WRAPPER_RE` (round 33) is Firefox/Gecko-specific
+  markup; Botasaurus drives a Chromium-based browser, not Firefox.
+
+  **Confirmed NOT affected, by reading each** (the hardening requirement
+  demanded checking the whole pipeline, not just the reported paths): L1
+  (`fetcher/level_1.py` — pure `httpx`/JA3/Scrapling HTTP clients; a real
+  HTTP status code always drives `success`, a real connection failure
+  raises a real `httpx` exception, no browser rendering involved at all).
+  L2's Camoufox fallback (`_fetch_via_camoufox`) and all of L3
+  (`level_3.py`) — both call Playwright's `page.goto()`, which **does**
+  raise a real exception for network-level navigation failures (the
+  existing `try/except` around every `page.goto()` call already
+  propagates correctly to each function's outer
+  `except Exception as exc: classify_fetch_exception(exc, BROWSER_CRASH)`
+  handler). `botasaurus_pool.py::_reuse_fetch()` (second+ fetch for an
+  already-open driver) uses `driver.requests.get()` — a different code
+  path (in-page JS `fetch()`), confirmed via `botasaurus_driver/
+  requests.py`: it inspects the JS fetch's own error and raises
+  `DriverException` on failure. Already safe.
+
+  **Fix — reuses the existing, already-correct failure pipeline instead
+  of building a parallel one.** `orchestrator/worker.py` already has
+  fully correct, battle-tested handling for a browser-level operational
+  failure: `classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH)`
+  (the exact default both `level_2.py`/`level_3.py`'s outer exception
+  handlers already use), `_PROXY_ATTRIBUTABLE_CATEGORIES = {BROWSER_CRASH,
+  NETWORK_TIMEOUT}` (round 37's same-level fresh-proxy retry), and
+  circuit-breaker/DLQ/`dlq_reaper.py` auto-retry all already handle
+  `BROWSER_CRASH` correctly. Deliberately **no new `FailureCategory`**
+  (would have rippled into `DLQ_ELIGIBLE_CATEGORIES`,
+  `TRANSIENT_FAILURE_CATEGORIES`, `dlq_reaper.py`'s own category list, for
+  no benefit — `BROWSER_CRASH` is already semantically correct). New
+  shared module `browser/_botasaurus_nav_check.py`:
+  `raise_if_navigation_failed(driver, url)` checks `driver.current_url`
+  right after navigation in both confirmed gap sites and raises a new
+  `BotasaurusNavigationError` (plain `Exception` subclass) if it starts
+  with `chrome-error://`. `current_url` was chosen over matching the
+  interstitial's rendered text because Chromium's internal URL scheme is
+  ONE signal covering the whole `net::ERR_*` failure class (DNS,
+  connection-reset, empty-response, proxy-failure alike) — directly
+  satisfies the hardening requirement — and unlike the human-readable
+  heading/body text ("This site can't be reached", "This page isn't
+  working", "No internet"...) it is not affected by browser UI locale.
+  Fails open by design: if reading `current_url` itself raises, the check
+  is skipped rather than becoming a new source of failure. Placed
+  immediately after navigation, before `short_random_sleep()`/`page_html`
+  read — directly satisfies "don't waste resources on content already
+  known to be garbage." Because `BotasaurusNavigationError` is a plain
+  `Exception`, it's **automatically** caught by the existing
+  `except (Exception, SystemExit): return None` in
+  `level_2.py::_fetch_via_botasaurus` (the exact handler round 40 added
+  for `SystemExit`) — zero `level_2.py`/`worker.py` changes needed; the
+  Botasaurus→Camoufox fallback now actually triggers for this failure
+  class instead of silently persisting garbage as `success=True`.
+
+  **Defense-in-depth, per the explicit hardening requirement**: a single
+  signal isn't "hardened against every possible failure" alone — added a
+  second, independent, structural regex to `ChallengeDetector`
+  (`fetcher/challenge_detector.py`): `_CHROMIUM_NET_ERROR_RE =
+  re.compile(r"\bnet::ERR_[A-Z_]+\b")`, checked unconditionally alongside
+  the existing gateway-error/Firefox-wrapper checks — same "structural,
+  not per-wording literal strings" philosophy this file's own round-33
+  comments already state ("generalizes to vendor software never seen
+  before"). Chromium keeps this token untranslated even when the browser
+  UI is localized, unlike the heading/body text. Plugs into `worker.py`'s
+  **already-existing, centralized**
+  `result.is_challenge_page = self._challenge_detector.is_challenge_page(...)`
+  classification (added round 45) for free — zero `worker.py` changes.
+
+  **Deliberately not done**: re-enabling `short_page_is_suspect=True` in
+  `_fetch_via_botasaurus`'s `is_challenge_page` call. Considered — these
+  interstitials are short, so it would add marginal coverage — but it's
+  the weakest of the three layers (risk of false-positiving on a real
+  short page, e.g. a legitimate URL-shortener landing page), and the
+  `current_url` check plus the `net::ERR_` regex already independently
+  cover the full confirmed failure class without that risk.
+
+  **Live-verified**: 12 new tests — new file
+  `tests/unit/test_botasaurus_nav_check.py` (the check module itself:
+  raises on `chrome-error://`, no-ops on a real URL, fails open when
+  `current_url` itself raises), plus additions to
+  `test_botasaurus_wrapper.py`, `test_botasaurus_pool.py` (both confirm
+  the driver still gets closed on this failure path), and
+  `test_challenge_detector.py` using the peer's actual 3 reported example
+  bodies (DNS_PROBE/connection-reset, `ERR_EMPTY_RESPONSE`, proxy "No
+  internet") reconstructed as fixtures, plus a generalization test with an
+  unseen `net::ERR_*` code. `ruff check` clean. `mypy` clean matching
+  CI's exact invocation (`--ignore-missing-imports`) — plain
+  `mypy --strict <file>` on isolated files shows pre-existing, unrelated
+  "missing library stubs" noise for `botasaurus`/`asyncpg`/`boto3` etc.
+  that's already present without any of this round's changes, confirmed
+  via `git stash` comparison before concluding it wasn't a regression.
+  Full gate rerun with real docker-compose infra: **964 passed** (up from
+  round 56's 952 by exactly the 12 new tests), 3 skipped (pre-existing
+  Camoufox/CAPTCHA live-test skips, unchanged), 0 failed, **100.00%
+  coverage** (3925 statements, 0 missed).
+
+  **Honest gap, not blocking**: not live-browser-verified this session
+  (would need a real Botasaurus/Camoufox launch against a deliberately-
+  broken network target, e.g. a bad port or a dead proxy, to confirm the
+  real CDP behavior matches the mocked-driver unit tests exactly) — worth
+  doing if a future session has a browser-capable window to spare.
+
+  **Explicitly out of scope, not touched**: the real-404-content case
+  (round 45's already-shipped design decision — a page that genuinely
+  says 404 is a successful scrape of a page that says 404, not this bug
+  class; the peer's own report explicitly did not flag this as a bug
+  either); any `FailureCategory`/DLQ-category-list change; L1; the
+  Camoufox/Playwright paths — confirmed already correct by reading the
+  code, no fetcher-specific change needed there.
+
 ## Technical Debt / Open Threads (as of round 56)
 
 - **CLOSED (round 56) — 5 read-only capabilities existed server-side but
@@ -157,9 +312,10 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   --help` and `scraper-engine api jobs --help`, both printing the correct
   subcommand/flag tree with exit code 0.
 
-- **OPEN, NOT YET INVESTIGATED (round 56) — `success=True` sometimes
-  returns a rendered browser/proxy-level error page as `content`, not the
-  real page.** Reported via cross-session message by a peer Claude session
+- **RESOLVED (round 57 — see round-57 entry above) — `success=True`
+  sometimes returns a rendered browser/proxy-level error page as
+  `content`, not the real page.** Reported via cross-session message by a
+  peer Claude session
   working on `research_agent` (a sibling HTTP caller), who found it while
   diagnosing an accuracy drop in their own downstream model — turned out
   to be a data-quality issue on the scraping side, not their model.
