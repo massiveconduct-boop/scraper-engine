@@ -34,7 +34,7 @@ class TestBotasaurusWrapper:
             assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"
-        fetch.assert_called_once_with(URL, _proxy().auth_url(), None)
+        fetch.assert_called_once_with(URL, _proxy().auth_url(), None, 0, 1500)
         # Released after the call, not held open
         assert budget.BROWSER_SEMAPHORE.locked() is False
 
@@ -56,7 +56,7 @@ class TestBotasaurusWrapper:
         with patch.object(wrapper, "_botasaurus_fetch", return_value="<html>ok</html>") as fetch:
             await wrapper.fetch_html(URL, proxy=gateway_proxy, tenant_id=TENANT)
         fetch.assert_called_once_with(
-            URL, "http://user123:pass456@gw.dataimpulse.com:823", None
+            URL, "http://user123:pass456@gw.dataimpulse.com:823", None, 0, 1500
         )
 
     def test_parallel_always_forced_to_one(self):
@@ -224,6 +224,36 @@ class TestBotasaurusWrapper:
         assert URL in str(exc_info.value)
         # Must fail BEFORE any further processing of the fake page.
         assert "This site can't be reached" not in str(exc_info.value)
+
+    def test_autoscroll_invoked_when_scroll_passes_configured(self):
+        """Round 58 — the one-shot Botasaurus fetch now scrolls (lazy-load/
+        infinite-scroll) when scroll_passes>0, mirroring the Camoufox
+        pipeline's existing behavior."""
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            wrapper._botasaurus_fetch(
+                URL, "http://1.2.3.4:8080", None, scroll_passes=3, scroll_wait_ms=250
+            )
+        autoscroll.assert_called_once()
+        assert autoscroll.call_args.kwargs == {"max_passes": 3, "wait_ms": 250}
+
+    def test_autoscroll_not_invoked_by_default(self):
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        autoscroll.assert_not_called()
 
 
 class TestLevel2BotasaurusFallback:

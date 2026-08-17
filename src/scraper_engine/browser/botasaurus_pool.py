@@ -80,9 +80,17 @@ class BotasaurusPool:
         proxy: Proxy,
         domain: str,
         session_id: str | None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
     ) -> str:
         """Fetch `url`, reusing the pooled driver when it already belongs to
-        this exact (proxy, domain) pair, else (re)launching one."""
+        this exact (proxy, domain) pair, else (re)launching one.
+
+        scroll_passes/scroll_wait_ms only apply on the fresh-launch path
+        (_new_driver_fetch) — the reuse path below fires an in-page JS
+        `fetch()` call (`driver.requests.get`), not a real navigation, so
+        the visible DOM never becomes the fetched HTML and there's nothing
+        to scroll."""
         loop = asyncio.get_running_loop()
         async with self._lock:
             entry = self._entry
@@ -100,12 +108,25 @@ class BotasaurusPool:
                     self._entry = None
 
                 driver, html = await loop.run_in_executor(
-                    None, self._new_driver_fetch, url, proxy, session_id
+                    None,
+                    self._new_driver_fetch,
+                    url,
+                    proxy,
+                    session_id,
+                    scroll_passes,
+                    scroll_wait_ms,
                 )
             self._entry = _PooledDriver(driver, proxy.key(), domain)
             return html
 
-    def _new_driver_fetch(self, url: str, proxy: Proxy, session_id: str | None) -> tuple[Any, str]:
+    def _new_driver_fetch(
+        self,
+        url: str,
+        proxy: Proxy,
+        session_id: str | None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+    ) -> tuple[Any, str]:
         """Synchronous — constructs and navigates a fresh Driver, run in the
         executor same as BotasaurusWrapper._botasaurus_fetch (Selenium-style
         driver management has no native asyncio API to await on)."""
@@ -114,6 +135,7 @@ class BotasaurusPool:
         from botasaurus.window_size import WindowSize
 
         from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
 
         cfg = self._config
         kwargs: dict[str, object] = {
@@ -139,6 +161,8 @@ class BotasaurusPool:
             raise_if_navigation_failed(driver, url)
             if cfg.random_sleep_enabled:
                 driver.short_random_sleep()
+            if scroll_passes > 0:
+                botasaurus_autoscroll(driver, max_passes=scroll_passes, wait_ms=scroll_wait_ms)
             return driver, str(driver.page_html)
         except Exception:
             self._close_driver(driver)

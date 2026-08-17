@@ -103,6 +103,8 @@ class BotasaurusWrapper:
         proxy: Proxy,
         tenant_id: TenantId,
         session_id: str | None = None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
     ) -> str:
         """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox.
 
@@ -114,6 +116,10 @@ class BotasaurusWrapper:
         full fetch rather than just the launch/close moments — an accepted
         throughput trade for closing the Xvfb display-collision crash. See
         core/budget.py::XVFB_LOCK.
+
+        Round 58 — scroll_passes/scroll_wait_ms wire lazy-load/infinite-
+        scroll support into this path (previously only the Camoufox fallback
+        pipeline scrolled; see browser/_botasaurus_scroll.py).
         """
         async with budget.BROWSER_SEMAPHORE, budget.XVFB_LOCK:
             loop = asyncio.get_running_loop()
@@ -123,9 +129,18 @@ class BotasaurusWrapper:
                 url,
                 proxy.auth_url(),
                 session_id,
+                scroll_passes,
+                scroll_wait_ms,
             )
 
-    def _botasaurus_fetch(self, url: str, proxy_url: str, session_id: str | None) -> str:
+    def _botasaurus_fetch(
+        self,
+        url: str,
+        proxy_url: str,
+        session_id: str | None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+    ) -> str:
         """Synchronous Botasaurus fetch, run in executor — Botasaurus's driver
         management is Selenium-based (no native asyncio API to await on)."""
         from botasaurus.browser import Driver, browser
@@ -133,6 +148,7 @@ class BotasaurusWrapper:
         from botasaurus.window_size import WindowSize
 
         from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
 
         decorator_kwargs: dict[str, object] = {
             "headless": False,
@@ -191,6 +207,8 @@ class BotasaurusWrapper:
             raise_if_navigation_failed(driver, url)
             if use_random_sleep:
                 driver.short_random_sleep()
+            if scroll_passes > 0:
+                botasaurus_autoscroll(driver, max_passes=scroll_passes, wait_ms=scroll_wait_ms)
             return str(driver.page_html)
 
         try:

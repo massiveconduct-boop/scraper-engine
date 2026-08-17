@@ -159,3 +159,75 @@ class TestBotasaurusPool:
             )
         assert "https://a.example/1" in str(exc_info.value)
         driver.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fresh_launch_autoscrolls_when_scroll_passes_configured(self):
+        """Round 58 — fresh-driver fetches now scroll (lazy-load/infinite-
+        scroll) when scroll_passes>0, mirroring the Camoufox pipeline."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            html = await pool.fetch(
+                "https://a.example/1",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                scroll_passes=3,
+                scroll_wait_ms=200,
+            )
+        autoscroll.assert_called_once_with(driver, max_passes=3, wait_ms=200)
+        assert html == "<html>fresh</html>"
+
+    @pytest.mark.asyncio
+    async def test_fresh_launch_skips_autoscroll_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        autoscroll.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reuse_fetch_never_autoscrolls(self):
+        """Round 58 — the reuse path (driver.requests.get, an in-page JS
+        fetch()) never navigates, so scroll_passes must be ignored there
+        even when configured — the visible DOM would just be the previous
+        page, not the one just fetched."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            await pool.fetch(
+                "https://a.example/1",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                scroll_passes=3,
+                scroll_wait_ms=200,
+            )
+            autoscroll.reset_mock()
+            html = await pool.fetch(
+                "https://a.example/2",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                scroll_passes=3,
+                scroll_wait_ms=200,
+            )
+        autoscroll.assert_not_called()
+        assert html == "<html>reused</html>"

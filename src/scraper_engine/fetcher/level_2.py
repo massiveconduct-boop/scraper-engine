@@ -136,7 +136,12 @@ class Level2Fetcher:
         try:
             if self._botasaurus_pool is not None:
                 html = await self._botasaurus_pool.fetch(
-                    url, proxy=proxy, domain=domain, session_id=session_id
+                    url,
+                    proxy=proxy,
+                    domain=domain,
+                    session_id=session_id,
+                    scroll_passes=self._scroll_passes,
+                    scroll_wait_ms=self._scroll_wait_ms,
                 )
             else:
                 html = await self._botasaurus.fetch_html(
@@ -144,6 +149,8 @@ class Level2Fetcher:
                     proxy=proxy,
                     tenant_id=tenant_id,
                     session_id=session_id,
+                    scroll_passes=self._scroll_passes,
+                    scroll_wait_ms=self._scroll_wait_ms,
                 )
         except (Exception, SystemExit):
             # Round 40 — live-caught: botasaurus_driver's own proxy-auth

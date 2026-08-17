@@ -140,6 +140,49 @@ class TestFetchViaBotasaurus:
 
         assert result is None  # signals "fall back to Camoufox", not a raise
 
+    @pytest.mark.asyncio
+    async def test_scroll_settings_forwarded_to_botasaurus_pool(self):
+        """Round 58 — Level2Fetcher's scroll_passes/scroll_wait_ms must
+        reach the pool branch, not just the Camoufox fallback pipeline."""
+        botasaurus = MagicMock()
+        botasaurus_pool = AsyncMock()
+        botasaurus_pool.fetch.return_value = _REAL_HTML
+        fetcher = Level2Fetcher(
+            botasaurus=botasaurus,
+            botasaurus_pool=botasaurus_pool,
+            scroll_passes=4,
+            scroll_wait_ms=750,
+        )
+
+        await fetcher._fetch_via_botasaurus("http://example.com", TenantId("system"), _proxy())
+
+        botasaurus_pool.fetch.assert_awaited_once_with(
+            "http://example.com",
+            proxy=_proxy(),
+            domain="example.com",
+            session_id="system:example.com",
+            scroll_passes=4,
+            scroll_wait_ms=750,
+        )
+
+    @pytest.mark.asyncio
+    async def test_scroll_settings_forwarded_to_botasaurus_fetch_html(self):
+        """Same as above, direct fetch_html branch (no botasaurus_pool)."""
+        botasaurus = AsyncMock()
+        botasaurus.fetch_html.return_value = _REAL_HTML
+        fetcher = Level2Fetcher(botasaurus=botasaurus, scroll_passes=4, scroll_wait_ms=750)
+
+        await fetcher._fetch_via_botasaurus("http://example.com", TenantId("system"), _proxy())
+
+        botasaurus.fetch_html.assert_awaited_once_with(
+            "http://example.com",
+            proxy=_proxy(),
+            tenant_id=TenantId("system"),
+            session_id="system:example.com",
+            scroll_passes=4,
+            scroll_wait_ms=750,
+        )
+
 
 class TestFetchViaCamoufox:
     @pytest.mark.asyncio

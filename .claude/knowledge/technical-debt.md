@@ -32,7 +32,115 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 57)
+## Technical Debt / Open Threads (as of round 58)
+
+- **RESOLVED (round 58) — Botasaurus's fetch path never autoscrolled,
+  silently dropping lazy-load/infinite-scroll content.** Round 57's
+  Botasaurus-features recon (informational at the time) found a real
+  adjacent bug while checking scroll support:
+  `Level2Fetcher._fetch_via_botasaurus` (`fetcher/level_2.py`) never called
+  the lazy-load/infinite-scroll helper — only the Camoufox fallback path
+  (`_fetch_via_camoufox`) scrolled. Since Botasaurus is tried first on
+  every L2 fetch, any URL that succeeded on Botasaurus's first attempt
+  silently returned a page with `scroll_passes>0` configured but never
+  actually scrolled — no error, no log, no signal to the caller that
+  content was missing.
+
+  **Root cause**: `fetcher/_content_utils.py::autoscroll` is written
+  against Playwright's async `page.evaluate()`/`page.wait_for_timeout()`
+  API. Botasaurus's `Driver` is a synchronous, Selenium-style API
+  (`driver.run_js()`, no awaitable sleep) with no matching primitives — the
+  two code paths that actually drive Botasaurus
+  (`browser/botasaurus_pool.py`'s fresh-launch branch,
+  `fetcher/botasaurus_wrapper.py`'s one-shot fetch) never had a scroll call
+  wired in at all. Not a call that got dropped — one that was never written
+  for this engine.
+
+  **Fix**: new `browser/_botasaurus_scroll.py::botasaurus_autoscroll()` — a
+  sync port of the same height-stability algorithm (scroll to bottom via
+  `driver.run_js("window.scrollTo(0, document.body.scrollHeight);")`,
+  `time.sleep(wait_ms/1000)`, re-read `document.body.scrollHeight`, stop
+  after `stable_passes_before_stop` consecutive flat passes or
+  `max_passes`; never raises — a page that can't be scrolled just yields
+  0). Wired into `botasaurus_pool.py::_new_driver_fetch` and
+  `botasaurus_wrapper.py::_botasaurus_fetch` (both real-navigation paths,
+  right after `driver.short_random_sleep()`, before `page_html` is read),
+  with `scroll_passes`/`scroll_wait_ms` threaded as call-time arguments
+  from `Level2Fetcher._fetch_via_botasaurus` — values it already held
+  (`self._scroll_passes`/`self._scroll_wait_ms`, sourced from
+  `config.levels.level_2.scroll_passes`/`scroll_wait_ms` via
+  `fetcher/factory.py::build_level2_fetcher`). No config schema change.
+
+  **Deliberately excluded**: `BotasaurusPool._reuse_fetch` (the "2nd+
+  fetch for the same proxy+domain" path). It calls
+  `driver.requests.get(url)`, which is an in-page JS `fetch()` call, not a
+  real navigation — the visible DOM never becomes the fetched HTML, so
+  `document.body.scrollHeight` there reflects the *previous* page, not the
+  one just fetched. Wiring scroll into that path would silently scroll the
+  wrong page. Documented in code as a known, correct limitation, not a gap
+  to close. Also logged as a Key Learning in `.wolf/cerebrum.md` — the same
+  constraint applies to any future feature that reads/mutates the live
+  page on that path, not just scroll.
+
+  **Also deliberately excluded, per explicit user instruction this
+  round**: the other 6 Botasaurus feature gaps round 57's recon had found
+  (`block_images`/`block_images_and_css`, `calc_max_parallel_browsers()`,
+  human-mode mouse simulation, `extensions` kwarg, `lang` kwarg, raw CDP
+  network events). User's stated criterion: bundle a recon'd feature into
+  a bug-fix round only if it's genuinely in scope with the bug being
+  fixed. None of the 6 are required to fix a missing scroll call — they're
+  different subsystems (bandwidth/perf, RAM-aware concurrency sizing,
+  stealth mouse movement, extension loading, locale spoofing, network
+  introspection) — so none were touched. They remain open backlog in
+  `.wolf/STATUS.md`.
+
+  **Tests**: new `tests/unit/test_botasaurus_scroll.py` (6 tests — pure
+  logic against `botasaurus_autoscroll` with a mocked `driver.run_js`
+  height sequence: growing-then-flat stop condition, `max_passes` cap,
+  `max_passes<=0` no-op, initial-read exception, mid-loop exception).
+  3 new tests in `test_botasaurus_pool.py` (fresh-launch scrolls when
+  configured, skips by default, reuse path never scrolls even when
+  configured — confirms the exclusion above holds). 2 new tests in
+  `test_botasaurus_wrapper.py` (same shape for the one-shot path). 2 new
+  tests in `test_level_2.py` (scroll settings actually reach both the
+  `botasaurus_pool.fetch` and `botasaurus.fetch_html` call sites). 2
+  pre-existing `test_botasaurus_wrapper.py` tests
+  (`test_fetch_html_acquires_shared_browser_semaphore`,
+  `test_fetch_html_embeds_credentials_for_paid_gateway_proxy`) updated —
+  they asserted `_botasaurus_fetch`'s exact positional call args, which
+  now include the two new trailing params.
+
+  **Verification**: `ruff check` clean. `mypy` matching CI's exact
+  invocation (`src/... --ignore-missing-imports`) — 0 errors, 0 new vs
+  `tools/mypy-baseline.txt` (plain `mypy --strict` on isolated files shows
+  the same pre-existing, unrelated `botasaurus` "missing library stubs"
+  noise round 57 already noted, confirmed via `git stash` comparison
+  before concluding it wasn't a regression — same check repeated this
+  round). Full unit suite: **894 passed, 1 skipped**;
+  `fetcher/botasaurus_wrapper.py` and `fetcher/level_2.py` (the two
+  100%-coverage-gated files touched — `browser/` is excluded from the
+  coverage gate per `pyproject.toml`'s documented reason) both **100%
+  coverage**. Full integration+chaos gate was **not** rerun this round —
+  host was at 7.5/8GB swap used with another unrelated heavy process
+  already running (`free -h`/`ps aux` checked first, per this project's
+  own resource-safety rule); deferred rather than risk a freeze. This is a
+  real gap versus round 57's precedent of a full gate rerun and should be
+  closed opportunistically next time the host has headroom, not silently
+  treated as equivalent verification.
+
+  **Live-verified with a real Botasaurus/Chromium launch** (standalone
+  script, same precedent as round 57's two standalone scripts): constructed
+  a real `botasaurus_driver.Driver` directly (`headless=False,
+  enable_xvfb_virtual_display=True, proxy=None` — direct connection, no
+  proxy needed to prove real scroll behavior) against the same
+  infinite-scroll test page round 15 validated the Camoufox autoscroll fix
+  against. Confirmed real, not inferred: before scroll, the page snapshot
+  had 0 lazy-loaded content items; `botasaurus_autoscroll` performed 10
+  real scroll passes (hit `max_passes` — content kept growing every single
+  pass, never went flat); after scroll, the page had 100 items (that test
+  site's full known content set). Host memory checked stable
+  (`free -h`) before and after — no swap spike from the single browser
+  launch.
 
 - **RESOLVED (round 57) — Botasaurus silently returned Chromium's own
   internal network-error interstitial as `success=True` real content.**
