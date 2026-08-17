@@ -173,11 +173,32 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   Camoufox/CAPTCHA live-test skips, unchanged), 0 failed, **100.00%
   coverage** (3925 statements, 0 missed).
 
-  **Honest gap, not blocking**: not live-browser-verified this session
-  (would need a real Botasaurus/Camoufox launch against a deliberately-
-  broken network target, e.g. a bad port or a dead proxy, to confirm the
-  real CDP behavior matches the mocked-driver unit tests exactly) — worth
-  doing if a future session has a browser-capable window to spare.
+  **Live-verified with a real browser launch (same session, user
+  explicitly required it — a mocked-driver test alone doesn't clear this
+  project's own "evidence over assertion" bar for anything touching real
+  browser automation)**: two standalone scripts, each launching a real
+  Botasaurus/Chromium via Xvfb against a proxy pointed at a closed local
+  port (`127.0.0.1:1` — deterministic, fast, real network-level failure,
+  the same class the peer's "No internet... something wrong with the
+  proxy server" example reported), one exercising
+  `BotasaurusWrapper.fetch_html()` (the one-shot path) and one exercising
+  `BotasaurusPool.fetch()` (the pooled/reuse path). Both confirmed for
+  real, not inferred: `driver.current_url` genuinely reads
+  `chrome-error://chromewebdata/` after the failed navigation, and
+  `raise_if_navigation_failed()` correctly raises `BotasaurusNavigationError`
+  with the exact descriptive message in both cases —
+  `"Botasaurus/Chromium failed to navigate to 'https://example.com/' —
+  landed on its own internal error page
+  (current_url='chrome-error://chromewebdata/') instead of the real
+  target. No real response was ever received."` The pooled path's driver
+  is also confirmed not left "held" after the failure (`pool._entry is
+  None` afterward, matching `_new_driver_fetch`'s
+  `except Exception: self._close_driver(driver); raise`). This is the
+  first real confirmation that the root-cause claim (`Driver.get()`
+  silently landing on `chrome-error://` for a real network failure, not
+  just per the library's source code) holds against the actual installed
+  `botasaurus_driver`/Chromium on this host, not only against a mock built
+  from reading that source.
 
   **Explicitly out of scope, not touched**: the real-404-content case
   (round 45's already-shipped design decision — a page that genuinely

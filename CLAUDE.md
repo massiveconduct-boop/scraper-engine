@@ -33,10 +33,17 @@ already-centralized `is_challenge_page` classification for free. Live-
 verified via 12 new tests (using the peer's actual 3 reported example
 bodies as fixtures) — full gate: 964 passed (up from round 56's 952 by
 exactly the new tests), 3 skipped (pre-existing, unchanged), 0 failed,
-100.00% coverage. Not live-browser-verified this session (would need a
-real Botasaurus/Camoufox launch against a deliberately-broken network
-target) — flagged as the one open item, not blocking. Full detail:
-technical-debt.md round-57 entry. Round 56 (rounds 51-55 — `dlq_reaper` cross-category starvation
+100.00% coverage. Live-verified with a real browser launch too (user
+explicitly required it, same session, as a follow-up correction) — two
+standalone scripts launched real Botasaurus/Chromium via Xvfb against a
+proxy pointed at a closed local port, one exercising each of the two
+fixed call sites; both confirmed `driver.current_url` genuinely reads
+`chrome-error://chromewebdata/` after the failure and
+`BotasaurusNavigationError` is correctly raised with the exact descriptive
+message — first real confirmation the root-cause claim holds against the
+actual installed `botasaurus_driver`, not only against a mock built from
+reading its source. Full detail: technical-debt.md round-57 entry.
+Round 56 (rounds 51-55 — `dlq_reaper` cross-category starvation
 fix, two orphaned-PENDING-job reconciliation/live-deploy rounds, an
 enqueue-failure-after-insert fix, and a PROCESSING-stuck-forever rq-hard-kill
 fix — not narrated in this rolling paragraph, see technical-debt.md's
