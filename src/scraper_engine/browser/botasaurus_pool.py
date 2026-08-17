@@ -73,6 +73,21 @@ class BotasaurusPool:
         # SEMAPHORE, but this lock keeps this pool's own reuse/evict decision
         # atomic regardless of that external ceiling.
         self._lock = asyncio.Lock()
+        # Round 60 finding: CDP before_request_sent/after_response_received
+        # hooks are registered once, on first launch, and stay live on that
+        # Driver for its whole pooled lifetime (they're tab-scoped, not
+        # per-navigation) — but each fetch() call brings its own fresh
+        # events_sink for its own FetchResult. A hook capturing a *fixed*
+        # list reference from registration time would keep appending every
+        # later reused-driver fetch's traffic into the first call's already-
+        # returned list instead of each call's own. _new_driver_fetch
+        # registers a handler that reads this attribute dynamically
+        # (`register_network_capture(driver, lambda: self._active_events_
+        # sink)`) instead, and fetch() updates it on every call — including
+        # the reuse branch, which is what actually makes reused-driver
+        # capture work at all. Safe under self._lock: only one fetch() call
+        # is ever in flight per pool instance.
+        self._active_events_sink: list[dict[str, object]] | None = None
 
     async def fetch(
         self,
@@ -82,6 +97,7 @@ class BotasaurusPool:
         session_id: str | None,
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
     ) -> str:
         """Fetch `url`, reusing the pooled driver when it already belongs to
         this exact (proxy, domain) pair, else (re)launching one.
@@ -90,9 +106,13 @@ class BotasaurusPool:
         (_new_driver_fetch) — the reuse path below fires an in-page JS
         `fetch()` call (`driver.requests.get`), not a real navigation, so
         the visible DOM never becomes the fetched HTML and there's nothing
-        to scroll."""
+        to scroll. events_sink applies to BOTH paths — see
+        `self._active_events_sink`'s docstring above: a reused driver's
+        already-registered CDP hooks fire for its in-page fetch() too, and
+        get redirected into whichever call's events_sink is current."""
         loop = asyncio.get_running_loop()
         async with self._lock:
+            self._active_events_sink = events_sink
             entry = self._entry
             if entry is not None and entry.proxy_key == proxy.key() and entry.domain == domain:
                 return await loop.run_in_executor(None, self._reuse_fetch, entry.driver, url)
@@ -134,7 +154,9 @@ class BotasaurusPool:
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
 
+        from scraper_engine.browser._botasaurus_extension import LocalExtension
         from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_network_capture import register_network_capture
         from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
 
         cfg = self._config
@@ -151,11 +173,34 @@ class BotasaurusPool:
             "block_images": cfg.block_images,
             "block_images_and_css": cfg.block_images_and_css,
         }
+        if cfg.extensions:
+            kwargs["extensions"] = [LocalExtension(p) for p in cfg.extensions]
+        if cfg.lang:
+            kwargs["lang"] = cfg.lang
         if cfg.hashed_fingerprint and session_id is not None:
             kwargs["user_agent"] = UserAgent.HASHED
             kwargs["window_size"] = WindowSize.HASHED
         driver = Driver(**kwargs)
         try:
+            # Round 60 finding: these three calls were originally outside this
+            # try block. Any of them raising (e.g. enable_human_mode()'s
+            # lazy botasaurus_humancursor import failing, or a CDP command
+            # throwing — schema.py's own docstring already documents a live-
+            # confirmed CDP bug on a different domain in this installed
+            # version) would leak the just-launched driver/Xvfb display with
+            # no _close_driver() call, reintroducing the display-contention
+            # precondition round 41's XVFB_LOCK was built to close. Moved
+            # inside so any failure here is caught by the except below.
+            if cfg.capture_network_events:
+                register_network_capture(driver, lambda: self._active_events_sink)
+            if cfg.humanize_mouse:
+                driver.enable_human_mode()
+            if cfg.locale or cfg.timezone:
+                # Must be applied before navigation — driver.py:2148-2150's own
+                # docstring: "call this before navigating".
+                driver.set_locale_and_timezone(
+                    locale=cfg.locale or None, timezone_id=cfg.timezone or None
+                )
             if cfg.bypass_cloudflare:
                 driver.google_get(url, bypass_cloudflare=True)
             else:
@@ -164,7 +209,12 @@ class BotasaurusPool:
             if cfg.random_sleep_enabled:
                 driver.short_random_sleep()
             if scroll_passes > 0:
-                botasaurus_autoscroll(driver, max_passes=scroll_passes, wait_ms=scroll_wait_ms)
+                botasaurus_autoscroll(
+                    driver,
+                    max_passes=scroll_passes,
+                    wait_ms=scroll_wait_ms,
+                    humanize=cfg.humanize_mouse,
+                )
             return driver, str(driver.page_html)
         except Exception:
             self._close_driver(driver)

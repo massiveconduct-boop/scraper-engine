@@ -32,7 +32,222 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
-## Technical Debt / Open Threads (as of round 59)
+## Technical Debt / Open Threads (as of round 60)
+
+- **IMPLEMENTED (round 60) — the remaining 4 of round 57's 6 backlog
+  Botasaurus feature items: `extensions`, `lang`/locale/timezone spoof,
+  human-mode mouse simulation, raw CDP network events. Closes the round-57
+  audit entirely.** Explicit user instruction: implement each as an
+  independent unit (own config field, own live-browser verification) —
+  not bundled together despite landing in one session.
+
+  **`extensions`**: `Driver(extensions=[...])` is real
+  (`botasaurus_driver` 4.0.100 `driver.py:2074`), but each list item must
+  be an object exposing `.load(with_command_line_option=False) -> str`
+  (`core/config.py:83-89`'s `create_extensions_string`), not a raw path
+  string — no local-unpacked-extension helper ships in the installed
+  package. New `browser/_botasaurus_extension.py::LocalExtension` wraps a
+  configured directory path in that shape. New `BotasaurusConfig.
+  extensions: list[str] = []`, wired into both `browser/botasaurus_pool.py`
+  and `fetcher/botasaurus_wrapper.py`. **Live-verified for real**: built a
+  throwaway unpacked test-extension fixture
+  (`tests/fixtures/botasaurus_test_extension/`, content script sets a DOM
+  attribute marker — deliberately a DOM mutation, not a `window.*` JS
+  variable, since content-script isolated-world JS variables aren't
+  visible to page-context `run_js` reads, only real DOM writes are),
+  launched a real Chromium with it configured, confirmed the marker
+  appears in the page (extension genuinely loaded, not just that the CDP
+  flag was forwarded).
+
+  **`lang`/locale/timezone**: three genuinely independent settings, not
+  one value in two formats. `driver.set_locale_and_timezone(locale=...,
+  timezone_id=...)` (`driver.py:2142-2169`) **works and is live-verified**
+  — `Intl.DateTimeFormat().resolvedOptions().locale`/`.timeZone` both
+  correctly reflected a real spoofed `"de_DE"`/`"Europe/Berlin"` against a
+  real page. **`Driver(lang=...)` does NOT work as documented** — its own
+  docstring claims it drives JS-visible `navigator.language`, but live
+  testing (both `"de-DE"` and `"de"` formats, the installed Chromium build
+  does ship a `de.pak` locale resource so it isn't a missing-locale-data
+  issue) showed zero effect on `navigator.language`, `navigator.languages`,
+  or the `Accept-Language` request header (checked via a real
+  `before_request_sent` CDP hook, not just JS reads). A JS-injection
+  workaround (`driver.run_on_new_document()`, CDP
+  `Page.addScriptToEvaluateOnNewDocument`) was attempted and hit a
+  **separate real upstream bug**: `driver.run_cdp_command(cdp.page.
+  enable())` itself throws `ChromeException("Invalid parameters ... CBOR:
+  map start expected")` in this installed `botasaurus_driver` version —
+  confirmed not a general zero-param-command issue (`cdp.dom.enable()`/
+  `cdp.runtime.enable()` both succeed the same way), so it's Page-domain-
+  specific breakage in the installed package, out of scope to patch here.
+  `lang` field kept and wired anyway (real kwarg, correctly forwarded to
+  Chrome's command line, may behave differently on other Chromium builds)
+  but documented honestly in `schema.py`'s docstring as not usable for
+  `navigator.language` spoofing against this stack today — see
+  `decisions.md` for why it wasn't quietly dropped instead. New
+  `BotasaurusConfig.lang/locale/timezone: str | None = None`, wired into
+  both Botasaurus paths; `_reuse_fetch` untouched (in-page JS `fetch()`,
+  not a real navigation, same round-58 reasoning).
+
+  **Human-mode mouse simulation**: `driver.enable_human_mode()`
+  (`driver.py:2123-2137`, no params) makes every subsequent mouse call
+  route through `botasaurus_humancursor`'s curved-movement simulation
+  instead of an instant CDP jump — all mouse methods already auto-wrap via
+  an internal `with_human_mode()` helper, none require enabling first. New
+  `BotasaurusConfig.humanize_mouse: bool = False`; called right after
+  `Driver(**kwargs)` construction. Explicit movement wired into
+  `browser/_botasaurus_scroll.py::botasaurus_autoscroll()`'s new
+  `humanize` param — moves the mouse to a random in-viewport point (read
+  via `run_js("return [window.innerWidth, window.innerHeight];")`) before
+  each scroll pass, wrapped so a failed move (e.g. no headless mouse-move
+  support) never breaks the scroll loop itself. **Live-verified**:
+  `is_human_mode_enabled` flips `True` after `enable_human_mode()`, and a
+  direct `move_mouse_to_point()` call against a real loaded page executes
+  with no exception (unwrapped from the swallow-logic, to distinguish
+  "worked" from "silently failed").
+
+  **Raw CDP network events → job metadata**: the biggest of the four —
+  needed a DB migration, not just a config field. `driver.
+  before_request_sent()`/`after_response_received()` (`driver.py:760,793`)
+  are real hooks; new `browser/_botasaurus_network_capture.py::
+  register_network_capture()` wraps them into trimmed request/response
+  dicts (`request_id`/`url`/`method`-or-`status`/`headers`, deliberately
+  not full bodies) appended to a caller-supplied `events_sink` list. New
+  `BotasaurusConfig.capture_network_events: bool = False`. Deliberately
+  **did not** change `BotasaurusPool.fetch()`/`BotasaurusWrapper.
+  fetch_html()`'s existing `str` return type — added an optional
+  `events_sink: list[dict] | None = None` param instead, populated in
+  place, avoiding a wide return-type refactor across every caller.
+  `fetcher/level_2.py::_fetch_via_botasaurus` passes a fresh list each
+  call and attaches it to the `FetchResult` it constructs directly —
+  **this is where the actual plan (written before implementation) turned
+  out to be wrong**: the plan assumed `FetchResult.network_events` needed
+  threading through `orchestrator/worker.py`'s `process_job` (~line
+  490-551), based on that being where `result.extracted` gets assigned —
+  but that's the *extraction* step, which runs after `Level2Fetcher.fetch()`
+  already returns a complete `FetchResult`. The `FetchResult` itself is
+  actually constructed inside `_fetch_via_botasaurus`
+  (`fetcher/level_2.py`), which is where `network_events` needed to be set
+  — a real, live-discovered correction to the plan, not a bundling
+  violation (still exactly item 4, still one independent unit). New
+  `core/models.py::FetchResult.network_events: list[dict[str, Any]] |
+  None = None`. New `migrations/versions/010_scrape_results_network_
+  events.py` adds `network_events JSONB` to `scrape_results`
+  (`json_data` was already committed to `result.extracted`'s
+  extraction-schema output, not reusable as a free-form bucket) — same
+  `create_tenant_schema()`-redefinition + per-tenant-backfill-loop pattern
+  as `009_scrape_results_proxy_source.py`. `orchestrator/tasks.py::
+  _persist_one_result`'s `INSERT INTO scrape_results` gained the column.
+  **Live-verified end to end, not just unit-mocked**: applied the
+  migration for real (`docker compose build migrate` — a rebuild was
+  required first since the `migrate` service bakes the image at build
+  time rather than bind-mounting `migrations/`, the same class of gotcha
+  `.wolf/cerebrum.md` already has a 2026-08-14 Do-Not-Repeat entry for on
+  `api` — then `docker compose run --rm migrate`, confirmed `alembic_
+  version` moved `009` → `010` and the column exists with `data_type
+  jsonb` on a real tenant schema); a real Chromium launch through the
+  actual `BotasaurusPool.fetch(events_sink=...)` code path captured 81
+  real request/response events including real headers off a real
+  `https://example.com` navigation; confirmed `json.dumps()` serializes
+  `botasaurus_driver`'s `RequestId` (a `str` subclass) cleanly; ran a real
+  `INSERT ... network_events / SELECT / ROLLBACK` against the live
+  `scrape_results` table (transaction rolled back, no residue left) to
+  confirm the JSONB value round-trips exactly as captured.
+
+  **Tests**: new unit test files `test_botasaurus_extension.py` and
+  `test_botasaurus_network_capture.py`; new cases added to
+  `test_botasaurus_pool.py`, `test_botasaurus_wrapper.py`,
+  `test_botasaurus_scroll.py`, and `test_level_2.py` for every new field/
+  param (default-off and default-on cases, mocked `Driver`/mocked pool —
+  the real-browser proof for all four items lived only in this session's
+  throwaway live-verification scripts, not committed to the repo). 930
+  unit tests pass (0 failures, up from 900), `ruff` clean on every touched
+  file. Mypy: 6 pre-existing `import-untyped` errors on `botasaurus.*`
+  confirmed present identically on unmodified `HEAD` via `git stash` (not
+  a round-60 regression — a pre-existing per-file-invocation gap unrelated
+  to this round's diff).
+
+  **Post-implementation independent review (same session, user-requested,
+  a dedicated single-purpose review agent, before anything was committed)
+  found 3 real defects, all fixed and re-verified:**
+
+  1. **HIGH — resource leak.** `botasaurus_pool.py::_new_driver_fetch`'s
+     three new post-launch calls (`register_network_capture`,
+     `driver.enable_human_mode()`, `driver.set_locale_and_timezone()`)
+     originally ran *before* the existing `try:` block that closes the
+     driver on failure — an exception from any of them (e.g.
+     `enable_human_mode()`'s lazy `botasaurus_humancursor` import failing,
+     or a CDP command throwing, which `schema.py`'s own docstring already
+     documents happening on a different CDP domain in this installed
+     version) would leak the just-launched driver and its Xvfb display
+     with no `_close_driver()` call — reintroducing the exact display-
+     contention precondition round 41's `XVFB_LOCK` exists to close.
+     `fetcher/botasaurus_wrapper.py`'s equivalent code wasn't affected
+     (protected end-to-end by botasaurus's own `@browser` decorator,
+     `close_on_crash=True`). Fixed by moving all three calls inside the
+     `try:` block. New regression test:
+     `test_post_launch_setup_failure_closes_driver_and_propagates`
+     (`enable_human_mode` raises, asserts `driver.close()` was still
+     called).
+  2. **MEDIUM — `GET /v1/jobs/{job_id}` never returned `network_events`.**
+     `api/routes.py`'s DB-reconstruction `SELECT`/`FetchResult(...)` for
+     the polling endpoint listed every `scrape_results` column except the
+     new one (mirrors a pre-existing identical gap for round-49's
+     `proxy_source`, not fixed here — out of this round's scope, left for
+     a future round). The feature only worked through the webhook-payload
+     path (`_dispatch_job_webhook`, serializing live in-memory
+     `FetchResult` objects), not polling. Fixed: added `network_events` to
+     both the `SELECT` and the `FetchResult(...)` construction (`json.loads`
+     matching the existing `json_data`/`extracted` pattern exactly). New
+     test: `test_get_job_surfaces_network_events_from_db_row` (populated
+     + null cases, first real test to populate `scrape_results` rows for
+     this endpoint at all — no prior test exercised that reconstruction
+     code beyond an empty list).
+  3. **MEDIUM — reused-driver fetches silently dropped network-event
+     capture (and leaked into a dead list).** `before_request_sent`/
+     `after_response_received` are tab-scoped CDP hooks registered *once*
+     at first launch and live for the whole pooled `Driver`'s lifetime —
+     but each `BotasaurusPool.fetch()` call brought its own fresh
+     `events_sink` list. A 2nd+ same-domain reused-driver fetch's captured
+     traffic kept landing in the *first* call's already-returned,
+     never-read list instead of its own — meaning the feature only really
+     worked for the first URL of a multi-URL same-domain job, exactly
+     `BotasaurusPool`'s core use case, with no error or empty-list signal
+     to notice it. Root-fixed (not just documented) via a redirect
+     indirection: `_botasaurus_network_capture.py::register_network_
+     capture()`'s `events_sink` param now accepts a zero-arg callable
+     (resolved dynamically per event) in addition to a plain list;
+     `botasaurus_pool.py` gained `self._active_events_sink`, updated by
+     `fetch()` on *every* call (both the reuse and fresh-launch branches —
+     safe since `self._lock` guarantees only one `fetch()` call is ever in
+     flight per pool instance), and `_new_driver_fetch`'s registration now
+     passes `lambda: self._active_events_sink` instead of a fixed list
+     captured at registration time. New tests:
+     `test_network_capture_redirects_to_current_calls_sink_on_reuse`
+     (pool-level, proves a 2nd reused-driver fetch's event lands in the
+     2nd call's list, not the 1st's) and 2 new
+     `test_botasaurus_network_capture.py` cases for the callable form
+     directly (dynamic resolution per event, `None`-returning callable
+     drops the event without raising).
+
+  Also, informational (not a defect): the throwaway live-verification test
+  extension built for this round (`tests/fixtures/botasaurus_test_
+  extension/`) was committed but had zero references from the committed
+  test suite. Rather than delete it, added
+  `tests/live/test_botasaurus_extension_loading.py` (`@pytest.mark.live`,
+  same pattern as the existing `tests/live/` suite) so this feature has
+  permanent regression coverage that a mocked unit test structurally
+  cannot provide (proving Chromium *actually loads* the extension, not
+  just that the kwarg was forwarded) — re-run live after adding, confirmed
+  `PASSED` with the real marker attribute observed.
+
+  **Final state**: 935 unit tests pass (up from 930), `ruff` clean across
+  every touched file, mypy shows the same pre-existing untyped-import
+  warnings as before (nothing new). All 3 fixes independently
+  live-re-verified where a live check was possible (extension loading via
+  the new committed live test); the leak fix and the reuse-capture
+  redirect fix are covered by new unit-level regression tests that fail
+  against the pre-fix code (verified by construction — each test asserts
+  exactly the behavior the bug violated).
 
 - **IMPLEMENTED (round 59) — 2 of round 57's 6 backlog Botasaurus feature
   items: RAM-aware `BROWSER_SEMAPHORE` concurrency, and `block_images`/

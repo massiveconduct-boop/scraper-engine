@@ -83,6 +83,56 @@ class TestBotasaurusPool:
         assert html == "<html>reused</html>"
 
     @pytest.mark.asyncio
+    async def test_network_capture_redirects_to_current_calls_sink_on_reuse(self):
+        """Round 60 regression test — CDP hooks are registered once, on
+        first launch, and stay live on the pooled Driver for its whole
+        lifetime (tab-scoped, not per-navigation). Without redirecting to
+        the *current* call's events_sink, a 2nd+ same-domain reused-driver
+        fetch's captured traffic would silently land in the 1st call's
+        already-returned (and unread) list instead of its own."""
+        pool = BotasaurusPool(
+            tenant_id=TENANT, config=BotasaurusConfig(capture_network_events=True)
+        )
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            first_sink: list[dict] = []
+            await pool.fetch(
+                "https://a.example/1",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                events_sink=first_sink,
+            )
+            # Registered exactly once, on the fresh-launch path.
+            driver.before_request_sent.assert_called_once()
+            on_request = driver.before_request_sent.call_args.args[0]
+
+            second_sink: list[dict] = []
+            await pool.fetch(
+                "https://a.example/2",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                events_sink=second_sink,
+            )
+            # Still only registered once (reuse path doesn't re-register).
+            driver.before_request_sent.assert_called_once()
+
+            request = MagicMock(url="https://a.example/2", method="GET", headers={})
+            on_request("req-2", request, MagicMock())
+
+        assert second_sink == [
+            {
+                "type": "request",
+                "request_id": "req-2",
+                "url": "https://a.example/2",
+                "method": "GET",
+                "headers": {},
+            }
+        ]
+        assert first_sink == []  # not the stale first call's list
+
+    @pytest.mark.asyncio
     async def test_domain_mismatch_closes_old_driver_and_builds_new(self):
         pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
         driver_a = _fake_driver()
@@ -140,6 +190,29 @@ class TestBotasaurusPool:
         driver.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_post_launch_setup_failure_closes_driver_and_propagates(self):
+        """Round 60 regression test — enable_human_mode()/set_locale_and_
+        timezone()/register_network_capture() run after Driver(**kwargs) but
+        must stay inside the same try/except as navigation: a failure here
+        (e.g. enable_human_mode()'s lazy botasaurus_humancursor import
+        failing, or a CDP command throwing) must still close the driver
+        instead of leaking it and its Xvfb display (round 41's
+        display-contention crash precondition)."""
+        pool = BotasaurusPool(
+            tenant_id=TENANT, config=BotasaurusConfig(humanize_mouse=True)
+        )
+        driver = _fake_driver()
+        driver.enable_human_mode.side_effect = RuntimeError("humancursor import failed")
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            pytest.raises(RuntimeError, match="humancursor import failed"),
+        ):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.close.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_navigation_to_chromium_error_page_raises_and_closes_driver(self):
         """Round 57 — driver.get()/google_get() never raise for a real
         network-level failure; Chromium silently renders its own
@@ -180,7 +253,7 @@ class TestBotasaurusPool:
                 scroll_passes=3,
                 scroll_wait_ms=200,
             )
-        autoscroll.assert_called_once_with(driver, max_passes=3, wait_ms=200)
+        autoscroll.assert_called_once_with(driver, max_passes=3, wait_ms=200, humanize=False)
         assert html == "<html>fresh</html>"
 
     @pytest.mark.asyncio
@@ -258,3 +331,139 @@ class TestBotasaurusPool:
             )
         assert driver_cls.call_args.kwargs["block_images"] is False
         assert driver_cls.call_args.kwargs["block_images_and_css"] is False
+
+    @pytest.mark.asyncio
+    async def test_extensions_kwarg_forwarded_when_configured(self):
+        """Round 60 — extensions is a real Driver kwarg, but each item must
+        be an object exposing .load(with_command_line_option=False), not a
+        raw path string (see browser/_botasaurus_extension.py::LocalExtension)."""
+        pool = BotasaurusPool(
+            tenant_id=TENANT,
+            config=BotasaurusConfig(extensions=["/tmp/some-extension"]),
+        )
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        forwarded = driver_cls.call_args.kwargs["extensions"]
+        assert len(forwarded) == 1
+        assert forwarded[0].load(with_command_line_option=False) == "/tmp/some-extension"
+
+    @pytest.mark.asyncio
+    async def test_extensions_kwarg_absent_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert "extensions" not in driver_cls.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_lang_kwarg_forwarded_when_configured(self):
+        """Round 60 — Driver(lang=...) is the --lang= Chrome flag, drives
+        navigator.language (driver.py:2153's own docstring note)."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(lang="en-US"))
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert driver_cls.call_args.kwargs["lang"] == "en-US"
+
+    @pytest.mark.asyncio
+    async def test_lang_kwarg_absent_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert "lang" not in driver_cls.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_locale_and_timezone_applied_before_navigation(self):
+        """Round 60 — driver.set_locale_and_timezone() is a separate per-tab
+        CDP call from Driver(lang=...), must be called before driver.get()/
+        google_get() per driver.py:2148-2150's own docstring."""
+        pool = BotasaurusPool(
+            tenant_id=TENANT,
+            config=BotasaurusConfig(locale="en_US", timezone="America/New_York"),
+        )
+        driver = _fake_driver()
+        calls: list[str] = []
+        driver.set_locale_and_timezone.side_effect = lambda **_: calls.append("locale")
+        driver.google_get.side_effect = lambda *_a, **_k: calls.append("navigate")
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.set_locale_and_timezone.assert_called_once_with(
+            locale="en_US", timezone_id="America/New_York"
+        )
+        assert calls == ["locale", "navigate"]
+
+    @pytest.mark.asyncio
+    async def test_locale_and_timezone_not_called_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.set_locale_and_timezone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enable_human_mode_called_when_configured(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(humanize_mouse=True))
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.enable_human_mode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_enable_human_mode_not_called_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.enable_human_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_capture_registered_when_configured(self):
+        pool = BotasaurusPool(
+            tenant_id=TENANT, config=BotasaurusConfig(capture_network_events=True)
+        )
+        driver = _fake_driver()
+        events_sink: list[dict] = []
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                events_sink=events_sink,
+            )
+        driver.before_request_sent.assert_called_once()
+        driver.after_response_received.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_network_capture_not_registered_by_default(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        events_sink: list[dict] = []
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1",
+                proxy=_proxy(),
+                domain="a.example",
+                session_id="s1",
+                events_sink=events_sink,
+            )
+        driver.before_request_sent.assert_not_called()
+        driver.after_response_received.assert_not_called()

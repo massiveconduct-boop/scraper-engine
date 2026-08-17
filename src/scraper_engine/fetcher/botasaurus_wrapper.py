@@ -89,6 +89,12 @@ class BotasaurusWrapper:
         max_retry: int = 0,
         block_images: bool = False,
         block_images_and_css: bool = False,
+        extensions: list[str] | None = None,
+        lang: str | None = None,
+        locale: str | None = None,
+        timezone: str | None = None,
+        humanize_mouse: bool = False,
+        capture_network_events: bool = False,
     ) -> None:
         self.config: dict[str, object] = dict(config or {})
         self._bypass_cloudflare = bypass_cloudflare
@@ -100,6 +106,12 @@ class BotasaurusWrapper:
         self._max_retry = max_retry
         self._block_images = block_images
         self._block_images_and_css = block_images_and_css
+        self._extensions = extensions or []
+        self._lang = lang
+        self._locale = locale
+        self._timezone = timezone
+        self._humanize_mouse = humanize_mouse
+        self._capture_network_events = capture_network_events
 
     async def fetch_html(
         self,
@@ -109,6 +121,7 @@ class BotasaurusWrapper:
         session_id: str | None = None,
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
     ) -> str:
         """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox.
 
@@ -135,6 +148,7 @@ class BotasaurusWrapper:
                 session_id,
                 scroll_passes,
                 scroll_wait_ms,
+                events_sink,
             )
 
     def _botasaurus_fetch(
@@ -144,6 +158,7 @@ class BotasaurusWrapper:
         session_id: str | None,
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
     ) -> str:
         """Synchronous Botasaurus fetch, run in executor — Botasaurus's driver
         management is Selenium-based (no native asyncio API to await on)."""
@@ -151,7 +166,9 @@ class BotasaurusWrapper:
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
 
+        from scraper_engine.browser._botasaurus_extension import LocalExtension
         from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_network_capture import register_network_capture
         from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
 
         decorator_kwargs: dict[str, object] = {
@@ -172,6 +189,10 @@ class BotasaurusWrapper:
             "block_images": self._block_images,
             "block_images_and_css": self._block_images_and_css,
         }
+        if self._extensions:
+            decorator_kwargs["extensions"] = [LocalExtension(p) for p in self._extensions]
+        if self._lang:
+            decorator_kwargs["lang"] = self._lang
         if self._max_retry > 0:
             decorator_kwargs["max_retry"] = self._max_retry
         if self._hashed_fingerprint and session_id is not None:
@@ -185,6 +206,10 @@ class BotasaurusWrapper:
 
         bypass_cloudflare = self._bypass_cloudflare
         use_random_sleep = self._use_random_sleep
+        locale = self._locale
+        timezone = self._timezone
+        humanize_mouse = self._humanize_mouse
+        capture_network_events = self._capture_network_events
         # Round 41 — stashed so we can clean up this Driver's Xvfb lock/socket
         # files (see browser/_xvfb_cleanup.py) after the decorator's own
         # internal close runs; botasaurus's @browser decorator owns close
@@ -195,6 +220,10 @@ class BotasaurusWrapper:
         @browser(**decorator_kwargs)  # type: ignore[untyped-decorator]
         def _fetch(driver: Driver, _data: object = None) -> str:
             captured_driver.append(driver)
+            if capture_network_events and events_sink is not None:
+                register_network_capture(driver, events_sink)
+            if humanize_mouse:
+                driver.enable_human_mode()
             # botasaurus's own decorator always calls the wrapped function as
             # func(driver, data) — POSITIONALLY (browser_decorator.py's
             # run_task) — so a second parameter with a default value (e.g.
@@ -206,6 +235,10 @@ class BotasaurusWrapper:
             # expected"), which looked like a Chrome/CDP incompatibility but
             # wasn't — url must be read from the outer closure, never from a
             # same-named parameter default.
+            if locale or timezone:
+                # Must be applied before navigation — driver.py:2148-2150's
+                # own docstring: "call this before navigating".
+                driver.set_locale_and_timezone(locale=locale or None, timezone_id=timezone or None)
             if bypass_cloudflare:
                 driver.google_get(url, bypass_cloudflare=True)
             else:
@@ -214,7 +247,12 @@ class BotasaurusWrapper:
             if use_random_sleep:
                 driver.short_random_sleep()
             if scroll_passes > 0:
-                botasaurus_autoscroll(driver, max_passes=scroll_passes, wait_ms=scroll_wait_ms)
+                botasaurus_autoscroll(
+                    driver,
+                    max_passes=scroll_passes,
+                    wait_ms=scroll_wait_ms,
+                    humanize=humanize_mouse,
+                )
             return str(driver.page_html)
 
         try:

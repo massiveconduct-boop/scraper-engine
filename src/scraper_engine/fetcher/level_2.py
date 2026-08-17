@@ -133,6 +133,11 @@ class Level2Fetcher:
         domain = urlparse(url).hostname or "unknown"
         assert self._botasaurus is not None
         session_id = f"{tenant_id}:{domain}"
+        # Populated in place by botasaurus_pool.py/botasaurus_wrapper.py's own
+        # config.botasaurus.capture_network_events toggle — stays empty (and
+        # network_events below stays None) when that toggle is off, so this
+        # is a harmless no-op pass-through by default.
+        network_events: list[dict[str, object]] = []
         try:
             if self._botasaurus_pool is not None:
                 html = await self._botasaurus_pool.fetch(
@@ -142,6 +147,7 @@ class Level2Fetcher:
                     session_id=session_id,
                     scroll_passes=self._scroll_passes,
                     scroll_wait_ms=self._scroll_wait_ms,
+                    events_sink=network_events,
                 )
             else:
                 html = await self._botasaurus.fetch_html(
@@ -151,6 +157,7 @@ class Level2Fetcher:
                     session_id=session_id,
                     scroll_passes=self._scroll_passes,
                     scroll_wait_ms=self._scroll_wait_ms,
+                    events_sink=network_events,
                 )
         except (Exception, SystemExit):
             # Round 40 — live-caught: botasaurus_driver's own proxy-auth
@@ -176,6 +183,7 @@ class Level2Fetcher:
             level_used=2,
             proxy_used=proxy.key(),
             duration_ms=int((time.monotonic() - start) * 1000),
+            network_events=network_events or None,
         )
 
     async def _fetch_via_camoufox(

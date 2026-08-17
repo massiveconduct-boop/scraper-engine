@@ -391,9 +391,10 @@ async def _persist_one_result(
         """
         INSERT INTO scrape_results
             (job_id, url, success, http_status, is_challenge_page, level_used,
-             proxy_used, proxy_source, markdown, json_data, html_snapshot_url, content_hash,
-             time_taken_ms, error_message, failure_category)
-        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15)
+             proxy_used, proxy_source, markdown, json_data, network_events, html_snapshot_url,
+             content_hash, time_taken_ms, error_message, failure_category)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14,
+                $15, $16)
         """,
         job_id,
         result.url,
@@ -405,6 +406,7 @@ async def _persist_one_result(
         result.proxy_source,
         result.markdown,
         json.dumps(result.extracted) if result.extracted is not None else None,
+        json.dumps(result.network_events) if result.network_events is not None else None,
         html_snapshot_url,
         content_hash,
         result.duration_ms,

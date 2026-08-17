@@ -58,3 +58,45 @@ class TestBotasaurusAutoscroll:
         driver = MagicMock()
         driver.run_js.side_effect = RuntimeError("boom")
         botasaurus_autoscroll(driver, max_passes=5, wait_ms=1)  # must not raise
+
+    def test_humanize_off_by_default_never_calls_move_mouse(self):
+        driver = _driver_with_heights(10, 10, 10)
+        botasaurus_autoscroll(driver, max_passes=5, wait_ms=1)
+        driver.move_mouse_to_point.assert_not_called()
+
+    def test_humanize_true_moves_mouse_before_each_pass(self):
+        """Round 60 — humanize=True calls move_mouse_to_point() before each
+        scroll pass (browser/_botasaurus_scroll.py::_humanize_mouse_before_pass),
+        via a real (mocked) [innerWidth, innerHeight] run_js read."""
+        driver = MagicMock()
+        # initial height read, then per pass: viewport-size read, scrollTo,
+        # height re-read — 2 passes total, flat immediately (stable at 10).
+        driver.run_js.side_effect = [
+            10,  # initial height
+            [800, 600],  # pass1 viewport size
+            None,  # pass1 scrollTo
+            10,  # pass1 height (flat #1)
+            [800, 600],  # pass2 viewport size
+            None,  # pass2 scrollTo
+            10,  # pass2 height (flat #2, stop)
+        ]
+        passes = botasaurus_autoscroll(driver, max_passes=5, wait_ms=1, humanize=True)
+        assert passes == 2
+        assert driver.move_mouse_to_point.call_count == 2
+
+    def test_humanize_mouse_move_failure_does_not_break_scroll(self):
+        """A broken move_mouse_to_point (e.g. no headless mouse-move support)
+        must never take down the scroll loop it's meant to be decorating."""
+        driver = MagicMock()
+        driver.run_js.side_effect = [
+            10,  # initial height
+            [800, 600],  # pass1 viewport size
+            None,  # pass1 scrollTo
+            10,  # pass1 height (flat #1)
+            [800, 600],  # pass2 viewport size
+            None,  # pass2 scrollTo
+            10,  # pass2 height (flat #2, stop)
+        ]
+        driver.move_mouse_to_point.side_effect = RuntimeError("no cursor")
+        passes = botasaurus_autoscroll(driver, max_passes=5, wait_ms=1, humanize=True)
+        assert passes == 2

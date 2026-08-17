@@ -163,6 +163,7 @@ class TestFetchViaBotasaurus:
             session_id="system:example.com",
             scroll_passes=4,
             scroll_wait_ms=750,
+            events_sink=[],
         )
 
     @pytest.mark.asyncio
@@ -181,7 +182,44 @@ class TestFetchViaBotasaurus:
             session_id="system:example.com",
             scroll_passes=4,
             scroll_wait_ms=750,
+            events_sink=[],
         )
+
+    @pytest.mark.asyncio
+    async def test_network_events_attached_when_pool_populates_sink(self):
+        """Round 60 — the list passed as events_sink= gets populated in
+        place by botasaurus_pool.py's own capture_network_events toggle;
+        Level2Fetcher just has to read it back onto the FetchResult."""
+        botasaurus = MagicMock()
+        botasaurus_pool = AsyncMock()
+
+        async def fake_fetch(*_a, events_sink=None, **_k):
+            if events_sink is not None:
+                events_sink.append({"type": "request", "url": "http://example.com"})
+            return _REAL_HTML
+
+        botasaurus_pool.fetch.side_effect = fake_fetch
+        fetcher = Level2Fetcher(botasaurus=botasaurus, botasaurus_pool=botasaurus_pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is not None
+        assert result.network_events == [{"type": "request", "url": "http://example.com"}]
+
+    @pytest.mark.asyncio
+    async def test_network_events_none_when_sink_stays_empty(self):
+        botasaurus_pool = AsyncMock()
+        botasaurus_pool.fetch.return_value = _REAL_HTML
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=botasaurus_pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is not None
+        assert result.network_events is None
 
 
 class TestFetchViaCamoufox:

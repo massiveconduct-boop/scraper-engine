@@ -129,6 +129,59 @@ class BotasaurusConfig(BaseModel):
     # bypass_cloudflare above.
     block_images: bool = False
     block_images_and_css: bool = False
+    # Round 60 — Driver(extensions=[...]) is real (installed
+    # botasaurus_driver 4.0.100 driver.py:2074), but each item must be an
+    # object exposing .load(with_command_line_option=False) -> str
+    # (core/config.py:83-89's create_extensions_string), not a raw path
+    # string — see browser/_botasaurus_extension.py::LocalExtension, which
+    # wraps one of these directory paths. Default empty: no extension
+    # artifact ships with this repo, so this is pure capability wiring
+    # until a caller configures a path.
+    extensions: list[str] = Field(default_factory=list)
+    # Round 60 — three genuinely independent settings, not one value in two
+    # formats. `lang` is the Driver ctor's real `--lang=` Chrome flag,
+    # forwarded correctly (confirmed on the real chrome://version command
+    # line) — but driver.py:2153's own docstring claim that it drives JS-
+    # visible `navigator.language` did NOT hold up live: on the installed
+    # botasaurus_driver 4.0.100 / Playwright Chromium 1228 build, neither
+    # `--lang=de-DE` nor `--lang=de` changed navigator.language,
+    # navigator.languages, or the Accept-Language request header (checked
+    # via a real CDP before_request_sent hook) — verified live, not a docs
+    # guess. A JS-injection workaround (CDP Page.addScriptToEvaluateOnNew
+    # Document via driver.run_on_new_document()) was tried and hits a
+    # separate real upstream bug: driver.run_cdp_command(cdp.page.enable())
+    # itself throws ChromeException("Invalid parameters ... CBOR: map start
+    # expected") in this installed version — confirmed not a general zero-
+    # param-command issue (cdp.dom.enable()/cdp.runtime.enable() both
+    # succeed the same way), so this is Page-domain-specific breakage in
+    # the installed package, out of scope to patch here. Field kept and
+    # wired anyway since it's a real, correctly-forwarded kwarg that may
+    # behave differently on other Chromium builds — just don't rely on it
+    # for navigator.language spoofing against this stack today.
+    # `locale`/`timezone` are a separate, fully-working per-tab CDP
+    # override via driver.set_locale_and_timezone() (ICU underscore locale,
+    # e.g. "en_US", IANA timezone e.g. "America/New_York") driving
+    # Intl/Date.toLocaleString formatting and the JS timezone, called before
+    # first navigation on the fresh-launch path only (browser/botasaurus_
+    # pool.py's _reuse_fetch does an in-page JS fetch(), not a navigation —
+    # nothing to (re)apply there, same reasoning as round 58's autoscroll).
+    lang: str | None = None
+    locale: str | None = None
+    timezone: str | None = None
+    # Round 60 — driver.enable_human_mode() (driver.py:2123-2137) makes every
+    # subsequent mouse call (move_mouse_to_point/click_at_point/etc.) route
+    # through botasaurus_humancursor's curved-movement simulation instead of
+    # an instant CDP jump. Explicit per-scroll-pass movement is wired via
+    # browser/_botasaurus_scroll.py::botasaurus_autoscroll(humanize=...).
+    # Default off: no live-traffic validation yet, and headless mouse-move
+    # support isn't guaranteed identical to headful.
+    humanize_mouse: bool = False
+    # Round 60 — driver.before_request_sent()/after_response_received()
+    # (driver.py:760,793) are real CDP hooks, live-verified to actually fire
+    # with real request/response headers. Opt-in: captures full request/
+    # response metadata for every network request a fetch makes, which can
+    # be large and isn't needed by default.
+    capture_network_events: bool = False
 
 
 class ProxyHarvesterConfig(BaseModel):

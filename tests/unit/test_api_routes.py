@@ -8,6 +8,7 @@ must `str()` it or Pydantic raises and the endpoint 500s on every existing job
 """
 
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -61,6 +62,58 @@ async def test_get_job_coerces_uuid_job_id_to_str(wired_deps):
     assert resp.job_id == str(jid)
     assert isinstance(resp.job_id, str)
     assert resp.status == JobStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_get_job_surfaces_network_events_from_db_row(wired_deps):
+    """Round 60 — network_events must round-trip through the DB-polling path
+    (GET /v1/jobs/{id}), not just the in-memory webhook payload path. Both
+    a populated and a null network_events column are exercised."""
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    wired_deps.fetch.side_effect = [
+        [{"job_id": jid, "status": "COMPLETED", "urls": ["https://a.example", "https://b.example"]}],
+        [
+            {
+                "url": "https://a.example",
+                "success": True,
+                "http_status": 200,
+                "is_challenge_page": False,
+                "level_used": 2,
+                "proxy_used": "1.2.3.4:8080",
+                "markdown": None,
+                "json_data": None,
+                "network_events": '[{"type": "request", "url": "https://a.example"}]',
+                "html_snapshot_url": None,
+                "time_taken_ms": 100,
+                "error_message": None,
+                "failure_category": None,
+                "extracted_at": now,
+            },
+            {
+                "url": "https://b.example",
+                "success": True,
+                "http_status": 200,
+                "is_challenge_page": False,
+                "level_used": 1,
+                "proxy_used": None,
+                "markdown": None,
+                "json_data": None,
+                "network_events": None,
+                "html_snapshot_url": None,
+                "time_taken_ms": 50,
+                "error_message": None,
+                "failure_category": None,
+                "extracted_at": now,
+            },
+        ],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.results is not None
+    assert resp.results[0].network_events == [{"type": "request", "url": "https://a.example"}]
+    assert resp.results[1].network_events is None
 
 
 @pytest.mark.asyncio

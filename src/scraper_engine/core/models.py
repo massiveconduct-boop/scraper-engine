@@ -113,6 +113,12 @@ class FetchResult(BaseModel):
     # result already came from the paid gateway" apart from "this came from
     # the free pool" without re-deriving it from proxy_used's raw string.
     proxy_source: Literal["pool", "paid_gateway"] | None = None
+    # Round 60 — raw CDP request/response events captured during a
+    # Botasaurus fetch, opt-in via config.botasaurus.capture_network_events.
+    # None means capture was off or no real browser fetch ran (e.g. a pure
+    # L1 HTTP fetch, or a cache hit) — mirrors proxy_source's None meaning
+    # just above.
+    network_events: list[dict[str, Any]] | None = None
     html_snapshot_url: str | None = None
     from_cache: bool = False
     duration_ms: int

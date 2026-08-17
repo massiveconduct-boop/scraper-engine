@@ -14,8 +14,25 @@ than a shared one.
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
+
+
+def _humanize_mouse_before_pass(driver: Any) -> None:
+    """Best-effort: move the mouse to a random in-viewport point before a
+    scroll pass. driver.move_mouse_to_point() (driver.py:945-953) routes
+    through botasaurus_humancursor when human mode is enabled (see
+    config/schema.py's BotasaurusConfig.humanize_mouse docstring). Never
+    raises — headless mouse-move support isn't guaranteed, and a failed
+    movement must never break the scroll loop itself."""
+    try:
+        width, height = driver.run_js("return [window.innerWidth, window.innerHeight];")
+        x = random.randint(0, max(width - 1, 0))
+        y = random.randint(0, max(height - 1, 0))
+        driver.move_mouse_to_point(x, y)
+    except Exception:
+        pass
 
 
 def botasaurus_autoscroll(
@@ -24,6 +41,7 @@ def botasaurus_autoscroll(
     max_passes: int,
     wait_ms: int,
     stable_passes_before_stop: int = 2,
+    humanize: bool = False,
 ) -> int:
     """Scroll to the bottom repeatedly to trigger lazy-load / infinite scroll.
 
@@ -31,6 +49,9 @@ def botasaurus_autoscroll(
     re-read `document.body.scrollHeight`, stop once height has stayed flat
     for `stable_passes_before_stop` consecutive passes or `max_passes` is
     hit. Never raises — a page that can't be scrolled just yields 0.
+
+    humanize=True moves the mouse to a random in-viewport point before each
+    pass (round 60) — best-effort, never blocks the scroll itself on failure.
     """
     if max_passes <= 0:
         return 0
@@ -42,6 +63,8 @@ def botasaurus_autoscroll(
     stable = 0
     for _ in range(max_passes):
         try:
+            if humanize:
+                _humanize_mouse_before_pass(driver)
             driver.run_js("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(wait_ms / 1000)
             new_height = driver.run_js("return document.body.scrollHeight;")

@@ -2725,3 +2725,68 @@ concept, is useful; the fix is one canonical copy, not zero copies).
 
 **Status:** Active. Full detail: `technical-debt.md`'s round-57 entry
 (knowledge-audit subsection).
+
+---
+
+## Decision: Ship `BotasaurusConfig.lang` Despite Live Evidence It Doesn't Spoof `navigator.language`
+
+**Date:** 2026-08-17 | **Round:** 60
+
+**What:** Round 60 wired `Driver(lang=...)` (a real `botasaurus_driver`
+ctor kwarg) through as `BotasaurusConfig.lang`. Live testing against the
+installed `botasaurus_driver==4.0.100` / Playwright Chromium 1228 build
+showed it has **zero observed effect** on `navigator.language`,
+`navigator.languages`, or the `Accept-Language` request header — despite
+`driver.py:2153`'s own docstring explicitly claiming `navigator.language`
+"comes from the lang option." Tested both `"de-DE"` and `"de"` formats;
+confirmed the Chromium build does ship a matching `de.pak` locale
+resource, so it isn't a missing-locale-data explanation. A JS-injection
+workaround (`driver.run_on_new_document()`) was attempted and hit a
+separate, confirmed-real upstream bug: `driver.run_cdp_command(cdp.page.
+enable())` throws `ChromeException("Invalid parameters ... CBOR: map
+start expected")` in this installed version — verified not a general
+zero-param-command issue (`cdp.dom.enable()`/`cdp.runtime.enable()` both
+succeed) — so it's Page-domain-specific breakage inside the installed
+package, not something to route around within this task's scope. The
+field shipped anyway, config-gated and off by default, with the
+limitation documented directly in `config/schema.py`'s docstring.
+
+**Why:** `lang` is still a real, correctly-forwarded Driver kwarg
+(confirmed present on the actual Chrome command line via
+`chrome://version`) — its ineffectiveness for `navigator.language`
+spoofing is a property of *this installed browser build*, not evidence
+the kwarg itself is fake or that the wiring is broken. Removing it
+entirely would erase a real capability that may behave correctly on a
+different Chromium version (Chrome's handling of `--lang` for renderer-
+visible bindings has shifted across versions in ways this session didn't
+have the surface to fully audit) — better to ship a real, verified,
+honestly-documented kwarg than to either (a) silently claim it works when
+live evidence says it doesn't, or (b) delete a legitimate capability over
+one environment's specific behavior. This is the project's "evidence over
+assertion" operating rule cutting against removing something, not just
+for adding it.
+
+**Trade-offs:** A caller who sets `botasaurus.lang` expecting
+`navigator.language` spoofing (the documented behavior) will not get it
+against this stack today — the schema docstring is the only place this is
+flagged; there's no runtime warning if the field is set. If this bites a
+real caller, the fix is either a runtime log line when `lang` is set, or
+finally patching around the `Page.enable()` CDP bug (vendoring a patched
+`botasaurus_driver`, a much bigger undertaking, or filing/watching an
+upstream fix).
+
+**Alternatives considered:** (1) Drop the `lang` field entirely and only
+ship `locale`/`timezone` (which do work) — rejected per the reasoning
+above, this throws away a real capability over one build's limitation.
+(2) Chase the `Page.enable()` CBOR bug to make the JS-injection workaround
+functional — rejected as out of scope for this round: it would mean
+patching or vendoring the installed `botasaurus_driver` package, a
+materially bigger and separate initiative from "wire the real config
+kwargs" that the other 3 items in this round stayed scoped to. (3) Ship
+`lang` silently with no docstring caveat, treating "kwarg is real and
+forwarded" as sufficient proof of correctness — rejected, this is exactly
+the kind of unverified claim the project's evidence-over-assertion rule
+exists to prevent; the live test was cheap to run and directly
+contradicted the upstream docstring.
+
+**Status:** Active. Full detail: `technical-debt.md`'s round-60 entry.

@@ -108,6 +108,12 @@ def build_level2_fetcher(
             max_retry=bconf.max_retry,
             block_images=bconf.block_images,
             block_images_and_css=bconf.block_images_and_css,
+            extensions=bconf.extensions,
+            lang=bconf.lang,
+            locale=bconf.locale,
+            timezone=bconf.timezone,
+            humanize_mouse=bconf.humanize_mouse,
+            capture_network_events=bconf.capture_network_events,
         )
         if "botasaurus" in lvl.engine
         else None

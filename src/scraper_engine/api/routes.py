@@ -543,8 +543,8 @@ async def get_job(
     result_rows = await _storage_pg.fetch(
         tenant_id,
         """SELECT url, success, http_status, is_challenge_page, level_used, proxy_used,
-                  markdown, json_data, html_snapshot_url, time_taken_ms, error_message,
-                  failure_category, extracted_at
+                  markdown, json_data, network_events, html_snapshot_url, time_taken_ms,
+                  error_message, failure_category, extracted_at
            FROM scrape_results WHERE job_id = $1::uuid ORDER BY extracted_at""",
         job_id,
     )
@@ -558,6 +558,7 @@ async def get_job(
             proxy_used=r["proxy_used"],
             markdown=r["markdown"],
             extracted=json.loads(r["json_data"]) if r["json_data"] else None,
+            network_events=json.loads(r["network_events"]) if r["network_events"] else None,
             duration_ms=r["time_taken_ms"] or 0,
             error_message=r["error_message"],
             failure_category=(

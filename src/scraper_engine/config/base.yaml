@@ -80,6 +80,18 @@ botasaurus:
   # BotasaurusConfig docstring. Env-overridable, same reasoning.
   block_images: "${BOTASAURUS_BLOCK_IMAGES:false}"
   block_images_and_css: "${BOTASAURUS_BLOCK_IMAGES_AND_CSS:false}"
+  # Round 60 — local unpacked-extension directory paths, see schema.py's
+  # BotasaurusConfig docstring. Plain list literal, same pattern as
+  # ssrf_guard.additional_denied_cidrs below (lists in this file aren't
+  # env-templated).
+  extensions: []
+  # Round 60 — three independent settings, see schema.py's BotasaurusConfig
+  # docstring. Optional-string env pattern, same shape as ops_webhook_url.
+  lang: "${BOTASAURUS_LANG:}"
+  locale: "${BOTASAURUS_LOCALE:}"
+  timezone: "${BOTASAURUS_TIMEZONE:}"
+  humanize_mouse: "${BOTASAURUS_HUMANIZE_MOUSE:false}"
+  capture_network_events: "${BOTASAURUS_CAPTURE_NETWORK_EVENTS:false}"
 
 proxy_harvester:
   sources:
