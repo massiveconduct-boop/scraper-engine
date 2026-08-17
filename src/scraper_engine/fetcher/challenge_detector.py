@@ -118,6 +118,21 @@ class ChallengeDetector:
         r'<pre\s+style="word-wrap:\s*break-word;\s*white-space:\s*pre-wrap;?"', re.IGNORECASE
     )
 
+    # Round 57 — defense-in-depth for Chromium's own internal network-error
+    # interstitial (browser/_botasaurus_nav_check.py is the primary,
+    # root-cause fix, catching this at the Botasaurus source before it ever
+    # becomes "content" at all). Chromium keeps its net::ERR_* code visible
+    # and UNTRANSLATED even when the browser UI is localized — unlike the
+    # human-readable heading/body text ("This site can't be reached", "This
+    # page isn't working", "No internet"...), this token is locale-
+    # independent and appears on every Chromium-rendered network-error page
+    # regardless of the specific failure subtype (DNS, connection-reset,
+    # empty-response, proxy-failure, ...). A second, independent signal —
+    # in case the current_url check is ever bypassed by a future
+    # botasaurus_driver version, or some other path renders the same
+    # interstitial.
+    _CHROMIUM_NET_ERROR_RE = re.compile(r"\bnet::ERR_[A-Z_]+\b")
+
     # Patterns for classifying challenge vendor
     VENDOR_PATTERNS: dict[str, str] = {
         "cloudflare": r"cf-(?:browser-verification|challenge|ray-id)",
@@ -163,6 +178,10 @@ class ChallengeDetector:
 
         # Also unconditional, same rationale — see _FIREFOX_PLAINTEXT_WRAPPER_RE.
         if self._FIREFOX_PLAINTEXT_WRAPPER_RE.search(html):
+            return True
+
+        # Also unconditional, same rationale — see _CHROMIUM_NET_ERROR_RE.
+        if self._CHROMIUM_NET_ERROR_RE.search(html):
             return True
 
         # Short pages with no meaningful content are suspect

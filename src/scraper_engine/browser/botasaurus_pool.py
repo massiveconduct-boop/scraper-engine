@@ -113,6 +113,8 @@ class BotasaurusPool:
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
 
+        from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+
         cfg = self._config
         kwargs: dict[str, object] = {
             "headless": False,
@@ -134,6 +136,7 @@ class BotasaurusPool:
                 driver.google_get(url, bypass_cloudflare=True)
             else:
                 driver.get(url)
+            raise_if_navigation_failed(driver, url)
             if cfg.random_sleep_enabled:
                 driver.short_random_sleep()
             return driver, str(driver.page_html)

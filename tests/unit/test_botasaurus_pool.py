@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scraper_engine.browser._botasaurus_nav_check import BotasaurusNavigationError
 from scraper_engine.browser.botasaurus_pool import BotasaurusPool
 from scraper_engine.config.schema import BotasaurusConfig
 from scraper_engine.core.models import Proxy, ProxyProtocol
@@ -136,4 +137,25 @@ class TestBotasaurusPool:
             await pool.fetch(
                 "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
             )
+        driver.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_navigation_to_chromium_error_page_raises_and_closes_driver(self):
+        """Round 57 — driver.get()/google_get() never raise for a real
+        network-level failure; Chromium silently renders its own
+        chrome-error:// interstitial instead. This must surface as a real
+        exception (and the driver must still be closed, same as any other
+        construction failure), not a fake success carrying that
+        interstitial as page_html."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        driver.current_url = "chrome-error://chromewebdata/"
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            pytest.raises(BotasaurusNavigationError) as exc_info,
+        ):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert "https://a.example/1" in str(exc_info.value)
         driver.close.assert_called_once()

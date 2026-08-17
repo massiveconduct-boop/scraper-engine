@@ -203,6 +203,55 @@ class TestFirefoxPlaintextWrapper:
         assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is False
 
 
+class TestChromiumNetError:
+    """Round 57 — defense-in-depth for Chromium's own internal
+    network-error interstitial (the primary, root-cause fix is
+    browser/_botasaurus_nav_check.py, catching this at the Botasaurus
+    source before it ever becomes "content" — this is the independent,
+    structural second layer). Example bodies below are reconstructed from
+    a peer Claude session's cross-session bug report (research_agent's
+    scrape cache) of exactly this failure class slipping through as
+    success=True."""
+
+    def test_dns_probe_connection_reset_page_flagged(self):
+        html = (
+            "<html><body>This site can't be reached<br>"
+            "The connection was reset while the page was loading."
+            "<br>net::ERR_CONNECTION_RESET</body></html>"
+        )
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is True
+
+    def test_empty_response_page_flagged(self):
+        html = (
+            "<html><body>This page isn't working<br>"
+            "<b>allaboutcookies.org</b> didn't send any data.<br>"
+            "ERR_EMPTY_RESPONSE net::ERR_EMPTY_RESPONSE</body></html>"
+        )
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is True
+
+    def test_proxy_failure_page_flagged(self):
+        html = (
+            "<html><body>No internet<br>"
+            "There is something wrong with the proxy server, or the "
+            "address is incorrect.<br>net::ERR_PROXY_CONNECTION_FAILED"
+            "</body></html>"
+        )
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is True
+
+    def test_generalizes_to_an_unseen_net_error_code(self):
+        """The point of matching the structural net::ERR_ token, not any
+        one wording: an entirely different failure subtype never captured
+        live must also be caught."""
+        html = "<html><body>net::ERR_NAME_NOT_RESOLVED</body></html>"
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is True
+
+    def test_real_html_page_without_the_token_not_flagged(self):
+        """Control — a normal rendered page (no net::ERR_ token anywhere)
+        must not be caught by this check."""
+        html = "<html><body>" + "<p>Real article text. </p>" * 30 + "</body></html>"
+        assert CD.is_challenge_page(html, 200, short_page_is_suspect=False) is False
+
+
 class TestLooksJavascriptGated:
     def test_empty_spa_root(self):
         html = '<html><body><div id="root"></div><script src="/a.js"></script></body></html>'

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from scraper_engine.browser._botasaurus_nav_check import BotasaurusNavigationError
 from scraper_engine.core import budget
 from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
@@ -185,6 +186,45 @@ class TestBotasaurusWrapper:
         assert "user_agent" not in captured
         assert "window_size" not in captured
 
+    def test_navigation_to_chromium_error_page_raises_not_silently_succeeds(self):
+        """Round 57 — driver.get()/google_get() never raise for a real
+        network-level failure; Chromium silently renders its own
+        chrome-error:// interstitial instead. This must surface as a real
+        exception, not a fake success carrying that interstitial as
+        `page_html`."""
+        wrapper = BotasaurusWrapper()
+
+        class _FailedNavDriver:
+            page_html = "<html>This site can't be reached</html>"
+            current_url = "chrome-error://chromewebdata/"
+
+            def google_get(self, url, bypass_cloudflare=False):
+                pass
+
+            def get(self, url):
+                pass
+
+            def short_random_sleep(self):
+                pass
+
+        def fake_browser(**kwargs):
+            def decorator(fn):
+                def call(*a, **kw):
+                    return fn(_FailedNavDriver(), None)
+
+                return call
+
+            return decorator
+
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            pytest.raises(BotasaurusNavigationError) as exc_info,
+        ):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert URL in str(exc_info.value)
+        # Must fail BEFORE any further processing of the fake page.
+        assert "This site can't be reached" not in str(exc_info.value)
+
 
 class TestLevel2BotasaurusFallback:
     @pytest.mark.asyncio
@@ -204,6 +244,29 @@ class TestLevel2BotasaurusFallback:
     async def test_falls_back_to_camoufox_when_botasaurus_raises(self):
         botasaurus = AsyncMock()
         botasaurus.fetch_html.side_effect = RuntimeError("driver crashed")
+        fetcher = Level2Fetcher(botasaurus=botasaurus)
+
+        with patch.object(
+            fetcher, "_fetch_via_camoufox", new=AsyncMock(return_value="camoufox-result")
+        ) as camoufox_fallback:
+            result = await fetcher.fetch(URL, tenant_id=TENANT, proxy=_proxy())
+
+        assert result == "camoufox-result"
+        camoufox_fallback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_camoufox_when_botasaurus_hits_chromium_error_page(self):
+        """Round 57 — a BotasaurusNavigationError (the new, specific
+        exception the source-level fix raises) must fall back to Camoufox
+        exactly like any other Botasaurus failure, via the existing
+        `except (Exception, SystemExit): return None` in
+        _fetch_via_botasaurus — no Level2Fetcher change was needed for this."""
+        botasaurus = AsyncMock()
+        botasaurus.fetch_html.side_effect = BotasaurusNavigationError(
+            f"Botasaurus/Chromium failed to navigate to {URL!r} — landed on "
+            f"its own internal error page (current_url='chrome-error://"
+            f"chromewebdata/') instead of the real target."
+        )
         fetcher = Level2Fetcher(botasaurus=botasaurus)
 
         with patch.object(

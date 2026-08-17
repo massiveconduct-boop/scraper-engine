@@ -132,6 +132,8 @@ class BotasaurusWrapper:
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
 
+        from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+
         decorator_kwargs: dict[str, object] = {
             "headless": False,
             "enable_xvfb_virtual_display": True,
@@ -186,6 +188,7 @@ class BotasaurusWrapper:
                 driver.google_get(url, bypass_cloudflare=True)
             else:
                 driver.get(url)
+            raise_if_navigation_failed(driver, url)
             if use_random_sleep:
                 driver.short_random_sleep()
             return str(driver.page_html)
