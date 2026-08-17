@@ -1,93 +1,17 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Currently at round 57 (root-caused and fixed the browser-error-page bug a
-peer Claude session flagged last round: `botasaurus_driver.Driver.get()`/
-`google_get()` wrap a raw CDP `Page.navigate` and never inspect or raise on
-a network-level navigation failure (DNS, connection reset, empty response,
-proxy failure) — confirmed by reading the actual installed
-`botasaurus_driver` source, not inferred from wording — so Chromium
-silently renders its own `chrome-error://chromewebdata/` interstitial as
-if it were a real page, and every downstream safety net
-(`ChallengeDetector`'s vendor signatures, gateway-error regex, Firefox-
-plaintext-wrapper regex) was individually verified to structurally miss
-it, since none of them expect Chromium's own UI chrome as input. Confirmed
-NOT affected, by reading each: L1 (pure httpx/JA3/Scrapling, real status
-codes and real exceptions throughout), L2's Camoufox fallback and all of
-L3 (Playwright's `page.goto()` DOES raise for real network failures,
-already correctly caught), and `botasaurus_pool.py`'s driver-reuse path
-(uses an in-page JS `fetch()` that already raises `DriverException`).
-Fixed by reusing the existing, already-correct `BROWSER_CRASH` failure
-pipeline instead of adding a new category: new
-`browser/_botasaurus_nav_check.py::raise_if_navigation_failed()` checks
-`driver.current_url` for Chromium's internal error scheme right after
-navigation in the 2 confirmed gap sites (`botasaurus_wrapper.py`,
-`botasaurus_pool.py`), raising `BotasaurusNavigationError` — a plain
-`Exception` automatically caught by the existing `except (Exception,
-SystemExit): return None` in `level_2.py::_fetch_via_botasaurus` (the same
-handler round 40 added for `SystemExit`), with zero `level_2.py`/
-`worker.py` changes needed; the Botasaurus→Camoufox fallback now actually
-triggers instead of silently persisting garbage as `success=True`. Second,
-independent defense-in-depth layer: a structural, locale-independent
-`net::ERR_` regex added to `ChallengeDetector`, plugging into `worker.py`'s
-already-centralized `is_challenge_page` classification for free. Live-
-verified via 12 new tests (using the peer's actual 3 reported example
-bodies as fixtures) — full gate: 964 passed (up from round 56's 952 by
-exactly the new tests), 3 skipped (pre-existing, unchanged), 0 failed,
-100.00% coverage. Live-verified with a real browser launch too (user
-explicitly required it, same session, as a follow-up correction) — two
-standalone scripts launched real Botasaurus/Chromium via Xvfb against a
-proxy pointed at a closed local port, one exercising each of the two
-fixed call sites; both confirmed `driver.current_url` genuinely reads
-`chrome-error://chromewebdata/` after the failure and
-`BotasaurusNavigationError` is correctly raised with the exact descriptive
-message — first real confirmation the root-cause claim holds against the
-actual installed `botasaurus_driver`, not only against a mock built from
-reading its source. Full detail: technical-debt.md round-57 entry.
-Round 56 (rounds 51-55 — `dlq_reaper` cross-category starvation
-fix, two orphaned-PENDING-job reconciliation/live-deploy rounds, an
-enqueue-failure-after-insert fix, and a PROCESSING-stuck-forever rq-hard-kill
-fix — not narrated in this rolling paragraph, see technical-debt.md's
-round-51 through round-55 entries; this paragraph's rolling summary resumes
-below at round 50). Round 56 (user asked what capabilities were already
-built but never exposed to callers like `research_agent` via API/CLI.
-Audited and found 5 real gaps, all capability-already-exists-just-not-routed:
-no job-list endpoint, no quota-visibility endpoint (`QuotaManager.remaining()`
-existed since early rounds, unused by any route — callers only learned
-their limit by hitting a 429), no tenant-wide DLQ listing
-(`DeadLetterQueue.list_for_tenant()`'s `job_id=None` mode already existed
-for ops tooling/the `dlq_size` gauge, just had no route), no caller-facing
-webhook-event-schema reference (`webhook_events.py`'s taxonomy was
-internal-only), and an ops-only CLI with no caller-facing HTTP client.
-Implemented all 5, split into 4 independently-shipped, purely additive
-phases per explicit user instruction not to bundle them: Phase A `GET
-/v1/jobs` (paginated, tenant-scoped, optional status filter) + `GET
-/v1/quota`; Phase B `GET /v1/dlq` (tenant-wide); Phase C `GET
-/v1/webhook-events` (static reflection of `WebhookEventType` +
-`WebhookEvent.model_json_schema()`); Phase D new `scraper-engine api` CLI
-subcommand group (`scrape`/`jobs`/`job`/`quota`/`dlq`) — a thin `httpx`
-client over the real HTTP API, unlike every other CLI command which talks
-directly to Postgres/Redis, giving a curl-free path through the same
-auth/SSRF/quota checks a real integrator hits. Caught and fixed one real
-bug along the way: FastAPI's `Query(50, ge=1, le=500)` parameter marker is
-never resolved to its plain value when a route function is called directly
-— which is how every test in `test_api_routes.py` calls routes — fixed
-with plain `int` params plus a new shared `_validate_pagination()` helper
-instead of `Query()`. Zero existing route/function/SQL/response-model was
-modified — every change is additive. Live-verified: full gate rerun with
-real docker-compose infra (postgres/redis/pgbouncer) after all 4 phases —
-952 passed, 3 skipped (pre-existing Camoufox/CAPTCHA live-test skips), 0
-failed, 100.00% coverage. Separately, a peer Claude session working on
-`research_agent` flagged via cross-session message a distinct, NOT YET
-INVESTIGATED bug this round: a real fraction of scrape results come back
-`success=True` with `content` that's actually a rendered browser/proxy-level
-error page (Chromium DNS_PROBE/connection-reset, `ERR_EMPTY_RESPONSE`, a
-proxy-layer "No internet" page) rather than real page content — distinct
-from the already-understood real-404-content case (round 45). Suspected,
-unconfirmed root cause: `ChallengeDetector` likely doesn't cover Chromium's
-own internal error-page UI, which probably renders `http_status=200` with
-no known challenge signature. Explicitly deferred to a future round per
-user instruction — logged as an open thread, not investigated or fixed
-this round. Full detail: technical-debt.md round-56 entry. Round 50 (same peer session, follow-up report with concrete evidence: `fingerprint_preset=True` (round 46) crashed an ENTIRE job — `BrowserPool.start()`'s prewarm loop runs outside `process_job`'s per-URL try/except — when a randomly-sampled real fingerprint's WebGL vendor/renderer isn't covered by camoufox's own separate `webgl_data.db` lookup table (`ValueError: No WebGL data found for vendor...`, verified against the actual installed camoufox source: `camoufox/utils.py` passes a preset's pinned vendor/renderer straight to `camoufox/webgl/sample.py::sample_webgl`, which raises if that exact pair isn't a row in the table — a genuine gap between camoufox's own two internal datasets). Three distinct real vendor/renderer combos observed crashing across two runs, confirming a real percentage of the fingerprint pool, not a rare edge case. Fixed with the same pattern as round 37's `InvalidIP` geoip fallback: `CamoufoxWrapper._launch_with_geoip_fallback()` retries with `fingerprint_preset=False` on this specific, message-scoped `ValueError`, restructured into a bounded 3-attempt loop so it can stack with the geoip fallback in one launch. Full detail: technical-debt.md round-50 entry. Round 49 (a peer Claude session working on `research_agent`, a sibling service hitting this API over HTTP, reported real batches scoring 0-7/33, dominated by `detection_block`/`circuit_open`/`scraper_engine_job_timeout`. Root-caused two real gaps: `free_first` (round 40) only fell back to the paid gateway on total pool exhaustion, never on a circuit-open domain or a still-blocked final-level result — the two failure modes actually being hit; and `process_job`'s zero-concurrency URL loop (round 45, deliberately deferred until "fix everything reported" made it in scope) made large batches slow enough to trip the caller's own job-timeout. Fixed both: `FetchResult.proxy_source` + a `force_gateway` param let `process_job` force a level through the gateway when the circuit is open (level 1 skipped — no gateway path there — straight to level 2) or when a final-level result is still blocked after one retry; `process_job`'s URL loop is now `asyncio.Semaphore`-bounded concurrent dispatch (new `politeness.max_concurrent_urls_per_job`, default 5), verified safe since PolitenessController/CircuitBreaker are already Redis-atomic per-domain and BROWSER_SEMAPHORE already caps live browsers process-wide. Full detail: technical-debt.md round-49 entry. Round 48 (user asked what else in the codebase needed round 47's fix — audited the rest of `config/base.yaml` for the same "hardcoded literal, no env override" pattern. Found and fixed 2 real matches: `levels.level_2/level_3.capsolver_enabled` (gated real CapSolver spend, hardcoded `true`, now a shared `${CAPSOLVER_ENABLED:true}`) and `botasaurus.l1_ja3_client_enabled` (a real opt-in feature, hardcoded `false`, now `${BOTASAURUS_L1_JA3_CLIENT_ENABLED:false}`); both live-verified via `load_config()`. Deliberately left the rest of `base.yaml` (circuit breaker, politeness, proxy-tier fallback, pgbouncer, session retention, dlq_reaper, observability toggles) as internal ops-tuning knobs, not capability toggles — converting those would add real misconfiguration risk for a source-blind external caller without matching round 47/48's actual bug pattern. Full detail: technical-debt.md round-48 entry. Round 47 (a developer on `research_agent`, a separate service that calls this one over HTTP, reported it couldn't turn on the DataImpulse paid-gateway proxy — no bind-mounted source, no visibility into this repo's `docker-compose.yml`, so it can't edit code or compose files directly, even though DataImpulse credentials were already reaching the container via env. Root cause: `dataimpulse.enabled`/`strategy` in `config/base.yaml` were the only hardcoded, non-overridable literal values in the whole config file — every other setting already used the `${VAR:default}` env-placeholder pattern. Fixed: both now read `${DATAIMPULSE_ENABLED:false}`/`${DATAIMPULSE_STRATEGY:free_only}`; live-verified via `load_config()` that unset env keeps the unchanged default (`enabled=False`) and setting the env vars actually flips it, no rebuild needed. `.env.example` also gained a full DataImpulse section — it previously documented none of these vars at all. Full detail: technical-debt.md round-47 entry. Round 46 (user asked whether "detection_block" failures meant we weren't using the full anti-detection features of Scrapling/Botasaurus/Camoufox. Found a real bug on investigation: 3 of 12 failures were a FALSE POSITIVE in our own `ChallengeDetector` — bare `"interstitial"`/`"g-recaptcha"` signatures matching completely normal Google Ad Manager ad-slot code and a comment-form reCAPTCHA widget on real, live 200-status pages, not actual anti-bot pages; removed both, live-verified all 3 URLs now succeed. Separately upgraded Camoufox's anti-detection config, verified against real docs (Context7): added `fingerprint_preset=True` (real captured fingerprints, officially recommended for our Firefox 152) and `os="linux"` (pinned to match the actual Docker host — Camoufox's own docs warn impersonating a different OS is counterproductive, not an improvement). Live-verified this doesn't flip `crunchbase.com`/`cbn.gov.ng`'s remaining genuine 403 blocks — concluded these are IP-reputation-based (proxy quality), not fixable via browser fingerprint tuning; the only real lever is round 40's opt-in paid gateway proxy. Full detail: technical-debt.md round-46 entry. Round 45 (user pushed back with real evidence — their own browser loaded nairametrics.com/sec.gov.ng fine, contradicting round 44's "404 = definitively dead" assumption — requesting deeper investigation, suspecting anti-bot detection. Correct: live-verified 2 of 5 domains' "404" was actually Cloudflare bot-management rejecting L1's non-JS request ("error code: 1010"), disguised as not-found. Round 44's NOT_FOUND (permanent, no escalation) was too confident — reverted: 404 now added to `ChallengeDetector.CHALLENGE_STATUS_CODES` alongside 403/429/5xx, so it escalates through a real browser like any other block status; only if the FINAL level's own real-browser render STILL looks blocked does `worker.py` downgrade it to a real failure (closing a separate pre-existing gap where the final level unconditionally accepted "whatever it got," which is exactly how a real 404 error page for businessday.ng had been silently stored as "successful" markdown). Live-verified against the exact 7 URLs in question: `sec.gov.ng`, `techcabal.com`, `konga.com` now correctly succeed (real 200 via browser escalation — confirms the user's suspicion); `nairametrics.com` (both URLs), `punchng.com`, `businessday.ng`'s specific article paths independently confirmed genuinely dead via two separate methods (system's real L3 Camoufox browser, and a no-proxy realistic-header direct check both hitting the real origin's own WordPress 404 page) — each domain's homepage verified healthy, only these specific stale deep-links are gone. Full detail: technical-debt.md round-45 entry. Round 44 (root-caused all 6 remaining failures from round 43's rerun, user-requested "robust and resilient solutions": a definitive HTTP 404 (`FailureCategory.NOT_FOUND`, new) now stops escalation and is exempt from circuit-breaker penalty instead of wasting L2/L3 attempts and damaging domain health over a URL that will never exist; `classify_fetch_exception`'s marker-based DNS-failure matching was mislabeling PROXY-side DNS blips as permanent `HOST_UNREACHABLE` — since SSRFGuard's own unproxied pre-check already proves a domain resolves before any level's real fetch attempt runs, a raw DNS exception surfacing after that can only be proxy/network-side, so it now falls through to the caller's already-retryable default; circuit breaker's `max_cooldown_seconds` cut 3600s→1200s and `trip_count` now TTL-decays instead of compounding forever (both live-verified: `crunchbase.com`/`cowrywise.com`, blocked for hours by stale trip state, succeeded immediately once cleared — they were never actually unscrapeable). Full detail: technical-debt.md round-44 entry. Round 43 (live rerun of round 42's fix surfaced 4 more issues, user-requested "root-cause and fix, one at a time, live verify each": (1) markdown RecursionError fallback made to actually convert deeply-nested real pages instead of just degrading — iterative wrapper-chain flattening plus a large-stack thread for genuinely deep nesting; (2) SSRF guard was mislabeling dead/unresolvable domains as `ssrf_blocked` instead of the already-existing `HOST_UNREACHABLE` category — fixed via `SSRFBlockedError.is_unresolvable`; (3) circuit breaker had no TTL on its failure-streak counters, so one job's crashed-run failures silently poisoned later unrelated jobs' trip decisions for up to an hour — fixed with `failure_streak_ttl_seconds`, plus a `record_success` counter-reset asymmetry; (4) remaining genuine `proxy_exhausted` cases verified NOT a bug — real free-tier top-tier supply scarcity, already correctly labeled and mitigated. Full detail: technical-debt.md round-43 entry). Round 42 root-caused "proxy_exhausted" to ground truth, user-requested — two stacked bugs, neither about proxy supply: `orchestrator/worker.py::process_job`'s terminal escalation branch was fabricating `PROXY_EXHAUSTED` for any all-levels-failed reason, which was hiding a real schema regression — migrations 004/005/007 had each silently reverted migration 002's `browser_sessions` fix, breaking session-state persistence on 100% of live tenant schemas with `column "storage_state" does not exist`; fixed with a real-category-preserving terminal branch plus new migration `008_fix_browser_sessions_schema_regression.py`, live-verified both together. Round 41 root-caused and fixed round 40's Xvfb display-contention crash — botasaurus_driver's non-atomic Xvfb display-number picker plus a leftover-lock-file leak on close; fixed via a new process-wide `core.budget.XVFB_LOCK` serializing display spinup/teardown across both engines, plus proactive stale-file cleanup; live-verified crash-free across 4 rounds of concurrent real jobs. Round 40 added a toggleable paid rotating-gateway proxy (DataImpulse) for L2/L3, additive to the free pool, off by default. Round 39 corrected years of silently-inflated proxy scoring plus four leasing-reliability hardenings. Round 38 grew free-harvest source breadth and fixed two L3-scoring bugs. Round 37: six-layer L2/L3 leasing-reliability fix. Full round-by-round narrative, every open thread, every decision: `.claude/knowledge/technical-debt.md` (start there, not here — this file is navigation only). Source code is fully implemented — not blueprint phase.
+Project identity, operating rules, and navigation. Currently at round 57.
+This paragraph is deliberately a one-liner, not a round-by-round diary —
+a round-28 knowledge-architecture audit removed 7 growing dated paragraphs
+from this exact spot once already (see "Evolution history" below); the
+pattern crept back in over rounds 37-57 and a round-57 knowledge audit
+removed it again (see `decisions.md` → "Knowledge-Audit: Round-57 CLAUDE.md
+Diary Regression"). If you're about to prepend a new round's narrative
+here, it belongs in `.claude/knowledge/technical-debt.md` and, if terse,
+the "Evolution history" bullet below — not here. Full round-by-round
+narrative, every open thread, every decision: `.claude/knowledge/
+technical-debt.md` (start there, not here — this file is navigation
+only). Source code is fully implemented — not blueprint phase.
 
 ## Project Identity
 
@@ -157,7 +81,36 @@ openwolf cron        # cron task management
   structurally can't reach L3" ceiling — a judge-validation latency
   measurement polluted by dead-candidate timeout time, and a proxy's
   latency reading frozen forever at its first sample instead of refreshed
-  by later health checks (round 38). Current design, topic-
+  by later health checks (round 38); corrected years of silently-inflated
+  proxy scoring plus four leasing-reliability hardenings (round 39);
+  toggleable paid DataImpulse gateway proxy for L2/L3, additive, off by
+  default (round 40); root-caused and fixed round 40's Xvfb display-
+  contention crash via a process-wide lock (round 41); `proxy_exhausted`
+  root-caused to a `browser_sessions` schema regression across 3
+  migrations, not real pool exhaustion (round 42); 4 more issues from a
+  live rerun — markdown `RecursionError` fallback, SSRF unresolvable-host
+  mislabeling, circuit-breaker failure-streak TTL, confirmed non-bug
+  proxy scarcity (round 43); `NOT_FOUND` category + DNS-exception
+  reclassification + circuit-breaker cooldown/trip-count decay (round 44);
+  404 reverted to escalate through a real browser again after live
+  evidence it was often a disguised anti-bot block, not a dead page
+  (round 45); `ChallengeDetector` false-positive fix (`interstitial`/
+  `g-recaptcha` bare-string matches) + Camoufox `fingerprint_preset`/`os`
+  pinning (round 46); DataImpulse `enabled`/`strategy` made env-
+  overridable for a caller with no compose access (round 47); same fix
+  applied to 2 more hardcoded config toggles (round 48); `free_first`
+  gateway-fallback gaps (circuit-open, still-blocked final level) +
+  `asyncio.Semaphore`-bounded concurrent URL dispatch (round 49);
+  `fingerprint_preset`'s WebGL-data crash fixed with a bounded fallback
+  loop (round 50); `dlq_reaper` cross-category starvation fix, 2 orphaned-
+  PENDING-job reconciliation/live-deploy rounds, an enqueue-failure-after-
+  insert fix, and a PROCESSING-stuck-forever rq-hard-kill fix (rounds
+  51-55); surfaced 5 existing-but-unrouted capabilities (job list, quota,
+  tenant-wide DLQ, webhook-event schema, caller-facing CLI) as 4
+  independently-shipped API/CLI phases (round 56); Botasaurus silently
+  returning Chromium's own `chrome-error://` interstitial as
+  `success=True` root-caused and fixed, live-verified with a real browser
+  launch (round 57). Current design, topic-
   organized: `.claude/knowledge/architecture.md`. Full chronological
   history, every bug found, every decision: `.claude/knowledge/
   technical-debt.md`. WHY each call was made: `.claude/knowledge/

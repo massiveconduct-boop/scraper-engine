@@ -72,49 +72,15 @@ force-loaded every session regardless of relevance).
 |---|---|---|
 | `.claude/knowledge/technical-debt.md` | Complete round-by-round history — every bug found, every decision, every open thread, from project inception to the current round | Investigating whether something was already fixed; needing the full story behind a "RESOLVED (round N)" reference; auditing a specific round's changes |
 
-**Current state, for a quick orientation without opening that file:** as of
-round 34, proxy pool exhaustion now self-heals (event-driven harvest
-trigger, not just a timer) and transient DLQ entries (`PROXY_EXHAUSTED`,
-`CIRCUIT_OPEN`) auto-retry once their condition clears; webhook delivery
-is a durable transactional outbox with a real Slack Block Kit formatter
-instead of fire-and-forget raw JSON; `JobStatusResponse.partial_failure`
-stops a job with a DLQ'd URL from reporting as a clean `COMPLETED`; the
-webhook URL is now SSRF-guarded like any scrape target. **Both open
-threads from round 34 are now resolved** (same-day knowledge audit +
-follow-up): (1) the pool-health-to-Slack path (`ops_webhook_url`) and the
-pre-existing `ProxyPoolCriticallyLow` Alertmanager rule are kept as
-deliberately independent, complementary alert paths — not merged, not
-reconciled into one — see `decisions.md` → "Keep Both Pool-Health Alert
-Paths"; (2) the coverage gate regression the audit found (97.91%,
-`webhook_sweeper.py`/`dlq_reaper.py`'s `run()` functions untested,
-`harvester_daemon.py` regressed from 100%) is fixed — 99.57% now, every
-round-34 file at 100%, only a pre-existing aarch64-sandbox-only gap
-remains (`botasaurus_requests_client.py`, not a CI blocker). See
-`technical-debt.md`'s round-34 entry for both. Rounds 30–33 are now
-backfilled into `technical-debt.md` too (round-40 knowledge-maintenance
-pass — recovered from `.wolf/STATUS.md` before that file was trimmed
-back to a true rolling snapshot).
-Round 29's 8 caller-facing gaps (failed URLs no longer vanishing from job
-results, `html_snapshot_url` reaching callers, job cancellation,
-`Idempotency-Key` retry-safety, real per-URL progress, `Retry-After` on
-429s) plus its 7-day scrape-result cache and generalized markdown
-conversion still stand as documented. Schema-driven extraction accepting
-multiple input formats remains explicitly deferred, not forgotten. Full
-detail, as always, in `technical-debt.md` above.
-
-**Since then (rounds 35–40, not yet folded into the paragraph above):**
-proxy_exhausted root-caused to ASN misclassification + self-healing
-daemon consolidation (35); `/v1/health` daemon-liveness reporting (36);
-six-layer L2/L3 leasing-reliability fix (37); free-harvest source growth
-8→12 + two real L3-scoring bugs fixed, first-ever L3-caliber proxies (38);
-proxy scoring corrected from years of silent inflation (stale-snapshot
-race, hardcoded `success_rate=None`, a `GREATEST`-ratchet blocking
-downward correction) plus four leasing-reliability hardenings (39); a
-toggleable paid rotating-gateway proxy (DataImpulse) added for L2/L3,
-strictly additive to the free pool, off by default, live-proven working
-at the Camoufox layer with one open thread (a suspected Xvfb
-display-contention crash under the full job pipeline, not yet
-root-caused) (40). Full detail for all of these: `technical-debt.md`.
+**Current state, for a quick orientation without opening that file:**
+`CLAUDE.md`'s "Evolution history" bullet (under Architecture) carries a
+terse, one-clause-per-round rolling summary from round 22 through the
+current round — read that first for orientation instead of a duplicate
+copy here. This section used to duplicate that summary inline and drifted
+17 rounds stale (frozen at round 40 while the project moved through round
+57) before a round-57 knowledge audit removed it — see `decisions.md` →
+"Knowledge-Audit: Round-57 CLAUDE.md Diary Regression" for why keeping
+one summary in one place, not two that can drift apart, is the fix.
 
 ## Reference
 

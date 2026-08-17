@@ -2667,3 +2667,61 @@ not, and covers the whole `net::ERR_*` failure class with one check
 instead of enumerating wordings).
 
 **Status:** Active. Full detail: `technical-debt.md`'s round-57 entry.
+
+---
+
+## Decision: Knowledge-Audit — Round-57 CLAUDE.md Diary Regression
+
+**Date:** 2026-08-17 | **Round:** 57 (knowledge audit, user-invoked via `/knowledge-audit`)
+
+**What:** `CLAUDE.md`'s opening paragraph had regrown into a ~4000-word,
+round-by-round dated narrative (every round 37 through 57, each with its
+own "Round N (..." block) — the exact same failure mode a round-28
+knowledge-architecture audit had already fixed once, documented in
+`CLAUDE.md`'s own "Evolution history" bullet as "was 7 growing paragraphs
+here." Trimmed back to a one-line "Currently at round 57" pointer, and the
+existing terse "Evolution history" bullet (which already compactly covered
+rounds 22-38 in ~280 words) was extended in the same one-clause-per-round
+style to cover rounds 39-57 too, so the compact orientation this file is
+supposed to provide stays current without re-accumulating prose. Also
+found and fixed the same drift pattern in `.claude/MEMORY.md`'s "Current
+state, for a quick orientation" section — it had frozen at round 40 while
+the project moved through round 57 (self-labeled "Since then (rounds
+35-40, not yet folded into the paragraph above)" with nothing ever folded
+in after); rather than re-fix it as a second rolling summary (which just
+recreates the two-copies-that-drift-apart problem), it now points at
+`CLAUDE.md`'s Evolution History bullet as the one place that summary
+lives.
+
+**Why:** `CLAUDE.md` is loaded into every session's context regardless of
+task relevance — this project's own `knowledge-audit`/`knowledge-
+maintainer` skills state it should be "small, stable, high-signal —
+navigation and architecture only, never a project diary." A ~4000-word
+diary paragraph that grows every round is the opposite of that, and
+because every round's content already had a full, real home in
+`technical-debt.md` (verified round-by-round before trimming — every round
+37-57 cited in the old paragraph has either its own `## ... (as of round
+N)` section or, for round 47, a `RESOLVED (round 47)` bullet nested inside
+round 48's section), nothing was lost by removing the diary copy — it was
+pure duplication of content that already existed in more permanent,
+better-organized form.
+
+**Trade-offs:** The one-clause-per-round "Evolution history" bullet is
+necessarily lossy compared to the full paragraphs it replaces — a reader
+gets "what happened," not the full root-cause reasoning, live-verification
+detail, or numbers. That's intentional: this file's whole job is
+navigation, and `technical-debt.md`'s "Full detail: ... round-N entry"
+pointer (unchanged) is exactly how a reader gets the rest.
+
+**Alternatives considered:** Leaving `CLAUDE.md`'s diary paragraph in place
+and only trimming future rounds going forward (rejected — doesn't fix the
+existing ~4000 words of bloat already there, and does nothing to prevent
+the same regression happening a third time, since the incentive that
+caused it twice — "just prepend this round's summary, matches the existing
+pattern" — would still be the path of least resistance for the next
+session). Deleting `MEMORY.md`'s stale orientation section outright
+instead of pointing it at `CLAUDE.md` (rejected — the section itself, as a
+concept, is useful; the fix is one canonical copy, not zero copies).
+
+**Status:** Active. Full detail: `technical-debt.md`'s round-57 entry
+(knowledge-audit subsection).

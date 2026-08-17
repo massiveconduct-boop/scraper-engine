@@ -93,5 +93,9 @@ Every report must have: Header Metadata (date, spec ref), Environment & Infrastr
 
 - Conventional Commits format: `fix:`, `feat:`, `docs:`, `test:`, `chore:`
 - Reference issue/gap IDs in body (F-02, G-05, BD-01)
-- Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude &lt;actual model name of the session that made the
+  commit&gt; &lt;noreply@anthropic.com&gt; — not a fixed model name; different
+  sessions across this project's history have run different Claude
+  models, and the trailer should reflect whichever one actually did the
+  work
 - Subject ≤50 chars, body only when "why" isn't obvious from the diff

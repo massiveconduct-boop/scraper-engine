@@ -208,6 +208,30 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   Camoufox/Playwright paths — confirmed already correct by reading the
   code, no fetcher-specific change needed there.
 
+- **Knowledge audit (round 57, user-invoked via `/knowledge-audit`) —
+  `CLAUDE.md`'s opening paragraph had regrown into a ~4000-word round-by-
+  round diary (rounds 37-57), the exact same failure mode a round-28
+  audit had already fixed once (documented in `CLAUDE.md`'s own
+  "Evolution history" bullet). Trimmed to a one-line pointer; the existing
+  terse "Evolution history" bullet was extended to cover rounds 39-57 in
+  the same one-clause-per-round style instead. `MEMORY.md`'s "Current
+  state" orientation section was found frozen at round 40 (17 rounds
+  stale) and re-pointed at `CLAUDE.md`'s bullet rather than re-fixed as a
+  second copy that would just drift again. Also verified, before trimming
+  anything, that every round 37-57 cited in the old paragraph has real
+  content in this file (either its own `## ... (as of round N)` section,
+  or for round 47, a `RESOLVED (round 47)` bullet nested inside round
+  48's section — noted as a minor, non-blocking structural inconsistency,
+  not a broken reference; content is present and findable either way).
+  Also flagged, not fixed this round (bigger content jobs, need domain
+  judgment beyond a mechanical trim): `docs/reference/api-reference.md`
+  documents none of round 56's 4 new endpoints (`GET /v1/jobs` list,
+  `GET /v1/quota`, `GET /v1/dlq`, `GET /v1/webhook-events`); `architecture.md`
+  has barely been touched since ~round 40 (1 grep hit for rounds 41-57 in
+  1080 lines) and doesn't reflect round 56's new API routes or round 57's
+  new `browser/_botasaurus_nav_check.py` module. Full detail:
+  `decisions.md` → "Knowledge-Audit: Round-57 CLAUDE.md Diary Regression".
+
 ## Technical Debt / Open Threads (as of round 56)
 
 - **CLOSED (round 56) — 5 read-only capabilities existed server-side but
