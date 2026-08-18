@@ -2790,3 +2790,127 @@ exists to prevent; the live test was cheap to run and directly
 contradicted the upstream docstring.
 
 **Status:** Active. Full detail: `technical-debt.md`'s round-60 entry.
+
+---
+
+## STATUS.md Stale Zero-Concurrency Claim (Round 49 Fix Never Reflected)
+
+**Date:** 2026-08-18
+
+**Context:** User asked why scrape jobs regularly exceed 120s given the
+`job_timeout` formula (`max(600, url_count * 120)`, `api/routes.py:247`).
+While answering, `.wolf/STATUS.md`'s "Genuinely open" list (item 4) was
+cited as background — it claimed `process_job` still ran URLs strictly
+sequentially with zero intra-job concurrency, "deliberately deferred per
+explicit user instruction," pointing at the round-45 entry.
+
+**Finding:** That claim was stale. Round 49 (`orchestrator/worker.py:245`,
+comment block at line 226) replaced the sequential `for url in
+request.urls:` loop with `asyncio.Semaphore`-bounded concurrent dispatch
+(`_dispatch_one_url`/`_process_one_url`), default cap
+`politeness.max_concurrent_urls_per_job = 5` (`config/base.yaml:168`).
+CLAUDE.md's own "Evolution history" bullet already documented this round
+49 change correctly — only `.wolf/STATUS.md` had drifted, carrying the
+round-45 framing forward 11 rounds past its own fix without ever being
+corrected.
+
+**Why it matters:** `STATUS.md` is the explicit single-source-of-truth,
+read-first document per `.wolf/OPENWOLF.md`. A stale claim there about a
+core execution-model property (sequential vs. concurrent) risks a future
+session re-implementing already-shipped concurrency, or mis-explaining
+real job-latency behavior to a caller — which is exactly what almost
+happened here.
+
+**Fix:** `.wolf/STATUS.md` item 4 corrected in place with the real
+current state, the round-49 code references, and a pointer back to this
+entry. The real explanation for jobs exceeding 120s is the interaction of
+the 5-way concurrency cap with per-URL L1(20s)/L2(40s)/L3(60s) escalation
+cost (each level retried once with a fresh proxy on proxy-attributable
+failure per round 37) — not sequential processing.
+
+**Status:** Active — `max_concurrent_urls_per_job` raise/lower is a
+politeness/anti-detection tradeoff, left as-is unless the user asks.
+
+---
+
+## Knowledge-Audit: CLAUDE.md Diary Regression, 3rd Occurrence
+
+**Date:** 2026-08-18
+
+**Context:** User asked for a full knowledge-audit sweep (via the
+`knowledge-audit` skill) after a stale-STATUS.md finding (see "STATUS.md
+Stale Zero-Concurrency Claim" above) prompted a closer look at the whole
+knowledge system. The audit found `CLAUDE.md`'s Evolution History bullet
+and Module Map table had regrown into a full round-by-round diary — the
+same failure mode fixed at round 28 and again at round 57 — this time
+inside the very structures round 57's fix created to prevent it.
+
+**Finding:** Evolution History (~690 words) and Module Map (~2080 words)
+had accumulated per-round mechanism narratives with specific figures
+(e.g. "804.7MB" RSS measurement, `LocalExtension` implementation detail,
+`chrome-error://` scheme name) instead of round-57's established
+one-clause-per-round style. File had reached 31.7KB (~8K tokens),
+always loaded every session. Verified via grep that every specific
+figure and mechanism detail already existed in `technical-debt.md`
+before trimming (per the audit skill's explicit rule: never trim
+investigation detail on the assumption alone that a pointer covers it —
+confirm first) — `LocalExtension`, `804.7MB`/`0.79GB`, and
+`chrome-error` all present there.
+
+**Fix:** Re-trimmed both sections to current-state summaries — Evolution
+History back to true one-clause-per-round (round number + a few words,
+no mechanism prose), Module Map back to package-level current-state
+one-liners with round citations removed entirely. File dropped from
+31.7KB to 13.8KB (~1557 words). Full detail for both sections remains
+exactly where it already lived: `architecture.md` (design) and
+`technical-debt.md` (full round history).
+
+**Why it keeps happening:** Nothing mechanically prevents it — the file
+carries an explicit warning comment against exactly this (added round
+28, reinforced round 57) and it still regrew, because normal end-of-round
+edits add "just one more clause" each time and no single edit looks like
+regrowth in isolation.
+
+**Recommendation, not yet implemented:** add a CI or pre-commit check
+that fails if `CLAUDE.md` exceeds roughly 1500 words, so regrowth is
+caught mechanically at the next offending commit instead of waiting for
+the next manual audit. This is the fork audit's top future
+recommendation; left as an open suggestion since it's a CI/tooling
+change, not a knowledge-doc edit.
+
+**Status:** Active. If this happens a 4th time, the CI gate above should
+be treated as no-longer-optional.
+
+---
+
+## CLAUDE.md Size Gate — CI + pre-commit (closes prior recommendation)
+
+**Date:** 2026-08-18
+
+**Context:** Closes the open recommendation from "Knowledge-Audit: CLAUDE.md
+Diary Regression, 3rd Occurrence" (above) — a mechanical check so the same
+regrowth doesn't need a 4th manual audit to catch.
+
+**What shipped:** `tools/check_claude_md_size.sh` — `wc -w CLAUDE.md`, fails
+if over 1800 words (file was 1557 words right after the same-day trim; 1800
+gives real headroom for legitimate navigation additions without tolerating
+regrowth back toward the pre-trim ~4900-word size). Wired into both:
+- CI (`.github/workflows/test.yml`, `lint` job, new "CLAUDE.md size gate"
+  step, same grep-gate pattern as the existing `no direct fetcher
+  construction`/`force_engine` steps — hard fail, not advisory).
+- pre-commit (`.pre-commit-config.yaml`, new local `claude-md-size` hook,
+  scoped to `files: ^CLAUDE\.md$` so it only runs when the file itself
+  changes).
+
+**Why both, not just one:** pre-commit catches it before the commit even
+happens (fast local feedback); CI catches it regardless of whether a given
+contributor has pre-commit installed — same reasoning as the existing
+`ruff`/`mypy-strict` hooks being duplicated in both places.
+
+**Trade-off:** 1800 is a word count, not a token count — a rough proxy.
+Good enough here since English prose tokenizes fairly consistently
+(~1.3-1.5 tokens/word); a code-heavy file would need a different metric,
+but CLAUDE.md is prose by design.
+
+**Status:** Active, live-verified: script runs clean against the current
+1557-word file (`CLAUDE.md: 1557 words (limit: 1800)` / `OK`).
