@@ -73,24 +73,31 @@ class TestAllowRequest:
 
 class TestRecordSuccess:
     @pytest.mark.asyncio
-    async def test_success_while_closed_resets_both_counters(self, breaker, redis) -> None:
-        """Round 43 — a success must break a failure streak: both
-        failure_window_attempts AND consecutive_failures reset, not just
-        the window. Before this fix, consecutive_failures survived an
-        ordinary closed-state success despite its name, letting failures
-        from before the success silently carry into the next streak."""
-        await redis.set("cb:closedok.com:consecutive_failures", "7")
-        await breaker.record_success("closedok.com")
-        assert await redis.get("cb:closedok.com:failure_window_attempts") == "0"
-        assert await redis.get("cb:closedok.com:consecutive_failures") == "0"
-        assert await breaker.state("closedok.com") == CircuitState.CLOSED
+    async def test_success_while_closed_counts_as_attempt_without_resetting_failures(
+        self, breaker, redis
+    ) -> None:
+        """Round 61 — fixes the round-43 open thread: failure_threshold's
+        ratio was vestigial because failure_window_attempts used to reset
+        to 0 on any success, forcing failures==attempts (rate always 1.0)
+        whenever the trip check ran. Now a closed-state success is a real
+        attempt: it increments failure_window_attempts (grows the ratio's
+        denominator) but must NOT zero failure_window_failures — otherwise
+        the ratio is still fake, just reset one call later instead of on
+        the spot."""
+        await redis.set("cb:mixed2.com:failure_window_attempts", "7")
+        await redis.set("cb:mixed2.com:failure_window_failures", "7")
+        await breaker.record_success("mixed2.com")
+        assert await redis.get("cb:mixed2.com:failure_window_attempts") == "8"
+        assert await redis.get("cb:mixed2.com:failure_window_failures") == "7"
+        assert await breaker.state("mixed2.com") == CircuitState.CLOSED
 
     @pytest.mark.asyncio
     async def test_success_while_half_open_closes_circuit(self, breaker, redis) -> None:
         await redis.set("cb:recover.com:state", CircuitState.HALF_OPEN.value)
         await breaker.record_success("recover.com")
         assert await breaker.state("recover.com") == CircuitState.CLOSED
-        assert await redis.get("cb:recover.com:consecutive_failures") == "0"
+        assert await redis.get("cb:recover.com:failure_window_failures") == "0"
+        assert await redis.get("cb:recover.com:failure_window_attempts") == "0"
 
 
 class TestRecordFailure:
@@ -109,11 +116,29 @@ class TestRecordFailure:
     @pytest.mark.asyncio
     async def test_failure_rate_below_threshold_stays_closed(self, breaker, redis) -> None:
         """Reaches attempt_threshold (10) but failure_rate (4/10=0.4) stays
-        below failure_threshold (0.5) — must not trip."""
+        below failure_threshold (0.5) — must not trip, and (round 61) the
+        window resets after being fully sampled so a stale ratio doesn't
+        linger and dilute the next batch."""
         await redis.set("cb:mixed.com:failure_window_attempts", "9")
-        await redis.set("cb:mixed.com:consecutive_failures", "3")
+        await redis.set("cb:mixed.com:failure_window_failures", "3")
         await breaker.record_failure("mixed.com")  # -> attempts=10, failures=4
         assert await breaker.state("mixed.com") == CircuitState.CLOSED
+        assert await redis.get("cb:mixed.com:failure_window_attempts") == "0"
+        assert await redis.get("cb:mixed.com:failure_window_failures") == "0"
+
+    @pytest.mark.asyncio
+    async def test_failure_rate_trips_despite_one_earlier_success(self, breaker) -> None:
+        """Round 61 — the actual fix under test. One success followed by 9
+        failures (10 attempts, 9 failures, rate 0.9 >= failure_threshold
+        0.5) must trip. Under the pre-fix code this was impossible without
+        directly seeding Redis: record_success zeroed both counters, so
+        reaching attempt_threshold again required 10 fresh consecutive
+        failures after the success — a 9-failure run like this one never
+        tripped, regardless of failure_threshold's configured value."""
+        await breaker.record_success("almosttrip.com")
+        for _ in range(9):
+            await breaker.record_failure("almosttrip.com")
+        assert await breaker.state("almosttrip.com") == CircuitState.OPEN
 
     @pytest.mark.asyncio
     async def test_failure_rate_at_threshold_opens_circuit(self, breaker) -> None:
@@ -135,7 +160,7 @@ class TestFailureStreakTtl:
     async def test_record_failure_sets_ttl_on_streak_keys(self, breaker, redis) -> None:
         await breaker.record_failure("ttl.com")
         assert await redis.ttl("cb:ttl.com:failure_window_attempts") > 0
-        assert await redis.ttl("cb:ttl.com:consecutive_failures") > 0
+        assert await redis.ttl("cb:ttl.com:failure_window_failures") > 0
 
     @pytest.mark.asyncio
     async def test_stale_failure_streak_expires_independent_of_new_job(
@@ -173,6 +198,7 @@ class TestOpenCircuitBackoff:
         assert await redis.get("cb:tripped.com:trip_count") == "1"
         assert await redis.get("cb:tripped.com:cooldown_until") is not None
         assert await redis.get("cb:tripped.com:failure_window_attempts") == "0"
+        assert await redis.get("cb:tripped.com:failure_window_failures") == "0"
 
     @pytest.mark.asyncio
     async def test_trip_count_has_ttl_for_decay(self, breaker, redis) -> None:

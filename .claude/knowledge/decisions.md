@@ -1016,6 +1016,25 @@ ever reconsidered (see `.wolf/STATUS.md` → Next phase), keep the actual
 gate — `--cov-fail-under=100` — in exactly one place; don't let it drift
 back into two or three.
 
+**Follow-up resolved, round 62:** the deferred question — whether
+`unit`/`integration`'s bare (no-`--cov`) pytest runs are worth keeping —
+is closed. **Keep both jobs.** The `needs:` chain
+(`lint → unit → integration → chaos → build-and-push`) is strictly
+sequential, not parallel, and each stage's *infra* cost strictly
+increases: `unit` has zero `services:`/docker setup, `integration` adds
+GH Actions `services:` containers for Postgres+Redis, `chaos` brings up
+the project's full docker-compose stack (Postgres/Redis/PgBouncer/MinIO,
+4 containers including real PgBouncer transaction-pooling `services:`
+can't replicate) plus coverage instrumentation on top. "Redundant" in the
+original framing meant only that `unit`'s and `integration`'s test *files*
+get executed a second time inside `chaos`'s combined run — not that the
+jobs themselves add nothing. Removing them would mean every ordinary test
+failure only surfaces after the heaviest job's full infra spinup, with no
+compensating CI-time savings on the happy path (`chaos` still has to run
+every test file regardless, per this same decision's "one combined run"
+design above). Verified via `.github/workflows/test.yml`: no parallelism
+exists to reclaim by merging them.
+
 ---
 
 ## Decision: Scrapling Engine — Manual Redirect Loop, Not `follow_redirects=True`

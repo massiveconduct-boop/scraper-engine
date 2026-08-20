@@ -117,6 +117,36 @@ as its own `ssrf_blocked` entry in `GET /v1/jobs/{job_id}`, same as
 
 ---
 
+### `GET /v1/jobs`
+
+List jobs for the calling tenant — schema-per-tenant search_path already
+scopes this to the caller's own jobs, same isolation as
+`GET /v1/jobs/{job_id}`. Ordered newest-first.
+
+**Query params:** `status` (optional, must be a valid job status or `422`),
+`limit` (default 50, capped at 500 — same per-request cap as
+`POST /v1/scrape`'s URL list), `offset` (default 0)
+
+**Response:** `200 OK`
+```json
+{
+  "jobs": [
+    {
+      "job_id": "550e8400-e29b-41d4-a716-446655440000",
+      "status": "COMPLETED",
+      "url_count": 3,
+      "created_at": "2026-08-16T12:00:00Z",
+      "updated_at": "2026-08-16T12:00:07Z"
+    }
+  ],
+  "limit": 50,
+  "offset": 0,
+  "count": 1
+}
+```
+
+---
+
 ### `GET /v1/jobs/{job_id}`
 
 Poll job status and retrieve results. `results` includes both successful
@@ -222,6 +252,65 @@ keeps its original `job_id`; poll `GET /v1/jobs/{job_id}` to see it move
 through `PENDING`/`PROCESSING` again rather than watching this endpoint.
 Every other `failure_category` (`ssrf_blocked`, `quota_exceeded`,
 `host_unreachable`) is permanent and never auto-retried.
+
+---
+
+### `GET /v1/dlq`
+
+Tenant-wide dead-letter listing — the caller-facing sibling of
+`GET /v1/jobs/{job_id}/dlq`, covering every dead URL across all of the
+tenant's jobs instead of requiring the caller to already know one job's id.
+Same entry shape, same auto-retry semantics as above.
+
+**Query params:** `limit` (default 100), `offset` (default 0)
+
+**Response:** `200 OK` — a JSON array of `DeadLetterEntryResponse`, same
+shape as `GET /v1/jobs/{job_id}/dlq`'s response above.
+
+---
+
+### `GET /v1/quota`
+
+Remaining daily quota for the calling tenant — lets a caller check its
+limit proactively instead of discovering it by hitting a `429` on
+`POST /v1/scrape`.
+
+**Response:** `200 OK`
+```json
+{
+  "tenant": "acme-corp",
+  "daily_limit": 1000,
+  "used": 342,
+  "remaining": 658,
+  "resets_in_seconds": 41273
+}
+```
+
+---
+
+### `GET /v1/webhook-events`
+
+Webhook event taxonomy and payload schema — lets a caller wiring up a
+webhook receiver discover every `WebhookEventType` value and the full
+`WebhookEvent` JSON schema without reading this repo's source. Pure static
+reflection: no database or Redis touch, and (unlike every other `/v1`
+route) nothing tenant-specific to fail on once the API key itself checks
+out.
+
+**Response:** `200 OK`
+```json
+{
+  "event_types": [
+    "job.completed",
+    "job.failed",
+    "job.partial_failure",
+    "job.cancelled",
+    "proxy_pool.degraded",
+    "proxy_pool.critical"
+  ],
+  "payload_schema": { "...": "JSON Schema for WebhookEvent" }
+}
+```
 
 ---
 

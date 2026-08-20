@@ -599,6 +599,36 @@ All routes enforce 4 invariants per blueprint:
 
 **Startup:** `api/main.py` uses `lifespan` context manager to initialize `PostgresClient`, `RedisClient`, and `TenantResolver` singletons. `@app.on_event("startup")` was unreliable in FastAPI 0.139.2.
 
+**Caller-facing surface expanded (Round 56).** Five capabilities that
+already existed internally had no route exposing them to a caller — surfaced
+as 4 independently-shipped routes plus a CLI wrapper, each following the
+same 4-invariant shape above:
+
+- `GET /v1/jobs` — tenant-scoped job list (`status`/`limit`/`offset`
+  filters), same schema-per-tenant isolation as `GET /v1/jobs/{job_id}`.
+- `GET /v1/dlq` — tenant-wide dead-letter listing, the caller-facing sibling
+  of the existing per-job `GET /v1/jobs/{job_id}/dlq`
+  (`DeadLetterQueue.list_for_tenant`'s `job_id=None` mode, previously only
+  used internally by ops tooling and the `dlq_size` gauge).
+- `GET /v1/quota` — remaining daily quota for the calling tenant
+  (`QuotaManager` already tracked this; a caller previously only discovered
+  its limit by hitting a `429`).
+- `GET /v1/webhook-events` — static reflection of `WebhookEventType`'s
+  values and `WebhookEvent`'s JSON schema, no DB/Redis touch.
+- `cli/` gained a caller-facing `api` subcommand group (`scrape`/`jobs`/
+  `job`/`quota`/`dlq`) that wraps these routes over `httpx` instead of
+  talking to storage directly — distinct from the ops subcommands
+  (`serve`/`worker`/`harvest`/…), which still touch Postgres/Redis directly.
+
+Caught along the way: FastAPI's `Query(...)` marker never resolves to its
+plain value when a route function is called directly (every test in
+`api/routes.py`'s module does this, bypassing FastAPI's DI) — `list_jobs`/
+`list_dlq` use plain `int` params with a manual `_validate_pagination()`
+helper (422 on out-of-range) instead.
+
+Full detail: `.claude/knowledge/technical-debt.md` round-56 entry. Endpoint
+request/response shapes: `docs/reference/api-reference.md`.
+
 ---
 
 ## SSRF Enforcement — Two Checkpoints, Not One (Round 22 — closes invariant #4 TOCTOU gap)
@@ -908,6 +938,69 @@ against `challenge-mirror` returns real content
 `BotasaurusPool.fetch()` run confirms exactly one `Driver()` construction
 across both calls (the 2nd fetch used `driver.requests.get()`, not a new
 browser launch) — both are now real, not just source-cited + mocked.
+
+**Silent-false-success on a Chromium internal error page (Round 57).**
+`botasaurus_driver`'s navigation never raises when Chromium lands on its own
+internal `chrome-error://` page (a DNS failure, a connection reset, etc.) —
+it returns normally, so a genuinely failed navigation looked identical to a
+successful one to every caller. Fixed with a dedicated post-navigation
+check, `browser/_botasaurus_nav_check.py::raise_if_navigation_failed()`
+(checks `driver.current_url` for the `chrome-error://` scheme), called from
+both real-navigation Botasaurus paths (`fetcher/botasaurus_wrapper.py`,
+`browser/botasaurus_pool.py`). Live-verified with a real Chromium launch
+against a deliberately unreachable host.
+
+**Missing autoscroll (Round 58).** `Level2Fetcher._fetch_via_botasaurus`
+never autoscrolled, silently dropping any lazy-loaded content below the
+fold — every other fetch path already autoscrolled. Fixed via
+`browser/_botasaurus_scroll.py::botasaurus_autoscroll()`, a sync port of
+the same height-stability algorithm the Playwright/Camoufox paths use
+(`driver.run_js` scroll + height-poll loop, since Botasaurus's `Driver` API
+is synchronous, not `page.evaluate()`). Live-verified against a real
+infinite-scroll page.
+
+**RAM-aware concurrency cap + image/CSS blocking (Round 59).**
+`core/budget.py::resolve_browser_max_total_instances()` — opt-in
+(`camoufox.ram_aware_concurrency_enabled`, default off) ceiling on live
+browser instances, delegating to Botasaurus's own
+`calc_max_parallel_browsers()` (reads `psutil.virtual_memory().available`);
+can only reduce the configured `BROWSER_SEMAPHORE` size, never raise it.
+Calibrated against a real measured Botasaurus/Chromium headful launch RSS
+(804.7MB on the host measured, isolated via before/after PID diff) rather
+than Camoufox's much lighter figure, since the semaphore is shared across
+both engines and Botasaurus is the heavier one. Separately,
+`block_images`/`block_images_and_css` (`BotasaurusConfig`, opt-in) wired
+into both real-navigation Botasaurus paths as real `botasaurus_driver.
+Driver` kwargs — live-verified: a real launch with `block_images=True`
+showed the page's `<img>` tag present in the DOM but never loaded
+(`naturalWidth` stayed 0).
+
+**Extensions, lang/locale/timezone, mouse simulation, CDP network capture
+(Round 60).** Four more opt-in `BotasaurusConfig` fields, each independently
+implemented and live-verified: `extensions` via new
+`browser/_botasaurus_extension.py::LocalExtension` (Driver needs
+`.load()`-exposing objects, not raw paths); `driver.
+set_locale_and_timezone()` for locale/timezone spoof (live-verified
+correct); `driver.enable_human_mode()` + humanized per-scroll-pass
+`move_mouse_to_point()`; and raw CDP request/response capture via new
+`browser/_botasaurus_network_capture.py`, persisted as
+`FetchResult.network_events` / `scrape_results.network_events` (migration
+`010`). **Known, documented limitation:** `Driver(lang=...)` was live-tested
+to have zero effect on `navigator.language`/`Accept-Language` despite its
+own docstring's claim — kept as a real but ineffective config field rather
+than silently dropped, since a JS-injection workaround hit a separate
+confirmed upstream CDP bug (`Page.enable()` CBOR error), out of scope to
+chase. A same-session independent review before merge found and fixed 3
+real defects: a resource leak in `_new_driver_fetch` (3 new post-launch
+calls sat outside the existing try/except, reintroducing round-41's
+display-contention precondition on failure), `GET /v1/jobs/{id}` never
+returning the new `network_events` column, and reused-driver fetches
+silently dropping network-event capture into a dead first-call list
+(CDP hooks are tab-scoped, registered once at launch — fixed with a
+redirect indirection).
+
+Full detail for rounds 57-60: `.claude/knowledge/technical-debt.md`'s
+per-round entries.
 
 ---
 

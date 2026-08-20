@@ -101,21 +101,63 @@ class CircuitBreaker:
 
         return True
 
+    async def _reset_window(self, domain: str) -> None:
+        await self._set(self._key(domain, "failure_window_attempts"), "0")
+        await self._set(self._key(domain, "failure_window_failures"), "0")
+
+    async def _record_attempt(self, domain: str, *, failed: bool) -> tuple[int, int]:
+        """Increment the rolling window and return (attempts, failures).
+
+        Round 61 fix — `failure_window_attempts` used to be reset to 0 on
+        every success (see record_success's old docstring below), so by the
+        time attempt_threshold triggered a trip check, failures always
+        equaled attempts and failure_rate was always 1.0: attempt_threshold
+        alone decided trips, and failure_threshold was a dead comparison
+        (round 43 open thread, never fixed until now). Fix: attempts now
+        increments on every call — success or failure — while failures only
+        increments on a failure, and neither resets on a lone success. That
+        makes failure_threshold real: e.g. attempt_threshold=20,
+        failure_threshold=0.95 now genuinely tolerates up to 1 success in
+        the last 20 attempts before tripping, instead of requiring 20
+        purely-consecutive failures with zero successes mixed in.
+        """
+        attempts_raw = await self._get(self._key(domain, "failure_window_attempts"))
+        failures_raw = await self._get(self._key(domain, "failure_window_failures"))
+
+        attempts = (int(attempts_raw) if attempts_raw else 0) + 1
+        failures = (int(failures_raw) if failures_raw else 0) + (1 if failed else 0)
+
+        await self._set(
+            self._key(domain, "failure_window_attempts"),
+            str(attempts),
+            ttl_seconds=self._failure_streak_ttl_seconds,
+        )
+        await self._set(
+            self._key(domain, "failure_window_failures"),
+            str(failures),
+            ttl_seconds=self._failure_streak_ttl_seconds,
+        )
+        return attempts, failures
+
     async def record_success(self, domain: str) -> None:
         """Record a successful request. Closes circuit if half-open.
 
-        Any success — closed or half-open — breaks a failure streak. Before
-        round 43 only failure_window_attempts was reset outside the
-        half-open branch; consecutive_failures was left untouched despite
-        its name, so a stray success didn't actually reset "consecutive"
-        failures. Both must reset together or the two counters drift apart.
+        A half-open success (recovery confirmed) fully resets the window.
+        An ordinary closed-state success still counts as a real attempt in
+        the rolling window (round 61 — see _record_attempt); the window
+        itself resets once attempt_threshold attempts have been sampled
+        without tripping, so a long healthy run doesn't dilute the ratio
+        forever.
         """
         current = await self.state(domain)
         if current == CircuitState.HALF_OPEN:
             await self._set(self._key(domain, "state"), CircuitState.CLOSED.value)
+            await self._reset_window(domain)
+            return
 
-        await self._set(self._key(domain, "consecutive_failures"), "0")
-        await self._set(self._key(domain, "failure_window_attempts"), "0")
+        attempts, _ = await self._record_attempt(domain, failed=False)
+        if attempts >= self._attempt_threshold:
+            await self._reset_window(domain)
 
     async def record_failure(self, domain: str) -> None:
         """Record a failed request. May open circuit if threshold exceeded."""
@@ -125,27 +167,14 @@ class CircuitBreaker:
             await self._open_circuit(domain)
             return
 
-        attempts_raw = await self._get(self._key(domain, "failure_window_attempts"))
-        failures_raw = await self._get(self._key(domain, "consecutive_failures"))
-
-        attempts = (int(attempts_raw) if attempts_raw else 0) + 1
-        failures = (int(failures_raw) if failures_raw else 0) + 1
-
-        await self._set(
-            self._key(domain, "failure_window_attempts"),
-            str(attempts),
-            ttl_seconds=self._failure_streak_ttl_seconds,
-        )
-        await self._set(
-            self._key(domain, "consecutive_failures"),
-            str(failures),
-            ttl_seconds=self._failure_streak_ttl_seconds,
-        )
+        attempts, failures = await self._record_attempt(domain, failed=True)
 
         if attempts >= self._attempt_threshold:
             failure_rate = failures / attempts
             if failure_rate >= self._failure_threshold:
                 await self._open_circuit(domain)
+            else:
+                await self._reset_window(domain)
 
     async def _open_circuit(self, domain: str) -> None:
         """Open the circuit with exponential backoff cooldown."""
@@ -179,4 +208,4 @@ class CircuitBreaker:
 
         await self._set(self._key(domain, "state"), CircuitState.OPEN.value)
         await self._set(self._key(domain, "cooldown_until"), str(cooldown_until))
-        await self._set(self._key(domain, "failure_window_attempts"), "0")
+        await self._reset_window(domain)
