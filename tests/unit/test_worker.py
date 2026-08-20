@@ -330,30 +330,52 @@ class TestWorker:
         assert worker._extract_domain("https://sub.dom.com:8080/x") == "sub.dom.com"
 
     @pytest.mark.asyncio
-    async def test_politeness_slot_busy_sleeps_and_advances_to_next_level(
+    async def test_politeness_slot_busy_retries_same_level_until_available(
         self, tenant, worker, monkeypatch
     ):
-        """acquire_slot returning None means no free slot right now — the real
-        code sleeps then `continue`s the *level* loop (moving straight to the
-        next level) rather than retrying the same level indefinitely."""
+        """acquire_slot returning None means no free slot right now — round
+        61: the slot pool is shared across all 3 levels, so a busy slot
+        means "wait for a concurrent sibling to finish," not "this level
+        failed." Retries the SAME level until a slot frees up, never
+        advances to the next level just because the first attempt was busy."""
         sleep_mock = AsyncMock()
         monkeypatch.setattr("scraper_engine.orchestrator.worker.asyncio.sleep", sleep_mock)
         worker._politeness.acquire_slot = AsyncMock(side_effect=[None, "worker-2"])
         worker._fetch_url = AsyncMock(
             return_value=FetchResult(
-                url="http://example.com", success=True, level_used=2, duration_ms=10
+                url="http://example.com", success=True, level_used=1, duration_ms=10
             )
         )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
         response = await worker.process_job(tenant, "job-slot-busy", request)
 
-        sleep_mock.assert_awaited_once_with(1)
+        sleep_mock.assert_awaited_once_with(worker._config.politeness.slot_retry_interval_seconds)
         assert worker._fetch_url.await_count == 1
-        # level 1 was skipped (busy slot) — the one real fetch is for level 2
-        assert worker._fetch_url.await_args.args[2] == 2
+        # retried level 1 until the slot freed — never advanced to level 2
+        assert worker._fetch_url.await_args.args[2] == 1
         worker._politeness.release_slot.assert_awaited_once()
         assert response.status == JobStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_politeness_slot_timeout_exhausted_advances_to_next_level(
+        self, tenant, worker
+    ):
+        """When a slot never frees up within slot_wait_timeout_seconds, the
+        level genuinely gives up and the loop advances — round-42's DLQ
+        fallback ("politeness slot never available") stays reachable for a
+        REAL exhaustion across every level, not a token 1s nap."""
+        worker._config.politeness.slot_wait_timeout_seconds = 0.0
+        worker._politeness.acquire_slot = AsyncMock(return_value=None)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-slot-timeout", request)
+
+        assert response.status == JobStatus.FAILED
+        worker._politeness.release_slot.assert_not_awaited()
+        dlq_call = worker._dlq.enqueue.await_args
+        assert dlq_call.args[3] == FailureCategory.PROXY_EXHAUSTED
+        assert "politeness slot never available" in dlq_call.args[4]
 
     @pytest.mark.asyncio
     async def test_fetch_url_none_result_advances_to_next_level(self, tenant, worker):

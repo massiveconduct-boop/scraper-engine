@@ -232,6 +232,19 @@ class PolitenessConfig(BaseModel):
     default_concurrency: int = 2
     default_delay_seconds: float = 5.0
     slot_ttl_seconds: int = 120
+    # Round 61 — orchestrator/worker.py's per-level slot-acquisition retry
+    # budget. Before this, a busy slot got exactly one 1s nap before the
+    # level loop moved on to the NEXT level (wrong: a busy slot means "wait,"
+    # not "this level failed") — under concurrent same-domain dispatch
+    # (max_concurrent_urls_per_job URLs racing default_concurrency slots,
+    # which is usually a much smaller number), a URL could burn through all
+    # 3 levels in ~3s of napping without a single real fetch attempt, then
+    # permanently DLQ as "no attempt ever made." Now retries the SAME level
+    # with slot_retry_interval_seconds backoff until slot_wait_timeout_seconds
+    # of real wall-clock elapses, giving concurrent siblings genuine time to
+    # finish and release their slot before conceding.
+    slot_wait_timeout_seconds: float = 30.0
+    slot_retry_interval_seconds: float = 1.0
     # Round 49 — orchestrator/worker.py::Worker.process_job's per-job URL
     # dispatch semaphore size. Was strictly sequential before this (root
     # cause of slow large-batch job runs, round 45). Deliberately below

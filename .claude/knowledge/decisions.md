@@ -2914,3 +2914,161 @@ but CLAUDE.md is prose by design.
 
 **Status:** Active, live-verified: script runs clean against the current
 1557-word file (`CLAUDE.md: 1557 words (limit: 1800)` / `OK`).
+
+---
+
+## Diagnostic Function Existing ≠ Wired Into the Real Path (Round 61)
+
+**Date:** 2026-08-20
+
+**Context:** Investigating a Slack alert ("DLQ has 610+ entries") plus a
+stuck `research_agent`-tenant job, traced to `detection_block` DLQ
+entries. Full technical account: `technical-debt.md`'s round-61 entry;
+bug log: `.wolf/buglog.json` → `bug-r61-01`.
+
+**What was found:** Round 22 (`technical-debt.md`'s round-21/22 entries;
+`.archive/evidence/round-19/20-evidence.md`) already root-caused the
+exact failure mode hit again here — a NoCaptchaAI account with balance
+but no active subscription plan accepts worker-slot-based captcha tasks
+(reCAPTCHA v2, Turnstile, GeeTest, MTCaptcha) and silently never solves
+them, sitting at `status: "idle"` forever. Round 22 built the correct
+detector for it, `NoCaptchaAIClient.has_active_plan()`, and even a
+preflight CLI tool (`tools/validate_captcha_keys.py`) that reports it
+honestly. But `has_active_plan()` was wired into exactly that one call
+site — the manual CLI — and nowhere near the actual runtime solve path
+(`_solve_token`, called by every real `solve_recaptcha_v2`/`solve_
+turnstile`/etc.). So for the ~2 months between round 22 and round 61,
+every real solve attempt against a plan-less account still burned the
+full dead poll (measured at 92.64s per attempt, round 61) — the round-22
+fix diagnosed the disease correctly but never actually treated it.
+
+**Why this matters beyond this one bug:** the failure isn't "the check
+was wrong" — the check was and is correct. The failure is a category
+that's easy to miss in review: a function that looks like it closes an
+issue (correct logic, has a docstring citing the round it was built,
+even a dedicated preflight tool) can still be dead weight on the path
+that actually matters, if nothing calls it from there. `grep`-ing for
+"does X exist" answers a different question than "is X called from where
+it needs to run."
+
+**Decision:** When closing out a round that adds a diagnostic/guard
+function specifically to detect a known failure mode, treat "wired into
+every real call site that can hit that failure mode" as part of the
+definition of done — not just "the detector exists and a manual tool can
+report it." Applies most to anything under `services/`/`fetcher/` that
+guards a third-party integration's degraded-but-not-erroring state
+(the class of bug where the provider returns HTTP 200 and `errorId: 0`
+right up until the timeout).
+
+**Status:** Closed for `has_active_plan()`/`_solve_token` specifically
+(round 61). Recorded here as a general lesson — also captured in
+`.wolf/cerebrum.md`'s Do-Not-Repeat section for session-local recall.
+
+---
+
+## Scoping: Fix CAPTCHA Fail-Fast Now, Defer `proxy_exhausted` (Round 61)
+
+**Date:** 2026-08-20
+
+**Context:** Round 61's DLQ investigation found two largely independent
+root causes behind the 610-entry pile: `detection_block` (180/592, 30%,
+traced to the NoCaptchaAI wiring gap above — a real, scoped, high-
+confidence code fix) and `proxy_exhausted` (298/592, 50%, traced to
+proxy-pool composition — 173 residential + 2 mobile out of 740 proxies —
+against a broad set of hardened targets; DataImpulse paid-gateway
+fallback confirmed correctly wired, ruling out a quick dead-wiring fix
+like the captcha one). Full technical detail: `technical-debt.md`'s
+round-61 entry.
+
+**Decision, made by explicit user choice when offered the option to dig
+further into `proxy_exhausted` in the same session:** implement the
+captcha fix now; treat `proxy_exhausted` as a separate follow-up rather
+than bundle both into one round. These two DLQ categories share a
+symptom (jobs dying, DLQ growing) but not a root cause or a fix shape:
+one is a wiring bug fixable in an afternoon with existing infrastructure,
+the other is an open question about whether more proxy budget or a real
+domain-tier-aware selection feature is the right lever — a bigger design
+decision that deserves its own scoped investigation rather than being
+rushed alongside an unrelated fix.
+
+**Status:** Captcha fix shipped (round 61). `proxy_exhausted` is the
+explicit next candidate quest — see `.wolf/STATUS.md` → "Next phase" for
+what's already known going in.
+
+**Follow-up, same day (2026-08-20):** the premise of this deferral was
+wrong. Re-investigating `proxy_exhausted` (triggered by a second identical
+Slack alert, not a planned follow-up) found that 292 of the 298 rows
+predate the `free_first` gateway fallback shipping (2026-08-15) and zero
+exist after it except 6 caused by an unrelated politeness-slot bug, fixed
+the same session. There was no proxy-supply/quality question to defer —
+the scoping decision above turned out to be moot, not merely postponed.
+Recorded as a lesson, not a correction of the decision itself: choosing
+to scope work apart was still the right call given what was known at the
+time (see the round-22-regression lesson entry above for the general
+principle — "diagnostic function existing ≠ wired in" — this is that
+lesson's mirror image: "DLQ category dominance ≠ still happening,"
+always check `dead_at`/timestamp distribution against known fix dates
+before concluding a failure pattern is current). Full account:
+`technical-debt.md`'s round-61 entry (corrected in place).
+
+---
+
+## DLQ Alert Redesign: Growth-Rate Over Lifetime-Count (Round 61)
+
+**Date:** 2026-08-20
+
+**Context:** The false-positive-forever mechanism above (`DeadLetterQueueGrowing`
+firing on a monotonic, unfiltered `dlq_size` lifetime count) is a real
+design flaw, separate from any of the underlying failure causes. User's
+explicit ask: fix what's actually causing the DLQ to fill up first (done —
+see the captcha and politeness entries above), then come back and design
+the alert properly — with one hard constraint: **keep getting alerted
+when something is actually wrong.** Silencing or loosening the alert was
+never on the table.
+
+**Options considered** (presented to the user): (1) growth-rate alert
+only; (2) growth-rate alert + a separate low-priority informational nudge
+about lifetime table size; (3) same as (2) plus actually building
+retention/archival for old DLQ rows. User picked (2).
+
+**Decision:** `DeadLetterQueueGrowing`'s expression changed from
+`dlq_size > 100` to `increase(dlq_size[1h]) > 20`
+(`monitoring/alerts/prometheus_rules.yml`) — the exact same pattern the
+file's pre-existing `CircuitBreakerFrequentTrips` rule already used for
+`circuit_breaker_trips_total`. No metrics/code change was needed:
+`dlq_size` is already effectively monotonic under the current no-purge
+DLQ design (see the round-61 entries above), so Prometheus's own
+`increase()` windowing gives an accurate "how many new failures landed in
+this hour" reading for free. This is the general lesson from the
+`proxy_exhausted` correction above applied directly to the alert itself —
+a raw lifetime count can't distinguish "still happening" from "happened
+once, forever recorded" without a time window.
+
+New `DeadLetterQueuePileLarge` (`dlq_size > 2000`, `severity: info`) is
+explicitly NOT a duplicate active-incident alert — it's a periodic
+housekeeping nudge that the lifetime table is getting large, routed
+(new `alertmanager.yml` `severity: info` match) to a 24h repeat interval
+instead of the 4h default so it can't nag like a real problem. Both
+thresholds are starting points pending real production volume data.
+
+**Rejected for this round:** actual DLQ retention/archival (option 3).
+`storage/dlq.py::clear()`'s docstring states permanent-forever is
+intentional (audit trail) — changing that is a data-retention policy
+decision with its own tradeoffs (compliance/audit needs vs. table
+bloat), not something to bundle into an alerting fix. Left open, see
+`.wolf/STATUS.md` → "Next phase".
+
+**Verification:** `promtool check rules` and `amtool check-config` both
+run clean against the new files (the amtool `unsupported scheme` warning
+on `${SLACK_WEBHOOK_URL}` is pre-existing — confirmed via `git stash` that
+it fails identically against the unmodified file; substitution happens at
+`docker-entrypoint.sh`, not statically). `prometheus`+`alertmanager`
+restarted to load the new config. **Live-verified via Prometheus's own
+`/api/v1/alerts` and `/api/v1/query` endpoints**: `dlq_size` still reads
+610 (unchanged, confirming this is genuinely the same stale data, not a
+coincidentally-resolved count) but neither `DeadLetterQueueGrowing` nor
+`DeadLetterQueuePileLarge` appears in the active alert list — the old
+`dlq_size > 100` expression would still be firing at this exact instant.
+
+**Status:** Shipped and live. Not yet committed (round 60's `5d8c7df`
+still HEAD).

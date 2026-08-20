@@ -344,9 +344,8 @@ class Worker:
                     if circuit_open and level == 1:
                         continue
 
-                    slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
+                    slot_worker_id = await self._acquire_politeness_slot(domain, tenant_id)
                     if slot_worker_id is None:
-                        await asyncio.sleep(1)
                         continue
 
                     try:
@@ -909,6 +908,32 @@ class Worker:
 
         assert last_result is not None  # loop always assigns it before falling through
         return last_result
+
+    async def _acquire_politeness_slot(self, domain: str, tenant_id: TenantId) -> str | None:
+        """Retry acquiring a politeness slot for up to
+        politeness.slot_wait_timeout_seconds before giving up.
+
+        Round 61 fix: the slot pool is keyed by domain+tenant only, shared
+        across all 3 fetch levels — not per-level. A busy slot means "wait
+        for a concurrent sibling to finish," not "this level failed, try the
+        next one." The previous single-attempt-then-advance-to-next-level
+        behavior let a URL burn through L1->L2->L3 in ~3s of napping under
+        contention (e.g. 5 concurrent same-domain URLs racing a
+        default_concurrency=2 slot pool) without ever making one real fetch
+        attempt, then permanently DLQ as "no attempt ever made" — live-caught
+        via 6 real DLQ entries during the round-61 investigation.
+        """
+        import time
+
+        cfg = self._config.politeness
+        deadline = time.monotonic() + cfg.slot_wait_timeout_seconds
+        while True:
+            slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
+            if slot_worker_id is not None:
+                return slot_worker_id
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(cfg.slot_retry_interval_seconds)
 
     @staticmethod
     def _extract_domain(url: str) -> str:

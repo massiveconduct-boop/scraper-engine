@@ -1,6 +1,6 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Currently at round 60.
+Project identity, operating rules, and navigation. Currently at round 61.
 This paragraph is deliberately a one-liner, not a round-by-round diary —
 a round-28 knowledge-architecture audit removed 7 growing dated paragraphs
 from this exact spot once already (see "Evolution history" below); the
@@ -79,7 +79,9 @@ openwolf cron        # cron task management
   reliability fixes (51-55), 4 unrouted capabilities surfaced as API/CLI
   phases (56), Botasaurus silent-false-success fix (57), Botasaurus
   autoscroll fix (58), `block_images` + RAM-aware concurrency cap (59),
-  Botasaurus extensions/lang/locale/timezone/mouse/network-capture (60).
+  Botasaurus extensions/lang/locale/timezone/mouse/network-capture (60),
+  CAPTCHA no-active-plan check wired into the real solve path + politeness
+  slot-retry fix (61).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:

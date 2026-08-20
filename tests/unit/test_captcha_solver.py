@@ -207,6 +207,7 @@ class TestProviderTaskTypes:
         budget = AsyncMock()
         budget.check_and_reserve.return_value = True
         client = nc.NoCaptchaAIClient("k", budget)
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=True))
         tok = await getattr(client, method)(TENANT, "sk", "http://x")
         assert tok == "tok"
         assert captured["type"] == expected_type
@@ -226,6 +227,7 @@ class TestProviderTaskTypes:
         budget = AsyncMock()
         budget.check_and_reserve.return_value = True
         client = nc.NoCaptchaAIClient("k", budget)
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=True))
         assert await client.solve_geetest(TENANT, "CID123", "http://x") == "gtok"
         assert captured["type"] == "GeeTestTaskProxyLess"
         assert captured["captchaId"] == "CID123"

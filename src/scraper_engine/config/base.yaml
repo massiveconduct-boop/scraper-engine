@@ -166,6 +166,8 @@ politeness:
   default_delay_seconds: 5.0
   slot_ttl_seconds: 120
   max_concurrent_urls_per_job: 5
+  slot_wait_timeout_seconds: 30.0
+  slot_retry_interval_seconds: 1.0
 
 circuit_breaker:
   failure_threshold: 0.95

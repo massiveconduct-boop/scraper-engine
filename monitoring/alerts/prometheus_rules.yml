@@ -38,15 +38,56 @@ groups:
           summary: "Circuit breaker tripped >5x/hour across all domains — cooldown backoff likely misconfigured"
           description: "{{ $value }} circuit trips in the last hour (all domains combined)."
 
-      # Dead letter queue growing — jobs accumulating without resolution
+      # Dead letter queue growing — jobs accumulating without resolution.
+      #
+      # Round 61 — was `dlq_size > 100` (a level check on a raw, unfiltered
+      # `COUNT(*)`, observability/metrics.py::refresh_dlq_size). dead_letter_
+      # queue rows are permanent by design (storage/dlq.py::clear()'s
+      # docstring — no retention/archival), so under the old expression this
+      # could only ever ratchet toward permanently firing: once the lifetime
+      # total crossed 100, the alert stayed on forever regardless of whether
+      # anything was still actually failing, re-notifying every
+      # `repeat_interval` (alertmanager.yml, 4h) on stale data. Live-caught:
+      # a second identical alert fired with zero new DLQ entries in the
+      # preceding 2+ days — the 610-row count was 100% historical debris,
+      # not an active incident (`.claude/knowledge/technical-debt.md`'s
+      # round-61 entry has the full account).
+      #
+      # Fixed the same way CircuitBreakerFrequentTrips above already does it
+      # for a similarly append-only counter: `increase(dlq_size[1h])` reads
+      # as "how many new rows landed in the last hour" precisely because
+      # dlq_size never decreases under the current no-purge design — no
+      # code/metrics change needed, Prometheus's own windowing does the
+      # work. This alert now genuinely self-resolves when new failures stop,
+      # and still fires promptly on a real spike. Threshold (20/hour) is a
+      # starting point, not calibrated against real production job volume
+      # yet — tune once this has fired a few times for real.
       - alert: DeadLetterQueueGrowing
-        expr: dlq_size > 100
+        expr: increase(dlq_size[1h]) > 20
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Dead letter queue has {{ $value }} entries — jobs accumulating"
-          description: "More than 100 jobs in the DLQ. Investigate failure patterns."
+          summary: "Dead letter queue grew by {{ $value }} entries in the last hour"
+          description: "More than 20 new DLQ entries in the last hour. Investigate failure patterns — this fires on NEW failures, not the lifetime total (see DeadLetterQueuePileLarge for that)."
+
+      # Companion to DeadLetterQueueGrowing above — NOT an active-incident
+      # signal. dead_letter_queue has no retention/archival (permanent by
+      # design), so its lifetime size only ever grows; this is a periodic
+      # housekeeping nudge that the table is getting large, nothing more.
+      # severity: info routes to the default receiver same as warning (no
+      # dedicated info channel configured yet) but with a much longer
+      # repeat_interval (see alertmanager.yml) so it doesn't nag like an
+      # active problem would. 2000 is a starting point — current baseline
+      # observed round 61 was 610, all historical.
+      - alert: DeadLetterQueuePileLarge
+        expr: dlq_size > 2000
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Dead letter queue lifetime total is {{ $value }} rows — housekeeping nudge, not an active incident"
+          description: "dead_letter_queue has no retention policy, so this only ever grows. Not urgent — a prompt to consider archival/pruning policy, not to investigate failures (see DeadLetterQueueGrowing for that)."
 
       # CapSolver budget near ceiling. Per-tenant now (round 25 — the ceiling
       # used to be one hardcoded global $1.00/day; tenants.capsolver_daily_credit_ceiling

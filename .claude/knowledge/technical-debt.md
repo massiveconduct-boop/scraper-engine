@@ -32,6 +32,185 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 61)
+
+- **FIXED (round 61) — round-22's `has_active_plan()` check was never wired
+  into the runtime CAPTCHA solve path, only into the manual preflight CLI.**
+  Triggered by a Slack alert ("DLQ has 610+ entries") plus a stuck
+  `research_agent`-tenant job (bbc.com/pidgin sat PROCESSING until the
+  12-minute job-timeout ceiling, no result). Live investigation (not from
+  memory — confirmed via `docker compose ps`, direct Postgres queries
+  against `research_agent.dead_letter_queue`, and running
+  `captcha_solver.py::validate_captcha_keys()` inside the live api
+  container) found: DLQ = 610 total (592 `research_agent` + 18
+  `retestclient`), broken down `research_agent` — `proxy_exhausted` 298
+  (50%, see below), `detection_block` 180 (30%, permanent —
+  `dlq_reaper.py::_TRANSIENT_CATEGORIES` excludes it), `circuit_open` 63,
+  `host_unreachable` 21, `not_found` 15, `ssrf_blocked` 10, `browser_crash`
+  5.
+
+  Root cause of `detection_block`: NoCaptchaAI has balance ($0.9972) but
+  **no active plan** — worker-slot-based task types (reCAPTCHA v2,
+  Turnstile, GeeTest, MTCaptcha — everything except `ImageToText`) get
+  accepted and silently never solved, exactly the failure mode round 22
+  (see round-22 entry below in this file, and `decisions.md` → "CAPTCHA
+  Solver" round-22 follow-ups) already root-caused and built a detector
+  for: `NoCaptchaAIClient.has_active_plan()`. But that detector was wired
+  into exactly one call site — `services/captcha_solver.py::
+  validate_captcha_keys()`, the manual `tools/validate_captcha_keys.py`
+  ops CLI — and never into `_solve_token`, the actual method every
+  `solve_recaptcha_v2`/`solve_turnstile`/`solve_aws_waf`/`solve_geetest`/
+  `solve_mtcaptcha` call routes through. So every real solve attempt
+  against the plan-less account created a task, got silently accepted
+  (`status: "idle"`, `errorId: 0` forever — the same raw API behavior
+  round 22 documented), and burned the full dead poll in
+  `services/_anticaptcha.py::solve_anticaptcha` (60 iterations × 2s sleep
+  = up to 120s) before returning `None` — **live-measured at 92.64s for
+  one `solve_turnstile` call**, pre-fix, against the real account. This
+  fed the 180 permanent `detection_block` DLQ entries directly and
+  inflated job wall-time/proxy churn on every captcha-gated URL — a
+  captcha wall no proxy quality can pass regardless of the proxy behind
+  it.
+
+  **Fix**: `_solve_token` (`services/nocaptcha.py`) now calls
+  `has_active_plan()` first and returns `None` immediately — skipping
+  `solve_anticaptcha` entirely — when it's confirmed `False`.
+  `captcha_solver.py`'s existing primary-then-CapSolver-fallback logic in
+  `_key_url` needed no changes; it already falls through on `None`.
+  `has_active_plan()` itself is now TTL-cached (300s,
+  `asyncio.Lock`-guarded against a thundering herd of concurrent solves
+  all triggering their own plan check on a cold cache) so the gate adds
+  **no** network round-trip to the common case of every solve call — only
+  one `GET /balance` call per 5-minute window regardless of solve volume.
+  A `None` result (plan endpoint itself unreachable, distinct from a
+  confirmed no-plan account) fails open — never cached as a false
+  no-plan verdict, so a transient network blip can't permanently disable
+  solving. **This does not make CAPTCHA solving work** — NoCaptchaAI
+  still needs an active plan purchased and CapSolver still needs balance
+  topped up, both account-holder actions outside this codebase's control
+  (unchanged from round 22's conclusion) — the fix's scope is turning a
+  silent ~120s black hole into an immediate, loud
+  (`nocaptchaai_no_active_plan` log line naming the task type), cheap
+  failure, and one that self-heals within 5 minutes of the account
+  actually being fixed with no code change or restart needed.
+
+  **Verification**: 6 pre-existing unit tests broke — they mocked
+  `solve_anticaptcha` directly but not the new `has_active_plan()` network
+  call, so the real (test-env) `httpx.AsyncClient` fired inside a unit
+  test. Fixed by mocking the gate (`monkeypatch.setattr(client,
+  "has_active_plan", AsyncMock(return_value=True))`) in
+  `tests/unit/test_nocaptcha.py` and `tests/unit/test_captcha_solver.py`.
+  Added 3 new tests: the gate itself (confirmed `False` → `solve_
+  anticaptcha` never called), fail-open on `None`, and a genuine
+  concurrency test (`asyncio.gather` of two racing `has_active_plan()`
+  calls against a slow mocked endpoint, asserting exactly one real network
+  call — exercises the double-checked-locking inner re-check branch).
+  32/32 pass, 100% coverage on `nocaptcha.py`, `ruff` clean, `mypy
+  --strict` clean. **Live-reverified against the real broken account**
+  after rebuilding the `api`+`worker-l1`+`worker-l2`+`worker-l3` Docker
+  images — `docker compose up -d --build api` alone does **not**
+  cascade-rebuild the worker services even though they share the same
+  Dockerfile/image (previously documented in `.wolf/cerebrum.md`'s
+  2026-08-14 entry; hit again this round before catching it and rebuilding
+  all four): `solve_turnstile` against the real account went from
+  92.64s/`ERROR_CAPTCHA_UNSOLVABLE` to **0.091s**/`None` with the correct
+  log line. Bug log: `.wolf/buglog.json` → `bug-r61-01`.
+
+- **OPEN (round 61, investigated but deliberately not fixed this round) —
+  `proxy_exhausted` is 298 of the 592 `research_agent` DLQ entries (50%),
+  every single one permanently dead at the 3x `dlq_reaper` auto-retry cap
+  (`avg(auto_retry_count) = 3.0000000000000000` across all 298 rows —
+  100% of them hit the ceiling, none succeeded on retry).** Domains hit
+  span facebook.com, instagram.com, forbes.com, crunchbase.com,
+  nairametrics.com, businessday.ng — a broad set of hardened,
+  anti-bot-class targets, not one bad domain. `proxy_pool` composition at
+  investigation time: 740 rows total, only 173 `residential` + 2 `mobile`
+  vs. 537 `unknown` ASN class (avg `reliability_score` 44) + 28
+  `datacenter`. Ruled out as a dead-wiring bug (unlike the captcha issue
+  above): confirmed live that the DataImpulse paid-gateway fallback IS
+  correctly wired — `orchestrator/worker.py` catches
+  `ProxyPoolExhaustedError` from `proxy/manager.py::lease()` and, under
+  `dataimpulse.strategy == "free_first"` (confirmed `DATAIMPULSE_ENABLED=
+  true`/`DATAIMPULSE_STRATEGY=free_first` live in the api container's
+  env), calls `paid_gateway.py::build_gateway_proxy()`. So free-pool
+  exhaustion does correctly fall through to the paid gateway today; the
+  298 dead entries mean either the gateway attempt also failed for these
+  specific domains, or gateway capacity/quality itself isn't sufficient
+  against this target set. `proxy/manager.py::_select_candidate` has no
+  domain-difficulty/ASN-class-preference logic — every domain draws from
+  the same pool regardless of how hardened it's known to be. This looks
+  like a genuine proxy-supply/quality ceiling rather than a quick code
+  fix — would need either more paid-gateway budget or a real
+  domain-tier-aware proxy selection feature. **User explicitly chose to
+  scope this out as a separate follow-up rather than bundle it into round
+  61's captcha fix** (see `decisions.md` for the scoping rationale).
+
+  **CORRECTED same round, 2026-08-20 — this conclusion was wrong, reached
+  without checking `dead_at` dates against when the gateway fallback
+  actually shipped.** A second, identical Slack DLQ alert arrived
+  immediately after the captcha fix above shipped. Investigating it
+  (expecting a fresh spike) instead found **zero new DLQ entries of any
+  category since 2026-08-18** — `dlq_size` (`observability/metrics.py::
+  refresh_dlq_size`) is an unfiltered `SELECT COUNT(*)` with no time
+  window, so a permanently-dead historical pile and an active incident
+  are indistinguishable in the gauge; the alert was re-notifying on
+  schedule (`alertmanager.yml`'s `repeat_interval: 4h`), not signaling
+  anything new. Breaking the 298 `proxy_exhausted` rows down by exact
+  `dead_at` date: **246 predate 2026-08-15 14:34** (commit `980f7af`,
+  the `free_first` gateway fallback) and the remaining 46 "All fetch
+  levels exhausted" rows predate 2026-08-15 too. **Zero rows exist after
+  that fix shipped** except 6 with the message "All fetch levels
+  exhausted without a single attempt (politeness slot never available)"
+  (2026-08-16, 2026-08-18) — a genuinely different, separate bug, fixed
+  this same round (see the entry immediately below). **There is no open
+  proxy-supply/quality issue and no proxy-selection feature work to
+  schedule** — the gateway fallback that shipped 2026-08-15 already fully
+  resolved the historical `proxy_exhausted` pattern; the 292 stale rows
+  just sit there forever because `dead_letter_queue` has no retention
+  policy (see `storage/dlq.py::clear()`'s docstring — permanent by
+  design). Full corrected write-up: `.wolf/STATUS.md` → round-61 "Next
+  phase" section; `decisions.md` has a follow-up note on the original
+  scoping decision.
+
+- **FIXED (round 61, found by the same re-investigation above) —
+  `politeness.py`'s slot pool is shared across all 3 fetch levels (keyed
+  by `domain+tenant` only, not per-level), but `worker.py`'s level loop
+  treated a busy slot as "this level failed, advance to the next one"
+  instead of "wait for a concurrent sibling to release it."** This is
+  what actually produced the 6 post-gateway-fix `proxy_exhausted` DLQ
+  rows found above. Old code (`worker.py`, inside `for level in LEVELS:`):
+  `slot_worker_id = await self._politeness.acquire_slot(...); if
+  slot_worker_id is None: await asyncio.sleep(1); continue` — the
+  `continue` advances the *level* loop, not a retry of the current level.
+  Under round-49's concurrent same-domain dispatch
+  (`politeness.max_concurrent_urls_per_job=5`) racing
+  `politeness.default_concurrency=2` slots, 3 of 5 concurrently-dispatched
+  URLs lose the initial slot race; each then burns through L1→L2→L3 in
+  ~3s of 1s naps — far less than the tens-of-seconds a real fetch takes to
+  complete and release its slot — making zero real fetch attempts, then
+  permanently DLQs via round-42's exhausted-fallback labeling (intentional
+  for a *genuine* "never attempted" case, not for this).
+
+  **Fix**: new `Worker._acquire_politeness_slot(domain, tenant_id)`
+  retries the *same* level with `politeness.slot_retry_interval_seconds`
+  (new `PolitenessConfig` field, default 1.0s) backoff until
+  `politeness.slot_wait_timeout_seconds` (new field, default 30.0s) of
+  real wall-clock elapses, only then concedes — so round-42's DLQ
+  fallback path stays reachable for a genuine cross-level exhaustion, not
+  a token nap. **Live-verified against real Redis** (not mocked): a held
+  slot correctly returns `None` to a racing `acquire_slot`, and a polling
+  retry loop successfully reacquires the instant the real holder calls
+  `release_slot`. 1 existing unit test rewritten (it asserted the old,
+  wrong "advances to next level" behavior), 1 new test added for the
+  genuine-timeout-exhausted path. Full unit suite: 940 passed, 1 skipped,
+  `worker.py` 99% (2 misses are pre-existing, unrelated `self._pg is
+  None` guards elsewhere in the file — `config/` is deliberately outside
+  `pyproject.toml`'s coverage-gated source list, see `[tool.coverage.run]`
+  `source`). `ruff`/`mypy --strict` clean. Live-reverified end to end
+  after rebuilding api+worker-l1/l2/l3 images (same cascade-rebuild
+  gotcha as the captcha fix — caught immediately this time). Bug log:
+  `.wolf/buglog.json` → `bug-r61-02`.
+
 ## Technical Debt / Open Threads (as of round 60)
 
 - **IMPLEMENTED (round 60) — the remaining 4 of round 57's 6 backlog
