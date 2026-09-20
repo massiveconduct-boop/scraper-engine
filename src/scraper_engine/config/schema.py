@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LevelConfig(BaseModel):
@@ -444,6 +444,33 @@ class DataImpulseConfig(BaseModel):
         if isinstance(v, str) and not v.strip():
             return None
         return v
+
+    @model_validator(mode="after")
+    def _asn_requires_country(self) -> DataImpulseConfig:
+        """An ASN pin without a country pin is rejected by the gateway.
+
+        Verified live 2026-09-20: `login__asn.29465;sessid.N` fails proxy
+        auth on 6 of 6 attempts, while `login__cr.ng;asn.29465;sessid.N`
+        succeeds on 6 of 6. DataImpulse will not resolve an `asn.` parameter
+        that has no `cr.` alongside it.
+
+        Caught the hard way — `DATAIMPULSE_ASN` was set without
+        `DATAIMPULSE_COUNTRY` and every gateway request 407'd at fetch time,
+        which surfaces as an opaque per-request proxy failure rather than
+        anything pointing at config. Failing at load time instead means the
+        process refuses to start with a message naming the actual fix, in
+        the same spirit as Worker.__init__'s eager build_gateway_proxy()
+        check (a bad gateway config should fail loud once, not degrade every
+        fetch silently).
+        """
+        if self.asn is not None and not self.country.strip():
+            raise ValueError(
+                "dataimpulse.asn is set but dataimpulse.country is empty. "
+                "DataImpulse rejects an `asn.` username parameter with no `cr.` "
+                "alongside it (407). Set DATAIMPULSE_COUNTRY (e.g. 'ng' for "
+                "AS29465 MTN Nigeria), or unset DATAIMPULSE_ASN."
+            )
+        return self
 
 
 class AppConfig(BaseModel):

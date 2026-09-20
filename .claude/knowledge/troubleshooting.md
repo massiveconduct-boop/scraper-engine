@@ -231,6 +231,35 @@ convention only needed two call sites fixed.
 
 ---
 
+## The API Is Not On Port 8000 (Round 62)
+
+**Symptom:** `curl http://localhost:8000/v1/health` returns
+`{"detail":"Not Found"}` (or an unrelated app's response) while
+`docker compose ps` insists the api container is `healthy`.
+
+**Not a bug.** The container listens on 8000 *internally* — which is why
+the container healthcheck (`curl -f http://localhost:8000/v1/health`) is
+green and why `docker compose exec -T api curl ... :8000/v1/health` returns
+the real `{"status":"ok",...}` payload. The host-side published port is
+`API_PORT` from `.env`, and on this host it is **8010**, because another
+project of the operator's (`deepanalyze_agent-app-1`) already publishes
+8000. `deploy-platform-core-1` likewise sits on 8001.
+
+**Do not "free" port 8000** — those are unrelated running services, not
+leftovers from this stack.
+
+**Resolve it, don't guess it:**
+
+```bash
+docker compose port api 8000        # authoritative host mapping for this stack
+sudo ss -ltnp | grep :8000          # what actually holds 8000
+docker ps --format '{{.Names}}\t{{.Ports}}' | grep 8000
+```
+
+Related: `.wolf/cerebrum.md`'s 2026-08-07 Do-Not-Repeat entry already warned
+that 8000 can be held by something else; round 62 pins down the current
+owner and the one-command way to check.
+
 ## Infrastructure Failures
 
 ### PgBouncer Connection Refused (Port 6432)

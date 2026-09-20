@@ -123,6 +123,30 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   `/minio/health/live`, `pg_isready`); `mc ready local` was rejected because
   the server image ships no configured alias.
 
+- **FIXED (round 62, follow-up) — `asn` is rejected by the gateway unless
+  `country` is set alongside it.** Found by deploying the ASN pin and then
+  checking it rather than assuming: with `DATAIMPULSE_ASN=29465` and no
+  `DATAIMPULSE_COUNTRY`, every gateway request returned **407** (6 of 6),
+  while `cr.ng;asn.29465` returned 200 (6 of 6) and `cr.ng;asn.36873` 200
+  (6 of 6). DataImpulse will not resolve an `asn.` parameter with no `cr.`
+  beside it. This surfaces as an opaque per-request proxy failure that
+  points nowhere near config, so `DataImpulseConfig._asn_requires_country`
+  (a pydantic `model_validator`) now rejects the combination at load time
+  with a message naming the fix — same "fail loud once, never degrade every
+  fetch silently" rule as `Worker.__init__`'s eager gateway check. Deployed
+  config is now `cr.ng;asn.29465`, verified 4-of-4 real Jumia content
+  fetches through the rebuilt worker image with no overrides.
+
+- **NOT A BUG (round 62) — the API's host port is 8010, not 8000.**
+  `API_PORT` in `.env`. Port 8000 belongs to an unrelated project of the
+  operator's (`deepanalyze_agent-app-1`) and 8001 to
+  `deploy-platform-core-1`. The container still listens on 8000 internally,
+  so the compose healthcheck and an in-container curl are both correct while
+  a host-side `curl localhost:8000` returns someone else's 404. Documented
+  in `troubleshooting.md` → "The API Is Not On Port 8000" with the
+  `docker compose port api 8000` one-liner that resolves it instead of
+  guessing.
+
 - **FIXED (round 62, pre-existing) — the coverage gate was already red on
   `main`.** `orchestrator/circuit_breaker.py:160` (the clean-window reset in
   `record_success`) was uncovered at HEAD, verified by stashing this round's

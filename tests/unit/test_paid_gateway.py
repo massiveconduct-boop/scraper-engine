@@ -156,3 +156,58 @@ class TestGatewayProxyTargeting:
 
         assert proxy is not None
         assert proxy.username == "user123"
+
+
+class TestAsnRequiresCountry:
+    """config/schema.py::DataImpulseConfig._asn_requires_country — round 62.
+
+    Lives in this file rather than a config test module because the rule it
+    enforces is a property of DataImpulse's username grammar, documented in
+    proxy/paid_gateway.py, not of the config system.
+
+    Verified live 2026-09-20: `login__asn.29465;sessid.N` fails proxy auth
+    6 times out of 6; `login__cr.ng;asn.29465;sessid.N` succeeds 6 of 6.
+    Caught after `DATAIMPULSE_ASN` was set without `DATAIMPULSE_COUNTRY` and
+    every gateway request 407'd at fetch time — an opaque per-request proxy
+    failure that pointed nowhere near the config. Failing at load time turns
+    that into one startup error naming the fix.
+    """
+
+    def test_asn_with_country_is_accepted(self):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        assert DataImpulseConfig(asn=29465, country="ng").asn == 29465
+
+    def test_asn_without_country_is_rejected(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        with pytest.raises(ValidationError, match="dataimpulse.country is empty"):
+            DataImpulseConfig(asn=29465)
+
+    def test_asn_with_whitespace_only_country_is_rejected(self):
+        """base.yaml renders country from an env placeholder, so a var set to
+        spaces must not sneak past as "configured"."""
+        import pytest
+        from pydantic import ValidationError
+
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        with pytest.raises(ValidationError, match="dataimpulse.country is empty"):
+            DataImpulseConfig(asn=29465, country="   ")
+
+    def test_country_without_asn_is_fine(self):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        cfg = DataImpulseConfig(country="ng")
+        assert cfg.country == "ng"
+        assert cfg.asn is None
+
+    def test_default_config_has_neither(self):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        cfg = DataImpulseConfig()
+        assert cfg.asn is None
+        assert cfg.country == ""
