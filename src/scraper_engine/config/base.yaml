@@ -160,6 +160,16 @@ proxy_tiers:
 dataimpulse:
   enabled: "${DATAIMPULSE_ENABLED:false}"
   strategy: "${DATAIMPULSE_STRATEGY:free_only}"  # free_only | paid_only | free_first
+  # Round 62 — see schema.py::DataImpulseConfig. country is an ISO-3166
+  # alpha-2 code ("ng", "us"); empty means no country pin.
+  country: "${DATAIMPULSE_COUNTRY:}"
+  rotate_on_block_retries: "${DATAIMPULSE_ROTATE_ON_BLOCK_RETRIES:2}"
+  # Round 62 — empty means "no ASN pin", which is the right default: the
+  # parameter doubles DataImpulse's bandwidth rate. Set it per deployment for
+  # a target that blocks a whole operator range. Measured on the Jumia target
+  # (see proxy/paid_gateway.py): unpinned 1-of-12, asn=29465 (MTN Nigeria)
+  # 6-of-6, asn=36873 (Airtel Nigeria) 6-of-6.
+  asn: "${DATAIMPULSE_ASN:}"
 
 politeness:
   default_concurrency: 2

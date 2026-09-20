@@ -3091,3 +3091,67 @@ coincidentally-resolved count) but neither `DeadLetterQueueGrowing` nor
 
 **Status:** Shipped and live. Not yet committed (round 60's `5d8c7df`
 still HEAD).
+
+## Rotate the Gateway Identity, but Pin the ASN (Round 62)
+
+**Decision:** ship BOTH a per-attempt gateway session rotation (on by
+default, `rotate_on_block_retries=2`) and an optional ASN pin
+(`dataimpulse.asn`, off by default), rather than picking one.
+
+**Why not rotation alone:** it is what the consumer's report asked for
+("on challenge detection, rotate to a brand-new gateway session/IP"), and
+it is necessary — without it a block was terminal. But measuring it showed
+it is not sufficient. Against the report's own Jumia URL a fresh residential
+exit IP cleared Cloudflare roughly 1 time in 12 at both L2 and L3. Two
+rotations per level turns that into a coin flip, not a fix.
+
+**Why not the ASN pin alone:** it needs a known-good ASN per target, which
+only exists after someone measures one, and DataImpulse bills ASN-targeted
+traffic at double rate. It cannot be the default.
+
+**Why not `noasn` (the obvious answer):** DataImpulse documents an exclusion
+parameter, and excluding the one bad ASN is strictly better than pinning a
+good one — cheaper, and it keeps pool diversity. It was implemented first,
+then live-tested, and it does not work on this account: `__cr.ng;noasn.37127`
+authenticates and is silently ignored, returning AS37127 8 times in 12. The
+implementation was removed rather than shipped as a plausible-looking no-op.
+This is the round's main trap: the documented feature and the working
+feature were not the same one, and only a live check told them apart.
+
+**Resulting split:** rotation is the general mechanism, on by default,
+bounded, and correct for any target. The ASN pin is the precise instrument
+for a target already known to block an operator range, opt-in per deployment
+via `DATAIMPULSE_ASN`. On Jumia the pin alone moved 1-of-12 to 12-of-12.
+
+**Cost accepted:** each rotation is a full paid browser render, so the
+budget is capped at 10 and defaults to 2. A target that blocks three
+distinct residential IPs in a row is not blocking on IP reputation, and
+burning more renders will not discover otherwise.
+
+## Startup Waits, It Does Not Exit (Round 62)
+
+**Decision:** `core/startup.py::wait_for_dependency` retries FOREVER by
+default; only tests pass `max_attempts`.
+
+**Why:** this reverses the usual instinct, and deliberately. Operating rule
+#2 says fix root causes, and rule "fail loud" argues a bad DSN should crash
+the process. But the failure actually observed was not a bad DSN — it was
+the API losing a start-order race, exiting, exhausting supervisord's
+`startretries`, latching FATAL, and staying dead for ~3 weeks after its
+dependencies recovered. Exiting converted a self-healing ordering problem
+into a permanent outage. A process that cannot reach Postgres yet is not
+failing; it is early.
+
+**How loudness is preserved:** every failed attempt logs, and the level
+escalates WARNING → ERROR after 10 attempts, where a genuine
+misconfiguration is the likelier explanation than a start-order race. The
+container healthcheck reports unhealthy throughout. The operator sees a
+loud, unhealthy, log-spewing container instead of a silent dead one — which
+is strictly more diagnosable than the FATAL state this replaces.
+
+**Why the supervisord change too:** `wait_for_dependency` only covers the
+dependency-connect path. `startretries=1000000` is the backstop for crash
+modes it cannot cover — an OOM kill, an import error from a half-rolled
+deploy — so no crash mode can latch FATAL permanently again. `startsecs=5`
+still makes a genuinely broken program obvious in the logs; it is retried
+rather than abandoned.

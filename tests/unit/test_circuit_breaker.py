@@ -15,6 +15,11 @@ from fakeredis import FakeAsyncRedis
 from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker, CircuitState
 
 
+async def redis_get(breaker, key):
+    """Reads a raw window counter off the breaker's own Redis handle."""
+    return await breaker._redis.get(key)
+
+
 @pytest.fixture
 async def redis():
     return FakeAsyncRedis(decode_responses=True)
@@ -145,6 +150,33 @@ class TestRecordFailure:
         for _ in range(10):
             await breaker.record_failure("blown.com")
         assert await breaker.state("blown.com") == CircuitState.OPEN
+
+    @pytest.mark.asyncio
+    async def test_all_clean_window_resets_at_attempt_threshold(self, breaker) -> None:
+        """The other half of round 61's rolling window: a window that fills up
+        WITHOUT tripping has to reset too, otherwise a long healthy run keeps
+        accumulating attempts forever and every later failure is diluted
+        against an ever-growing denominator — the circuit would effectively
+        stop being able to open on a busy, mostly-healthy domain.
+
+        10 successes == attempt_threshold, so the counters must be back to
+        zero and the circuit still CLOSED.
+        """
+        for _ in range(10):
+            await breaker.record_success("healthy.com")
+
+        assert await breaker.state("healthy.com") == CircuitState.CLOSED
+        assert await redis_get(breaker, "cb:healthy.com:failure_window_attempts") == "0"
+        assert await redis_get(breaker, "cb:healthy.com:failure_window_failures") == "0"
+
+    @pytest.mark.asyncio
+    async def test_clean_window_below_attempt_threshold_keeps_counting(self, breaker) -> None:
+        """One short of the threshold: no reset, the attempts are still there.
+        Pins that the reset above is threshold-driven, not "every success"."""
+        for _ in range(9):
+            await breaker.record_success("healthy2.com")
+
+        assert await redis_get(breaker, "cb:healthy2.com:failure_window_attempts") == "9"
 
 
 class TestFailureStreakTtl:

@@ -407,6 +407,43 @@ class DataImpulseConfig(BaseModel):
     # free pool entirely, always use the gateway. free_first: try the free
     # pool as today, only fall to the gateway on ProxyPoolExhaustedError.
     strategy: Literal["free_only", "paid_only", "free_first"] = "free_only"
+    # Round 62 — ISO-3166 alpha-2 exit country for the gateway, rendered as
+    # DataImpulse's `__cr.<iso2>` username parameter (proxy/paid_gateway.py).
+    # Empty means "no country pin, gateway picks" — the pre-round-62
+    # behavior. Tuning, not a secret, so it lives here rather than in env
+    # alongside the credentials, same split the module's docstring sets out.
+    country: str = ""
+    # Round 62 — how many EXTRA gateway attempts, each on a brand-new sticky
+    # session (= a brand-new exit IP), a level gets after a DETECTION_BLOCK.
+    # 0 restores the pre-round-62 behavior of accepting the first block as
+    # final. The ceiling is deliberately low: every retry is a full browser
+    # render through paid residential bandwidth, and a target that blocks 3
+    # distinct residential IPs in a row is not blocking on IP reputation.
+    rotate_on_block_retries: int = Field(default=2, ge=0, le=10)
+    # Round 62 — pin the gateway's exit to one autonomous system, as
+    # DataImpulse's `__asn.<number>` username parameter (bare AS number, no
+    # "AS" prefix). None is the default and costs nothing; setting it DOUBLES
+    # the bandwidth bill, per DataImpulse's own docs, so it is opt-in per
+    # deployment rather than a global default. proxy/paid_gateway.py's module
+    # docstring has the measurement: on the Jumia target from
+    # DEVELOPER_REPORT.md one ASN was 0-for-9 against Cloudflare and made up
+    # most of the country's pool, which took the unpinned success rate to
+    # 1-in-12; pinning a clean ASN took it to 12-of-12. The documented
+    # `noasn` exclusion parameter is deliberately NOT modelled here — it is
+    # accepted by the gateway and then ignored, verified live.
+    asn: int | None = None
+
+    @field_validator("asn", mode="before")
+    @classmethod
+    def _empty_asn_is_none(cls, v: object) -> object:
+        """base.yaml renders this as `${DATAIMPULSE_ASN:}`, and an unset env
+        var leaves the empty STRING, not None — the loader substitutes text
+        and never re-types it. Without this, the default config fails
+        validation outright ("unable to parse string as an integer"), i.e.
+        every process refuses to start unless the var happens to be set."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class AppConfig(BaseModel):

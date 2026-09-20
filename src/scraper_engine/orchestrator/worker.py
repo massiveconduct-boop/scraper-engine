@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
     from scraper_engine.browser.pool import BrowserPool
     from scraper_engine.config.schema import AppConfig
-    from scraper_engine.core.models import ConfigOverrides, ScrapeRequest
+    from scraper_engine.core.models import ConfigOverrides, Proxy, ScrapeRequest
     from scraper_engine.core.tenant import TenantId
     from scraper_engine.storage.dlq import DeadLetterQueue
     from scraper_engine.storage.postgres_client import PostgresClient
@@ -53,6 +53,24 @@ _PROXY_RETRYABLE_CATEGORIES = frozenset(
     {FailureCategory.BROWSER_CRASH, FailureCategory.NETWORK_TIMEOUT}
 )
 _SAME_LEVEL_PROXY_RETRIES = 1  # one retry with a fresh proxy before giving up on this level
+
+# Round 62 — DETECTION_BLOCK is retryable too, but ONLY on the paid gateway,
+# and only because round 62 gave the gateway a way to present a genuinely
+# different exit IP on the next attempt (proxy/paid_gateway.py's sessid
+# parameter). It stays out of _PROXY_RETRYABLE_CATEGORIES above because
+# that set governs the free pool as well, where a block is far more often
+# the target fingerprinting the request than the IP, and where a wasted
+# retry costs a second full browser render for nothing.
+#
+# Live evidence this closes (ops/research/itel-30000mah-jumia,
+# 20 Sep 2026): the first Jumia catalog fetch through the gateway returned
+# 200, every subsequent one returned a Cloudflare 403 at L1, L2 AND L3.
+# DETECTION_BLOCK not being retryable here meant the engine accepted that
+# first 403 as final, and — since build_gateway_proxy() then produced one
+# fixed username — even process_job's gateway-fallback re-attempt went out
+# over the same, already-flagged exit identity. The pool never changed IP
+# because nothing in the system could ask it to.
+_GATEWAY_ROTATE_CATEGORIES = frozenset({FailureCategory.DETECTION_BLOCK})
 
 # round 29 — how long a successful scrape_results row is considered a valid
 # cache hit before it must be re-scraped. Sliding: a hit refreshes freshness
@@ -827,7 +845,6 @@ class Worker:
         from scraper_engine.core.exceptions import ProxyPoolExhaustedError
         from scraper_engine.proxy.lease import ProxyLease
         from scraper_engine.proxy.manager import ProxyManager
-        from scraper_engine.proxy.paid_gateway import build_gateway_proxy
 
         # Round 40 — three-way toggle (config/schema.py::DataImpulseConfig).
         # free_only is the default and is byte-for-byte the pre-round-40 code
@@ -837,12 +854,22 @@ class Worker:
 
         pm = ProxyManager(redis=self._redis, pg=pg, tier_config=self._config.proxy_tiers)
         domain = self._extract_domain(url)
-        last_result: FetchResult | None = None
 
-        for _attempt in range(_SAME_LEVEL_PROXY_RETRIES + 1):
+        # Round 62 — two independent retry budgets, deliberately not merged
+        # into one counter. pool_retries_left is round 37's: a fresh lease
+        # from the scored free pool after a plausibly-proxy-caused crash or
+        # timeout. block_rotations_left is new: a fresh GATEWAY EXIT IP
+        # after the target blocked us on reputation. They fire on disjoint
+        # categories and on different proxy sources, so one shared budget
+        # would let a crash loop eat the rotation allowance (or vice versa)
+        # and silently leave the real failure unretried.
+        pool_retries_left = _SAME_LEVEL_PROXY_RETRIES
+        block_rotations_left = di_cfg.rotate_on_block_retries if di_cfg.enabled else 0
+
+        while True:
             lease: ProxyLease
             if force_gateway:
-                gateway_proxy = build_gateway_proxy()
+                gateway_proxy = self._new_gateway_proxy()
                 if gateway_proxy is None:
                     raise RuntimeError(
                         "force_gateway=True but DataImpulse gateway is not configured"
@@ -854,7 +881,7 @@ class Worker:
                 # config was already caught at Worker.__init__ time, so a
                 # None here is unreachable; the raise is defense in depth,
                 # never a silent fallback to the free pool.
-                gateway_proxy = build_gateway_proxy()
+                gateway_proxy = self._new_gateway_proxy()
                 if gateway_proxy is None:
                     raise RuntimeError(
                         "dataimpulse strategy=paid_only but gateway is not configured"
@@ -865,7 +892,7 @@ class Worker:
                     lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
                 except ProxyPoolExhaustedError:
                     if strategy == "free_first":
-                        gateway_proxy = build_gateway_proxy()
+                        gateway_proxy = self._new_gateway_proxy()
                         if gateway_proxy is None:
                             raise RuntimeError(
                                 "dataimpulse strategy=free_first but gateway is not configured"
@@ -891,23 +918,72 @@ class Worker:
                 # a harmless no-op UPDATE either way, but gating on source
                 # makes that intent explicit instead of relying on an
                 # incidental 0-row match.
+                # Round 62 — the block check runs BEFORE the success
+                # short-circuit on purpose. At L3 a Cloudflare interstitial
+                # comes back as success=True with http_status=403 (see
+                # level_3.py's closing comment: the fetcher deliberately
+                # defers that verdict to process_job's centralized
+                # is_challenge_page check). Returning early on
+                # result.success would hand that "successful" 403 straight
+                # back and rotation would never fire for the single most
+                # common block shape there is — which is exactly what the
+                # Jumia run hit.
+                blocked = self._looks_blocked(result)
+                if blocked and lease.proxy.source == "paid_gateway" and block_rotations_left > 0:
+                    block_rotations_left -= 1
+                    continue  # new sessid on the next pass == new exit IP
+
                 if result.success:
                     if lease.proxy.source == "pool":
                         await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
                     return result
                 if lease.proxy.source == "pool":
                     await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
-                last_result = result
-                if result.failure_category not in _PROXY_RETRYABLE_CATEGORIES:
-                    return result
-                # else: loop again with a freshly leased proxy — for the
-                # gateway, build_gateway_proxy() returns the same static
-                # ip:port, but DataImpulse rotates the real exit IP
-                # server-side per connection (Rotating mode), so this retry
-                # still gets a genuinely different upstream identity.
+                if result.failure_category in _PROXY_RETRYABLE_CATEGORIES and pool_retries_left > 0:
+                    pool_retries_left -= 1
+                    continue  # loop again with a freshly leased proxy
+                return result
 
-        assert last_result is not None  # loop always assigns it before falling through
-        return last_result
+    def _new_gateway_proxy(self) -> Proxy | None:
+        """Build a gateway Proxy pinned to a brand-new sticky session.
+
+        Round 62. Every call returns a credential DataImpulse has never
+        seen, which is what makes it hand back a different exit IP
+        (proxy/paid_gateway.py's module docstring has the protocol detail).
+        Before this, _fetch_with_proxy called build_gateway_proxy() with no
+        arguments and got one fixed username back, so a "retry through the
+        gateway" re-presented the identity that had just been blocked —
+        the engine had no way to ask for a different IP even though it had
+        correctly detected it needed one.
+        """
+        from scraper_engine.proxy.paid_gateway import build_gateway_proxy, new_session_id
+
+        return build_gateway_proxy(
+            country=self._config.dataimpulse.country or None,
+            session_id=new_session_id(),
+            asn=self._config.dataimpulse.asn,
+        )
+
+    def _looks_blocked(self, result: FetchResult) -> bool:
+        """True when a fetch result is a target-side block, in either of the
+        two shapes one takes.
+
+        Round 62 — factored out of process_job's gateway-fallback branch so
+        _fetch_with_proxy's rotation decision uses the identical test rather
+        than a second, drifting copy of it. The two shapes (fetcher-level
+        DETECTION_BLOCK vs. a success=True result whose CONTENT is a
+        challenge page) are documented at that call site.
+        """
+        if result.failure_category in _GATEWAY_ROTATE_CATEGORIES:
+            return True
+        return bool(
+            result.success
+            and self._challenge_detector.is_challenge_page(
+                result.html or "",
+                result.http_status or 200,
+                short_page_is_suspect=False,
+            )
+        )
 
     async def _acquire_politeness_slot(self, domain: str, tenant_id: TenantId) -> str | None:
         """Retry acquiring a politeness slot for up to

@@ -358,9 +358,7 @@ class TestWorker:
         assert response.status == JobStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_politeness_slot_timeout_exhausted_advances_to_next_level(
-        self, tenant, worker
-    ):
+    async def test_politeness_slot_timeout_exhausted_advances_to_next_level(self, tenant, worker):
         """When a slot never frees up within slot_wait_timeout_seconds, the
         level genuinely gives up and the loop advances — round-42's DLQ
         fallback ("politeness slot never available") stays reachable for a
@@ -624,8 +622,7 @@ class TestWorker:
         exhausted = on_result.await_args.args[0]
         assert exhausted.failure_category == FailureCategory.PROXY_EXHAUSTED
         assert exhausted.error_message == (
-            "All fetch levels exhausted without a single attempt "
-            "(politeness slot never available)"
+            "All fetch levels exhausted without a single attempt (politeness slot never available)"
         )
 
     @pytest.mark.asyncio
@@ -1471,9 +1468,7 @@ class TestGatewayFallbackOnFailure:
         worker._fetch_url.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_still_blocked_final_level_retries_via_gateway_and_rescues(
-        self, tenant, worker
-    ):
+    async def test_still_blocked_final_level_retries_via_gateway_and_rescues(self, tenant, worker):
         """Final-level result still looks blocked (challenge page) — under
         free_first, one gateway retry is attempted before conceding; here
         the gateway attempt comes back clean and rescues the URL."""
@@ -1620,9 +1615,7 @@ class TestConcurrentUrlProcessing:
         assert peak > 1
 
     @pytest.mark.asyncio
-    async def test_result_order_matches_input_order_despite_completion_order(
-        self, tenant, worker
-    ):
+    async def test_result_order_matches_input_order_despite_completion_order(self, tenant, worker):
         """First URL is the slow one — if ordering were completion-order
         instead of input-order, it would land last in `results`."""
 
@@ -1652,9 +1645,7 @@ class TestConcurrentUrlProcessing:
         not just that cancellation eventually works."""
         worker._pg.fetchrow = AsyncMock(return_value={"status": JobStatus.CANCELLED.value})
         worker._fetch_url = AsyncMock()
-        request = ScrapeRequest(
-            urls=[HttpUrl(f"http://example{i}.com") for i in range(5)]
-        )
+        request = ScrapeRequest(urls=[HttpUrl(f"http://example{i}.com") for i in range(5)])
 
         response = await worker.process_job(tenant, "job-cancelled", request)
 
@@ -1860,3 +1851,298 @@ class TestExtractionWiring:
 
         assert response.results is not None
         assert response.results[0].extracted is None
+
+
+class TestGatewayExitIpRotation:
+    """Round 62 — _fetch_with_proxy rotates the paid gateway's EXIT IP when
+    the target blocks, instead of accepting the first block as final.
+
+    Live evidence (ops/research/itel-30000mah-jumia, 20 Sep 2026): the first
+    Jumia catalog fetch through the gateway returned 200; every later one
+    returned a Cloudflare 403 at L1, L2 and L3, and the engine gave up. Two
+    separate defects combined to produce that. DETECTION_BLOCK was not a
+    retryable category, so no second attempt was made at all; and
+    build_gateway_proxy() took no arguments, so even the attempts that DID
+    happen re-presented the identity that had just been flagged.
+    """
+
+    @staticmethod
+    def _fetcher_returning(*results):
+        """A fetcher whose successive fetch() calls return `results` in order."""
+        fetcher = MagicMock()
+        fetcher.fetch = AsyncMock(side_effect=list(results))
+        return fetcher
+
+    @staticmethod
+    def _blocked(level=2):
+        return FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=level,
+            duration_ms=5,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message="403",
+        )
+
+    @staticmethod
+    def _ok(level=2):
+        return FetchResult(
+            url="http://example.com", success=True, level_used=level, duration_ms=5, html="<html/>"
+        )
+
+    def _wire(
+        self,
+        worker,
+        monkeypatch,
+        *results,
+        strategy="paid_only",
+        rotations=2,
+        country="",
+        asn=None,
+    ):
+        """paid_only + a scripted fetcher. Returns (fetcher, usernames-seen)."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(
+            enabled=True,
+            strategy=strategy,
+            country=country,
+            asn=asn,
+            rotate_on_block_retries=rotations,
+        )
+        pm_instance = MagicMock()
+        # paid_only never reaches the free pool; a bare AsyncMock here would
+        # silently satisfy a call that must not happen, so assert it doesn't.
+        pm_instance.get_proxy = AsyncMock()
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+
+        def _build(*, country=None, session_id=None, asn=None):
+            return Proxy(
+                id=-1,
+                ip="gw.dataimpulse.com",
+                port=823,
+                protocol=ProxyProtocol.HTTP,
+                username=f"user123__cr.{country};asn.{asn};sessid.{session_id}",
+                password="pass456",
+                source="paid_gateway",
+            )
+
+        monkeypatch.setattr("scraper_engine.proxy.paid_gateway.build_gateway_proxy", _build)
+        fetcher = self._fetcher_returning(*results)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher", MagicMock(return_value=fetcher)
+        )
+        self._pm = pm_instance
+        return fetcher
+
+    @staticmethod
+    def _usernames(fetcher):
+        return [c.kwargs["proxy"].username for c in fetcher.fetch.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_block_rotates_to_a_new_exit_ip_and_succeeds(self, tenant, worker, monkeypatch):
+        fetcher = self._wire(worker, monkeypatch, self._blocked(), self._ok())
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result.success is True
+        assert fetcher.fetch.await_count == 2
+        first, second = self._usernames(fetcher)
+        # Same account, DIFFERENT sticky-session label == different exit IP.
+        assert first != second
+        assert first.startswith("user123__") and second.startswith("user123__")
+        # Rotation happens entirely within the gateway — it must never quietly
+        # become a free-pool lease, which would be a different proxy source
+        # with different (scored, DB-backed) semantics.
+        self._pm.get_proxy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rotation_budget_is_bounded_then_the_block_is_returned(
+        self, tenant, worker, monkeypatch
+    ):
+        fetcher = self._wire(worker, monkeypatch, *[self._blocked() for _ in range(4)], rotations=2)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        # 1 initial attempt + 2 rotations. Each one is a full paid browser
+        # render, so the ceiling is the config value, not "retry until done".
+        assert fetcher.fetch.await_count == 3
+        assert len(set(self._usernames(fetcher))) == 3
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+
+    @pytest.mark.asyncio
+    async def test_rotation_disabled_by_config_accepts_the_first_block(
+        self, tenant, worker, monkeypatch
+    ):
+        """rotate_on_block_retries=0 restores the exact pre-round-62 behavior."""
+        fetcher = self._wire(worker, monkeypatch, self._blocked(), self._ok(), rotations=0)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_success_shaped_challenge_page_also_rotates(self, tenant, worker, monkeypatch):
+        """The L3 shape. level_3.py deliberately returns success=True with the
+        real http_status for a Cloudflare interstitial and defers the verdict
+        to the worker. Checking result.success first would therefore skip
+        rotation for the single most common block there is."""
+        challenge = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=5,
+            http_status=403,
+            html="<html>Just a moment...</html>",
+        )
+        fetcher = self._wire(worker, monkeypatch, challenge, self._ok())
+        worker._challenge_detector.is_challenge_page = MagicMock(side_effect=[True, False])
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 2
+        assert result.success is True
+        assert result.html == "<html/>"
+
+    @pytest.mark.asyncio
+    async def test_free_pool_block_does_not_rotate(self, tenant, worker, monkeypatch):
+        """Only the gateway can be asked for a different exit IP. A free-pool
+        block escalates to the next level (and, under free_first, through
+        process_job's gateway fallback) rather than burning a second render
+        here — DETECTION_BLOCK stays out of _PROXY_RETRYABLE_CATEGORIES."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(
+            enabled=True, strategy="free_first", rotate_on_block_retries=2
+        )
+        pool_proxy = Proxy(
+            id=7, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP, source="pool"
+        )
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(
+            return_value=ProxyLease(proxy=pool_proxy, tenant_id=tenant)
+        )
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        fetcher = self._fetcher_returning(self._blocked(), self._ok())
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher", MagicMock(return_value=fetcher)
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.success is False
+        pm_instance.mark_failure.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_configured_country_reaches_the_gateway_username(
+        self, tenant, worker, monkeypatch
+    ):
+        fetcher = self._wire(worker, monkeypatch, self._ok(), country="ng")
+
+        await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert self._usernames(fetcher)[0].startswith("user123__cr.ng;asn.None;sessid.")
+
+    @pytest.mark.asyncio
+    async def test_configured_asn_pin_reaches_the_gateway_username(
+        self, tenant, worker, monkeypatch
+    ):
+        """The measured fix for the Jumia block. One ASN made up most of
+        DataImpulse's Nigerian pool and Cloudflare blocked all of it (1 clean
+        fetch in 12); pinning a clean ASN gave 12 of 12. See
+        proxy/paid_gateway.py's module docstring for the raw numbers."""
+        fetcher = self._wire(worker, monkeypatch, self._ok(), country="ng", asn=29465)
+
+        await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert self._usernames(fetcher)[0].startswith("user123__cr.ng;asn.29465;sessid.")
+
+    @pytest.mark.asyncio
+    async def test_asn_pin_still_rotates_the_session_on_a_block(self, tenant, worker, monkeypatch):
+        """Pinning an ASN narrows the pool; it must not freeze the exit IP.
+        Rotation still has to hand out a new sessid within that ASN."""
+        fetcher = self._wire(
+            worker, monkeypatch, self._blocked(), self._ok(), country="ng", asn=29465
+        )
+
+        await worker._fetch_url(tenant, "http://example.com", 2)
+
+        first, second = self._usernames(fetcher)
+        assert first != second
+        assert all(u.startswith("user123__cr.ng;asn.29465;") for u in (first, second))
+
+    @pytest.mark.asyncio
+    async def test_empty_country_is_not_sent_as_a_parameter(self, tenant, worker, monkeypatch):
+        """base.yaml's default is "", which must mean "no country pin" — an
+        empty `cr.` parameter is a malformed login the gateway rejects with
+        407 NO_USER, not a no-op."""
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="paid_only")
+        seen = {}
+
+        def _build(*, country=None, session_id=None, asn=None):
+            seen["country"] = country
+            seen["asn"] = asn
+            return Proxy(
+                id=-1,
+                ip="gw.dataimpulse.com",
+                port=823,
+                protocol=ProxyProtocol.HTTP,
+                username="user123",
+                password="pass456",
+                source="paid_gateway",
+            )
+
+        monkeypatch.setattr("scraper_engine.proxy.paid_gateway.build_gateway_proxy", _build)
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher",
+            MagicMock(return_value=self._fetcher_returning(self._ok())),
+        )
+
+        await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert seen["country"] is None
+        # Same reasoning for the ASN pin: unset must reach the builder as
+        # None, since sending `asn.None` would both cost double and 407.
+        assert seen["asn"] is None
+
+    @pytest.mark.asyncio
+    async def test_rotation_is_off_when_dataimpulse_is_disabled(self, tenant, worker, monkeypatch):
+        """free_only never leases the gateway, so there is nothing to rotate;
+        the budget must read 0 rather than inheriting the schema default."""
+        pool_proxy = Proxy(
+            id=7, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP, source="pool"
+        )
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(
+            return_value=ProxyLease(proxy=pool_proxy, tenant_id=tenant)
+        )
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        fetcher = self._fetcher_returning(self._blocked(), self._ok())
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher", MagicMock(return_value=fetcher)
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.success is False

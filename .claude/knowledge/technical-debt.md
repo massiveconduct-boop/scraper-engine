@@ -32,6 +32,104 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 62)
+
+- **FIXED (round 62) — the paid gateway had one fixed identity, so a
+  detected block could never be retried from a different IP.** Origin: an
+  external consumer's `DEVELOPER_REPORT.md` (hermespace
+  `ops/research/itel-30000mah-jumia/`, 20 Sep 2026) reporting that a Jumia
+  Nigeria catalog scrape succeeded exactly once and was then 403'd at every
+  level for the rest of the run. Three defects compounded:
+  1. `build_gateway_proxy()` took no arguments and returned one static
+     username, and `_fetch_with_proxy`'s retry comment asserted DataImpulse
+     "rotates the real exit IP server-side per connection", so a retry was
+     believed to be a new IP. Measured: it is not reliably one, and nothing
+     in the system could *ask* for a different IP.
+  2. `DETECTION_BLOCK` was not in `_PROXY_RETRYABLE_CATEGORIES`, so a block
+     ended the level immediately — no retry happened at all.
+  3. `process_job`'s gateway-fallback branch is gated on
+     `result.proxy_source != "paid_gateway"`, so under `paid_only` (or after
+     any gateway attempt) it could not fire either. Every path out of a
+     gateway block was closed.
+  Fix: `proxy/paid_gateway.py` gained `new_session_id()` and
+  `build_gateway_username()`, rendering DataImpulse's real username grammar
+  (`login__cr.ng;asn.29465;sessid.N` — double underscore, `;` separator,
+  `key.value` pairs; see https://docs.dataimpulse.com/proxies/parameters/).
+  `_fetch_with_proxy` now runs two independent retry budgets — round 37's
+  free-pool lease retry, and a new `rotate_on_block_retries` gateway budget
+  that fires on `_looks_blocked()` and presents a fresh `sessid` (= a fresh
+  exit IP) each pass. The block check runs *before* the `result.success`
+  short-circuit on purpose: L3 returns a Cloudflare interstitial as
+  `success=True, http_status=403`, so checking success first would have
+  skipped rotation for the most common block shape there is.
+
+- **FIXED (round 62) — the operator's `407 NO_USER` was a syntax error, not
+  a plan limitation.** The report concluded DataImpulse session parameters
+  were unsupported after `;countries=ng` failed auth. Wrong separator, wrong
+  key, `=` instead of `.`. The documented form authenticates on this account
+  first try. Recorded here because the report's conclusion ("the gateway
+  plan doesn't support them") would otherwise have been inherited as fact.
+
+- **FIXED (round 62) — the real reason Jumia blocked ~90% of attempts was
+  ONE ASN, not scattered IP reputation.** Rotation alone only converted a
+  hard failure into a lottery, so the odds were measured: 12 fresh Nigerian
+  exit IPs, one real Camoufox render each, against the report's own catalog
+  URL.
+
+  | ASN | result |
+  |---|---|
+  | AS37127 Visafone Communications | ok=0 blocked=9 |
+  | AS29465 MTN Nigeria | ok=1 blocked=0 |
+  | AS36873 Airtel Networks | ok=1 blocked=0 |
+  | AS328555 Timeless Network Services | ok=1 blocked=0 |
+
+  One ASN makes up most of DataImpulse's Nigerian residential pool and
+  Cloudflare blocks all of it. **The documented `noasn.<n>` exclusion
+  parameter does not work on this account** — it authenticates and is then
+  silently ignored (AS37127 still returned 8 times in 12 with
+  `__cr.ng;noasn.37127`), so it is deliberately NOT modelled in config.
+  Positive targeting does work (`__cr.ng;asn.29465` → MTN 10/10). Re-running
+  the blocked fetch pinned to a clean ASN: **asn.29465 ok=6 blocked=0,
+  asn.36873 ok=6 blocked=0 — 12 of 12, against 1 of 12 unpinned.**
+  `dataimpulse.asn` is therefore opt-in (`DATAIMPULSE_ASN`) and defaults to
+  unset, because DataImpulse bills ASN-targeted traffic at double rate.
+
+- **FIXED (round 62) — the API could latch permanently dead after a
+  transient dependency outage.** Same report, item 4: the API container came
+  up before Postgres/PgBouncer resolved, raised out of its lifespan and
+  exited; supervisord's `startretries=10` was exhausted by the restart
+  storm, the program went FATAL, and the stack stayed down ~3 weeks after
+  the dependencies recovered. Fixed at both layers, because either alone
+  still fails: new `core/startup.py::wait_for_dependency` makes the lifespan
+  wait with capped exponential backoff instead of exiting (so no retry is
+  ever burned), and `docker/supervisord.conf` raises `startretries` to
+  1000000 as the backstop for crash modes that helper cannot cover (OOM
+  kill, import error). Live-verified against a genuinely stopped PgBouncer:
+  the process logged retries, never exited, and printed `CONNECTED after
+  7.1s` once the dependency came back.
+
+- **FIXED (round 62) — nothing in compose would bring the stack back.**
+  Report item 5. Only `api` had `restart: unless-stopped`; workers,
+  postgres, pgbouncer, redis, minio, jaeger, prometheus and alertmanager had
+  no restart policy at all, so a daemon restart or host reboot left them
+  down silently. All long-running services now carry the policy (the two
+  one-shot services, `migrate` and `pgbouncer-init`, deliberately do not).
+  Separately, every `depends_on` used `condition: service_started`, which
+  only means "the container process exists" — that is what let the API open
+  a connection to a Postgres still running initdb. Redis, MinIO and
+  PgBouncer gained healthchecks and all four dependencies are now gated on
+  `service_healthy`. Each healthcheck binary was confirmed present inside
+  its actual image before being wired in (`redis-cli`, `curl` for MinIO's
+  `/minio/health/live`, `pg_isready`); `mc ready local` was rejected because
+  the server image ships no configured alias.
+
+- **FIXED (round 62, pre-existing) — the coverage gate was already red on
+  `main`.** `orchestrator/circuit_breaker.py:160` (the clean-window reset in
+  `record_success`) was uncovered at HEAD, verified by stashing this round's
+  work and re-running: 99.97%, same single miss. Closed with two tests
+  because the gate would otherwise have failed this round's commit for a
+  defect it did not introduce.
+
 ## Technical Debt / Open Threads (as of round 61)
 
 - **FIXED (round 61) — round-22's `has_active_plan()` check was never wired
