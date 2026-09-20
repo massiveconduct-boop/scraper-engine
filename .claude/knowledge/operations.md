@@ -233,10 +233,22 @@ round 28 (PR #15).
   project's own `pgbouncer-init` dependency chain from `docker-compose.yml`),
   polls `:6432` for TCP readiness, then runs the combined
   `tests/unit/ tests/integration/ tests/chaos/` suite with `--cov=
-  src/scraper_engine --cov-fail-under=100` (round 28 — this is where the
-  previously-dead coverage gate is now actually enforced; the other two
-  jobs run without `--cov` since this job re-runs everything anyway with
-  full infra up). See Known Operational Gaps #14.
+  src/scraper_engine --cov-fail-under=99 --cov-report=json:coverage.json`,
+  followed by a second step running `tools/check_coverage_ratchet.py
+  coverage.json` (round 28 wired the gate; round 62 split it in two). The
+  other two jobs run without `--cov` since this job re-runs everything
+  anyway with full infra up.
+
+  **`--cov-fail-under` is NOT the gate and is deliberately not 100.**
+  Round 62 enabled `branch = true`, which drops the blended figure to
+  ~99.3%, so the percentage is a coarse safety net only. The real gate is
+  the ratchet script: zero missed LINES (no tolerance, the pre-round-62
+  guarantee unchanged) plus an absolute missed-BRANCH budget that may only
+  ever shrink — the script fails if the count rises AND if it falls without
+  `BRANCH_BUDGET` being lowered, so improvements get locked in. Anyone
+  "fixing" the 99 back to 100 will break the build and silently re-hide the
+  branch gaps. See Known Operational Gaps #14 and
+  `.claude/knowledge/technical-debt.md`'s round-62 coverage audit.
 - **build-and-push (round 22):** builds the root `Dockerfile`, pushes to GHCR
   (`ghcr.io/<owner>/<repo>:<sha>` and `:latest`) via the automatic
   `GITHUB_TOKEN` — no new secret needed. Gated `if: github.event_name ==
@@ -450,7 +462,8 @@ levels:
     round 25 landed. Full story: `.claude/knowledge/technical-debt.md`
     (round 25 follow-up).
     Full finding: `.claude/knowledge/technical-debt.md` (round 24).
-14. **Coverage gate was dead config (RESOLVED round 28).**
+14. **Coverage gate was dead config (RESOLVED round 28; SCOPE CORRECTED
+    round 62 — see below).**
     `[tool.coverage.report] fail_under` was declared (90, then 100) but
     never enforced — none of the three pytest invocations in
     `.github/workflows/test.yml` passed `--cov`. Real measured coverage at

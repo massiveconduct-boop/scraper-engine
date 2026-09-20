@@ -54,7 +54,7 @@ openwolf cron        # cron task management
 - **Browser:** Camoufox v0.5.4 (Firefox 152), semaphore-gated pool with `lease()` context manager
 - **Proxy:** 8-URL sources across 6 operators, TCP probe + HTTP validation, two-tier scoring
 - **Storage:** PostgreSQL 16 (PgBouncer transaction-pooling), Redis 7, S3/MinIO
-- **Testing:** pytest 9.1.1, unit+integration+chaos suite passes at a real 100% coverage on a correctly-set-up host (see CI, not hardcoded count here per operating rule #4) + 18 live + load suite. Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). Coverage gate (`fail_under=100` in `pyproject.toml`) is wired for real (round 28) — CI's `chaos` job runs full suite with `--cov-fail-under=100`. Round 35 closed what were previously two documented local-environment exclusions, both root-caused as sandbox/venv corruption rather than real gaps: (1) `services/botasaurus_requests_client.py` "aarch64 sandbox" failures were `unittest.mock.patch("botasaurus_requests.session.firefox")` force-importing the real package, which loads a platform-specific native `.so` via ctypes at import time (fixed test-side by stubbing the module in `sys.modules` before import, see `tests/unit/test_botasaurus_requests_client.py`); (2) `browser/` chaos races were failing because this host's `playwright`/Camoufox binaries had been installed for the wrong CPU architecture (x86-64 artifacts on an aarch64 box) — fixed by reinstalling the correct-arch `playwright` wheel and re-running `camoufox fetch` after clearing the stale cached binary; the chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090) which isn't started automatically. A round-34 knowledge audit caught and same-day-closed a regression to 97.91%; see `.claude/knowledge/technical-debt.md` round-34 entry, "Coverage gap" note, for detail.
+- **Testing:** pytest 9.1.1, unit+integration+chaos suite + 18 live + load suite (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate (round 62): the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES (no tolerance) plus an absolute missed-BRANCH budget that may only shrink. `--cov-fail-under=99` is a coarse safety net only; it is not 100 because `branch = true` is now on and the blended figure is ~99.3%. Do not 'restore' it to 100 — that reading is what an audit found overstated for four rounds.** Gate covers 7 packages; `browser/` is measured-but-ungated (needs a real Firefox), and `cli`/`config`/`observability`/`scrapy_project` are outside it — see `.claude/knowledge/technical-debt.md` round-62 coverage audit and `.wolf/STATUS.md` T1-T4. Two former local-environment exclusions were closed in round 35, both root-caused as sandbox/venv corruption rather than real gaps (a wrong-arch native `.so` accepted by an upstream `check_library()` bug, and wrong-arch `playwright`/Camoufox binaries) — full mechanism in `.claude/knowledge/technical-debt.md`'s round-35 entry. The chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. A round-34 knowledge audit caught and same-day-closed a regression to 97.91%; see `.claude/knowledge/technical-debt.md` round-34 entry, "Coverage gap" note, for detail.
 - **Linting:** ruff (clean), mypy `--strict` clean (baseline retired round 18)
 - **Evolution history (one clause per round; a round-28 audit moved the
   full narrative out of this file once, a round-57 audit re-trimmed a
@@ -82,7 +82,8 @@ openwolf cron        # cron task management
   Botasaurus extensions/lang/locale/timezone/mouse/network-capture (60),
   CAPTCHA no-active-plan check wired into the real solve path + politeness
   slot-retry fix (61), paid-gateway exit-IP rotation + measured ASN pin +
-  startup/compose self-healing (62).
+  startup/compose self-healing + stuck-job reaper reachability fix +
+  branch-coverage ratchet (62).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:
@@ -130,7 +131,8 @@ see `.claude/knowledge/architecture.md` (design) and
 source .venv/bin/activate
 pre-commit install  # one-time per clone
 docker compose up -d postgres redis pgbouncer minio migrate   # migrate applies alembic upgrade head, then exits
-pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-fail-under=100   # pass count: see CI, not hardcoded here per operating rule #4
+pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-report=json:coverage.json --cov-fail-under=99
+python tools/check_coverage_ratchet.py coverage.json   # the real gate: 0 missed lines + branch budget
 ruff check . --exclude 'tests/fixtures/challenge_mirror'
 ```
 

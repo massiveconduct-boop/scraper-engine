@@ -980,6 +980,11 @@ match CI instead of the reverse.
 ## Decision: Coverage Gate — One Combined Run in `chaos`, Not Per-Job
 
 **Date:** 2026-07-29 | **Round:** 28
+**Status:** the one-combined-run shape below still holds. The
+`--cov-fail-under=100` figure does NOT — round 62 enabled branch coverage
+and moved the real gate to `tools/check_coverage_ratchet.py`; the flag is
+now a coarse `99` safety net. See "Two Separate Gates, Not One Percentage
+(Round 62)" at the end of this file.
 
 **What:** `--cov=src/scraper_engine --cov-fail-under=100` runs once, in the
 `chaos` job's final pytest invocation (`tests/unit/ tests/integration/
