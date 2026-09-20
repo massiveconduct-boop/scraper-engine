@@ -88,6 +88,16 @@ _STALE_PROCESSING_GRACE_SECONDS = 120
 # write, not an entire wait-in-line.
 _STALE_PENDING_GRACE_SECONDS = 300
 _RQ_TERMINAL_STATUSES = {"failed", "finished", "stopped", "canceled"}
+# Round 62 — the rq-side places a non-terminal job can legitimately be
+# waiting. A job hash claiming "queued"/"started"/"deferred" while being
+# absent from every one of these is unreachable: no worker can ever pick it
+# up, because workers poll these structures, not the job hashes.
+_RQ_QUEUE_KEY = "rq:queue:scraper-jobs"
+_RQ_REGISTRY_ZSETS = (
+    "rq:started:scraper-jobs",
+    "rq:deferred:scraper-jobs",
+    "rq:scheduled:scraper-jobs",
+)
 
 
 async def _rq_job_status(redis: RedisClient, job_id: str) -> str | None:
@@ -99,6 +109,36 @@ async def _rq_job_status(redis: RedisClient, job_id: str) -> str | None:
     if raw is None:
         return None
     return raw.decode() if isinstance(raw, bytes) else raw
+
+
+async def _rq_job_is_reachable(redis: RedisClient, job_id: str) -> bool:
+    """True if a worker could still actually pick this job up.
+
+    Round 62. A non-terminal status on the job HASH is not sufficient
+    evidence that a job is alive, and trusting it alone was a real bug: 20
+    rows sat PENDING in Postgres for five weeks (2026-08-12 to 2026-08-27)
+    while the reaper logged `reconciled=0 still_processing=20` once a
+    minute, forever. Their `rq:job:*` hashes existed, said `status=queued`,
+    and carried TTL -1 — but the ids were in no queue and no registry, so
+    nothing was ever going to run them. rq workers consume the queue list
+    and the registries; an orphaned hash is invisible to them.
+
+    Checking reachability instead of believing the hash turns that
+    permanent stall into an ordinary reconcile. Deliberately fails SAFE:
+    any Redis error here returns True (assume alive), because wrongly
+    reconciling a genuinely queued job cancels real work, while wrongly
+    skipping one only costs another 60s sweep.
+    """
+    try:
+        if await redis.raw.lpos(_RQ_QUEUE_KEY, job_id) is not None:
+            return True
+        for zset in _RQ_REGISTRY_ZSETS:
+            if await redis.raw.zscore(zset, job_id) is not None:
+                return True
+    except Exception:
+        logger.exception("rq_reachability_check_failed job_id=%s", job_id)
+        return True
+    return False
 
 
 async def _reconcile_tenant(
@@ -121,8 +161,12 @@ async def _reconcile_tenant(
         job_id = str(row["job_id"])
         rq_status = await _rq_job_status(redis, job_id)
         if rq_status is not None and rq_status not in _RQ_TERMINAL_STATUSES:
-            still_processing += 1
-            continue
+            # Round 62 — a non-terminal status is only believable if the job
+            # is still reachable by a worker. See _rq_job_is_reachable.
+            if await _rq_job_is_reachable(redis, job_id):
+                still_processing += 1
+                continue
+            rq_status = f"{rq_status} (orphaned: in no queue or registry)"
 
         await pg.execute(
             tenant,

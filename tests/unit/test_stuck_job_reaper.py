@@ -153,9 +153,7 @@ class TestReconcileTenant:
     async def test_dispatches_webhook_when_configured(self, tenant, cfg, monkeypatch):
         pg = AsyncMock()
         redis = AsyncMock()
-        pg.fetch.return_value = [
-            {"job_id": "job-1", "webhook_url": "https://example.com/hook"}
-        ]
+        pg.fetch.return_value = [{"job_id": "job-1", "webhook_url": "https://example.com/hook"}]
         monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="failed"))
         dispatch_mock = AsyncMock()
         monkeypatch.setattr(
@@ -188,9 +186,7 @@ class TestReconcileTenant:
     ):
         pg = AsyncMock()
         redis = AsyncMock()
-        pg.fetch.return_value = [
-            {"job_id": "job-1", "webhook_url": "https://example.com/hook"}
-        ]
+        pg.fetch.return_value = [{"job_id": "job-1", "webhook_url": "https://example.com/hook"}]
         monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="failed"))
         monkeypatch.setattr(
             "scraper_engine.orchestrator.tasks._dispatch_job_webhook",
@@ -295,3 +291,102 @@ class TestMain:
         monkeypatch.setattr(stuck_job_reaper, "run", fake_run)
         stuck_job_reaper.main()
         assert calls["n"] == 1
+
+
+class TestRqJobIsReachable:
+    """Round 62 — a non-terminal status on the rq job HASH is not evidence
+    that a worker can still reach the job.
+
+    Live-found: 20 rows sat PENDING in Postgres from 2026-08-12 to
+    2026-08-27 while this reaper logged `reconciled=0 still_processing=20`
+    every 60s, forever. Their `rq:job:*` hashes existed, reported
+    `status=queued`, and had TTL -1 — but the ids were in no queue and no
+    registry, so no worker was ever going to run them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reachable_when_still_in_the_queue_list(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = 3
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+        redis.raw.lpos.assert_awaited_once_with("rq:queue:scraper-jobs", "job-1")
+
+    @pytest.mark.asyncio
+    async def test_reachable_when_in_a_registry_zset(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.zscore.side_effect = [None, 1234.0, None]
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+
+    @pytest.mark.asyncio
+    async def test_orphan_in_no_queue_and_no_registry(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.zscore.return_value = None
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is False
+
+    @pytest.mark.asyncio
+    async def test_redis_error_fails_safe_as_reachable(self):
+        """Wrongly reconciling a genuinely queued job cancels real work;
+        wrongly skipping one costs another 60s sweep. Errors pick the
+        cheaper mistake."""
+        redis = AsyncMock()
+        redis.raw.lpos.side_effect = RuntimeError("redis exploded")
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+
+
+class TestOrphanedQueuedJobReconciliation:
+    @pytest.mark.asyncio
+    async def test_queued_but_unreachable_job_is_reconciled(self, tenant, cfg, monkeypatch):
+        """The exact five-week stall, as a test: rq says "queued", nothing
+        can reach it, so it must be failed rather than counted as live."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = [{"job_id": "pending-job-1", "webhook_url": None}]
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="queued"))
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_is_reachable", AsyncMock(return_value=False))
+
+        reconciled, still_processing = await stuck_job_reaper._reconcile_tenant(
+            pg, redis, tenant, cfg
+        )
+
+        assert reconciled == 1
+        assert still_processing == 0
+        pg.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_queued_and_reachable_job_is_left_alone(self, tenant, cfg, monkeypatch):
+        """Real backlog: 3 workers, one shared queue. A job genuinely waiting
+        its turn must survive every sweep."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = [{"job_id": "pending-job-1", "webhook_url": None}]
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="queued"))
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_is_reachable", AsyncMock(return_value=True))
+
+        reconciled, still_processing = await stuck_job_reaper._reconcile_tenant(
+            pg, redis, tenant, cfg
+        )
+
+        assert reconciled == 0
+        assert still_processing == 1
+        pg.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_never_consults_reachability(self, tenant, cfg, monkeypatch):
+        """A terminal status is already decisive — no extra Redis round trips."""
+        pg = AsyncMock()
+        redis = AsyncMock()
+        pg.fetch.return_value = [{"job_id": "job-1", "webhook_url": None}]
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_status", AsyncMock(return_value="failed"))
+        reachable = AsyncMock(return_value=True)
+        monkeypatch.setattr(stuck_job_reaper, "_rq_job_is_reachable", reachable)
+
+        reconciled, _ = await stuck_job_reaper._reconcile_tenant(pg, redis, tenant, cfg)
+
+        assert reconciled == 1
+        reachable.assert_not_awaited()
