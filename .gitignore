@@ -22,3 +22,4 @@ profiles/
 !.claude/MEMORY.md
 .archive/
 .local/
+coverage.json

@@ -147,6 +147,62 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   `docker compose port api 8000` one-liner that resolves it instead of
   guessing.
 
+- **AUDIT (round 62) — the "real 100% coverage" was 100% of LINES on 7 of
+  12 packages.** Measured, not inferred: `branch = true` had never been set,
+  so the gate counted lines and never decisions. Whole-project figures with
+  branches on were **93.7% line / 88.6% branch**, against the headline 100%.
+  Two causes. (1) 33 decision branches inside the supposedly-100% files had
+  never been taken one way — `api/main.py` 9, `api/routes.py` 8,
+  `orchestrator/worker.py` 5, `fetcher/level_1.py` 3, and singles elsewhere.
+  Most are defensive one-siders (`api/main.py`'s nine are all lifespan
+  idempotency guards), but `fetcher/level_1.py:102`'s
+  `for _ in range(MAX_REDIRECTS)` loop is never driven to exhaustion, so
+  redirect-limit behaviour is unverified. (2) Four packages sit outside the
+  gate's `include` list entirely — `scrapy_project` (124 stmts, **0%**),
+  `cli` (174, 32.9%), `observability` (131, 67.2%), `config` (192, 99.0%).
+  `browser` (395, 92.2%) is measured-but-ungated by documented design.
+
+  **Test QUALITY, by contrast, is strong and was verified adversarially.**
+  Mutation spot-checks: 9 of 9 caught. Five in round-62 code (session
+  rotation, rotation budget, asn/country validator, reaper reachability,
+  startup retry) and — deliberately, to avoid grading its own work — four in
+  older untouched code (circuit-breaker clean-window reset, circuit-breaker
+  trip, SSRF guard validation, challenge detection). A further 3 of 3 were
+  caught inside UNGATED packages via integration tests reaching them
+  indirectly. Only 10 `pragma: no cover` exist, all `__main__` guards or one
+  metrics-safety `except`. 25 of 1082 tests have no assertion (2.3%), mostly
+  legitimate "must not raise" checks. **The finding is gate SCOPE, not test
+  quality** — do not let a future session read the numbers above as "the
+  tests are weak".
+
+- **FIXED (round 62) — coverage gate rebuilt as lines-plus-branch-ratchet.**
+  Turning branches on drops the combined figure to 99.33%, so a plain
+  `--cov-fail-under` had to fall to 99 — and that is strictly WEAKER than
+  what existed before, because a 0.67% allowance is roughly 33 statements of
+  line slack that did not exist previously. `tools/check_coverage_ratchet.py`
+  therefore holds the two guarantees separately and exactly: zero missed
+  lines (no tolerance, unchanged) and at most `BRANCH_BUDGET` missed
+  branches, an absolute count that cannot be diluted by adding code. The
+  budget is a true ratchet — the script FAILS when the real count drops
+  below it, forcing the constant down so an improvement is locked in rather
+  than becoming permission to regress later. All four behaviours were
+  negative-tested by exit code: budget too low → 1, budget too high → 1,
+  exact → 0, one injected missing line → 1. Wired into CI after the pytest
+  step (`.github/workflows/test.yml`).
+
+- **RESOLVED (round 62) — is `scrapy_project` dead code?** No, but only
+  partly live, and the answer needed the container to settle. `scrapy.cfg`
+  points `get_project_settings()` at
+  `scraper_engine.scrapy_project.settings`, and that resolution was verified
+  **inside the running worker container** (`/app/scrapy.cfg` present,
+  settings resolve): `TenantMiddleware`, `ProxyMiddleware`, `DedupPipeline`
+  and `StoragePipeline` all load on every `POST /v1/crawl`, with zero tests
+  anywhere. `spiders/generic_spider.py` (34 stmts) IS effectively dead —
+  `services/scrapy_adapter.py::_run_spider_subprocess` defines its own
+  `_DynamicSpider` inline and never references it, so it is reachable only
+  via a manual `scrapy crawl` from a shell, never through the API. Tracked
+  as T1 in `.wolf/STATUS.md`.
+
 - **FIXED (round 62) — the stuck-job reaper believed rq's status field
   over actual reachability, stalling 20 rows for five weeks.** Found while
   surveying live state, not from a report. `research_agent` had 20 jobs

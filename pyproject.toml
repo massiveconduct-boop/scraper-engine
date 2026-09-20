@@ -161,6 +161,13 @@ markers = [
 ]
 
 [tool.coverage.run]
+# Round 62 — branch coverage on. Line coverage alone reported 100% while 33
+# decision branches inside those same "100%" files had never been taken one
+# way (see .claude/knowledge/technical-debt.md round 62, coverage audit).
+# The 100%-lines guarantee is NOT relaxed by this: tools/check_coverage_
+# ratchet.py still fails on a single missed line, and additionally holds
+# missing branches to a budget that may only ever shrink.
+branch = true
 source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_engine/browser", "src/scraper_engine/fetcher", "src/scraper_engine/services", "src/scraper_engine/storage", "src/scraper_engine/orchestrator", "src/scraper_engine/api"]
 
 [tool.coverage.report]
@@ -168,5 +175,11 @@ source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_en
 # [tool.coverage.run] source except browser/, which needs a real Firefox
 # process (~80MB RSS, not available in CI runners) and is measured only
 # where possible (session_state, pool init) without being gated.
-fail_under = 100
+# Round 62 — with branch=true the combined figure is ~99.33%, so this is a
+# coarse safety net only. The REAL gate is tools/check_coverage_ratchet.py,
+# which enforces zero missed LINES (no tolerance, same as before) plus a
+# shrinking absolute budget for missed branches. A percentage alone cannot
+# express "100% of lines AND at most N branches", and lowering it to 99
+# without the ratchet would silently start tolerating ~33 missed lines.
+fail_under = 99
 include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*", "src/scraper_engine/fetcher/*", "src/scraper_engine/services/*", "src/scraper_engine/storage/*", "src/scraper_engine/api/*"]

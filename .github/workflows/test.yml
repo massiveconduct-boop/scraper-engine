@@ -209,7 +209,12 @@ jobs:
       # integration+chaos suite is actually run with --cov and enforced —
       # fail_under=100 in pyproject.toml was previously dead config that no
       # `pytest` invocation in this file ever passed --cov to.
-      - run: python -m pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=short --cov=src/scraper_engine --cov-report=term-missing --cov-report=xml --cov-fail-under=100
+      - run: python -m pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=short --cov=src/scraper_engine --cov-report=term-missing --cov-report=xml --cov-report=json:coverage.json --cov-fail-under=99
+      # Round 62 — the real gate. --cov-fail-under above is a coarse safety
+      # net that had to drop to 99 once branch coverage was switched on; this
+      # step restores the exact guarantee (zero missed lines) and adds a
+      # shrinking budget for missed branches. See the script's docstring.
+      - run: python tools/check_coverage_ratchet.py coverage.json
 
   # Builds and publishes the image CI has been proving works — only on a real
   # merge to main (never on pull_request, so a fork PR never gets registry

@@ -3219,3 +3219,42 @@ source-free index. Migration step for whoever owns OpenWolf: ship
 Python-aware defaults upstream, or track a committed config template.
 Until then the check is `grep -c "^## src" .wolf/anatomy.md` — zero means
 the index is lying.
+
+## Two Separate Gates, Not One Percentage (Round 62)
+
+**Decision:** enforce coverage with `tools/check_coverage_ratchet.py` —
+zero missed lines AND an absolute missed-branch budget — rather than a
+single `--cov-fail-under` number.
+
+**Why not just lower fail_under to 99:** it looks equivalent and is not.
+`fail_under` is one blended figure over lines and branches. Dropping it to
+99 to accommodate the 33 branches simultaneously buys ~33 statements of
+LINE slack that the project did not have before. The gate would have been
+loosened in the exact dimension it was already strong, in order to add
+coverage of a dimension it was weak in. Two guarantees that differ in kind
+need two checks.
+
+**Why an absolute count for branches, not a percentage:** a percentage
+budget grows as the codebase grows — add 1,000 covered statements and the
+same 33 uncovered branches quietly become "acceptable" against a larger
+denominator. A count cannot be diluted.
+
+**Why the ratchet fails when coverage IMPROVES:** the script errors if the
+real count is BELOW the budget, demanding the constant be lowered. Without
+that, a budget set once becomes standing permission to regress back up to
+it — the number would record the worst the project has ever been rather
+than the best. Failing on improvement is mildly annoying exactly once per
+improvement, and it is what makes it a ratchet rather than a ceiling.
+
+**Rejected:** `# pragma: no branch` on the 33. It would produce a green
+100% with branches enabled and hide the `fetcher/level_1.py` redirect-
+exhaustion gap, which is a real untested behaviour rather than a defensive
+guard. Marking untested logic as exempt to restore a round number is how
+the line gate came to overstate its own strength in the first place.
+
+**Scope deliberately unchanged:** `browser/` stays measured-but-ungated
+(needs a real Firefox CI runners lack — pre-existing, documented), and
+`cli`/`config`/`observability`/`scrapy_project` stay outside the gate for
+now. Widening scope and adding branch enforcement in one step would have
+made the CI failure impossible to attribute. Widening is tracked as T1/T3
+in `.wolf/STATUS.md`.
