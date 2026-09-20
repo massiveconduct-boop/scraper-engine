@@ -3155,3 +3155,67 @@ modes it cannot cover — an OOM kill, an import error from a half-rolled
 deploy — so no crash mode can latch FATAL permanently again. `startsecs=5`
 still makes a genuinely broken program obvious in the logs; it is retried
 rather than abandoned.
+
+## Reachability Over Reported Status, and Fail-Safe Direction (Round 62)
+
+**Decision:** the stuck-job reaper treats rq's own `status` field as a
+claim to be checked, not an answer, and when the check itself fails it
+assumes the job is ALIVE.
+
+**Why not trust the status field:** it was already the implementation, and
+it stalled 20 jobs for five weeks while logging a healthy-looking
+`reconciled=0 still_processing=20` every minute. A job hash saying
+"queued" while absent from the queue and every registry describes a job
+no worker can reach. rq's workers poll the queue list and the registries;
+the hash is bookkeeping, not routing. Reading bookkeeping and inferring
+routing was the bug.
+
+**Why fail safe toward "alive":** the two mistakes are not symmetric.
+Wrongly reconciling a genuinely queued job marks real, in-flight work as
+FAILED and fires a failure webhook at the tenant — visible, wrong, and
+unrecoverable. Wrongly skipping an orphan costs one more 60-second sweep.
+So every Redis error in the reachability check returns True. This is the
+opposite of the existing `_rq_job_status` convention, where a MISSING hash
+is treated as reconcilable — and deliberately so: absence of a hash is
+evidence, whereas a failed lookup is absence of evidence.
+
+**Rejected:** deleting the stale rows directly. They are real job history
+for a real tenant; marking them FAILED preserves the record and fires the
+same reconciliation webhook any other timeout would. A DELETE would have
+been faster and silently lossy.
+
+## Knowledge-Audit: Round-62 Catalog and Anatomy Findings
+
+**Context:** user asked for the knowledge system to be de-stale before
+starting a fresh session. Seven findings; the two structural ones are
+worth recording as decisions rather than just fixes.
+
+**`.claude/MEMORY.md` now indexes `.wolf/`.** The project runs two entry
+-point systems: `CLAUDE.md` → "Knowledge catalog: `.claude/MEMORY.md` —
+**Read this first**", and `CLAUDE.md`'s `@`-import of `.wolf/OPENWOLF.md`
+→ "`.wolf/STATUS.md` is the **first file** you read". Each declared itself
+primary and neither mentioned the other, so which set of documents a
+session discovered depended on which sentence it happened to act on. The
+catalog now lists all four `.wolf/` entry points. The `@` import was
+challenged per audit protocol and KEPT: it defines mandatory
+every-session protocol (read STATUS first, anatomy before file reads,
+cerebrum before code, buglog before bug fixes), which is the bar an
+always-loaded import has to clear.
+
+**Superseded sections state history, never current state.** STATUS.md's
+round-61 section had grown to ~205 lines carrying live figures ("zero new
+DLQ entries of any category since 2026-08-18", "`dlq_size` is still 610").
+Both were true when written and are false now. The content was verified
+present in `technical-debt.md` before trimming — grepped for `246`,
+`980f7af`, `repeat_interval`, `slot pool is shared` rather than trusting
+the existing "full account lives there" pointer, since a pointer can
+overclaim. Replaced with a pointer plus an explicit instruction to treat
+superseded figures as history and query the database for current state.
+
+**Not fixed, cannot be fixed here:** `.wolf/config.json` is gitignored, so
+the anatomy exclusion fix does not travel with the repo. A fresh clone
+gets the JavaScript-ecosystem defaults again and silently rebuilds a
+source-free index. Migration step for whoever owns OpenWolf: ship
+Python-aware defaults upstream, or track a committed config template.
+Until then the check is `grep -c "^## src" .wolf/anatomy.md` — zero means
+the index is lying.

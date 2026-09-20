@@ -147,6 +147,49 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
   `docker compose port api 8000` one-liner that resolves it instead of
   guessing.
 
+- **FIXED (round 62) — the stuck-job reaper believed rq's status field
+  over actual reachability, stalling 20 rows for five weeks.** Found while
+  surveying live state, not from a report. `research_agent` had 20 jobs
+  PENDING dated 2026-08-12 to 2026-08-27, and the reaper logged
+  `reconciled=0 still_processing=20` once a minute, indefinitely. Their
+  `rq:job:*` hashes existed, reported `status=queued` and carried TTL -1 —
+  but `LPOS rq:queue:scraper-jobs <id>` and every registry ZSET returned
+  nothing. rq workers consume the queue list and the registries, never the
+  job hashes, so a hash orphaned from both is unreachable and its job will
+  never run. `_reconcile_tenant` read the hash's status alone, saw a
+  non-terminal value, classified the rows as genuinely in flight, and
+  skipped them every sweep — the exact orphan class this daemon exists to
+  clear was invisible to it. Fix: `_rq_job_is_reachable()` now checks the
+  queue list plus the started/deferred/scheduled registries before
+  believing a non-terminal status, and fails SAFE (any Redis error returns
+  True) because wrongly reconciling a live job cancels real work while
+  wrongly skipping one costs another 60s sweep. Terminal statuses stay
+  decisive on their own and skip the extra round trips. Live-verified: the
+  first sweep after deploy logged `reconciled=21 still_processing=0` (the
+  20 PENDING rows plus one stuck PROCESSING row) and the tenant now reports
+  zero jobs in either state, with live traffic unaffected throughout.
+
+- **FIXED (round 62) — `.wolf/anatomy.md` tracked 541 files and not one of
+  them was source code.** `CLAUDE.md` and `.wolf/OPENWOLF.md` both instruct
+  every session to consult `anatomy.md` before opening any file, and to
+  fall back to Grep only for files it doesn't list. It listed `.venv/`
+  site-packages internals, `.mypy_cache/`, `.pytest_cache/`, `.ruff_cache/`
+  and `.archive/` — `grep -c "^## src" .wolf/anatomy.md` returned **0**.
+  Root cause: `.wolf/config.json`'s `anatomy.exclude_patterns` ships a
+  JavaScript-ecosystem default list (`node_modules`, `.next`, `.nuxt`,
+  `dist`, `build`) with no Python equivalents, so the 500-file cap was
+  consumed alphabetically long before the scan reached `src/`. Every
+  session following the documented protocol got a directory listing of
+  third-party libraries and learned nothing about this project. Fix: added
+  Python/tooling exclusions (`.venv`, `site-packages`, `.mypy_cache`,
+  `.pytest_cache`, `.ruff_cache`, `.archive`, `egg-info`, `profiles`,
+  `htmlcov`, compiled/artifact globs) and re-ran `openwolf scan` — now 310
+  files with all 18 `src/scraper_engine/` packages present. NOTE:
+  `.wolf/config.json` is gitignored, so this fix does NOT travel with the
+  repo; a fresh clone starts with the JS defaults again. Re-check with
+  `grep -c "^## src" .wolf/anatomy.md` (expect >0) after any clone or
+  OpenWolf upgrade.
+
 - **FIXED (round 62, pre-existing) — the coverage gate was already red on
   `main`.** `orchestrator/circuit_breaker.py:160` (the clean-window reset in
   `record_success`) was uncovered at HEAD, verified by stashing this round's

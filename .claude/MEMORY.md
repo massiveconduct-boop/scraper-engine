@@ -8,6 +8,23 @@ of every file in `.claude/knowledge/`), not duplicated here — open the
 document once it looks relevant, don't expect the full picture from this
 table alone.
 
+## Session Entry Points (`.wolf/`, OpenWolf-managed)
+
+These are not `.claude/knowledge/` documents, but `CLAUDE.md`'s `@`-import
+of `.wolf/OPENWOLF.md` makes reading them mandatory protocol every session.
+They were absent from this catalog until a round-62 audit — so a session
+that started from this file alone never learned they existed, while a
+session that started from `OPENWOLF.md` never learned this catalog existed.
+Both halves are listed here now; the division of labour is in
+`decisions.md` → "OpenWolf ↔ `.claude/knowledge/` Division of Labor".
+
+| Document | Purpose | When to read |
+|---|---|---|
+| `.wolf/STATUS.md` | Rolling CURRENT-state handoff: concluded work, next quest, live runtime config, useful commands. Deliberately NOT a history — only the last ~3 rounds carry detail, older ones are one clause pointing at `technical-debt.md` | FIRST file of every resumed session |
+| `.wolf/cerebrum.md` | Session-local capture: User Preferences, Key Learnings, Do-Not-Repeat (dated gotchas), Decision Log | Before generating code; before repeating a past approach |
+| `.wolf/buglog.json` | Structured bug memory — error message, root cause, fix, tags | Before debugging anything; the fix may already be recorded |
+| `.wolf/anatomy.md` | Token-efficient file index (~310 files) with per-file descriptions and token estimates. Regenerate with `openwolf scan`; exclusions live in `.wolf/config.json` | Before opening any file, to avoid a full read |
+
 ## Architecture & Design
 
 | Document | Purpose | When to read |
