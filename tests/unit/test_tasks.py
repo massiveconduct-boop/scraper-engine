@@ -751,3 +751,30 @@ async def test_a_crawl_with_no_seeds_scores_no_proxy(monkeypatch):
     assert results == []
     _FakeProxyManager.instance.mark_success.assert_not_awaited()
     _FakeProxyManager.instance.mark_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_job_tolerates_a_provider_without_force_flush(fake_clients, monkeypatch):
+    """Round 64 (branch burn-down) — the default no-op tracer provider has no
+    force_flush at all; the job's finally block must not assume one."""
+    from opentelemetry import trace
+
+    class _BareProvider:
+        def get_tracer(self, *_a, **_k):
+            return trace.NoOpTracer()
+
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: _BareProvider())
+    monkeypatch.setattr(
+        tasks_module,
+        "_run_scrape",
+        AsyncMock(return_value=JobStatusResponse(job_id="job-noflush", status=JobStatus.COMPLETED)),
+    )
+    monkeypatch.setattr(
+        "scraper_engine.orchestrator.webhook.WebhookDispatcher.deliver",
+        AsyncMock(return_value=True),
+    )
+    pg, *_ = fake_clients
+
+    await tasks_module._run_scrape_job("system", "job-noflush")
+
+    assert pg.stop.await_count == 1

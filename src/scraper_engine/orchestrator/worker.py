@@ -191,10 +191,6 @@ class Worker:
         from scraper_engine.services.captcha_solver import build_captcha_solver
 
         self._captcha_solver = build_captcha_solver(CapSolverBudget(self._redis, pg=self._pg))
-        # Circuit breaker and politeness use raw Redis (not tenant-scoped),
-        # so pass the underlying client for system-level key operations
-        if hasattr(circuit_breaker, "_redis"):
-            pass  # already set by caller
         # Built once here (not per-fetch), same rationale as captcha_solver
         # above. None when neither FIRECRAWL_API_KEY nor FIRECRAWL_BASE_URL
         # is set — markdown conversion is simply skipped (round 29 — moved

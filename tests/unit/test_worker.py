@@ -2503,6 +2503,65 @@ class TestEscalationReasons:
         assert response.results[0].escalations is None
 
 
+class TestBranchBurnDown:
+    """Round 64 — branches the coverage ratchet counted as never taken."""
+
+    @pytest.mark.asyncio
+    async def test_bypass_cache_never_consults_the_cache(self, tenant, worker):
+        worker._check_cache = AsyncMock()
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com",
+                success=True,
+                level_used=1,
+                http_status=200,
+                html="<html><body>" + "real content " * 80 + "</body></html>",
+                duration_ms=1,
+            )
+        )
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")],
+            config_overrides=ConfigOverrides(bypass_cache=True),
+        )
+        response = await worker.process_job(tenant, "job-bypass", request)
+        worker._check_cache.assert_not_awaited()
+        assert "cache_check_ms" not in response.results[0].timings
+
+    @pytest.mark.asyncio
+    async def test_a_cache_hit_without_a_result_callback(self, tenant, worker):
+        cached = FetchResult(
+            url="http://example.com", success=True, level_used=2, duration_ms=0, from_cache=True
+        )
+        worker._check_cache = AsyncMock(return_value=cached)
+        worker._fetch_url = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        response = await worker.process_job(tenant, "job-cached", request)
+        assert response.results[0].from_cache is True
+        worker._fetch_url.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_retry_that_yields_nothing_keeps_the_blocked_result(
+        self, tenant, worker
+    ):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        blocked = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            duration_ms=1,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            proxy_source="pool",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[blocked, None] * 3)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        response = await worker.process_job(tenant, "job-retry-none", request)
+        assert response.results[0].success is False
+        assert response.results[0].failure_category == FailureCategory.DETECTION_BLOCK
+
+
 class TestPolitenessTimeoutStreaming:
     @pytest.mark.asyncio
     async def test_slot_timeout_result_is_streamed_to_on_result(self, tenant, worker):

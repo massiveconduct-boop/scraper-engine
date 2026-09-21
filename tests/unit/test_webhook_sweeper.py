@@ -260,3 +260,21 @@ class TestMain:
         monkeypatch.setattr(webhook_sweeper, "run", fake_run)
         webhook_sweeper.main()
         assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_counts_only_delivered_and_retrying(tenant, webhook_cfg, monkeypatch):
+    """Round 64 (branch burn-down) — a dead-lettered entry is neither
+    delivered nor still pending, so it must not land in either count."""
+    monkeypatch.setattr(
+        webhook_sweeper.WebhookOutbox,
+        "list_pending",
+        AsyncMock(return_value=[make_entry(), make_entry(), make_entry()]),
+    )
+    monkeypatch.setattr(
+        webhook_sweeper,
+        "_deliver_entry",
+        AsyncMock(side_effect=["delivered", "retrying", "dead"]),
+    )
+    counts = await webhook_sweeper._sweep_tenant(AsyncMock(), tenant, webhook_cfg, AsyncMock())
+    assert counts == (1, 1)

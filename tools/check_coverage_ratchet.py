@@ -61,7 +61,13 @@ GATED_PREFIXES = (
 # burn-down: the gateway retry lost its `level == url_levels[-1]` clause, and
 # BrowserPool's eviction moved into core/budget.py, which is tested
 # directly.
-BRANCH_BUDGET = 28
+# 2026-09-21 (round 64): 0 — the T2 burn-down. Every remaining branch got a
+# test, except two that were wrong code rather than untested code:
+# orchestrator/worker.py's `if hasattr(circuit_breaker, "_redis"): pass`
+# (a no-op, deleted) and api/routes.py's "is storage wired?" conditionals on
+# /v1/scrape and /v1/crawl, which silently skipped persisting, charging or
+# queueing a job and still answered 200 — now a 503 up front.
+BRANCH_BUDGET = 0
 
 
 def main() -> int:

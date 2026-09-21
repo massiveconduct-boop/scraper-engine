@@ -1542,3 +1542,55 @@ async def test_get_job_phase_durations_are_none_before_the_transitions(wired_dep
 
     assert resp.queued_ms is None
     assert resp.runtime_ms is None
+
+
+# --- Round 64: required dependencies + branch burn-down ----------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["_storage_pg", "_storage_redis", "_queue"])
+@pytest.mark.parametrize("endpoint", ["scrape", "crawl"])
+async def test_missing_storage_or_queue_is_503_not_a_phantom_job(
+    wired_scrape_deps, monkeypatch, missing, endpoint
+):
+    """With pg missing these endpoints used to answer 200 with a job id that
+    was never saved; with Redis missing they skipped the quota charge; with
+    the queue missing they saved a PENDING row nothing would ever run."""
+    from scraper_engine.core.models import CrawlRequest, ScrapeRequest
+
+    monkeypatch.setattr(deps, missing, None)
+    with pytest.raises(HTTPException) as ei:
+        if endpoint == "scrape":
+            await scrape(ScrapeRequest(urls=["http://example.com"]), x_api_key="sk-admin")
+        else:
+            await crawl(
+                CrawlRequest(spider_name="t", start_urls=["http://example.com"]),
+                x_api_key="sk-admin",
+            )
+    assert ei.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_without_a_queue_still_cancels_cooperatively(wired_cancel_deps, monkeypatch):
+    pg, _queue = wired_cancel_deps
+    pg.fetchrow.return_value = {"status": "CANCELLED"}
+    monkeypatch.setattr(deps, "_queue", None)
+    resp = await cancel_job(str(uuid.uuid4()), x_api_key="sk-admin")
+    assert resp["status"] == "CANCELLED"
+
+
+def test_metrics_endpoint_skips_redis_gauges_without_redis(monkeypatch):
+    monkeypatch.setattr(deps, "_storage_pg", MagicMock())
+    monkeypatch.setattr(deps, "_storage_redis", None)
+    capsolver = AsyncMock(return_value=None)
+    for name, mock in [
+        ("count_validated_proxies", AsyncMock(return_value=0)),
+        ("refresh_dlq_size", AsyncMock(return_value=None)),
+        ("refresh_capsolver_spend", capsolver),
+        ("refresh_redis_backed_counters", AsyncMock(return_value=None)),
+        ("refresh_proxy_source_health", AsyncMock(return_value=None)),
+    ]:
+        monkeypatch.setattr(f"scraper_engine.observability.metrics.{name}", mock)
+    resp = TestClient(_metrics_app()).get("/metrics")
+    assert resp.status_code == 200
+    capsolver.assert_not_awaited()

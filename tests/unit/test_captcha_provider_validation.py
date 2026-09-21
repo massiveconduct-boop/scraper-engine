@@ -89,3 +89,28 @@ async def test_absent_keys_report_not_configured(monkeypatch):
         "balance": None,
         "detail": "no key set",
     }
+
+
+@pytest.mark.asyncio
+async def test_plan_check_is_nocaptcha_only_and_optional(monkeypatch):
+    """Round 64 (branch burn-down) — a working CapSolver key never gets a
+    NoCaptchaAI plan check, and a NoCaptchaAI client without
+    has_active_plan (older client) is reported on balance alone."""
+    monkeypatch.setenv("NOCAPTCHA_AI_API_KEY", "nk")
+    monkeypatch.setenv("CAPSOLVER_API_KEY", "ck")
+
+    class _NoPlanClient:
+        async def get_balance(self):
+            return 3.0
+
+    capsolver_client = MagicMock(spec=["get_balance"], get_balance=AsyncMock(return_value=7.0))
+    monkeypatch.setattr(nocaptcha, "NoCaptchaAIClient", MagicMock(return_value=_NoPlanClient()))
+    monkeypatch.setattr(capsolver, "CapSolverClient", MagicMock(return_value=capsolver_client))
+
+    r = await validate_captcha_keys()
+
+    assert r["nocaptchaai"]["ok"] is True
+    assert "has_active_plan" not in r["nocaptchaai"]
+    assert r["capsolver"]["ok"] is True
+    assert r["capsolver"]["balance"] == 7.0
+    assert "has_active_plan" not in r["capsolver"]

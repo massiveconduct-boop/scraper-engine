@@ -257,6 +257,23 @@ class TestProxyManager:
         assert new_score >= 70.0
 
     @pytest.mark.asyncio
+    async def test_mark_success_scores_a_never_validated_proxy(self, tenant):
+        """Round 64 (branch burn-down) — last_validated is NULL for a proxy
+        that was harvested but never validated; recency must be treated as
+        unknown, not crash on `now - None`."""
+        pg = AsyncMock()
+        pg.fetchrow.return_value = {
+            "anonymity_level": "elite",
+            "asn_class": "residential",
+            "response_time_ms": 50,
+            "global_success_count": 1,
+            "global_failure_count": 0,
+            "last_validated": None,
+        }
+        await ProxyManager(redis=AsyncMock(), pg=pg).mark_success(tenant, "1.2.3.4", 8080)
+        assert 0.0 <= pg.execute.await_args.args[2] <= 100.0
+
+    @pytest.mark.asyncio
     async def test_mark_success_no_matching_row_is_a_noop(self, tenant):
         """A proxy that no longer exists in the pool (e.g. reaped between
         lease and use) must not crash — fetchrow returning None short-circuits."""
