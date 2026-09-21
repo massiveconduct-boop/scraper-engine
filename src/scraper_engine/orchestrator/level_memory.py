@@ -69,24 +69,49 @@ class LevelMemory:
     def _probe_key(tenant_id: TenantId, domain: str) -> str:
         return f"levelhint:probe:{tenant_id}:{domain}"
 
-    async def start_level(self, tenant_id: TenantId, domain: str, levels: list[int]) -> int:
-        """The level to enter the ladder at for the next URL of `domain`.
+    @staticmethod
+    def _pool_block_key(tenant_id: TenantId, domain: str) -> str:
+        return f"levelhint:poolblock:{tenant_id}:{domain}"
 
-        Returns `levels[0]` (i.e. no change) when memory is disabled, when
-        there is no hint yet, when this call is the periodic re-probe, or on
-        any Redis error. A hint outside `levels` — because the caller
-        narrowed the ladder with max_level — is clamped into it rather than
-        ignored, so `max_level=2` against an L3 hint still starts at 2.
+    async def plan(
+        self, tenant_id: TenantId, domain: str, levels: list[int]
+    ) -> tuple[int, bool]:
+        """(level to enter the ladder at, whether to skip the free proxy pool)
+        for the next URL of `domain`.
+
+        Returns `(levels[0], False)` — no change — when memory is disabled,
+        when this call is the periodic re-probe, or on any Redis error. One
+        re-probe counter covers both hints, so a re-probe URL retries the
+        full ladder AND the free pool. A level hint outside `levels` (the
+        caller narrowed the ladder with max_level) is clamped into it rather
+        than ignored, so `max_level=2` against an L3 hint still starts at 2.
+
+        Round 64 added the pool hint. A live cold run showed a domain that
+        refuses free datacenter exits (Jumia: 403 at L2 from every pool
+        proxy, 200 through the gateway) paying a doomed pool attempt — two
+        browsers, 40-94s — on every URL before the gateway retry that always
+        worked, and the browser churn from those doomed attempts queued the
+        retries behind them. The pool hint skips it the same way the level
+        hint skips doomed levels.
         """
         if not self._config.level_memory_enabled:
-            return levels[0]
+            return levels[0], False
         try:
             if await self._is_reprobe(tenant_id, domain):
-                return levels[0]
+                return levels[0], False
             raw = await self._raw.get(self._hint_key(tenant_id, domain))
+            pool_blocked = await self._raw.get(self._pool_block_key(tenant_id, domain))
         except Exception:
             logger.warning("level_memory_read_failed domain=%s", domain, exc_info=True)
-            return levels[0]
+            return levels[0], False
+        return self._clamp(raw, levels), pool_blocked is not None
+
+    async def start_level(self, tenant_id: TenantId, domain: str, levels: list[int]) -> int:
+        """The level half of plan()."""
+        return (await self.plan(tenant_id, domain, levels))[0]
+
+    @staticmethod
+    def _clamp(raw: Any, levels: list[int]) -> int:
         if raw is None:
             return levels[0]
         try:
@@ -95,6 +120,29 @@ class LevelMemory:
             return levels[0]
         # Never start below the caller's own floor, never above its ceiling.
         return min(max(hint, levels[0]), levels[-1])
+
+    async def record_pool_blocked(self, tenant_id: TenantId, domain: str) -> None:
+        """A free-pool attempt was blocked and the gateway retry at the same
+        level was not — this domain refuses the pool, not the level."""
+        if not self._config.level_memory_enabled:
+            return
+        try:
+            await self._raw.set(
+                self._pool_block_key(tenant_id, domain),
+                "1",
+                ex=self._config.level_memory_ttl_seconds,
+            )
+        except Exception:
+            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
+
+    async def record_pool_ok(self, tenant_id: TenantId, domain: str) -> None:
+        """A free-pool proxy produced usable content — drop the pool hint."""
+        if not self._config.level_memory_enabled:
+            return
+        try:
+            await self._raw.delete(self._pool_block_key(tenant_id, domain))
+        except Exception:
+            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
 
     async def _is_reprobe(self, tenant_id: TenantId, domain: str) -> bool:
         """True once every `reprobe_every` calls for this domain."""

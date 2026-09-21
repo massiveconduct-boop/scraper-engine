@@ -2562,6 +2562,92 @@ class TestBranchBurnDown:
         assert response.results[0].failure_category == FailureCategory.DETECTION_BLOCK
 
 
+class TestPoolHintWiring:
+    """Round 64 — a domain that refuses the free pool skips it."""
+
+    def _gateway_worker(self, worker):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        return worker
+
+    @staticmethod
+    def _good(source):
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=1,
+            proxy_source=source,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_known_pool_block_goes_straight_to_the_gateway(self, tenant, worker):
+        worker = self._gateway_worker(worker)
+        worker._level_memory.plan = AsyncMock(return_value=(2, True))
+        worker._fetch_url = AsyncMock(return_value=self._good("paid_gateway"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-pool-hint", request)
+        assert worker._fetch_url.await_count == 1
+        assert worker._fetch_url.await_args.kwargs["force_gateway"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_hint_is_ignored_without_a_gateway(self, tenant, worker):
+        worker._level_memory.plan = AsyncMock(return_value=(2, True))
+        worker._fetch_url = AsyncMock(return_value=self._good("pool"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-pool-hint-free-only", request)
+        assert worker._fetch_url.await_args.kwargs["force_gateway"] is False
+
+    @pytest.mark.asyncio
+    async def test_pool_blocked_then_gateway_ok_records_the_hint(self, tenant, worker):
+        worker = self._gateway_worker(worker)
+        worker._level_memory.plan = AsyncMock(return_value=(2, False))
+        worker._level_memory.record_pool_blocked = AsyncMock()
+        blocked = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=403,
+            html="<html>forbidden</html>",
+            duration_ms=1,
+            proxy_source="pool",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[blocked, self._good("paid_gateway")])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-pool-block", request)
+        worker._level_memory.record_pool_blocked.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_retry_that_is_also_blocked_records_nothing(self, tenant, worker):
+        worker = self._gateway_worker(worker)
+        worker._level_memory.plan = AsyncMock(return_value=(3, False))
+        worker._level_memory.record_pool_blocked = AsyncMock()
+        blocked = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            duration_ms=1,
+        )
+        worker._fetch_url = AsyncMock(side_effect=[blocked, blocked])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-both-blocked", request)
+        worker._level_memory.record_pool_blocked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_pool_success_clears_the_hint(self, tenant, worker):
+        worker._level_memory.plan = AsyncMock(return_value=(1, False))
+        worker._level_memory.record_pool_ok = AsyncMock()
+        worker._fetch_url = AsyncMock(return_value=self._good("pool"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-pool-ok", request)
+        worker._level_memory.record_pool_ok.assert_awaited_once()
+
+
 class TestPolitenessTimeoutStreaming:
     @pytest.mark.asyncio
     async def test_slot_timeout_result_is_streamed_to_on_result(self, tenant, worker):

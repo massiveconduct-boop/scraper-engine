@@ -376,7 +376,18 @@ class Worker:
                     return
 
             domain = self._extract_domain(url_str)
-            start_level = await self._level_memory.start_level(tenant_id, domain, levels)
+            start_level, pool_blocked = await self._level_memory.plan(tenant_id, domain, levels)
+            # Round 64 — a domain known to refuse the free pool goes straight
+            # to the gateway (see LevelMemory.plan). Only where the gateway
+            # fallback exists at all: under free_only there is nowhere to go.
+            gateway_first = pool_blocked and self._gateway_fallback_eligible
+            if gateway_first:
+                logger.info(
+                    "pool_skipped_known_block job_id=%s url=%s domain=%s",
+                    job_id,
+                    url_str,
+                    domain,
+                )
             # An explicit min_level is the caller's own floor and already
             # narrowed `levels`, so the hint can only move the start UP from
             # there — never below what the caller asked for.
@@ -511,7 +522,7 @@ class Worker:
                             url_str,
                             level,
                             request.config_overrides,
-                            force_gateway=circuit_open,
+                            force_gateway=circuit_open or gateway_first,
                         )
                     level_ms = int((time.monotonic() - level_start) * 1000)
                     timings[f"level_{level}_ms"] = level_ms
@@ -599,6 +610,11 @@ class Worker:
                         if gateway_result is not None:
                             result = gateway_result
                             last_level_result = result
+                            if not self._looks_blocked(gateway_result):
+                                # The pool was blocked, the gateway at the
+                                # same level was not: the domain refuses the
+                                # pool, not this level.
+                                await self._level_memory.record_pool_blocked(tenant_id, domain)
 
                     if result.success:
                         await self._circuit_breaker.record_success(domain)
@@ -682,6 +698,8 @@ class Worker:
                         # would have taught a level whose "success" is about to
                         # be reclassified as a block.
                         await self._level_memory.record_success(tenant_id, domain, level)
+                        if result.proxy_source == "pool":
+                            await self._level_memory.record_pool_ok(tenant_id, domain)
                         if result.html:
                             extract_start = time.monotonic()
                             # FetchResult.extracted was declared on the model and

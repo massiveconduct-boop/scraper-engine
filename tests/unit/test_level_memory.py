@@ -140,3 +140,63 @@ def test_default_hint_lifetime_is_a_day():
     config = EscalationConfig()
     assert config.level_memory_ttl_seconds == 86400
     assert config.reprobe_every == 20
+
+
+class TestPoolHint:
+    """Round 64 — "this domain refuses the free proxy pool". A live cold run
+    paid a doomed pool attempt (two browsers, 40-94s) on every Jumia URL
+    before the gateway retry that always worked."""
+
+    def _memory(self, *, hint=None, pool=None, count=1, config=None):
+        redis = AsyncMock()
+        redis.raw.get.side_effect = lambda key: pool if "poolblock" in key else hint
+        redis.raw.incr.return_value = count
+        return LevelMemory(redis, config or EscalationConfig()), redis
+
+    @pytest.mark.asyncio
+    async def test_plan_reports_both_hints(self):
+        memory, _ = self._memory(hint="2", pool="1")
+        assert await memory.plan(TENANT, "a.example", LEVELS) == (2, True)
+
+    @pytest.mark.asyncio
+    async def test_no_pool_hint_uses_the_pool(self):
+        memory, _ = self._memory(hint="2")
+        assert await memory.plan(TENANT, "a.example", LEVELS) == (2, False)
+
+    @pytest.mark.asyncio
+    async def test_a_reprobe_retries_the_pool_too(self):
+        memory, _ = self._memory(hint="3", pool="1", count=20)
+        assert await memory.plan(TENANT, "a.example", LEVELS) == (1, False)
+
+    @pytest.mark.asyncio
+    async def test_disabled_memory_never_skips_the_pool(self):
+        memory, redis = self._memory(
+            pool="1", config=EscalationConfig(level_memory_enabled=False)
+        )
+        assert await memory.plan(TENANT, "a.example", LEVELS) == (1, False)
+        await memory.record_pool_blocked(TENANT, "a.example")
+        await memory.record_pool_ok(TENANT, "a.example")
+        redis.raw.set.assert_not_awaited()
+        redis.raw.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_record_pool_blocked_sets_the_hint_with_the_ttl(self):
+        memory, redis = self._memory()
+        await memory.record_pool_blocked(TENANT, "a.example")
+        redis.raw.set.assert_awaited_once_with(
+            "levelhint:poolblock:levelmem:a.example", "1", ex=86400
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_pool_ok_clears_the_hint(self):
+        memory, redis = self._memory()
+        await memory.record_pool_ok(TENANT, "a.example")
+        redis.raw.delete.assert_awaited_once_with("levelhint:poolblock:levelmem:a.example")
+
+    @pytest.mark.asyncio
+    async def test_redis_errors_never_fail_a_job(self):
+        memory, redis = self._memory()
+        redis.raw.set.side_effect = ConnectionError("redis down")
+        redis.raw.delete.side_effect = ConnectionError("redis down")
+        await memory.record_pool_blocked(TENANT, "a.example")
+        await memory.record_pool_ok(TENANT, "a.example")
