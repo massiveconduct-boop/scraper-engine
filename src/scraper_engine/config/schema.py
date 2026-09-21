@@ -417,6 +417,71 @@ class DlqReaperConfig(BaseModel):
     batch_size_per_tenant: int = 20
 
 
+class HostCapacityConfig(BaseModel):
+    """Round 65 — one browser budget per HOST, shared by every worker process
+    on it (orchestrator/host_capacity.py), sized by a pressure-driven controller
+    (orchestrator/capacity_controller.py).
+
+    Before this, each rq work-horse sized core.budget.BROWSER_SEMAPHORE as if
+    it owned the machine: 3 worker containers x 5 concurrent URLs put 15
+    renders on a 4-core host (load avg 58-69, measured live) and slowed every
+    one of them. Units, not browsers: a render costs `*_weight` units, and the
+    controller moves the host total between `min_units` and `max_units`.
+    `None` for max/default means "derive from the host's CPU count".
+    """
+
+    enabled: bool = False
+    min_units: float = Field(default=1.0, gt=0)
+    max_units: float | None = Field(default=None, gt=0)
+    # What workers use when the controller's target key is missing (controller
+    # down, or not started yet) — a safe static fallback, never "unlimited".
+    default_units: float | None = Field(default=None, gt=0)
+    camoufox_weight: float = Field(default=1.0, gt=0)
+    botasaurus_weight: float = Field(default=1.0, gt=0)
+    # While another tenant is waiting, one tenant holds at most
+    # ceil(target * tenant_share) units.
+    tenant_share: float = Field(default=0.6, gt=0, le=1)
+    lease_ttl_seconds: int = Field(default=90, ge=10)
+    renew_interval_seconds: int = Field(default=20, ge=1)
+    # A holder past this stops renewing (its seat returns to the pool within
+    # one lease TTL). The render itself is never cancelled from here.
+    max_hold_seconds: int = Field(default=900, ge=60)
+    waiter_ttl_seconds: int = Field(default=10, ge=2)
+    poll_min_seconds: float = Field(default=0.5, gt=0)
+    poll_max_seconds: float = Field(default=1.0, gt=0)
+    per_url_admission_cap_seconds: float = Field(default=1800.0, gt=0)
+    # Stop waiting this long before rq's own job deadline, so the URL still
+    # gets a CAPACITY_TIMEOUT row instead of being lost to rq's hard kill.
+    deadline_margin_seconds: float = Field(default=240.0, ge=0)
+    cancel_check_interval_seconds: float = Field(default=10.0, gt=0)
+    # Controller (orchestrator/capacity_controller.py).
+    controller_interval_seconds: int = Field(default=5, ge=1)
+    cpu_pressure_low: float = Field(default=40.0, ge=0, le=100)
+    cpu_pressure_high: float = Field(default=80.0, ge=0, le=100)
+    mem_available_floor_mb: int = Field(default=1536, ge=0)
+    raise_dwell_seconds: int = Field(default=30, ge=0)
+    cut_dwell_seconds: int = Field(default=15, ge=0)
+    cut_factor: float = Field(default=0.7, gt=0, lt=1)
+    target_ttl_seconds: int = Field(default=120, ge=10)
+
+    @model_validator(mode="after")
+    def bounds_are_coherent(self) -> HostCapacityConfig:
+        if self.max_units is not None and self.min_units > self.max_units:
+            raise ValueError(
+                f"host_capacity.min_units ({self.min_units}) exceeds max_units ({self.max_units})"
+            )
+        if self.cpu_pressure_low >= self.cpu_pressure_high:
+            raise ValueError("host_capacity.cpu_pressure_low must be below cpu_pressure_high")
+        if self.poll_min_seconds > self.poll_max_seconds:
+            raise ValueError("host_capacity.poll_min_seconds exceeds poll_max_seconds")
+        if self.renew_interval_seconds * 2 >= self.lease_ttl_seconds:
+            raise ValueError(
+                "host_capacity.renew_interval_seconds must be under half of "
+                "lease_ttl_seconds, so one missed renewal never loses a live lease"
+            )
+        return self
+
+
 class SessionRetentionConfig(BaseModel):
     browser_sessions_ttl_days: int = 30
     domain_ban_history_retention_days: int = 7
@@ -564,6 +629,7 @@ class AppConfig(BaseModel):
     proxy_tiers: ProxyTierConfig = Field(default_factory=ProxyTierConfig)
     dataimpulse: DataImpulseConfig = Field(default_factory=DataImpulseConfig)
     politeness: PolitenessConfig = Field(default_factory=PolitenessConfig)
+    host_capacity: HostCapacityConfig = Field(default_factory=HostCapacityConfig)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)

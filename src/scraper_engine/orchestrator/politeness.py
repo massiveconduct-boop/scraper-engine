@@ -27,9 +27,19 @@ if TYPE_CHECKING:
 # The key name changed with the type (`slots` -> `turns`): a SET and a ZSET
 # under one name would make old and new workers fail each other's calls with
 # WRONGTYPE for as long as both were running.
+#
+# The key's own TTL only ever grows (extend_ttl): orchestrator/host_capacity.py adds
+# members to the same key with a different lifetime than slot_ttl_seconds,
+# and a plain PEXPIRE from the shorter one would expire the key out from
+# under a longer-lived member.
 _NOW_MS_LUA = """
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local function extend_ttl(k, ms)
+    if redis.call('PTTL', k) < ms then
+        redis.call('PEXPIRE', k, ms)
+    end
+end
 """
 
 ACQUIRE_SLOT_LUA = (
@@ -42,7 +52,7 @@ local ttl_ms = tonumber(ARGV[3]) * 1000
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms)
 if redis.call('ZCARD', key) < max_concurrent then
     redis.call('ZADD', key, now_ms + ttl_ms, worker_id)
-    redis.call('PEXPIRE', key, ttl_ms)
+    extend_ttl(key, ttl_ms)
     return 1
 end
 return 0
@@ -61,8 +71,8 @@ return 1
 # without this the slot would expire under a live holder and be handed to
 # someone else while it was still fetching. Only refreshes a slot the caller
 # still holds and that has not already expired, so a released or expired slot
-# is never resurrected. The key's own TTL is re-armed too: it only has to
-# outlive the newest member, which this refresh just became.
+# is never resurrected. The key's own TTL is extended too, so it outlives
+# this refreshed member.
 REFRESH_SLOT_LUA = (
     _NOW_MS_LUA
     + """
@@ -72,7 +82,7 @@ local ttl_ms = tonumber(ARGV[2]) * 1000
 local expires_at = tonumber(redis.call('ZSCORE', key, worker_id) or '0')
 if expires_at > now_ms then
     redis.call('ZADD', key, 'XX', now_ms + ttl_ms, worker_id)
-    redis.call('PEXPIRE', key, ttl_ms)
+    extend_ttl(key, ttl_ms)
     return 1
 end
 return 0
@@ -115,6 +125,18 @@ return next_at - now_ms
 """
 
 
+def slot_key(domain: str, tenant_id: TenantId) -> str:
+    """Where a tenant's live slots on one domain are kept. Shared with
+    orchestrator/host_capacity.py, whose browser claims take a slot on this same key."""
+    return f"politeness:turns:{tenant_id}:{domain}"
+
+
+def delay_key(domain: str, tenant_id: TenantId) -> str:
+    """Where a tenant's next allowed fetch instant on one domain is kept
+    (milliseconds, Redis clock). Shared with orchestrator/host_capacity.py."""
+    return f"politeness:last:{tenant_id}:{domain}"
+
+
 class PolitenessController:
     """Atomic concurrency + delay controller for per-domain politeness.
 
@@ -143,10 +165,10 @@ class PolitenessController:
         self._slot_ttl = slot_ttl_seconds
 
     def _slot_key(self, domain: str, tenant_id: TenantId) -> str:
-        return f"politeness:turns:{tenant_id}:{domain}"
+        return slot_key(domain, tenant_id)
 
     def _last_fetch_key(self, domain: str, tenant_id: TenantId) -> str:
-        return f"politeness:last:{tenant_id}:{domain}"
+        return delay_key(domain, tenant_id)
 
     async def acquire_slot(
         self, domain: str, tenant_id: TenantId, *, concurrency: int | None = None

@@ -181,6 +181,15 @@ politeness:
   max_request_concurrency: 10
   min_request_delay_seconds: 0.5
 
+# Round 65 — host-wide browser admission (orchestrator/host_capacity.py). Off until
+# live-verified; see config/schema.py::HostCapacityConfig for every knob.
+host_capacity:
+  enabled: false
+  min_units: 1.0
+  tenant_share: 0.6
+  lease_ttl_seconds: 90
+  renew_interval_seconds: 20
+
 escalation:
   level_memory_enabled: true
   level_memory_ttl_seconds: 86400
