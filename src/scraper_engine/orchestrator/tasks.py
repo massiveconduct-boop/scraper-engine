@@ -55,15 +55,34 @@ logger = logging.getLogger(__name__)
 # module-level code is the right place to bootstrap once, rather than
 # reconfiguring logging/tracing (or resizing the budget semaphores) on every
 # single job inside _run_scrape_job.
+def _warn_if_ceiling_below_url_concurrency(browser_ceiling: int, urls_per_job: int) -> None:
+    """Round 64 — AppConfig rejects a CONFIGURED browser ceiling below the
+    per-job URL concurrency, but the RAM-aware cap can lower the real ceiling
+    at startup, which config validation cannot see. Say so once, loudly,
+    rather than letting jobs quietly queue on BROWSER_SEMAPHORE."""
+    if browser_ceiling < urls_per_job:
+        logger.warning(
+            "browser_ceiling_below_url_concurrency ceiling=%d "
+            "max_concurrent_urls_per_job=%d — the RAM-aware cap lowered the "
+            "browser ceiling; URLs beyond it will queue for a browser",
+            browser_ceiling,
+            urls_per_job,
+        )
+
+
 _bootstrap_cfg = load_config()
 bootstrap_observability(_bootstrap_cfg.observability)
+_browser_ceiling = resolve_browser_max_total_instances(
+    _bootstrap_cfg.camoufox.max_total_instances,
+    enabled=_bootstrap_cfg.camoufox.ram_aware_concurrency_enabled,
+    average_ram_per_instance_gb=_bootstrap_cfg.camoufox.ram_aware_avg_instance_gb,
+)
 configure_budget(
-    browser_max_total_instances=resolve_browser_max_total_instances(
-        _bootstrap_cfg.camoufox.max_total_instances,
-        enabled=_bootstrap_cfg.camoufox.ram_aware_concurrency_enabled,
-        average_ram_per_instance_gb=_bootstrap_cfg.camoufox.ram_aware_avg_instance_gb,
-    ),
+    browser_max_total_instances=_browser_ceiling,
     capsolver_max_concurrent_solves=_bootstrap_cfg.capsolver.max_concurrent_solves,
+)
+_warn_if_ceiling_below_url_concurrency(
+    _browser_ceiling, _bootstrap_cfg.politeness.max_concurrent_urls_per_job
 )
 
 

@@ -574,3 +574,25 @@ class AppConfig(BaseModel):
     session_retention: SessionRetentionConfig = Field(default_factory=SessionRetentionConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     dlq_reaper: DlqReaperConfig = Field(default_factory=DlqReaperConfig)
+
+    @model_validator(mode="after")
+    def url_concurrency_fits_the_browser_ceiling(self) -> AppConfig:
+        """Round 64 — `politeness.max_concurrent_urls_per_job` and
+        `camoufox.max_total_instances` were tuned independently and nothing
+        related them. Every in-flight URL can need a live browser at L2/L3, so
+        a job allowed more concurrent URLs than the process allows browsers
+        just queues the excess on BROWSER_SEMAPHORE while holding their
+        politeness slots — slower than asking for fewer URLs, and a config
+        nobody chose on purpose. Both are per rq work-horse (one job per
+        process), so this is the comparison that matters. The RAM-aware cap
+        can still lower the real ceiling at startup; orchestrator/tasks.py
+        warns when it does."""
+        urls = self.politeness.max_concurrent_urls_per_job
+        browsers = self.camoufox.max_total_instances
+        if urls > browsers:
+            raise ValueError(
+                f"politeness.max_concurrent_urls_per_job ({urls}) exceeds "
+                f"camoufox.max_total_instances ({browsers}); each in-flight URL "
+                "can need its own browser"
+            )
+        return self
