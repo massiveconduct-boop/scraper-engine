@@ -580,6 +580,37 @@ every detail: `.claude/knowledge/technical-debt.md`'s round-42 entry.
 
 ---
 
+### Browser Permits Across Engines (Round 64)
+
+`core.budget.BROWSER_SEMAPHORE` is the process-wide ceiling on live
+browsers. Every engine takes a permit through
+`core.budget.acquire_browser_permit()`:
+
+- **Reclaim on arrival.** While no permit is free it calls registered
+  reclaimers — `BrowserPool._evict_oldest_spare`, held by weak reference —
+  each of which closes one PARKED instance (never one mid-fetch). With
+  nothing left to reclaim it waits: genuine contention.
+- **Hand over on return.** While blocked it counts as a waiter
+  (`permit_waiters()`); `BrowserPool.release(healthy=True)` closes a
+  returning instance instead of parking it when someone is waiting and no
+  permit is free.
+- `CamoufoxWrapper.__aenter__` and `BotasaurusWrapper` hold their permit for
+  the browser's life / the one-shot fetch. `BotasaurusPool` holds one only
+  while a fetch runs; a parked driver holds none (a parked permit-holder is
+  the round-63 deadlock), and parked drivers are bounded by
+  `botasaurus.max_pooled_drivers` instead.
+- `XVFB_LOCK` covers display spinup and teardown only (launch/close), never
+  navigation — except `BotasaurusWrapper`'s one-shot `@browser` path, which
+  has no seam to split.
+
+**Sizing.** Every figure here is per rq work-horse: each container runs one
+job at a time in its own forked process with its own semaphore, so a host's
+worst case is containers × `camoufox.max_total_instances`.
+`AppConfig` rejects `politeness.max_concurrent_urls_per_job` above
+`camoufox.max_total_instances`; the RAM-aware cap can still lower the real
+ceiling at startup, and `orchestrator/tasks.py` logs
+`browser_ceiling_below_url_concurrency` when it does.
+
 ## PgBouncer
 
 **Architecture:** `pgbouncer-init` Docker service auto-regenerates SCRAM userlist from Postgres `pg_authid.rolpassword`. PgBouncer mounts shared volume. Zero manual steps.

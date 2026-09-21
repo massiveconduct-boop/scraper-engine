@@ -640,3 +640,34 @@ check on an unexpected live-test failure before assuming the code under
 test is broken — a `SSRFBlockedError`/`NETWORK_TIMEOUT`/etc. failure
 category means the *test's own target address* is the problem, not the
 escalation ladder.
+
+## Why Did This URL Climb to L3? (Round 64)
+
+Read the result's `escalations` list (`GET /v1/jobs/{id}`, or the
+`level_rejected` worker log line). Each entry names the level, the exact
+check (`reason`), the HTTP status, the L2 engine, and the proxy source.
+
+- `proxy_source: "pool"` with `status:403` (or `failure:detection_block`)
+  and a following `level_N_gateway_retry_ms` in `timings`: the target
+  refuses free datacenter exits, not the level. Live on Jumia (round 64),
+  forced to L2 the same URLs returned 200 with ~600 links through the
+  gateway. Since round 64 that retry happens at the blocked level instead
+  of only the last one.
+- `signature:<text>` on a page that looks fine to you: a broad literal in
+  `ChallengeDetector.CHALLENGE_SIGNATURES` (e.g. `_challenge`,
+  `access denied`) matched the site's own markup — a detector false
+  positive to fix there, with the captured HTML as the regression test.
+- `js_gated`: an SPA shell; escalation to a browser is correct.
+
+- A slow L2 with no rejection at all: grep the worker log for
+  `l2_botasaurus_fallback` — Botasaurus failing inside L2 (e.g.
+  `CloudflareDetectionException`) before Camoufox answers is not an
+  escalation, so it never shows in `escalations`.
+
+Level memory (Redis, 24 h TTL, every 20th URL of a domain re-probes
+everything) decides three things per domain: the START level
+(`levelhint:{tenant}:{domain}`), whether to skip the free pool
+(`levelhint:poolblock:...`) and whether to skip Botasaurus at L2
+(`levelhint:botafail:...`). A job that skipped either shows
+`pool_skipped_known_block` in the worker log, or no Botasaurus attempt at
+all. Delete `levelhint*` for the domain to force a cold, full attempt.

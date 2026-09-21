@@ -32,6 +32,102 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 64)
+
+Origin: the user asked for every remaining known issue to be fixed after
+round 63 shipped. The known list (L2 never winning on Jumia, a 1-hour level
+hint, URL concurrency vs. the browser ceiling, one unexplained test
+failure, round-62 audit T1-T4) was re-checked against the code first, which
+found several defects nobody had logged. User decision this round: crawl
+traffic uses the same proxy order as scrapes.
+
+- **FIXED — L2 lost to proxy blocks and nothing said why.** Every rejected
+  level now leaves an entry in `FetchResult.escalations` (`level`,
+  `reason` from the new `ChallengeDetector.challenge_reason()`,
+  `http_status`, L2 `engine`, `proxy_source`), stored inside the `timings`
+  JSONB and split back out by `GET /v1/jobs/{id}`. That made the cause
+  visible: forced to L2, Jumia returned 200 with ~600 links through the
+  gateway, while free-pool exits got 403 — and under `free_first` the
+  gateway retry only ran at the FINAL level, so a pool block at L2 climbed
+  to L3 instead. The retry now runs at the blocked level and is timed
+  (`level_N_gateway_retry_ms`). Live, a cold 10-URL Jumia job: 10/10 won
+  at L2 through the gateway, zero L3.
+- **FIXED — that fix alone made a cold run slower (288s -> 488s), because
+  every URL still paid the doomed pool attempt first.** L2's pool attempt
+  (Botasaurus, then Camoufox: 40-94s) was refused on every URL, and the
+  browser churn queued the gateway retries behind it (52-313s for a fetch
+  that itself took 17-37s). Level memory now also keeps a per-domain
+  "refuses the free pool" hint (`levelhint:poolblock:{tenant}:{domain}`),
+  set when a pool attempt is blocked and the same-level gateway retry is
+  not, cleared by any pool success, and re-probed on the same every-20th-URL
+  counter as the level hint. Live: cold 407s, warm 378s with one pool
+  attempt (the re-probe) — better, but still above round 63's L3-only 287s.
+- **FIXED — Botasaurus failed silently on every L2 attempt.** Its fallback
+  to Camoufox had no log line; once logged (`l2_botasaurus_fallback
+  reason=... elapsed_ms=...`) a warm run showed 13 of 13 failures (11
+  `CloudflareDetectionException`, 2 `BotasaurusNavigationError`, 26-85s
+  each) before Camoufox fetched every page. Level memory's third hint
+  (`levelhint:botafail:{tenant}:{domain}`, same re-probe) builds a
+  Camoufox-only L2 for that domain. `LevelMemory.plan()` returns a
+  `DomainPlan(start_level, skip_pool, skip_botasaurus)`.
+- **End result, same 10 Jumia URLs, all hints learned: COMPLETED 10/10 at
+  L2, zero rejected attempts, 115.8s wall, 24-63s per URL** (round 63:
+  287s; this round's first cold run: 488s). The learning run before it:
+  246.5s. The consumer's original baseline was ~3 min per URL, serialized.
+- **FIXED — Botasaurus held `XVFB_LOCK` across the whole navigation** and,
+  since every gateway attempt is a new identity, relaunched on every fetch
+  — one L2 fetch stalled every Camoufox launch and teardown in the worker.
+  Lock now covers launch/close only. One driver per job behind one lock
+  also serialized a job's concurrent URLs at L2; now up to
+  `botasaurus.max_pooled_drivers` (2 — the host has 4 CPUs).
+- **FIXED — a browser-permit protocol for every engine.** Botasaurus never
+  took a `BROWSER_SEMAPHORE` permit. Making it take one naively would have
+  reintroduced round 63's parked-spare deadlock across engines, so the
+  reclaim/hand-over logic moved from `BrowserPool` into
+  `core/budget.py::acquire_browser_permit` (see architecture.md "Browser
+  Permits Across Engines" and decisions.md).
+- **FIXED — level hint TTL 3600 -> 86400.** Staleness is the re-probe's
+  job; the short TTL only made later-the-same-day crawls cold.
+- **FIXED — URL concurrency vs. browser ceiling.** `AppConfig` rejects
+  `max_concurrent_urls_per_job > camoufox.max_total_instances`; a startup
+  warning covers the RAM-aware cap lowering the ceiling.
+- **FIXED — L1 reported an endless redirect as success** (all three
+  engines fell out of `range(MAX_REDIRECTS)` with a 3xx and computed
+  `success = status < 400`). Now DETECTION_BLOCK, which escalates.
+- **FIXED — `POST /v1/crawl` broke invariant #4.** Redirect hops were never
+  SSRF-checked; new `SSRFMiddleware` checks every request via
+  `SSRFGuard.validate_sync`. Proven with a real Scrapy run whose seed 302s
+  to 169.254.169.254: hop ignored, `ssrf/blocked: 1`.
+- **FIXED — crawls went out from the server IP**, `DedupPipeline` was a
+  stub, and items were collected inside `parse()` (before the pipelines), so
+  a live crawl logged `pipeline/dedup_dropped: 1` and still returned both
+  copies. The parent now leases a proxy (free pool, then gateway) and passes
+  it as `CRAWL_PROXY_URL`; items come from `item_scraped`; settings module
+  set explicitly; dead `TenantMiddleware`/`StoragePipeline`/`generic_spider`
+  /`addons` removed. Live: crawl results carry `proxy_source: pool`.
+- **FIXED — `/v1/scrape` and `/v1/crawl` answered 200 with storage, Redis
+  or the queue missing** (never saved / never charged / never queued). Now
+  503 up front. Found by the branch burn-down.
+- **FIXED — `create-tenant` leaked its Postgres pool on failure.**
+- **DONE — round-62 audit T1-T4.** `scrapy_project`, `cli` and
+  `observability` are inside the coverage gate; the missed-branch budget
+  went 32 -> 0 (every branch tested, except a no-op `if hasattr(...): pass`
+  in `Worker.__init__`, deleted); the quota test asserts its Lua arguments.
+
+- **NOT REPRODUCED — the one unexplained round-63 test failure.** Six
+  full-suite runs on the round-64 tree (3 serial, 3 under `pytest -n 4`)
+  passed 1283/1283 each. Its name was lost to output compression, so there
+  is nothing specific to re-run; recorded rather than "fixed".
+
+### Open threads carried out of round 64
+
+- **Jumia at L1 is refused on the gateway too** (`failure:detection_block`
+  for both attempts): plain HTTP is fingerprinted, not IP-filtered. Level
+  memory starts later URLs at L2, so it costs only the first few URLs of a
+  cold crawl.
+- **Host disk**: 97% during this round's redeploys; each rebuild needs
+  ~6-8 GB. The user's to clear.
+
 ## Technical Debt / Open Threads (as of round 63)
 
 Origin: a second external consumer report, `DEVELOPER_REPORT_PERFORMANCE.md`
@@ -2211,7 +2307,7 @@ completed".
 
 ## Technical Debt / Open Threads (as of round 45)
 
-- **OPEN, NOT URGENT — `orchestrator/worker.py::process_job` processes a
+- **RESOLVED round 49 (marked round 64 — this heading still said OPEN; concurrent URL dispatch via `politeness.max_concurrent_urls_per_job` shipped in round 49) — `orchestrator/worker.py::process_job` processes a
   job's URLs strictly sequentially, zero intra-job concurrency.** User
   asked why each full-batch rerun takes so long; root-caused, not yet
   fixed — user explicitly wants the scraper correct and stable first,

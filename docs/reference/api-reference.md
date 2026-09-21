@@ -98,6 +98,7 @@ as any other per-URL failure, not a silent drop.
 | `403` | Every URL in the batch was SSRF blocked (private/internal IP), or the `webhook` URL itself was SSRF blocked (rejects the whole request — there's only one webhook, unlike the per-URL batch handling above) |
 | `413` | Request body > 1 MB |
 | `429` | Quota exceeded or rate limit exceeded (100 req/min per IP) — carries a `Retry-After` header |
+| `503` | Engine not fully started (database, Redis or job queue unavailable) — nothing was saved, charged or queued; safe to retry. Also returned when the job was saved but could not be queued (it is marked `FAILED`) |
 
 ---
 
@@ -106,10 +107,17 @@ as any other per-URL failure, not a silent drop.
 Bulk Scrapy crawl for target sets larger than `/v1/scrape`'s 500-URL cap.
 Same auth, `Idempotency-Key`, and error shape as `/v1/scrape`, including the
 same per-URL (not whole-batch) SSRF handling — a blocked seed URL is
-dropped from `start_urls` before the crawl runs (the Scrapy spider has no
-SSRF check of its own, unlike the L1/L2/L3 escalation ladder) and recorded
-as its own `ssrf_blocked` entry in `GET /v1/jobs/{job_id}`, same as
-`/v1/scrape`.
+dropped from `start_urls` before the crawl runs and recorded as its own
+`ssrf_blocked` entry in `GET /v1/jobs/{job_id}`, same as `/v1/scrape`.
+Every request the crawl then sends — including each redirect hop — is
+SSRF-checked again inside the crawl, so a public seed that redirects to a
+private address is dropped at that hop.
+
+The crawl goes out through one leased proxy, chosen the same way as for
+`/v1/scrape`: the free pool first, the paid gateway when the pool is
+exhausted (if the deployment enables it), never directly from the server.
+Each result carries `proxy_used` and `proxy_source`. A URL that appears
+twice (or two seeds that land on the same final URL) is returned once.
 
 ```json
 {
@@ -202,6 +210,10 @@ finished URLs and a real `progress`.
         "markdown_ms": 314,
         "total_ms": 70908
       },
+      "escalations": [
+        {"level": 1, "reason": "status:403", "http_status": 403,
+         "engine": null, "proxy_source": "pool"}
+      ],
       "fetched_at": "2026-07-21T12:00:00Z"
     }
   ],
@@ -226,6 +238,18 @@ need a real browser, later URLs for it start at that level instead of
 re-paying the attempts that already failed, so their timings show only
 `level_3_ms`. Pin the ladder explicitly with `config_overrides.min_level` /
 `max_level` if you want to override that.
+
+**`escalations` — why each earlier attempt was not the answer.** One
+entry per level (or per same-level attempt) the engine rejected before the
+result you got, in order; `null` when the first attempt succeeded.
+`reason` is the exact check that fired — `status:403`,
+`signature:<text>` (a known challenge-page marker), `gateway_error`,
+`chromium_net_error`, `js_gated`, or `failure:<category>` — and `engine`
+names what produced it inside a level (`botasaurus` or `camoufox` at L2).
+When a free-pool proxy is blocked the engine retries that same level once
+through the paid gateway (if enabled) before moving up; that retry's time
+is `level_N_gateway_retry_ms` in `timings`, and the blocked attempt appears
+here with `proxy_source: "pool"`.
 
 **`partial_failure`:** `true` when `status` is `COMPLETED` but at least
 one URL in this job landed in the dead-letter queue alongside a

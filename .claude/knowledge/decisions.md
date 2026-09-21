@@ -3342,3 +3342,85 @@ the line gate came to overstate its own strength in the first place.
 now. Widening scope and adding branch enforcement in one step would have
 made the CI failure impossible to attribute. Widening is tracked as T1/T3
 in `.wolf/STATUS.md`.
+
+## Browser Permits: One Protocol in core/budget.py, Not Per Pool (Round 64)
+
+**Decision:** every engine takes a `BROWSER_SEMAPHORE` permit through
+`core.budget.acquire_browser_permit()`. That function asks registered
+reclaimers (pools that can close a PARKED instance) to free permits while
+none is free, and counts itself as a waiter while blocked; a pool about to
+park a returning instance checks `permit_waiters()` and closes it instead.
+`BrowserPool` registers `_evict_oldest_spare` (held by weak reference).
+`BotasaurusPool` holds a permit only while a fetch runs, never while a
+driver is parked.
+
+**Why:** round 63 fixed "parked spares hold every permit, the next launch
+waits forever" inside `BrowserPool`, for `BrowserPool`'s own launches only.
+Botasaurus had never taken a permit at all (its Chrome was invisible to the
+ceiling). Making it take one naively would have recreated the same deadlock
+across engines: a Botasaurus fetch blocked behind parked Camoufox spares
+that nothing on its path could evict. The protocol had to live where every
+engine meets — the semaphore's own module.
+
+**Rejected:** per-pool permit sub-budgets (splits an already-small ceiling
+and still needs cross-pool eviction); keeping Botasaurus outside the
+semaphore (leaves the RAM-aware cap blind to Chrome).
+
+## Gateway Retry at the Level That Was Blocked, Not Only the Last (Round 64)
+
+**Decision:** under `free_first`, a free-pool result that is blocked
+(DETECTION_BLOCK or a challenge page) gets one retry through the paid
+gateway at the SAME level, at every level — not only at the final one.
+
+**Why:** the old rule assumed a block was the level's fault ("retrying a
+non-final level's block is pointless — it's about to escalate anyway").
+Live, it was the proxy's: Jumia 403s free datacenter exits at L2, while the
+same L2 through the gateway returned 200 with ~600 links in 20-25s.
+Escalating paid a free-pool L3 attempt blocked the same way, then this
+retry at L3 anyway, and taught level memory that the domain needs L3 — so
+every later URL skipped the cheaper level too.
+
+**Cost accepted:** one extra gateway attempt per blocked level. At L1 that
+is one HTTP request; at L2/L3 it replaces, rather than adds to, the climb.
+
+## Crawls Lease Proxies Like Scrapes (Round 64, user decision)
+
+**Decision:** `POST /v1/crawl` leases one proxy per crawl in the parent
+(`orchestrator/tasks.py::_run_crawl_job`) — scored free pool first, paid
+gateway on exhaustion under `free_first`, gateway only under `paid_only`,
+and a loud failure (never a direct connection) otherwise — and hands it to
+the Scrapy subprocess as `CRAWL_PROXY_URL`.
+
+**Why:** crawls left from the server's own IP. The user chose "same as
+scrapes" over "gateway only" (every page costs paid bandwidth) and "stay
+direct" (server IP gets blocked). The subprocess cannot use the async
+`ProxyManager`, so the lease is taken where it can be and passed down.
+
+## Required Dependencies Fail Loud at the Door (Round 64)
+
+**Decision:** `/v1/scrape` and `/v1/crawl` return 503 when Postgres, Redis
+or the rq queue is not wired, instead of wrapping each step in an "is it
+wired?" conditional.
+
+**Why:** the conditionals made every missing dependency a silent wrong
+answer — a 200 with a job id never saved (no Postgres), never charged (no
+Redis) or never queued (no queue). They surfaced only because the branch
+burn-down asked why those branches were never taken.
+
+## Level Memory Learns What to Skip, Not Just Where to Start (Round 64)
+
+**Decision:** alongside the start level, level memory keeps two per-domain
+skip hints — "the free proxy pool is refused here" and "Botasaurus fails
+here" — set only from evidence (a pool attempt blocked while the same-level
+gateway retry was not; an accepted L2 result that came from Camoufox after
+Botasaurus was tried), cleared by any contrary success, and re-probed on the
+same every-20th-URL counter.
+
+**Why:** each was measured before it existed. Making the right level win
+(gateway retry at the blocked level) turned a 288s cold run into 488s,
+because every URL still paid the doomed attempts in front of the winning
+one. With both hints the same 10 Jumia URLs took 115.8s.
+
+**Invariant kept:** like the level hint, these only SKIP work that recently
+failed for the domain, and the re-probe retries it; they can make a job
+faster, never turn a fetch that would have succeeded into a failure.
