@@ -251,6 +251,12 @@ class Worker:
         return concurrency, delay
 
     @property
+    def _l2_tries_botasaurus(self) -> bool:
+        """Whether L2 is configured to attempt Botasaurus before Camoufox
+        (fetcher/factory.py::build_level2_fetcher uses the same test)."""
+        return "botasaurus" in self._config.levels.level_2.engine
+
+    @property
     def _gateway_fallback_eligible(self) -> bool:
         """Round 49 — whether process_job's circuit-open and
         still-looks-blocked branches may force a level through the paid
@@ -376,11 +382,13 @@ class Worker:
                     return
 
             domain = self._extract_domain(url_str)
-            start_level, pool_blocked = await self._level_memory.plan(tenant_id, domain, levels)
+            plan = await self._level_memory.plan(tenant_id, domain, levels)
+            start_level = plan.start_level
             # Round 64 — a domain known to refuse the free pool goes straight
             # to the gateway (see LevelMemory.plan). Only where the gateway
             # fallback exists at all: under free_only there is nowhere to go.
-            gateway_first = pool_blocked and self._gateway_fallback_eligible
+            gateway_first = plan.skip_pool and self._gateway_fallback_eligible
+            skip_botasaurus = plan.skip_botasaurus
             if gateway_first:
                 logger.info(
                     "pool_skipped_known_block job_id=%s url=%s domain=%s",
@@ -523,6 +531,7 @@ class Worker:
                             level,
                             request.config_overrides,
                             force_gateway=circuit_open or gateway_first,
+                            skip_botasaurus=skip_botasaurus,
                         )
                     level_ms = int((time.monotonic() - level_start) * 1000)
                     timings[f"level_{level}_ms"] = level_ms
@@ -603,6 +612,7 @@ class Worker:
                             level,
                             request.config_overrides,
                             force_gateway=True,
+                            skip_botasaurus=skip_botasaurus,
                         )
                         timings[f"level_{level}_gateway_retry_ms"] = int(
                             (time.monotonic() - retry_start) * 1000
@@ -700,6 +710,13 @@ class Worker:
                         await self._level_memory.record_success(tenant_id, domain, level)
                         if result.proxy_source == "pool":
                             await self._level_memory.record_pool_ok(tenant_id, domain)
+                        if level == 2 and self._l2_tries_botasaurus and not skip_botasaurus:
+                            if result.engine == "botasaurus":
+                                await self._level_memory.record_botasaurus_ok(tenant_id, domain)
+                            elif result.engine == "camoufox":
+                                await self._level_memory.record_botasaurus_failed(
+                                    tenant_id, domain
+                                )
                         if result.html:
                             extract_start = time.monotonic()
                             # FetchResult.extracted was declared on the model and
@@ -992,6 +1009,7 @@ class Worker:
         level: int,
         overrides: ConfigOverrides | None = None,
         force_gateway: bool = False,
+        skip_botasaurus: bool = False,
     ) -> FetchResult | None:
         """Dispatch fetch to the appropriate level fetcher.
 
@@ -1017,6 +1035,7 @@ class Worker:
                     captcha_solver=self._captcha_solver,
                     pool=self._browser_pool,
                     botasaurus_pool=self._botasaurus_pool,
+                    skip_botasaurus=skip_botasaurus,
                 )
 
             return await self._fetch_with_proxy(

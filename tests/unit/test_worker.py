@@ -774,6 +774,7 @@ class TestFetchUrlDispatch:
             captcha_solver=worker._captcha_solver,
             pool=worker._browser_pool,
             botasaurus_pool=worker._botasaurus_pool,
+            skip_botasaurus=False,
         )
         fake_fetcher.fetch.assert_awaited_once_with(
             "http://example.com", tenant, proxy=proxy_sentinel, overrides=None
@@ -1515,7 +1516,7 @@ class TestGatewayFallbackOnFailure:
         # level 1 never actually calls _fetch_url (no gateway path to force
         # it through) — the only real attempt is level 2, forced.
         worker._fetch_url.assert_awaited_once_with(
-            tenant, "http://example.com/", 2, None, force_gateway=True
+            tenant, "http://example.com/", 2, None, force_gateway=True, skip_botasaurus=False
         )
 
     @pytest.mark.asyncio
@@ -2562,6 +2563,9 @@ class TestBranchBurnDown:
         assert response.results[0].failure_category == FailureCategory.DETECTION_BLOCK
 
 
+from scraper_engine.orchestrator.level_memory import DomainPlan  # noqa: E402
+
+
 class TestPoolHintWiring:
     """Round 64 — a domain that refuses the free pool skips it."""
 
@@ -2586,7 +2590,7 @@ class TestPoolHintWiring:
     @pytest.mark.asyncio
     async def test_a_known_pool_block_goes_straight_to_the_gateway(self, tenant, worker):
         worker = self._gateway_worker(worker)
-        worker._level_memory.plan = AsyncMock(return_value=(2, True))
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_pool=True))
         worker._fetch_url = AsyncMock(return_value=self._good("paid_gateway"))
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         await worker.process_job(tenant, "job-pool-hint", request)
@@ -2595,7 +2599,7 @@ class TestPoolHintWiring:
 
     @pytest.mark.asyncio
     async def test_the_hint_is_ignored_without_a_gateway(self, tenant, worker):
-        worker._level_memory.plan = AsyncMock(return_value=(2, True))
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_pool=True))
         worker._fetch_url = AsyncMock(return_value=self._good("pool"))
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         await worker.process_job(tenant, "job-pool-hint-free-only", request)
@@ -2604,7 +2608,7 @@ class TestPoolHintWiring:
     @pytest.mark.asyncio
     async def test_pool_blocked_then_gateway_ok_records_the_hint(self, tenant, worker):
         worker = self._gateway_worker(worker)
-        worker._level_memory.plan = AsyncMock(return_value=(2, False))
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_pool=False))
         worker._level_memory.record_pool_blocked = AsyncMock()
         blocked = FetchResult(
             url="http://example.com",
@@ -2623,7 +2627,7 @@ class TestPoolHintWiring:
     @pytest.mark.asyncio
     async def test_a_gateway_retry_that_is_also_blocked_records_nothing(self, tenant, worker):
         worker = self._gateway_worker(worker)
-        worker._level_memory.plan = AsyncMock(return_value=(3, False))
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(3, skip_pool=False))
         worker._level_memory.record_pool_blocked = AsyncMock()
         blocked = FetchResult(
             url="http://example.com",
@@ -2640,12 +2644,63 @@ class TestPoolHintWiring:
 
     @pytest.mark.asyncio
     async def test_a_pool_success_clears_the_hint(self, tenant, worker):
-        worker._level_memory.plan = AsyncMock(return_value=(1, False))
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(1, skip_pool=False))
         worker._level_memory.record_pool_ok = AsyncMock()
         worker._fetch_url = AsyncMock(return_value=self._good("pool"))
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
         await worker.process_job(tenant, "job-pool-ok", request)
         worker._level_memory.record_pool_ok.assert_awaited_once()
+
+
+class TestBotasaurusHintWiring:
+    """Round 64 — a domain where Botasaurus keeps failing uses L2's Camoufox
+    engine directly."""
+
+    @staticmethod
+    def _l2(engine):
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=1,
+            engine=engine,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("engine", "recorded"),
+        [("camoufox", "record_botasaurus_failed"), ("botasaurus", "record_botasaurus_ok")],
+    )
+    async def test_the_winning_l2_engine_updates_the_hint(self, tenant, worker, engine, recorded):
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2))
+        worker._level_memory.record_botasaurus_failed = AsyncMock()
+        worker._level_memory.record_botasaurus_ok = AsyncMock()
+        worker._fetch_url = AsyncMock(return_value=self._l2(engine))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-bota-hint", request)
+        getattr(worker._level_memory, recorded).assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_known_failure_skips_botasaurus_and_records_nothing(self, tenant, worker):
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_botasaurus=True))
+        worker._level_memory.record_botasaurus_failed = AsyncMock()
+        worker._fetch_url = AsyncMock(return_value=self._l2("camoufox"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-bota-skip", request)
+        assert worker._fetch_url.await_args.kwargs["skip_botasaurus"] is True
+        worker._level_memory.record_botasaurus_failed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_camoufox_only_l2_config_never_touches_the_hint(self, tenant, worker):
+        worker._config.levels.level_2.engine = "camoufox"
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2))
+        worker._level_memory.record_botasaurus_failed = AsyncMock()
+        worker._fetch_url = AsyncMock(return_value=self._l2("camoufox"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-camoufox-only", request)
+        worker._level_memory.record_botasaurus_failed.assert_not_awaited()
 
 
 class TestPolitenessTimeoutStreaming:

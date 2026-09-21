@@ -27,6 +27,7 @@ Two invariants keep this safe to have on by default:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -34,6 +35,17 @@ if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DomainPlan:
+    """What level memory says about the next URL of a domain (round 64)."""
+
+    start_level: int
+    # The free proxy pool is refused here; go straight to the paid gateway.
+    skip_pool: bool = False
+    # Botasaurus keeps failing here at L2; use L2's Camoufox engine directly.
+    skip_botasaurus: bool = False
 
 
 class LevelMemory:
@@ -73,42 +85,49 @@ class LevelMemory:
     def _pool_block_key(tenant_id: TenantId, domain: str) -> str:
         return f"levelhint:poolblock:{tenant_id}:{domain}"
 
-    async def plan(
-        self, tenant_id: TenantId, domain: str, levels: list[int]
-    ) -> tuple[int, bool]:
-        """(level to enter the ladder at, whether to skip the free proxy pool)
-        for the next URL of `domain`.
+    @staticmethod
+    def _botasaurus_fails_key(tenant_id: TenantId, domain: str) -> str:
+        return f"levelhint:botafail:{tenant_id}:{domain}"
 
-        Returns `(levels[0], False)` — no change — when memory is disabled,
-        when this call is the periodic re-probe, or on any Redis error. One
-        re-probe counter covers both hints, so a re-probe URL retries the
-        full ladder AND the free pool. A level hint outside `levels` (the
-        caller narrowed the ladder with max_level) is clamped into it rather
-        than ignored, so `max_level=2` against an L3 hint still starts at 2.
+    async def plan(self, tenant_id: TenantId, domain: str, levels: list[int]) -> DomainPlan:
+        """What to skip for the next URL of `domain`.
 
-        Round 64 added the pool hint. A live cold run showed a domain that
-        refuses free datacenter exits (Jumia: 403 at L2 from every pool
-        proxy, 200 through the gateway) paying a doomed pool attempt — two
-        browsers, 40-94s — on every URL before the gateway retry that always
-        worked, and the browser churn from those doomed attempts queued the
-        retries behind them. The pool hint skips it the same way the level
-        hint skips doomed levels.
+        Returns the neutral plan — `levels[0]`, nothing skipped — when memory
+        is disabled, when this call is the periodic re-probe, or on any Redis
+        error. One re-probe counter covers every hint, so a re-probe URL
+        retries the full ladder, the free pool AND Botasaurus. A level hint
+        outside `levels` (the caller narrowed the ladder with max_level) is
+        clamped into it rather than ignored, so `max_level=2` against an L3
+        hint still starts at 2.
+
+        Round 64 added the two skip hints, each measured live on Jumia before
+        it existed: every URL paid a doomed free-pool L2 attempt (two
+        browsers, 40-94s, always 403) before the gateway retry that always
+        worked, and every L2 attempt ran Botasaurus first, which failed 13 of
+        13 times (CloudflareDetectionException, 26-85s each) before L2's
+        Camoufox fetched the page.
         """
+        neutral = DomainPlan(start_level=levels[0])
         if not self._config.level_memory_enabled:
-            return levels[0], False
+            return neutral
         try:
             if await self._is_reprobe(tenant_id, domain):
-                return levels[0], False
+                return neutral
             raw = await self._raw.get(self._hint_key(tenant_id, domain))
             pool_blocked = await self._raw.get(self._pool_block_key(tenant_id, domain))
+            bota_fails = await self._raw.get(self._botasaurus_fails_key(tenant_id, domain))
         except Exception:
             logger.warning("level_memory_read_failed domain=%s", domain, exc_info=True)
-            return levels[0], False
-        return self._clamp(raw, levels), pool_blocked is not None
+            return neutral
+        return DomainPlan(
+            start_level=self._clamp(raw, levels),
+            skip_pool=pool_blocked is not None,
+            skip_botasaurus=bota_fails is not None,
+        )
 
     async def start_level(self, tenant_id: TenantId, domain: str, levels: list[int]) -> int:
-        """The level half of plan()."""
-        return (await self.plan(tenant_id, domain, levels))[0]
+        """The level part of plan()."""
+        return (await self.plan(tenant_id, domain, levels)).start_level
 
     @staticmethod
     def _clamp(raw: Any, levels: list[int]) -> int:
@@ -120,29 +139,6 @@ class LevelMemory:
             return levels[0]
         # Never start below the caller's own floor, never above its ceiling.
         return min(max(hint, levels[0]), levels[-1])
-
-    async def record_pool_blocked(self, tenant_id: TenantId, domain: str) -> None:
-        """A free-pool attempt was blocked and the gateway retry at the same
-        level was not — this domain refuses the pool, not the level."""
-        if not self._config.level_memory_enabled:
-            return
-        try:
-            await self._raw.set(
-                self._pool_block_key(tenant_id, domain),
-                "1",
-                ex=self._config.level_memory_ttl_seconds,
-            )
-        except Exception:
-            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
-
-    async def record_pool_ok(self, tenant_id: TenantId, domain: str) -> None:
-        """A free-pool proxy produced usable content — drop the pool hint."""
-        if not self._config.level_memory_enabled:
-            return
-        try:
-            await self._raw.delete(self._pool_block_key(tenant_id, domain))
-        except Exception:
-            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
 
     async def _is_reprobe(self, tenant_id: TenantId, domain: str) -> bool:
         """True once every `reprobe_every` calls for this domain."""
@@ -178,5 +174,38 @@ class LevelMemory:
                 await self._raw.set(
                     key, str(level), ex=self._config.level_memory_ttl_seconds
                 )
+        except Exception:
+            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
+
+    async def record_pool_blocked(self, tenant_id: TenantId, domain: str) -> None:
+        """A free-pool attempt was blocked and the gateway retry at the same
+        level was not — this domain refuses the pool, not the level."""
+        await self._set_flag(self._pool_block_key(tenant_id, domain), domain)
+
+    async def record_pool_ok(self, tenant_id: TenantId, domain: str) -> None:
+        """A free-pool proxy produced usable content — drop the pool hint."""
+        await self._clear_flag(self._pool_block_key(tenant_id, domain), domain)
+
+    async def record_botasaurus_failed(self, tenant_id: TenantId, domain: str) -> None:
+        """L2 fell back from Botasaurus and its Camoufox engine succeeded."""
+        await self._set_flag(self._botasaurus_fails_key(tenant_id, domain), domain)
+
+    async def record_botasaurus_ok(self, tenant_id: TenantId, domain: str) -> None:
+        """Botasaurus produced the accepted L2 result — drop the hint."""
+        await self._clear_flag(self._botasaurus_fails_key(tenant_id, domain), domain)
+
+    async def _set_flag(self, key: str, domain: str) -> None:
+        if not self._config.level_memory_enabled:
+            return
+        try:
+            await self._raw.set(key, "1", ex=self._config.level_memory_ttl_seconds)
+        except Exception:
+            logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)
+
+    async def _clear_flag(self, key: str, domain: str) -> None:
+        if not self._config.level_memory_enabled:
+            return
+        try:
+            await self._raw.delete(key)
         except Exception:
             logger.warning("level_memory_write_failed domain=%s", domain, exc_info=True)

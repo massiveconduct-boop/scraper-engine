@@ -77,3 +77,19 @@ def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling():
     fetcher = build_level1_fetcher(config)
 
     assert fetcher._scrapling_client is None
+
+
+def test_skip_botasaurus_builds_a_camoufox_only_level2():
+    """Round 64 — level memory's Botasaurus hint reaches the fetcher as a
+    Camoufox-only L2 for that fetch (and no Botasaurus driver pool)."""
+    from unittest.mock import MagicMock
+
+    from scraper_engine.config.schema import AppConfig
+    from scraper_engine.fetcher.factory import build_level2_fetcher
+
+    config = AppConfig()
+    assert "botasaurus" in config.levels.level_2.engine
+    normal = build_level2_fetcher(config, botasaurus_pool=MagicMock())
+    skipped = build_level2_fetcher(config, botasaurus_pool=MagicMock(), skip_botasaurus=True)
+    assert normal._botasaurus is not None and normal._botasaurus_pool is not None
+    assert skipped._botasaurus is None and skipped._botasaurus_pool is None

@@ -75,8 +75,13 @@ def build_level2_fetcher(
     captcha_solver: CaptchaSolver | None = None,
     pool: BrowserPool | None = None,
     botasaurus_pool: BotasaurusPool | None = None,
+    skip_botasaurus: bool = False,
 ) -> Level2Fetcher:
     """Construct the L2 (Botasaurus+Camoufox) fetcher from config.levels.level_2.
+
+    skip_botasaurus (round 64) builds a Camoufox-only L2 for this one fetch:
+    set by the worker when level memory says Botasaurus keeps failing on the
+    target domain (see orchestrator/level_memory.py::DomainPlan).
 
     captcha_solver is optional — the worker builds it once (env keys + budget)
     and threads it through so an in-page CAPTCHA can be solved mid-fetch. None
@@ -115,7 +120,7 @@ def build_level2_fetcher(
             humanize_mouse=bconf.humanize_mouse,
             capture_network_events=bconf.capture_network_events,
         )
-        if "botasaurus" in lvl.engine
+        if "botasaurus" in lvl.engine and not skip_botasaurus
         else None
     )
     return Level2Fetcher(
@@ -130,7 +135,7 @@ def build_level2_fetcher(
         ssrf_guard=_build_ssrf_guard(config),
         pool=pool,
         botasaurus=botasaurus,
-        botasaurus_pool=botasaurus_pool,
+        botasaurus_pool=botasaurus_pool if botasaurus is not None else None,
     )
 
 

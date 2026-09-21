@@ -109,6 +109,7 @@ async def test_extraction_smallmodel_end_to_end(monkeypatch, fake_extraction_eng
         level: int,
         overrides: object = None,
         force_gateway: bool = False,
+        skip_botasaurus: bool = False,
     ) -> FetchResult:
         assert level == 1, "this test's fake fetch only succeeds at L1 — escalation must stop there"
         return FetchResult(

@@ -13,7 +13,7 @@ import pytest
 
 from scraper_engine.config.schema import EscalationConfig
 from scraper_engine.core.tenant import TenantId
-from scraper_engine.orchestrator.level_memory import LevelMemory
+from scraper_engine.orchestrator.level_memory import DomainPlan, LevelMemory
 
 TENANT = TenantId("levelmem")
 LEVELS = [1, 2, 3]
@@ -147,33 +147,35 @@ class TestPoolHint:
     paid a doomed pool attempt (two browsers, 40-94s) on every Jumia URL
     before the gateway retry that always worked."""
 
-    def _memory(self, *, hint=None, pool=None, count=1, config=None):
+    def _memory(self, *, hint=None, pool=None, bota=None, count=1, config=None):
         redis = AsyncMock()
-        redis.raw.get.side_effect = lambda key: pool if "poolblock" in key else hint
+        redis.raw.get.side_effect = lambda key: (
+            pool if "poolblock" in key else bota if "botafail" in key else hint
+        )
         redis.raw.incr.return_value = count
         return LevelMemory(redis, config or EscalationConfig()), redis
 
     @pytest.mark.asyncio
     async def test_plan_reports_both_hints(self):
         memory, _ = self._memory(hint="2", pool="1")
-        assert await memory.plan(TENANT, "a.example", LEVELS) == (2, True)
+        assert await memory.plan(TENANT, "a.example", LEVELS) == DomainPlan(2, skip_pool=True)
 
     @pytest.mark.asyncio
     async def test_no_pool_hint_uses_the_pool(self):
         memory, _ = self._memory(hint="2")
-        assert await memory.plan(TENANT, "a.example", LEVELS) == (2, False)
+        assert await memory.plan(TENANT, "a.example", LEVELS) == DomainPlan(2)
 
     @pytest.mark.asyncio
     async def test_a_reprobe_retries_the_pool_too(self):
         memory, _ = self._memory(hint="3", pool="1", count=20)
-        assert await memory.plan(TENANT, "a.example", LEVELS) == (1, False)
+        assert await memory.plan(TENANT, "a.example", LEVELS) == DomainPlan(1)
 
     @pytest.mark.asyncio
     async def test_disabled_memory_never_skips_the_pool(self):
         memory, redis = self._memory(
             pool="1", config=EscalationConfig(level_memory_enabled=False)
         )
-        assert await memory.plan(TENANT, "a.example", LEVELS) == (1, False)
+        assert await memory.plan(TENANT, "a.example", LEVELS) == DomainPlan(1)
         await memory.record_pool_blocked(TENANT, "a.example")
         await memory.record_pool_ok(TENANT, "a.example")
         redis.raw.set.assert_not_awaited()
@@ -200,3 +202,35 @@ class TestPoolHint:
         redis.raw.delete.side_effect = ConnectionError("redis down")
         await memory.record_pool_blocked(TENANT, "a.example")
         await memory.record_pool_ok(TENANT, "a.example")
+
+
+class TestBotasaurusHint:
+    """Round 64 — Botasaurus failed 13 of 13 L2 attempts on Jumia
+    (CloudflareDetectionException, 26-85s each) before L2's Camoufox fetched
+    every page."""
+
+    def _memory(self, *, bota=None, count=1):
+        redis = AsyncMock()
+        redis.raw.get.side_effect = lambda key: bota if "botafail" in key else None
+        redis.raw.incr.return_value = count
+        return LevelMemory(redis, EscalationConfig()), redis
+
+    @pytest.mark.asyncio
+    async def test_plan_reports_the_botasaurus_hint(self):
+        memory, _ = self._memory(bota="1")
+        assert (await memory.plan(TENANT, "a.example", LEVELS)).skip_botasaurus is True
+
+    @pytest.mark.asyncio
+    async def test_a_reprobe_retries_botasaurus(self):
+        memory, _ = self._memory(bota="1", count=20)
+        assert (await memory.plan(TENANT, "a.example", LEVELS)).skip_botasaurus is False
+
+    @pytest.mark.asyncio
+    async def test_record_and_clear(self):
+        memory, redis = self._memory()
+        await memory.record_botasaurus_failed(TENANT, "a.example")
+        redis.raw.set.assert_awaited_once_with(
+            "levelhint:botafail:levelmem:a.example", "1", ex=86400
+        )
+        await memory.record_botasaurus_ok(TENANT, "a.example")
+        redis.raw.delete.assert_awaited_once_with("levelhint:botafail:levelmem:a.example")

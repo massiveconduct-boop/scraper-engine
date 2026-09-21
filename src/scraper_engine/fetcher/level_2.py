@@ -8,6 +8,7 @@ Botasaurus always runs with parallel=1 (our orchestrator owns concurrency).
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, cast
@@ -26,6 +27,8 @@ from scraper_engine.fetcher._failure import classify_fetch_exception
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
@@ -159,7 +162,7 @@ class Level2Fetcher:
                     scroll_wait_ms=self._scroll_wait_ms,
                     events_sink=network_events,
                 )
-        except (Exception, SystemExit):
+        except (Exception, SystemExit) as exc:
             # Round 40 — live-caught: botasaurus_driver's own proxy-auth
             # helper (javascript_fixes.check_node(), reached only when the
             # proxy string carries embedded credentials — see Dockerfile's
@@ -172,8 +175,25 @@ class Level2Fetcher:
             # (job cancellation, orchestrator/worker.py's `_is_cancelled`
             # path) and KeyboardInterrupt, both of which must keep
             # propagating.
+            #
+            # Round 64 — logged. This fallback was silent: a live Jumia run
+            # spent 80-360s per URL at L2 and nothing said whether Botasaurus
+            # was failing, how, or how long it took before Camoufox ran.
+            logger.warning(
+                "l2_botasaurus_fallback reason=exception:%s elapsed_ms=%d url=%s",
+                type(exc).__name__,
+                int((time.monotonic() - start) * 1000),
+                url,
+            )
             return None
-        if self._challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False):
+        reason = self._challenge_detector.challenge_reason(html, 200, short_page_is_suspect=False)
+        if reason is not None:
+            logger.warning(
+                "l2_botasaurus_fallback reason=%s elapsed_ms=%d url=%s",
+                reason,
+                int((time.monotonic() - start) * 1000),
+                url,
+            )
             return None
         return FetchResult(
             engine="botasaurus",
