@@ -12,6 +12,85 @@ round it shipped in.
 
 ---
 
+## Decision: Level Memory Skips Levels but Never Blocks Escalation
+
+**Date:** 2026-09-20 | **Round:** 63
+
+**What:** `orchestrator/level_memory.py` remembers, per (tenant, domain), the
+escalation level that last produced usable content, and the ladder starts
+there instead of at L1. On by default (`escalation.level_memory_enabled`).
+
+**Why:** An external consumer measured 169.2s of PROCESSING for a page whose
+real fetch took 27.6s, with every successful fetch landing at L3 — the
+missing time was L1 and L2 failing again, once per URL, forever. `level_used`
+was already persisted; nothing read it back to decide anything.
+
+**Tradeoffs:** A hint is a claim about a target's CURRENT bot posture, which
+is exactly the thing that changes without warning. Two properties bound the
+damage: the hint only ever SKIPS levels (escalation above it is untouched, so
+a hint can make a job faster and can never turn a succeeding fetch into a
+failure), and `escalation.reprobe_every` (20) URLs one ignores the hint and
+runs the full ladder. The TTL alone would not re-probe — a continuously
+crawled domain refreshes its hint before it can expire — so the counter, not
+the TTL, is what keeps this from being a one-way ratchet. Worst case of a
+stale hint is an hour of unnecessary L3, not a wrong result.
+
+**Alternatives:** Deriving the start level from `scrape_results` per URL
+(rejected — a DB round trip per URL for something that is a per-domain fact,
+and the URL-exact cache check already covers the per-URL case). Making it
+opt-in (rejected — the default path is the one that was slow; an opt-in fix
+leaves every existing caller on the old behaviour). Recording at
+`if result.success` (rejected — a non-final level returning a challenge page
+is "successful" there and gets escalated, so that would have pinned domains
+to the level reliably getting blocked; recorded past both
+`still_looks_blocked` gates instead).
+
+**Status:** Active. Live-verified against Jumia: 85.5s cold, 55.2s with the
+hint, with `level_1_ms`/`level_2_ms` absent from the result's timings.
+
+---
+
+## Decision: rq Key Names Are Asked of rq, Never Hardcoded
+
+**Date:** 2026-09-20 | **Round:** 63
+
+**What:** `stuck_job_reaper.py` derives its registry keys from rq's own
+registry classes and tests membership by `rq:executions:{job_id}` plus a
+`ZSCAN MATCH "{job_id}:*"`, rather than comparing a hardcoded key name
+against a bare job id.
+
+**Why:** Round 62's reachability check hardcoded `rq:started:scraper-jobs`.
+rq 2.10's `StartedJobRegistry.key_template` is `rq:wip:{0}` — the key it
+asked about does not exist on this deployment — and that registry's members
+are `{job_id}:{execution_id}`, not bare ids, so even the corrected key could
+not match by `zscore`. Both signals failing meant every RUNNING job read as
+an orphan, and any job still PROCESSING past the 120s grace was reconciled
+to FAILED underneath its own live worker. A 1-URL job finishes inside the
+grace and never shows it; a multi-URL job structurally cannot — this is the
+whole of the consumer's "a 5-URL job never completed". Live-reproduced: a
+10-URL job was declared dead at 161s and then wrote 9 of 10 results.
+
+**Tradeoffs:** Importing rq inside the reaper couples it to rq's API surface
+rather than to its wire format. That is the correct direction — the wire
+format is what silently changed. `ZSCAN` is O(N) over a registry rather than
+O(1), which is irrelevant at this queue's size and is the price of covering
+both member shapes without hardcoding which registry uses which.
+
+**Alternatives:** Keeping hardcoded strings and just correcting them
+(rejected — fixes the instance, not the class; the next rq upgrade re-breaks
+it in the same silent, maximally-damaging direction). Trusting the job hash's
+status (rejected — that is the round-52/62 bug this check exists to fix).
+Widening `_STALE_PROCESSING_GRACE_SECONDS` (rejected — a grace window cannot
+be wide enough for an arbitrarily long job, and it would delay reaping of
+genuinely dead ones).
+
+**Status:** Active, plus a second independent signal:
+`_persist_one_result` now touches `scrape_jobs.updated_at` per result, so
+"stale" means "not progressing" rather than "started a while ago". Two
+signals must now fail before live work is reconciled away.
+
+---
+
 ## Decision: proxybroker2 Subprocess Isolation
 
 **Date:** 2026-07-24 | **Round:** 4-5

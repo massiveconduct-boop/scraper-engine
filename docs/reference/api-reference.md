@@ -58,6 +58,10 @@ Submit URLs for scraping. Returns immediately with a `job_id` for async polling.
 | `config_overrides.timeout_seconds` | int | no | 120 | Per-URL timeout |
 | `config_overrides.respect_robots` | bool | no | false | Respect robots.txt |
 | `config_overrides.bypass_cache` | bool | no | false | Skip the cache reuse check below and force a fresh scrape |
+| `config_overrides.min_level` | int | no | — | Start the L1→L2→L3 ladder at this level (1-3). Use when you already know the target needs a real browser, instead of paying two doomed attempts to rediscover it. Overrides the learned per-domain hint in both directions |
+| `config_overrides.max_level` | int | no | — | Never escalate past this level (1-3). `max_level: 1` means "never spend a browser render on this". Must be >= `min_level` |
+| `config_overrides.politeness_concurrency` | int | no | — | Concurrent fetches allowed against one domain for this job. Clamped server-side to the operator's `politeness.max_request_concurrency` |
+| `config_overrides.politeness_delay_seconds` | float | no | — | Minimum delay between successive fetches of one domain. Clamped UP to the operator's `politeness.min_request_delay_seconds` — a request can never go below the configured floor |
 | `async_mode` | bool | no | true | Async job processing |
 | `webhook` | string | no | — | POST callback URL on completion. SSRF-checked the same way scrape target URLs are — a webhook pointed at a private/internal address is rejected with `403` before the job is created, it is not silently dropped |
 
@@ -154,6 +158,17 @@ and failed URLs, each with its own `failure_category`/`error_message` —
 a partial failure never silently disappears. `progress` is a real fraction
 (URLs completed / total URLs), not an estimate.
 
+**Results stream — you do not have to wait for the job to finish.** Rows are
+written one per URL as each completes, and this endpoint returns whatever has
+landed regardless of `status`, so a `PROCESSING` job already returns its
+finished URLs and a real `progress`.
+
+**Query parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `since` | ISO-8601 timestamp | Return only results extracted strictly after this instant. Pass the newest `fetched_at` from your previous poll to fetch just what is new instead of re-downloading the whole result set each time. `progress` and `partial_failure` always reflect the WHOLE job, never just the returned window |
+
 **Response:** `200 OK`
 ```json
 {
@@ -174,14 +189,43 @@ a partial failure never silently disappears. `progress` is a real fraction
       "proxy_used": "1.2.3.4:8080",
       "html_snapshot_url": "snapshots/acme/550e8400.../20260729T120000.html",
       "from_cache": false,
+      "proxy_source": "pool",
       "duration_ms": 234,
+      "timings": {
+        "cache_check_ms": 4,
+        "politeness_wait_ms": 1759,
+        "slot_wait_ms": 0,
+        "level_1_ms": 235,
+        "level_2_ms": 23427,
+        "level_3_ms": 18897,
+        "extract_ms": 107,
+        "markdown_ms": 314,
+        "total_ms": 70908
+      },
       "fetched_at": "2026-07-21T12:00:00Z"
     }
   ],
   "error": null,
-  "partial_failure": false
+  "partial_failure": false,
+  "queued_ms": 875,
+  "runtime_ms": 80644
 }
 ```
+
+**`timings`, `queued_ms`, `runtime_ms` — where the time actually went.**
+`duration_ms` is a single number written by whichever escalation level
+finally returned, so it cannot distinguish "the fetch is slow" from "the
+fetch was fine and everything around it was slow". `timings` breaks one
+URL down by phase in milliseconds; `queued_ms` is how long the job waited
+in the queue before a worker picked it up, and `runtime_ms` how long it
+then ran (both `null` until the corresponding transition has happened).
+
+A level that was skipped simply has no `level_N_ms` key — that is how you
+see the engine's per-domain level memory working. Once a domain is known to
+need a real browser, later URLs for it start at that level instead of
+re-paying the attempts that already failed, so their timings show only
+`level_3_ms`. Pin the ladder explicitly with `config_overrides.min_level` /
+`max_level` if you want to override that.
 
 **`partial_failure`:** `true` when `status` is `COMPLETED` but at least
 one URL in this job landed in the dead-letter queue alongside a

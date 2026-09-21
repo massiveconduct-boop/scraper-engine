@@ -32,6 +32,244 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 63)
+
+Origin: a second external consumer report, `DEVELOPER_REPORT_PERFORMANCE.md`
+(hermespace `ops/research/itel-30000mah-jumia/`, 20 Sep 2026), filed after
+round 62 fixed the reliability half. Reliability held — zero failures across
+55+ product pages — but throughput did not. Their measurement of one fresh
+product page: submit->PENDING 3.1s, PENDING->PROCESSING 3.0s,
+PROCESSING->COMPLETED **169.2s**, against an engine-reported fetch duration
+of **27.6s**. ~84% of each job's wall time was not the fetch. 95 URLs took
+~4.75 hours as serialized 1-URL jobs, because a 5-URL job they tried never
+came back.
+
+Eight of their nine observations were real. One was not, and is corrected
+below. Two further root causes were found only by live-reproducing the
+multi-URL case, and they are the ones that actually explain "never
+completed".
+
+- **FIXED (round 63) — the escalation ladder had no memory, so every URL
+  re-paid the levels that had already failed for its domain.**
+  `orchestrator/worker.py`'s `LEVELS = [1, 2, 3]` was entered at L1 for
+  every URL of every job. `level_used` was written to `scrape_results` but
+  read back only by the URL-exact cache check, never to decide where to
+  start (grep for `start_level|min_level|level_hint|last_successful_level`
+  across `src/` returned zero hits). For a domain that only succeeds in a
+  real browser that is one doomed HTTP attempt plus one doomed Botasaurus
+  launch before every fetch that can work — measured live at 23.4s of L2
+  plus 0.2s of L1 ahead of an 18.9s L3 render. New
+  `orchestrator/level_memory.py` stores a per-(tenant, domain) hint in
+  Redis. Two invariants keep it safe on by default: it only ever SKIPS
+  levels that recently failed (escalation above the hint is untouched, so a
+  hint can make a job faster and can never turn a succeeding fetch into a
+  failure), and it re-probes — `escalation.reprobe_every` (default 20) URLs,
+  one ignores the hint and runs the full ladder, so a target whose defences
+  relax is rediscovered. The TTL alone would not do that: a continuously
+  crawled domain refreshes its hint before it can ever expire. Callers can
+  also pin the ladder directly with `ConfigOverrides.min_level`/`max_level`.
+  Live: 85.5s cold -> 55.2s with the hint, with `level_1_ms`/`level_2_ms`
+  absent from the timings entirely.
+
+- **FIXED (round 63) — `stuck_job_reaper.py` was marking LIVE jobs FAILED,
+  and this is the real reason multi-URL jobs "never completed".** Round 62
+  rewrote the reaper to check real rq reachability rather than trusting the
+  job hash's status field. That was the right idea implemented against key
+  names and member shapes that do not match the installed rq 2.10, and it
+  failed in the most damaging possible direction — reporting every RUNNING
+  job as an orphan:
+  1. `_RQ_REGISTRY_ZSETS` hardcoded `rq:started:scraper-jobs`. rq 2.10's
+     `StartedJobRegistry.key_template` is `rq:wip:{0}`. The key the reaper
+     asked about does not exist on this deployment at all
+     (`redis-cli keys 'rq:*scraper-jobs*'` returns only `rq:wip:`,
+     `rq:failed:`, `rq:workers:`).
+  2. Even with the right key, the members are not bare job ids. rq's own
+     `StartedJobRegistry` docstring: "Each entry is a
+     {job_id}:{execution_id}". A `zscore(key, job_id)` could never match a
+     started job. Verified live: `zrange rq:wip:scraper-jobs 0 -1` returns
+     `ba547687-...:3d04729116c7...`.
+  Any PROCESSING row older than `_STALE_PROCESSING_GRACE_SECONDS` (120)
+  therefore had both of its reachability signals fail and was reconciled to
+  FAILED underneath its own live worker. A 1-URL job finishes inside 120s
+  and never shows it; a multi-URL job structurally cannot. That is exactly
+  the consumer's "submitted a 5-URL job, never completed within ~7 minutes,
+  had to abandon the test, fell back to 1-URL jobs". Live-reproduced twice:
+  a 10-URL job marked FAILED at 161s with `rq_status=started (orphaned: in
+  no queue or registry)` — and the worker, untouched, went on to write
+  **9 of 10 results after it had been declared dead**.
+  Fix: registry keys are asked of rq (`StartedJobRegistry(name=...,
+  connection=None).key`) instead of hardcoded, so an rq upgrade that renames
+  a registry can no longer silently turn this check into "reap everything
+  that is running"; membership is tested by `rq:executions:{job_id}` (the
+  live-execution registry, keyed by the bare id and the most direct "is
+  anyone working on this" signal rq offers) and by a `ZSCAN MATCH
+  "{job_id}:*"` that covers both member shapes. Independently,
+  `_persist_one_result` now touches `scrape_jobs.updated_at` as each result
+  lands, so "stale" means "not progressing" rather than "started more than
+  N seconds ago" — two independent signals must now fail before live work is
+  reconciled away.
+
+- **FIXED (round 63) — a pooled browser keeps its `BROWSER_SEMAPHORE`
+  permit, so a job could deadlock on its own idle spares.**
+  `BrowserPool.release(healthy=True)` returns a context to the queue but
+  does not release the semaphore, and `acquire()` deliberately keeps a
+  proxy/domain-mismatched spare pooled while launching a fresh instance
+  ("total concurrently-alive instances still can't exceed
+  core.budget.BROWSER_SEMAPHORE either way" — true, and exactly the
+  problem). Round 62 made this reachable in ordinary use: the gateway now
+  presents a fresh `sessid` per attempt, so `proxy` differs on nearly every
+  attempt and the mismatch branch is taken nearly every time. Once
+  `max_total_instances` permits are held by idle spares, the next launch
+  blocks on `BROWSER_SEMAPHORE.acquire()` forever — nothing is running, so
+  nothing will ever release. Live-caught: 8 live Camoufox instances, an
+  idle event loop, 2 of 10 URLs done.
+  The first fix (`_evict_spare_if_at_ceiling()`, evict the oldest parked
+  spare at `acquire()` entry when this pool's own instance count reached
+  `max_total_instances`) was **not enough**, and the live rerun showed it:
+  9 of 10 URLs done, then the 10th hung ~8 minutes with 8 live browsers
+  and an idle loop until RQ killed the job at 1288s. It covered only one
+  ordering of the deadlock. The other: a launch arrives while every
+  instance is leased (pool empty, nothing to evict, so it waits on the
+  semaphore), then its siblings finish and park their instances healthy —
+  each keeping its permit — behind a waiter nobody ever wakes. It was also
+  keyed on the pool's instance count against config, while the semaphore
+  is shared with Botasaurus and sized by
+  `resolve_browser_max_total_instances()`, so the count could sit below the
+  real ceiling. Final shape: `_make_room_for_launch()` evicts parked spares
+  while `BROWSER_SEMAPHORE.locked()` (semaphore-keyed); `acquire()` counts
+  `_launch_waiters`, and `release(healthy=True)` tears an instance down
+  instead of parking it when a launch is waiting and no permit is free,
+  handing the permit over. Same pass fixed three leaks on the cancellation
+  path: `lease()` and `CamoufoxWrapper.__aenter__` caught only `Exception`,
+  so `CancelledError` skipped cleanup and leaked the instance and its
+  permit; a launch that failed or was cancelled stayed listed in
+  `_active_wrappers`; and a browser whose `new_context()` failed was left
+  running unowned (`__aenter__` now runs a full `__aexit__`). Regression
+  test `test_a_spare_parked_while_a_launch_waits_is_handed_over` was
+  mutation-checked: it fails (times out) with the hand-over disabled.
+  Live, after redeploy: the same 10-URL Jumia job COMPLETED 10/10 in
+  286.7s wall (previous run FAILED at 1288s), max slot wait 21ms, zero
+  `stuck_job_reconciled`, teardown timeouts or tracebacks in the logs, with
+  the full L1->L3 ladder on every URL (the level hint had expired).
+  Eviction is still a no-op when the pool is empty — every instance
+  genuinely leased out is real contention the semaphore should absorb by
+  making the caller wait, not a reason to tear down a browser mid-fetch.
+
+- **FIXED (round 63) — politeness starved concurrent same-domain URLs into
+  DLQ without ever fetching them.** Three compounding defects:
+  `wait_if_needed` was awaited INSIDE the held slot, so a slot was occupied
+  for delay + full fetch and the pool's real throughput was one URL per
+  (delay + fetch) rather than one per fetch; `slot_wait_timeout_seconds` was
+  30, shorter than a single worst-case L3 attempt (~85s of configured waits
+  alone, before `level_3.timeout_seconds` for the navigation), and running
+  it out `continue`d to the NEXT level — a busy slot says nothing about the
+  current level, so a URL walked the whole ladder without one fetch and then
+  DLQ'd as `PROXY_EXHAUSTED` with "All fetch levels exhausted without a
+  single attempt"; and `slot_ttl_seconds` (120) was itself shorter than a
+  worst-case L3 attempt, so the deadman switch could release a slot still in
+  use. Now: the delay is served before the slot is taken, the budget is 300s
+  and running it out is terminal for that URL rather than a level advance,
+  reported as the new `FailureCategory.POLITENESS_TIMEOUT` (transient, so
+  `dlq_reaper` may auto-retry it), and `PolitenessController.held_slot()`
+  refreshes the TTL while held and always releases. The delay itself became
+  an atomic Lua reservation: the old read-sleep-write let N concurrent
+  siblings read the same timestamp, sleep the same amount and fetch at the
+  same instant, defeating the delay exactly when it mattered; and it wrote
+  `time.monotonic()` — a process-local epoch — into a Redis key shared by
+  every worker, so the comparison was only meaningful within one process.
+  Redis's own `TIME` is the clock now.
+
+- **FIXED (round 63) — per-request politeness.** `default_concurrency` /
+  `default_delay_seconds` were construction-time scalars no caller could
+  reach, so a trusted bulk crawl of one domain ran at the same pace as an
+  untrusted scrape of a stranger's site. `ConfigOverrides` now carries
+  `politeness_concurrency` / `politeness_delay_seconds`, clamped
+  server-side by `politeness.max_request_concurrency` (10) and
+  `min_request_delay_seconds` (0.5). The clamp is server-side precisely
+  because the request is the untrusted half of the decision.
+
+- **FIXED (round 63) — "L3 loses product links" was the 100-link cap.**
+  `adaptive_selector.py` built `links` as `hrefs[:100]` over raw DOM order:
+  relative, un-deduped, hard-capped. `FetchResult` has no `links` field at
+  all — links are produced once, centrally, post-ladder
+  (`worker.py`), from the same HTML string that feeds `content` and the S3
+  snapshot, so the L2/L3 difference was only ever *when that string was
+  captured*, never how it was parsed. On a real Jumia catalog page L3's
+  wait-and-scroll lets the nav mega-menu hydrate, and its ~100 links fill
+  the cap before the first product; L2 snapshotted before hydration and so
+  happened to fit products in. Now absolutized against the page URL,
+  filtered of `javascript:`/`mailto:`/`tel:`/`data:`/`blob:`/bare fragments,
+  deduped preserving first-seen order, capped at `extraction.max_links`
+  (1000). Live on the page that previously returned zero product links:
+  **607 links, 144 product URLs**.
+
+- **FIXED (round 63) — L2's non-determinism was driver reuse silently
+  changing the fetch method.** `botasaurus_pool._reuse_fetch` fired
+  `driver.requests.get(url)`, an in-page HTTP call with no JS execution, no
+  challenge handling and no scroll, so only the FIRST URL of a domain got a
+  real browser render and every later one got structurally different HTML.
+  Whether L2 succeeded depended on whether a URL happened to be first in its
+  domain — the consumer's "same URL, same parameters, sometimes L2, mostly
+  L3". The reuse gate also keyed on `proxy.key()` (ip:port), which is
+  CONSTANT for the paid gateway, so a deliberately rotated `sessid` reused
+  the already-blocked exit IP. Now the reuse path navigates (keeping the
+  launch/Xvfb saving that was the real win) and the gate is the new
+  `Proxy.identity_key()` (username@ip:port).
+
+- **FIXED (round 63) — L3 paid a 10s fixed wait on every page.**
+  `post_load_fixed_wait_ms` ran unconditionally, before anything had looked
+  at the page. A domain that escalates to L3 tends to stay there for a whole
+  crawl, so that was 10s multiplied by every URL of the job for the majority
+  of pages that render fine once a real browser asks. The wait is now paid
+  only when the first content read looks like a challenge; an interstitial
+  keeps the identical budget.
+
+- **FIXED (round 63) — no per-phase timing existed, which is why this class
+  of problem took a consumer hours to describe and us minutes to confirm.**
+  `observability/metrics.py` had no `Histogram` at all and job duration was
+  a scalar sum/count pair; `scrape_jobs` had only `created_at` and an
+  `updated_at` overwritten by every transition, so queue wait was
+  underivable; `FetchResult.duration_ms` is one number, written by whichever
+  level finally returned. Migration 011 adds `scrape_jobs.started_at` /
+  `finished_at` and `scrape_results.timings`; `FetchResult.timings` carries
+  a per-phase millisecond breakdown; `GET /v1/jobs/{id}` returns it plus
+  `queued_ms`/`runtime_ms`, and also surfaces `proxy_source`, which was
+  persisted and then dropped on the way back out. A skipped level simply has
+  no `level_N_ms` key, which is how the level hint is observed working.
+  `fetch_duration_seconds` is the module's first real histogram, labelled by
+  level. `finished_at` is set on the success path, the crash path AND by the
+  reaper, so the jobs whose duration is most worth knowing are not the ones
+  reporting none.
+
+- **CORRECTED (round 63) — the report's "no result streaming" is not
+  true.** `api/routes.py::get_job` has always selected every
+  `scrape_results` row and returned them regardless of job status, and
+  computes real fractional progress from the row count; rows land one per
+  URL as each completes (`tasks.py`'s `on_result` callback, round 29). What
+  was missing was a cursor: every poll re-sent every result already
+  delivered, which is what made polling a 95-URL job unattractive. `GET
+  /v1/jobs/{id}?since=<ISO-8601>` now filters `extracted_at`, with
+  `progress` still counting the whole job via its own `COUNT(*)` so a caller
+  paging forward never sees progress fall back. Surfaced on the CLI as
+  `api job --since`.
+
+### Open threads carried out of round 63
+
+- **The round-62 coverage TODOs (T1-T4) were deliberately NOT done here.**
+  They are an unrelated concern (gate SCOPE, not throughput) and the user
+  explicitly scoped this round to the performance report. They stand
+  unchanged in `.wolf/STATUS.md`.
+- **`BROWSER_SEMAPHORE` sizing is still independent of URL concurrency.**
+  Parked spares can no longer starve a launch. A job whose in-flight URLs genuinely need
+  more than `camoufox.max_total_instances` live browsers at once still
+  waits, which is correct, but `politeness.max_concurrent_urls_per_job` (5)
+  and `camoufox.max_total_instances` (8) are tuned independently and nothing
+  asserts a sane relationship between them.
+- **The consumer's original scrape is still unfinished** — pages 2-3 and the
+  product-detail pages of the itel 30,000 mAh catalog were never collected.
+  It should now be re-runnable as a small number of multi-URL jobs rather
+  than 95 serialized ones.
+
 ## Technical Debt / Open Threads (as of round 62)
 
 - **FIXED (round 62) — the paid gateway had one fixed identity, so a
