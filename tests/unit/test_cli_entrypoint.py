@@ -150,11 +150,26 @@ def test_run_api_command_job_gets_by_id(monkeypatch):
         "scraper_engine.cli.entrypoint._api_client", lambda base_url, api_key: fake
     )
 
-    _run_api_command(_args("job", job_id="abc-123"))
+    _run_api_command(_args("job", job_id="abc-123", since=None))
 
-    method, path, _kwargs = fake.calls[0]
+    method, path, kwargs = fake.calls[0]
     assert method == "GET"
     assert path == "/v1/jobs/abc-123"
+    assert kwargs["params"] is None
+
+
+def test_run_api_command_job_forwards_since_cursor(monkeypatch):
+    """Round 63 — polling a long job re-sent every result already seen. The
+    cursor is what lets a caller fetch only what is new."""
+    fake = FakeClient()
+    monkeypatch.setattr(
+        "scraper_engine.cli.entrypoint._api_client", lambda base_url, api_key: fake
+    )
+
+    _run_api_command(_args("job", job_id="abc-123", since="2026-09-20T12:00:00Z"))
+
+    _method, _path, kwargs = fake.calls[0]
+    assert kwargs["params"] == {"since": "2026-09-20T12:00:00Z"}
 
 
 def test_run_api_command_quota_gets_quota(monkeypatch):

@@ -58,6 +58,14 @@ RETRY_MATRIX: dict[FailureCategory, RetryStrategy] = {
     FailureCategory.NOT_FOUND: RetryStrategy(
         max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
     ),
+    # Round 63 — pure politeness contention against one domain. Worth
+    # retrying (the blocker is sibling URLs finishing, which they will), but
+    # with a long base delay: retrying quickly just re-enters the same queue
+    # the URL already waited out, and adds load to the domain the delay
+    # exists to protect.
+    FailureCategory.POLITENESS_TIMEOUT: RetryStrategy(
+        max_attempts=2, base_delay_seconds=30.0, max_delay_seconds=120.0, retryable=True
+    ),
 }
 
 

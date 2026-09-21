@@ -7,8 +7,9 @@ must `str()` it or Pydantic raises and the endpoint 500s on every existing job
 (round 16 — caught by the full-stack e2e smoke).
 """
 
+import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,12 +48,33 @@ def wired_deps(monkeypatch):
     return pg
 
 
+def _job_row(job_id, status, urls, *, created_at=None, started_at=None, finished_at=None):
+    """A scrape_jobs row as get_job selects it.
+
+    Round 63 added created_at/started_at/finished_at to that SELECT so the
+    response can report queued_ms/runtime_ms. Defaulting the phase timestamps
+    to None here keeps each test naming only what it is actually about, and
+    matches a real row for a job that has not started yet.
+    """
+    return {
+        "job_id": job_id,
+        "status": status,
+        "urls": urls,
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+
+
 @pytest.mark.asyncio
 async def test_get_job_coerces_uuid_job_id_to_str(wired_deps):
     jid = uuid.uuid4()
-    # First fetch() is the scrape_jobs lookup, second is the scrape_results join.
+    # fetch() calls, in order: the scrape_jobs lookup, the completed-count
+    # (round 63 — its own query so `progress` still counts the whole job when
+    # the caller pages with ?since=), then the scrape_results rows.
     wired_deps.fetch.side_effect = [
-        [{"job_id": jid, "status": "PENDING", "urls": ["https://example.com"]}],
+        [_job_row(jid, "PENDING", ["https://example.com"])],
+        [{"n": 0}],
         [],
     ]
 
@@ -72,7 +94,8 @@ async def test_get_job_surfaces_network_events_from_db_row(wired_deps):
     jid = uuid.uuid4()
     now = datetime.now(UTC)
     wired_deps.fetch.side_effect = [
-        [{"job_id": jid, "status": "COMPLETED", "urls": ["https://a.example", "https://b.example"]}],
+        [_job_row(jid, "COMPLETED", ["https://a.example", "https://b.example"])],
+        [{"n": 2}],
         [
             {
                 "url": "https://a.example",
@@ -89,6 +112,8 @@ async def test_get_job_surfaces_network_events_from_db_row(wired_deps):
                 "error_message": None,
                 "failure_category": None,
                 "extracted_at": now,
+                "proxy_source": None,
+                "timings": None,
             },
             {
                 "url": "https://b.example",
@@ -105,6 +130,8 @@ async def test_get_job_surfaces_network_events_from_db_row(wired_deps):
                 "error_message": None,
                 "failure_category": None,
                 "extracted_at": now,
+                "proxy_source": None,
+                "timings": None,
             },
         ],
     ]
@@ -188,7 +215,7 @@ async def test_scrape_job_timeout_scales_with_url_count(wired_scrape_deps):
     await scrape(request, x_api_key="sk-admin")
 
     call_args = queue.enqueue.call_args
-    assert call_args.kwargs["job_timeout"] == 20 * 120
+    assert call_args.kwargs["job_timeout"] == 20 * 180
 
 
 @pytest.mark.asyncio
@@ -1358,3 +1385,135 @@ async def test_cancel_job_invalid_api_key_401(wired_cancel_deps):
     with pytest.raises(HTTPException) as ei:
         await cancel_job(str(uuid.uuid4()), x_api_key="sk-bad")
     assert ei.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Round 63 — the polling contract. Partial results of a still-PROCESSING job
+# were always readable (rows land one per URL as they complete), but every
+# poll re-sent the whole set, so a 95-URL job re-transferred everything it had
+# already delivered on each check. `since` is the cursor that was missing.
+# ---------------------------------------------------------------------------
+
+
+def _result_row(url, now, **over):
+    row = {
+        "url": url,
+        "success": True,
+        "http_status": 200,
+        "proxy_source": "pool",
+        "is_challenge_page": False,
+        "level_used": 3,
+        "proxy_used": "1.2.3.4:8080",
+        "markdown": None,
+        "json_data": None,
+        "network_events": None,
+        "html_snapshot_url": None,
+        "time_taken_ms": 27600,
+        "error_message": None,
+        "failure_category": None,
+        "extracted_at": now,
+        "timings": None,
+    }
+    row.update(over)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_get_job_since_is_passed_to_the_query(wired_deps):
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    cursor = now - timedelta(minutes=5)
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "PROCESSING", ["https://a.example", "https://b.example"])],
+        [{"n": 2}],
+        [_result_row("https://b.example", now)],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin", since=cursor)
+
+    assert resp.results is not None
+    assert len(resp.results) == 1
+    assert cursor in wired_deps.fetch.await_args.args
+
+
+@pytest.mark.asyncio
+async def test_get_job_progress_counts_the_whole_job_not_the_since_window(wired_deps):
+    """The cursor narrows the payload, never the progress figure — a caller
+    paging through a job must not see progress fall back as it advances."""
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "PROCESSING", [f"https://{i}.example" for i in range(10)])],
+        [{"n": 8}],
+        [_result_row("https://7.example", now)],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin", since=now - timedelta(seconds=30))
+
+    assert resp.progress == 0.8
+    assert resp.results is not None and len(resp.results) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_job_surfaces_timings_and_proxy_source(wired_deps):
+    """Both columns were persisted and then dropped on the way back out, so
+    a caller could not see where a URL's time went or which proxy path served
+    it (round 63)."""
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    breakdown = {"level_1_ms": 20000, "level_2_ms": 120000, "level_3_ms": 27600}
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "COMPLETED", ["https://a.example"])],
+        [{"n": 1}],
+        [
+            _result_row(
+                "https://a.example", now, timings=json.dumps(breakdown), proxy_source="paid_gateway"
+            )
+        ],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.results is not None
+    assert resp.results[0].timings == breakdown
+    assert resp.results[0].proxy_source == "paid_gateway"
+
+
+@pytest.mark.asyncio
+async def test_get_job_reports_queue_wait_and_runtime(wired_deps):
+    jid = uuid.uuid4()
+    created = datetime.now(UTC)
+    wired_deps.fetch.side_effect = [
+        [
+            _job_row(
+                jid,
+                "COMPLETED",
+                ["https://a.example"],
+                created_at=created,
+                started_at=created + timedelta(seconds=3),
+                finished_at=created + timedelta(seconds=178),
+            )
+        ],
+        [{"n": 1}],
+        [],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.queued_ms == 3000
+    assert resp.runtime_ms == 175000
+
+
+@pytest.mark.asyncio
+async def test_get_job_phase_durations_are_none_before_the_transitions(wired_deps):
+    jid = uuid.uuid4()
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "PENDING", ["https://a.example"], created_at=datetime.now(UTC))],
+        [{"n": 0}],
+        [],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.queued_ms is None
+    assert resp.runtime_ms is None

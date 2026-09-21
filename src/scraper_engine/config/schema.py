@@ -243,8 +243,29 @@ class PolitenessConfig(BaseModel):
     # with slot_retry_interval_seconds backoff until slot_wait_timeout_seconds
     # of real wall-clock elapses, giving concurrent siblings genuine time to
     # finish and release their slot before conceding.
-    slot_wait_timeout_seconds: float = 30.0
+    # Round 63 — raised from 30.0. 30s could not cover even ONE slot-holder:
+    # a worst-case Level-3 attempt is ~85s of configured waits alone
+    # (post_load_fixed_wait_ms + max_total_wait_ms + 10 scroll passes + a
+    # post-captcha re-poll) on top of level_3.timeout_seconds for the
+    # navigation itself. So under concurrent same-domain dispatch the losing
+    # siblings reliably ran out the budget on EVERY level and the URL DLQ'd
+    # having never once been fetched — round 61 made the wait real but left
+    # it an order of magnitude too short, which is what an external consumer
+    # hit as "a 5-URL job never completed". 300s covers two full L3 holders
+    # deep. Round 63 also stopped a timeout here from advancing to the next
+    # level (a busy slot never said anything about the current level), so
+    # this budget is now the URL's whole politeness allowance, not a
+    # per-level one.
+    slot_wait_timeout_seconds: float = 300.0
     slot_retry_interval_seconds: float = 1.0
+    # Round 63 — ceilings for the per-request politeness overrides on
+    # core/models.py::ConfigOverrides. A caller running a trusted bulk crawl
+    # can raise concurrency and drop the delay for its own job, but only
+    # within these operator-set bounds: orchestrator/worker.py clamps every
+    # request against them, so the blast radius of a caller asking for "as
+    # fast as possible" stays something the operator chose.
+    max_request_concurrency: int = 10
+    min_request_delay_seconds: float = 0.5
     # Round 49 — orchestrator/worker.py::Worker.process_job's per-job URL
     # dispatch semaphore size. Was strictly sequential before this (root
     # cause of slow large-batch job runs, round 45). Deliberately below
@@ -255,6 +276,52 @@ class PolitenessConfig(BaseModel):
     # this process across every job," and a concurrent task simply queues
     # on BROWSER_SEMAPHORE once this job's own budget is saturated.
     max_concurrent_urls_per_job: int = 5
+
+
+class EscalationConfig(BaseModel):
+    """Round 63 — cross-job memory of which level actually works for a domain.
+
+    The L1->L2->L3 ladder was entered at L1 for every URL of every job, with
+    no record anywhere of what had just worked. For a domain that only ever
+    succeeds at L3 that means paying a doomed L1 attempt plus a doomed L2
+    browser launch before the one attempt that can work — measured by an
+    external consumer at ~140s of the 169s a single Jumia product page spent
+    in PROCESSING, against a 27.6s real fetch. `level_used` was already
+    written to scrape_results; nothing read it back to decide anything.
+
+    orchestrator/level_memory.py stores the hint. It only ever SKIPS levels
+    that recently failed for this domain — escalation above the hint is
+    untouched, so the hint can make a job faster but never make a fetch that
+    would have succeeded fail.
+    """
+
+    level_memory_enabled: bool = True
+    # Short on purpose. A hint is a claim about a target's CURRENT bot
+    # posture, which is exactly the thing that changes without warning; an
+    # hour is long enough to carry a bulk crawl of one domain end to end and
+    # short enough that a stale hint costs at most an hour of unnecessary L3.
+    level_memory_ttl_seconds: int = 3600
+    # Staleness guard: every Nth URL for a domain ignores the hint and runs
+    # the full ladder, so a target that gets EASIER (challenge lifted, WAF
+    # rule relaxed) is rediscovered instead of paying L3 forever. Without
+    # this the hint is a one-way ratchet — the TTL alone would only re-probe
+    # after a full hour of inactivity, which a continuous crawl never has.
+    # 0 disables re-probing.
+    reprobe_every: int = 20
+
+
+class ExtractionConfig(BaseModel):
+    """Round 63 — limits for fetcher/adaptive_selector.py's extraction."""
+
+    # Was a hardcoded `links[:100]` slice of the raw DOM order. On a real
+    # Jumia catalog page rendered at L3 the hydrated nav mega-menu alone
+    # supplies ~100 links before the first product link, so the cap filled
+    # with site navigation and returned ZERO product URLs — while the same
+    # page snapshotted earlier at L2 (before hydration) returned them all.
+    # That read as "L3 loses product links"; it was the cap. Kept as a limit
+    # rather than removed so a pathological page can't return a
+    # multi-megabyte link list, but set well above any real page's nav.
+    max_links: int = 1000
 
 
 class CircuitBreakerConfig(BaseModel):
@@ -486,6 +553,8 @@ class AppConfig(BaseModel):
     proxy_tiers: ProxyTierConfig = Field(default_factory=ProxyTierConfig)
     dataimpulse: DataImpulseConfig = Field(default_factory=DataImpulseConfig)
     politeness: PolitenessConfig = Field(default_factory=PolitenessConfig)
+    escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     capsolver: CapSolverConfig = Field(default_factory=CapSolverConfig)
     ssrf_guard: SSRFGuardConfig = Field(default_factory=SSRFGuardConfig)

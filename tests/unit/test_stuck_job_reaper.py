@@ -316,7 +316,11 @@ class TestRqJobIsReachable:
     async def test_reachable_when_in_a_registry_zset(self):
         redis = AsyncMock()
         redis.raw.lpos.return_value = None
+        redis.raw.exists.return_value = 0
         redis.raw.zscore.side_effect = [None, 1234.0, None]
+        # The first registry misses under BOTH member shapes, so the scan has
+        # to come back empty for the loop to reach the second one (round 63).
+        redis.raw.zscan.return_value = (0, [])
 
         assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
 
@@ -324,7 +328,11 @@ class TestRqJobIsReachable:
     async def test_orphan_in_no_queue_and_no_registry(self):
         redis = AsyncMock()
         redis.raw.lpos.return_value = None
+        # No live execution and no registry entry under either member shape
+        # (round 63) — every signal has to be absent for an orphan verdict.
+        redis.raw.exists.return_value = 0
         redis.raw.zscore.return_value = None
+        redis.raw.zscan.return_value = (0, [])
 
         assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is False
 
@@ -390,3 +398,110 @@ class TestOrphanedQueuedJobReconciliation:
 
         assert reconciled == 1
         reachable.assert_not_awaited()
+
+
+class TestRegistryKeysMatchInstalledRq:
+    """Round 63 — the reachability check has to compare against the registry
+    keys the INSTALLED rq actually uses.
+
+    They were hardcoded, and the most important one was wrong: rq 2.10's
+    StartedJobRegistry key is `rq:wip:<queue>`, while the constant said
+    `rq:started:<queue>` — a key that does not exist. Every genuinely running
+    job therefore read as "in no queue or registry", so any job still
+    PROCESSING past the 120s grace was reconciled to FAILED underneath its
+    own live worker. A 1-URL job finishes inside the grace and never shows
+    it; a multi-URL job cannot, which is why an external consumer's 5-URL
+    job "never completed" and they fell back to 95 serialized 1-URL jobs.
+    """
+
+    def test_started_registry_key_is_the_one_rq_actually_writes(self):
+        from rq.registry import StartedJobRegistry
+
+        from scraper_engine.orchestrator.job_queue import QUEUE_NAME
+
+        real = StartedJobRegistry(name=QUEUE_NAME, connection=None).key
+        assert real in stuck_job_reaper._rq_registry_zsets()
+
+    def test_every_registry_key_is_asked_of_rq_not_hardcoded(self):
+        from rq.registry import DeferredJobRegistry, ScheduledJobRegistry, StartedJobRegistry
+
+        from scraper_engine.orchestrator.job_queue import QUEUE_NAME
+
+        expected = {
+            cls(name=QUEUE_NAME, connection=None).key
+            for cls in (StartedJobRegistry, DeferredJobRegistry, ScheduledJobRegistry)
+        }
+        assert set(stuck_job_reaper._rq_registry_zsets()) == expected
+
+    def test_queue_key_follows_the_queue_the_producer_enqueues_to(self):
+        from scraper_engine.orchestrator.job_queue import QUEUE_NAME
+
+        assert f"rq:queue:{QUEUE_NAME}" == stuck_job_reaper._RQ_QUEUE_KEY
+
+    @pytest.mark.asyncio
+    async def test_a_running_job_in_the_started_registry_is_reachable(self):
+        """The regression itself: a job sitting in rq's real started registry
+        must never be reported as an orphan."""
+        from rq.registry import StartedJobRegistry
+
+        from scraper_engine.orchestrator.job_queue import QUEUE_NAME
+
+        started_key = StartedJobRegistry(name=QUEUE_NAME, connection=None).key
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.zscore.side_effect = lambda key, _jid: 1234.0 if key == started_key else None
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+
+
+class TestStartedRegistryMemberShape:
+    """Round 63 — StartedJobRegistry members are `{job_id}:{execution_id}`.
+
+    rq's own docstring says so. A bare `zscore(key, job_id)` therefore could
+    never match a running job, so even after the key name was corrected from
+    `rq:started:` to `rq:wip:` the check still reported every running job as
+    an orphan — and the reaper went on marking live multi-URL jobs FAILED
+    under their own workers. Live-caught twice on the same 10-URL job.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_job_found_by_its_execution_registry(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.exists.return_value = 1
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+        redis.raw.exists.assert_awaited_once_with("rq:executions:job-1")
+
+    @pytest.mark.asyncio
+    async def test_running_job_found_by_composite_registry_member(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.exists.return_value = 0
+        redis.raw.zscore.return_value = None
+        redis.raw.zscan.return_value = (0, [("job-1:exec-abc", 1234.0)])
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+        assert redis.raw.zscan.await_args.kwargs["match"] == "job-1:*"
+
+    @pytest.mark.asyncio
+    async def test_scan_continues_past_an_empty_first_cursor_page(self):
+        """ZSCAN may return an empty page with a non-zero cursor; stopping
+        there would call a live job an orphan on a large registry."""
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.exists.return_value = 0
+        redis.raw.zscore.return_value = None
+        redis.raw.zscan.side_effect = [(17, []), (0, [("job-1:exec-abc", 1234.0)])]
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is True
+
+    @pytest.mark.asyncio
+    async def test_genuine_orphan_still_reported_after_a_full_scan(self):
+        redis = AsyncMock()
+        redis.raw.lpos.return_value = None
+        redis.raw.exists.return_value = 0
+        redis.raw.zscore.return_value = None
+        redis.raw.zscan.return_value = (0, [])
+
+        assert await stuck_job_reaper._rq_job_is_reachable(redis, "job-1") is False

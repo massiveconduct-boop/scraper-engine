@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 from scraper_engine.fetcher._failure import classify_http_status
+from scraper_engine.observability.metrics import fetch_duration_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,10 @@ TRANSIENT_FAILURE_CATEGORIES = frozenset(
     {
         FailureCategory.PROXY_EXHAUSTED,
         FailureCategory.CIRCUIT_OPEN,
+        # Round 63 — pure contention: the URL never got a politeness slot.
+        # Transient by construction, since what clears it is sibling URLs
+        # finishing, so it is auto-retry eligible like the other two.
+        FailureCategory.POLITENESS_TIMEOUT,
     }
 )
 DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
@@ -205,6 +211,48 @@ class Worker:
         )
 
         self._extraction_engine = build_extraction_engine_client()
+        # Round 63 — per-domain "start the ladder here" memory. Reads and
+        # writes are best-effort (see level_memory.py): a Redis problem costs
+        # the latency this was built to save, never a job.
+        from .level_memory import LevelMemory
+
+        self._level_memory = LevelMemory(redis, self._config.escalation)
+
+    def _resolve_levels(self, overrides: ConfigOverrides | None) -> list[int]:
+        """The escalation ladder for this request, narrowed by min/max_level.
+
+        Round 63. Always non-empty: ConfigOverrides already rejects
+        min_level > max_level at validation time, and both are constrained to
+        the 1..3 range LEVELS spans.
+        """
+        if overrides is None:
+            return list(LEVELS)
+        low = overrides.min_level or LEVELS[0]
+        high = overrides.max_level or LEVELS[-1]
+        return [level for level in LEVELS if low <= level <= high]
+
+    def _resolve_politeness(self, overrides: ConfigOverrides | None) -> tuple[int, float]:
+        """This request's (concurrency, delay_seconds), clamped to the
+        operator's ceilings.
+
+        Round 63 — the limits used to be construction-time scalars a caller
+        could not reach at all, which meant a trusted bulk crawl of one
+        domain ran at the same 2-concurrent/5s-apart pace as an untrusted
+        scrape of a stranger's site. A caller may now trade politeness for
+        throughput, but only inside config.politeness's
+        max_request_concurrency / min_request_delay_seconds — the clamp is
+        server-side precisely because the request is the untrusted half of
+        this decision.
+        """
+        cfg = self._config.politeness
+        concurrency = cfg.default_concurrency
+        delay = cfg.default_delay_seconds
+        if overrides is not None:
+            if overrides.politeness_concurrency is not None:
+                concurrency = min(overrides.politeness_concurrency, cfg.max_request_concurrency)
+            if overrides.politeness_delay_seconds is not None:
+                delay = max(overrides.politeness_delay_seconds, cfg.min_request_delay_seconds)
+        return concurrency, delay
 
     @property
     def _gateway_fallback_eligible(self) -> bool:
@@ -261,6 +309,8 @@ class Worker:
         results: list[FetchResult | None] = [None] * len(request.urls)
         cancelled_state = {"value": False}
         semaphore = asyncio.Semaphore(self._config.politeness.max_concurrent_urls_per_job)
+        levels = self._resolve_levels(request.config_overrides)
+        req_concurrency, req_delay = self._resolve_politeness(request.config_overrides)
 
         async def _dispatch_one_url(index: int, url: HttpUrl) -> None:
             async with semaphore:
@@ -268,6 +318,20 @@ class Worker:
 
         async def _process_one_url(index: int, url: HttpUrl) -> None:
             url_str = str(url)
+            # Round 63 — per-phase millisecond breakdown for this URL, carried
+            # onto whichever FetchResult ends up terminal. duration_ms alone
+            # could not distinguish "the fetch is slow" from "the fetch was
+            # fine and everything around it was slow", which is exactly the
+            # question an external consumer could not answer about a 175s job
+            # whose fetch took 28s.
+            timings: dict[str, int] = {}
+            url_start = time.monotonic()
+
+            def _finish(result: FetchResult) -> FetchResult:
+                """Stamp the accumulated timings onto a terminal result."""
+                timings["total_ms"] = int((time.monotonic() - url_start) * 1000)
+                result.timings = dict(timings)
+                return result
 
             # Checked once per task, right after this task's semaphore slot
             # comes free — same cooperative granularity the old "checked
@@ -283,14 +347,23 @@ class Worker:
                 return
 
             if not bypass_cache:
+                cache_start = time.monotonic()
                 cached = await self._check_cache(tenant_id, url_str)
+                timings["cache_check_ms"] = int((time.monotonic() - cache_start) * 1000)
                 if cached is not None:
-                    results[index] = cached
+                    results[index] = _finish(cached)
                     if on_result is not None:
                         await on_result(cached)
                     return
 
             domain = self._extract_domain(url_str)
+            start_level = await self._level_memory.start_level(tenant_id, domain, levels)
+            # An explicit min_level is the caller's own floor and already
+            # narrowed `levels`, so the hint can only move the start UP from
+            # there — never below what the caller asked for.
+            # Which levels actually ran is readable from the timings dict
+            # itself: a skipped level simply has no level_N_ms key.
+            url_levels = [level for level in levels if level >= start_level]
             # Round 42 — wraps the rest of this URL's fetch/extract/markdown
             # pipeline in a try/except so an unexpected exception ANYWHERE in
             # it (fetch dispatch, extraction, markdown conversion, DLQ/on_result
@@ -316,7 +389,7 @@ class Worker:
                 # that branch's comment for the bug this closes.
                 last_level_result: FetchResult | None = None
 
-                for level in LEVELS:
+                for level in url_levels:
                     circuit_open = not await self._circuit_breaker.allow_request(domain)
                     # Round 49 — an open circuit reflects FREE-pool failure
                     # history for this domain (record_success/record_failure
@@ -349,7 +422,7 @@ class Worker:
                             level,
                         )
                         errors.append(f"Circuit open for {domain}")
-                        results[index] = circuit_result
+                        results[index] = _finish(circuit_result)
                         if on_result is not None:
                             await on_result(circuit_result)
                         break
@@ -362,12 +435,58 @@ class Worker:
                     if circuit_open and level == 1:
                         continue
 
-                    slot_worker_id = await self._acquire_politeness_slot(domain, tenant_id)
+                    # Round 63 — the inter-fetch delay is served BEFORE taking
+                    # a slot, not while holding one. Sleeping inside the slot
+                    # made every waiter pay for the delay too: with
+                    # default_concurrency slots and a per-fetch delay, the
+                    # pool's real throughput was one URL per (delay + fetch),
+                    # not one per fetch. It is also the correct order on its
+                    # own terms — the delay is about the TARGET's pacing, the
+                    # slot is about our own concurrency.
+                    timings["politeness_wait_ms"] = timings.get(
+                        "politeness_wait_ms", 0
+                    ) + await self._politeness.wait_if_needed(
+                        domain, tenant_id, delay_seconds=req_delay
+                    )
+                    slot_worker_id, slot_wait_ms = await self._acquire_politeness_slot(
+                        domain, tenant_id, concurrency=req_concurrency
+                    )
+                    timings["slot_wait_ms"] = timings.get("slot_wait_ms", 0) + slot_wait_ms
                     if slot_worker_id is None:
-                        continue
+                        # Round 63 — this used to `continue` to the NEXT level.
+                        # A busy slot says nothing about the current level, so
+                        # advancing on it let a URL walk the whole ladder
+                        # without a single fetch and then DLQ as if the proxy
+                        # pool were exhausted. Contention is terminal for this
+                        # URL now, reported as what it actually is.
+                        message = (
+                            f"No politeness slot for {domain} within "
+                            f"{self._config.politeness.slot_wait_timeout_seconds}s"
+                        )
+                        slot_result = FetchResult(
+                            url=url_str,
+                            success=False,
+                            level_used=level,
+                            duration_ms=0,
+                            failure_category=FailureCategory.POLITENESS_TIMEOUT,
+                            error_message=message,
+                        )
+                        await self._dlq.enqueue(
+                            tenant_id,
+                            job_id,
+                            url_str,
+                            FailureCategory.POLITENESS_TIMEOUT,
+                            message,
+                            level,
+                        )
+                        errors.append(message)
+                        results[index] = _finish(slot_result)
+                        if on_result is not None:
+                            await on_result(slot_result)
+                        break
 
-                    try:
-                        await self._politeness.wait_if_needed(domain, tenant_id)
+                    level_start = time.monotonic()
+                    async with self._politeness.held_slot(domain, tenant_id, slot_worker_id):
                         result = await self._fetch_url(
                             tenant_id,
                             url_str,
@@ -375,8 +494,9 @@ class Worker:
                             request.config_overrides,
                             force_gateway=circuit_open,
                         )
-                    finally:
-                        await self._politeness.release_slot(domain, tenant_id, slot_worker_id)
+                    level_ms = int((time.monotonic() - level_start) * 1000)
+                    timings[f"level_{level}_ms"] = level_ms
+                    fetch_duration_seconds.labels(level=str(level)).observe(level_ms / 1000)
 
                     if result is None:
                         continue
@@ -405,7 +525,7 @@ class Worker:
                     # on a result that already came from the gateway (one
                     # extra attempt per URL per level, never a second).
                     if (
-                        level == LEVELS[-1]
+                        level == url_levels[-1]
                         and self._gateway_fallback_eligible
                         and result.proxy_source != "paid_gateway"
                         and (
@@ -464,7 +584,7 @@ class Worker:
                         still_looks_blocked = result.is_challenge_page or (
                             self._challenge_detector.looks_javascript_gated(result.html or "")
                         )
-                        if level < LEVELS[-1] and still_looks_blocked:
+                        if level < url_levels[-1] and still_looks_blocked:
                             continue
                         # Round 45 — the final level used to unconditionally accept
                         # "whatever it got," even a page that STILL looks blocked
@@ -495,7 +615,15 @@ class Worker:
                                 f"(http_status={result.http_status})"
                             )
                             continue
+                        # Round 63 — this is the real "this level produced
+                        # usable content" point, past both still_looks_blocked
+                        # gates, so it is the only honest place to teach the
+                        # level memory. Recording at `if result.success` above
+                        # would have taught a level whose "success" is about to
+                        # be reclassified as a block.
+                        await self._level_memory.record_success(tenant_id, domain, level)
                         if result.html:
+                            extract_start = time.monotonic()
                             # FetchResult.extracted was declared on the model and
                             # persisted by orchestrator/tasks.py, but nothing ever
                             # populated it — AdaptiveSelector existed, fully
@@ -531,10 +659,17 @@ class Worker:
                                     ),
                                 )
                             if extracted is None:
-                                extracted = await AdaptiveSelector().extract(
-                                    result.html, schema=schema
-                                )
+                                # base_url (round 63): links come back
+                                # absolute, so a caller can follow them
+                                # without re-deriving the page's origin.
+                                extracted = await AdaptiveSelector(
+                                    max_links=self._config.extraction.max_links
+                                ).extract(result.html, schema=schema, base_url=url_str)
                             result.extracted = extracted
+                            timings["extract_ms"] = int(
+                                (time.monotonic() - extract_start) * 1000
+                            )
+                            markdown_start = time.monotonic()
                             # Markdown conversion (round 29) — same "wired once,
                             # applies regardless of level" rationale as
                             # extraction above. Previously only L1 ever produced
@@ -563,7 +698,10 @@ class Worker:
                                 )
 
                                 result.markdown = html_to_markdown(result.html)
-                        results[index] = result
+                            timings["markdown_ms"] = int(
+                                (time.monotonic() - markdown_start) * 1000
+                            )
+                        results[index] = _finish(result)
                         if on_result is not None:
                             await on_result(result)
                         break
@@ -579,7 +717,7 @@ class Worker:
                                 level,
                             )
                             errors.append(result.error_message or "DLQ")
-                            results[index] = result
+                            results[index] = _finish(result)
                             if on_result is not None:
                                 await on_result(result)
                             break
@@ -603,9 +741,15 @@ class Worker:
                     # had nothing to do with proxy pool health at all. Now uses
                     # the real last attempt's category/message, tracked via
                     # last_level_result above — falls back to the historical
-                    # label only in the one genuinely-unattempted case (every
-                    # level's politeness slot stayed busy, so `result` was
-                    # never assigned at all this URL).
+                    # label only in the one genuinely-unattempted case.
+                    #
+                    # Round 63 — the case that fallback was written for
+                    # (politeness contention starving every level) no longer
+                    # reaches here: slot contention is terminal at the level
+                    # it happens on and reports POLITENESS_TIMEOUT. What can
+                    # still land here unattempted is a circuit that was open
+                    # at L1 under free_first and then closed-but-unavailable
+                    # for the rest of the ladder.
                     if last_level_result is not None:
                         real_category = last_level_result.failure_category or (
                             FailureCategory.PROXY_EXHAUSTED
@@ -615,14 +759,11 @@ class Worker:
                         )
                     else:
                         real_category = FailureCategory.PROXY_EXHAUSTED
-                        real_message = (
-                            "All fetch levels exhausted without a single attempt "
-                            "(politeness slot never available)"
-                        )
+                        real_message = "All fetch levels exhausted without a single attempt"
                     exhausted_result = FetchResult(
                         url=url_str,
                         success=False,
-                        level_used=LEVELS[-1],
+                        level_used=url_levels[-1],
                         duration_ms=0,
                         failure_category=real_category,
                         error_message=real_message,
@@ -641,10 +782,10 @@ class Worker:
                         url_str,
                         real_category,
                         real_message,
-                        LEVELS[-1],
+                        url_levels[-1],
                     )
                     errors.append(real_message)
-                    results[index] = exhausted_result
+                    results[index] = _finish(exhausted_result)
                     if on_result is not None:
                         await on_result(exhausted_result)
             except Exception as exc:
@@ -657,7 +798,7 @@ class Worker:
                 crash_result = FetchResult(
                     url=url_str,
                     success=False,
-                    level_used=LEVELS[-1],
+                    level_used=url_levels[-1],
                     duration_ms=0,
                     failure_category=FailureCategory.PARSE_ERROR,
                     error_message=f"Unexpected error processing URL: {exc}",
@@ -668,10 +809,10 @@ class Worker:
                     url_str,
                     FailureCategory.PARSE_ERROR,
                     crash_result.error_message or "",
-                    LEVELS[-1],
+                    url_levels[-1],
                 )
                 errors.append(crash_result.error_message or "Unexpected error")
-                results[index] = crash_result
+                results[index] = _finish(crash_result)
                 if on_result is not None:
                     await on_result(crash_result)
 
@@ -985,9 +1126,17 @@ class Worker:
             )
         )
 
-    async def _acquire_politeness_slot(self, domain: str, tenant_id: TenantId) -> str | None:
+    async def _acquire_politeness_slot(
+        self, domain: str, tenant_id: TenantId, *, concurrency: int | None = None
+    ) -> tuple[str | None, int]:
         """Retry acquiring a politeness slot for up to
         politeness.slot_wait_timeout_seconds before giving up.
+
+        Returns (worker_id, waited_ms). worker_id is None only when the whole
+        budget elapsed without a slot ever coming free, which the caller
+        treats as terminal for this URL — see process_job. waited_ms is
+        returned either way so the wait shows up in the result's timings
+        instead of being invisible (round 63).
 
         Round 61 fix: the slot pool is keyed by domain+tenant only, shared
         across all 3 fetch levels — not per-level. A busy slot means "wait
@@ -997,18 +1146,22 @@ class Worker:
         contention (e.g. 5 concurrent same-domain URLs racing a
         default_concurrency=2 slot pool) without ever making one real fetch
         attempt, then permanently DLQ as "no attempt ever made" — live-caught
-        via 6 real DLQ entries during the round-61 investigation.
+        via 6 real DLQ entries during the round-61 investigation. Round 63
+        finished that fix: the budget is no longer shorter than a single
+        Level-3 attempt, and running it out no longer advances a level.
         """
-        import time
-
         cfg = self._config.politeness
-        deadline = time.monotonic() + cfg.slot_wait_timeout_seconds
+        started = time.monotonic()
+        deadline = started + cfg.slot_wait_timeout_seconds
         while True:
-            slot_worker_id = await self._politeness.acquire_slot(domain, tenant_id)
+            slot_worker_id = await self._politeness.acquire_slot(
+                domain, tenant_id, concurrency=concurrency
+            )
+            waited_ms = int((time.monotonic() - started) * 1000)
             if slot_worker_id is not None:
-                return slot_worker_id
+                return slot_worker_id, waited_ms
             if time.monotonic() >= deadline:
-                return None
+                return None, waited_ms
             await asyncio.sleep(cfg.slot_retry_interval_seconds)
 
     @staticmethod

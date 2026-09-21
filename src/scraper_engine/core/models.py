@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 class SessionType(str, Enum):
@@ -67,6 +67,22 @@ class Proxy(BaseModel):
     def key(self) -> str:
         return f"{self.ip}:{self.port}"
 
+    def identity_key(self) -> str:
+        """The exit identity this proxy represents, not just its endpoint.
+
+        Round 63. key() is ip:port, which is CONSTANT for a rotating paid
+        gateway — every DataImpulse session shares one host:port and the
+        username is what selects the exit IP. Anything caching a live
+        connection per proxy (browser/botasaurus_pool.py's driver reuse) must
+        key on this instead, or a deliberately rotated session silently
+        reuses the previous, already-blocked exit IP. key() is unchanged:
+        proxy/manager.py's mark_success/mark_failure address a proxy_pool
+        ROW, which really is identified by ip:port.
+        """
+        if self.username is None:
+            return self.key()
+        return f"{self.username}@{self.ip}:{self.port}"
+
 
 class FailureCategory(str, Enum):
     NETWORK_TIMEOUT = "network_timeout"
@@ -93,6 +109,14 @@ class FailureCategory(str, Enum):
     # retryable and circuit-exempt for the same reason HOST_UNREACHABLE is
     # non-retryable above.
     NOT_FOUND = "not_found"
+    # Round 63 — the URL never got a politeness slot for this domain within
+    # its whole wait budget, so no fetch was ever attempted. Previously this
+    # case was reported as PROXY_EXHAUSTED with "All fetch levels exhausted
+    # without a single attempt", which was doubly misleading: the proxy pool
+    # was fine, and under dataimpulse.strategy=paid_only it is not even
+    # consulted. Transient by nature — the contention that caused it is other
+    # URLs finishing.
+    POLITENESS_TIMEOUT = "politeness_timeout"
 
 
 class FetchResult(BaseModel):
@@ -122,6 +146,14 @@ class FetchResult(BaseModel):
     html_snapshot_url: str | None = None
     from_cache: bool = False
     duration_ms: int
+    # Round 63 — per-phase breakdown in milliseconds for THIS url, keyed by
+    # phase name (see orchestrator/worker.py's _Timings). duration_ms is one
+    # number, written by whichever level finally returned, so it cannot show
+    # that a 175s job spent 28s fetching and the rest waiting: an external
+    # consumer had to reverse-engineer that by polling status transitions.
+    # None means nothing was measured (e.g. a fetcher constructing a bare
+    # failure result); an empty dict never occurs.
+    timings: dict[str, int] | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -143,6 +175,35 @@ class ConfigOverrides(BaseModel):
     # Spends real operator money if extraction-engine's own EXTRACTION_LLM_API_KEY
     # is configured on that service — off by default for the same reason.
     extraction_enable_llm: bool = False
+    # Round 63 — explicit control over the L1->L2->L3 ladder. Both None (the
+    # default) keeps the full ladder, adjusted only by the learned per-domain
+    # hint (orchestrator/level_memory.py). min_level starts the ladder higher
+    # and OVERRIDES the hint in both directions — a caller who knows the
+    # target needs a real browser should not pay two doomed attempts to
+    # rediscover it, and a caller who says min_level=1 gets a genuine probe
+    # from the bottom. max_level truncates it, so "never spend a Camoufox
+    # render on this" is expressible.
+    min_level: int | None = Field(default=None, ge=1, le=3)
+    max_level: int | None = Field(default=None, ge=1, le=3)
+    # Round 63 — per-request politeness, for trusted bulk crawls of a single
+    # domain. Clamped server-side by orchestrator/worker.py against
+    # config.politeness.max_request_concurrency / min_request_delay_seconds:
+    # a caller can trade politeness for throughput only inside bounds the
+    # operator set. None means "use the configured default".
+    politeness_concurrency: int | None = Field(default=None, ge=1)
+    politeness_delay_seconds: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def level_range_is_coherent(self) -> ConfigOverrides:
+        if (
+            self.min_level is not None
+            and self.max_level is not None
+            and self.min_level > self.max_level
+        ):
+            raise ValueError(
+                f"min_level ({self.min_level}) must not exceed max_level ({self.max_level})"
+            )
+        return self
 
 
 class ScrapeRequest(BaseModel):
@@ -201,6 +262,16 @@ class JobStatusResponse(BaseModel):
     # existing values (avoids breaking any `status.value == "COMPLETED"`
     # check already relying on today's enum).
     partial_failure: bool = False
+    # Round 63 — the two job-level phase durations, from scrape_jobs'
+    # created_at/started_at/finished_at. queued_ms is how long the job sat in
+    # rq before a worker picked it up; runtime_ms is how long it then ran.
+    # Both None until the corresponding transition has happened, and both
+    # None on the in-memory response the worker itself returns (it has not
+    # read the row back). Together with FetchResult.timings this is what
+    # makes "the job took 175s and the fetch took 28s — where did the rest
+    # go?" answerable from the API instead of by polling status transitions.
+    queued_ms: int | None = None
+    runtime_ms: int | None = None
 
 
 class JobSummaryResponse(BaseModel):

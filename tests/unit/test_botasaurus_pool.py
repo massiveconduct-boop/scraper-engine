@@ -67,7 +67,14 @@ class TestBotasaurusPool:
         assert driver_cls.call_args.kwargs["proxy"] == "http://user123:pass456@gw.dataimpulse.com:823"
 
     @pytest.mark.asyncio
-    async def test_second_same_domain_fetch_reuses_driver_via_requests_get(self):
+    async def test_second_same_domain_fetch_reuses_driver_by_navigating(self):
+        """Round 63 — reuse keeps the launched driver but now NAVIGATES it.
+
+        It used to fire driver.requests.get(url), an in-page HTTP call with
+        no JS execution, so only the first URL of a domain got a real render
+        and every later one got something structurally different back. That
+        made L2 success depend on input order.
+        """
         pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
         driver = _fake_driver()
         with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
@@ -78,9 +85,42 @@ class TestBotasaurusPool:
                 "https://a.example/2", proxy=_proxy(), domain="a.example", session_id="s1"
             )
         driver_cls.assert_called_once()  # not called a second time
-        driver.requests.get.assert_called_once_with("https://a.example/2")
+        driver.requests.get.assert_not_called()
+        assert driver.google_get.call_args_list[-1].args[0] == "https://a.example/2"
         driver.close.assert_not_called()
-        assert html == "<html>reused</html>"
+        assert html == "<html>fresh</html>"
+
+    @pytest.mark.asyncio
+    async def test_reuse_is_keyed_on_proxy_identity_not_just_host_port(self):
+        """Round 63 — Proxy.key() is ip:port, which is CONSTANT for the paid
+        rotating gateway: every DataImpulse session shares one host:port and
+        the username selects the exit IP. Keyed on that, a deliberately
+        rotated session (round 62's fix for a blocked exit IP) hit the reuse
+        branch and silently kept the blocked IP. A new session must relaunch.
+        """
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+
+        def _gateway(session: str) -> Proxy:
+            return Proxy(
+                id=0,
+                ip="gw.dataimpulse.com",
+                port=823,
+                protocol=ProxyProtocol.HTTP,
+                username=f"user__sessid.{session}",
+                password="pw",
+                source="paid_gateway",
+            )
+
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_gateway("1"), domain="a.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://a.example/2", proxy=_gateway("2"), domain="a.example", session_id="s1"
+            )
+        assert driver_cls.call_count == 2
+        driver.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_network_capture_redirects_to_current_calls_sink_on_reuse(self):
@@ -272,11 +312,13 @@ class TestBotasaurusPool:
         autoscroll.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reuse_fetch_never_autoscrolls(self):
-        """Round 58 — the reuse path (driver.requests.get, an in-page JS
-        fetch()) never navigates, so scroll_passes must be ignored there
-        even when configured — the visible DOM would just be the previous
-        page, not the one just fetched."""
+    async def test_reuse_fetch_autoscrolls_like_a_fresh_launch(self):
+        """Round 58 skipped autoscroll on the reuse path because that path
+        did not navigate — the visible DOM was the PREVIOUS page, so
+        scrolling it was meaningless. Round 63 made reuse navigate, which
+        removes that reason: a reused driver's DOM is now the page just
+        requested, so it must lazy-load exactly like a fresh launch or the
+        two paths return different content for the same URL again."""
         pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
         driver = _fake_driver()
         with (
@@ -302,8 +344,10 @@ class TestBotasaurusPool:
                 scroll_passes=3,
                 scroll_wait_ms=200,
             )
-        autoscroll.assert_not_called()
-        assert html == "<html>reused</html>"
+        autoscroll.assert_called_once()
+        assert autoscroll.call_args.kwargs["max_passes"] == 3
+        assert autoscroll.call_args.kwargs["wait_ms"] == 200
+        assert html == "<html>fresh</html>"
 
     @pytest.mark.asyncio
     async def test_block_images_kwargs_forwarded_when_enabled(self):

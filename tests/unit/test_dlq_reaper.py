@@ -267,7 +267,7 @@ class TestRetryEntry:
             "job-1",
         )
         assert call.kwargs["job_id"] == "job-1"
-        assert call.kwargs["job_timeout"] == 600
+        assert call.kwargs["job_timeout"] == 900
 
     @pytest.mark.asyncio
     async def test_reenqueue_timeout_scales_with_original_job_url_count(self, tenant):
@@ -284,7 +284,7 @@ class TestRetryEntry:
 
         await dlq_reaper._retry_entry(pg, dlq, tenant, entry, queue)
 
-        assert queue.enqueue.call_args.kwargs["job_timeout"] == 51 * 120
+        assert queue.enqueue.call_args.kwargs["job_timeout"] == 51 * 180
 
     @pytest.mark.asyncio
     async def test_skips_reenqueue_when_job_already_active(self, tenant):

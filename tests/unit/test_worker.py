@@ -2,6 +2,7 @@
 """Worker state machine tests — escalation logic with mocks."""
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,17 +28,55 @@ def tenant():
     return TenantId("test")
 
 
+def make_politeness_mock():
+    """AsyncMock PolitenessController with a usable held_slot().
+
+    held_slot is an async context manager, which a bare AsyncMock attribute
+    cannot stand in for (`async with` on a coroutine fails), and it is what
+    releases the slot — so the stub delegates to the mock's own release_slot
+    and existing `release_slot.assert_awaited*` expectations keep working.
+    """
+    pc = AsyncMock()
+    pc.acquire_slot.return_value = "slot-1"
+    pc.release_slot.return_value = None
+    pc.refresh_slot.return_value = True
+    # Round 63 — returns the milliseconds it waited, not None.
+    pc.wait_if_needed.return_value = 0
+
+    @contextlib.asynccontextmanager
+    async def _held_slot(domain, tenant_id, worker_id):
+        try:
+            yield
+        finally:
+            await pc.release_slot(domain, tenant_id, worker_id)
+
+    pc.held_slot = _held_slot
+    return pc
+
+
+def make_redis_mock():
+    """AsyncMock RedisClient whose .raw answers the level-memory reads.
+
+    Round 63 — orchestrator/level_memory.py reads through redis.raw. Left as
+    a bare AsyncMock the hint read returns a Mock that int() rejects, which
+    LevelMemory swallows, so the tests would pass for the wrong reason and
+    log a warning per URL. These values are the real "no hint recorded yet"
+    answers: start at the bottom of the ladder, as before round 63.
+    """
+    redis = AsyncMock()
+    redis.raw.get.return_value = None
+    redis.raw.incr.return_value = 1
+    return redis
+
+
 @pytest.fixture
 def worker():
-    redis = AsyncMock()
+    redis = make_redis_mock()
     cb = AsyncMock()
     cb.allow_request.return_value = True
     cb.record_success.return_value = None
     cb.record_failure.return_value = None
-    pc = AsyncMock()
-    pc.acquire_slot.return_value = True
-    pc.release_slot.return_value = None
-    pc.wait_if_needed.return_value = None
+    pc = make_politeness_mock()
     dlq = AsyncMock()
     dlq.enqueue.return_value = None
     # Real PostgresClient (not None) so _dispatch_level's L2/L3 guard
@@ -358,22 +397,28 @@ class TestWorker:
         assert response.status == JobStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_politeness_slot_timeout_exhausted_advances_to_next_level(self, tenant, worker):
-        """When a slot never frees up within slot_wait_timeout_seconds, the
-        level genuinely gives up and the loop advances — round-42's DLQ
-        fallback ("politeness slot never available") stays reachable for a
-        REAL exhaustion across every level, not a token 1s nap."""
+    async def test_politeness_slot_timeout_is_terminal_not_a_level_advance(self, tenant, worker):
+        """Round 63 — running out the slot budget used to `continue` to the
+        next level. A busy slot says nothing about the current level, so that
+        walked the whole ladder without a single fetch and then DLQ'd the URL
+        as PROXY_EXHAUSTED. Contention is now terminal at the level it
+        happens on, and is reported as itself."""
         worker._config.politeness.slot_wait_timeout_seconds = 0.0
         worker._politeness.acquire_slot = AsyncMock(return_value=None)
+        worker._fetch_url = AsyncMock()
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
         response = await worker.process_job(tenant, "job-slot-timeout", request)
 
         assert response.status == JobStatus.FAILED
+        worker._fetch_url.assert_not_awaited()
         worker._politeness.release_slot.assert_not_awaited()
+        # One DLQ entry from level 1, not one per level.
+        assert worker._dlq.enqueue.await_count == 1
         dlq_call = worker._dlq.enqueue.await_args
-        assert dlq_call.args[3] == FailureCategory.PROXY_EXHAUSTED
-        assert "politeness slot never available" in dlq_call.args[4]
+        assert dlq_call.args[3] == FailureCategory.POLITENESS_TIMEOUT
+        assert dlq_call.args[5] == 1
+        assert "No politeness slot for example.com" in dlq_call.args[4]
 
     @pytest.mark.asyncio
     async def test_fetch_url_none_result_advances_to_next_level(self, tenant, worker):
@@ -603,26 +648,31 @@ class TestWorker:
     async def test_process_job_exhausted_levels_falls_back_when_no_attempt_made(
         self, tenant, worker, monkeypatch
     ):
-        """Round 42 edge case — if every level's politeness slot stays busy,
-        `_fetch_url` is never even called, so there's no real result to
-        report. The historical PROXY_EXHAUSTED/"All fetch levels exhausted"
-        label is still correct here — genuinely nothing was ever attempted."""
+        """Round 42 edge case — every level declined to run, so `_fetch_url`
+        was never called and there is no real result to report.
+
+        Round 63 changed what can reach this branch: politeness contention is
+        now terminal at its own level, so the remaining way to attempt
+        nothing is a circuit that is open under free_first (L1 has no gateway
+        path and is skipped) with the gateway then unavailable for L2/L3."""
         sleep_mock = AsyncMock()
         monkeypatch.setattr("scraper_engine.orchestrator.worker.asyncio.sleep", sleep_mock)
-        worker._politeness.acquire_slot = AsyncMock(return_value=None)
-        worker._fetch_url = AsyncMock()
+        worker._circuit_breaker.allow_request = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            type(worker), "_gateway_fallback_eligible", property(lambda self: True)
+        )
+        worker._fetch_url = AsyncMock(return_value=None)
         on_result = AsyncMock()
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
         response = await worker.process_job(tenant, "job-no-attempt", request, on_result=on_result)
 
         assert response.status == JobStatus.FAILED
-        worker._fetch_url.assert_not_awaited()
         on_result.assert_awaited_once()
         exhausted = on_result.await_args.args[0]
         assert exhausted.failure_category == FailureCategory.PROXY_EXHAUSTED
         assert exhausted.error_message == (
-            "All fetch levels exhausted without a single attempt (politeness slot never available)"
+            "All fetch levels exhausted without a single attempt"
         )
 
     @pytest.mark.asyncio
@@ -2146,3 +2196,233 @@ class TestGatewayExitIpRotation:
 
         assert fetcher.fetch.await_count == 1
         assert result.success is False
+
+
+class TestLevelMemoryWiring:
+    """Round 63 — the ladder starts where the domain last succeeded.
+
+    An external consumer measured 169.2s in PROCESSING for a Jumia product
+    page whose real fetch took 27.6s, with every successful fetch landing at
+    L3. The missing ~140s was L1 and L2 failing again, once per URL, forever,
+    because nothing carried "this domain needs L3" from one job to the next.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hint_skips_the_levels_that_already_failed(self, tenant, worker):
+        worker._redis.raw.get.return_value = "3"
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=3, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-hint", request)
+
+        assert worker._fetch_url.await_count == 1
+        assert worker._fetch_url.await_args.args[2] == 3
+
+    @pytest.mark.asyncio
+    async def test_the_winning_level_is_recorded(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                FetchResult(
+                    url="http://example.com",
+                    success=False,
+                    level_used=1,
+                    duration_ms=5,
+                    failure_category=FailureCategory.NETWORK_TIMEOUT,
+                ),
+                FetchResult(
+                    url="http://example.com", success=True, level_used=2, duration_ms=10
+                ),
+            ]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-record", request)
+
+        worker._redis.raw.set.assert_awaited_once()
+        assert worker._redis.raw.set.await_args.args[1] == "2"
+
+    @pytest.mark.asyncio
+    async def test_a_level_that_only_looks_successful_is_not_recorded(self, tenant, worker):
+        """A non-final level returning a challenge page escalates rather than
+        counting as a success, so it must not teach the memory either —
+        otherwise the hint would pin the domain to the level that is reliably
+        getting blocked."""
+        challenge = "<html><body>cf-challenge-running</body></html>"
+        worker._fetch_url = AsyncMock(
+            side_effect=[
+                FetchResult(
+                    url="http://example.com",
+                    success=True,
+                    level_used=1,
+                    duration_ms=5,
+                    html=challenge,
+                ),
+                FetchResult(
+                    url="http://example.com",
+                    success=True,
+                    level_used=2,
+                    duration_ms=10,
+                    html="<html><body>" + "<p>Real text. </p>" * 30 + "</body></html>",
+                ),
+            ]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-challenge-no-record", request)
+
+        worker._redis.raw.set.assert_awaited_once()
+        assert worker._redis.raw.set.await_args.args[1] == "2"
+
+
+class TestLadderNarrowing:
+    @pytest.mark.asyncio
+    async def test_min_level_starts_the_ladder_higher(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=2, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")], config_overrides=ConfigOverrides(min_level=2)
+        )
+
+        await worker.process_job(tenant, "job-min-level", request)
+
+        assert worker._fetch_url.await_args.args[2] == 2
+
+    @pytest.mark.asyncio
+    async def test_max_level_truncates_the_ladder(self, tenant, worker):
+        """max_level=1 means "never spend a browser render on this" — the
+        URL must fail out after L1 rather than escalating."""
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com",
+                success=False,
+                level_used=1,
+                duration_ms=5,
+                failure_category=FailureCategory.NETWORK_TIMEOUT,
+            )
+        )
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")], config_overrides=ConfigOverrides(max_level=1)
+        )
+
+        response = await worker.process_job(tenant, "job-max-level", request)
+
+        assert worker._fetch_url.await_count == 1
+        assert response.status == JobStatus.FAILED
+
+    def test_min_level_above_max_level_is_rejected_at_validation(self):
+        with pytest.raises(ValueError, match="min_level"):
+            ConfigOverrides(min_level=3, max_level=2)
+
+    def test_resolve_levels_defaults_to_the_full_ladder(self, worker):
+        assert worker._resolve_levels(None) == [1, 2, 3]
+
+
+class TestPerRequestPoliteness:
+    """Round 63 — a caller may trade politeness for throughput, inside
+    operator-set bounds. The clamp is server-side because the request is the
+    untrusted half of that decision."""
+
+    def test_defaults_come_from_config(self, worker):
+        worker._config.politeness.default_concurrency = 2
+        worker._config.politeness.default_delay_seconds = 5.0
+        assert worker._resolve_politeness(None) == (2, 5.0)
+
+    def test_request_values_are_used_when_within_bounds(self, worker):
+        worker._config.politeness.max_request_concurrency = 10
+        worker._config.politeness.min_request_delay_seconds = 0.5
+        overrides = ConfigOverrides(politeness_concurrency=8, politeness_delay_seconds=1.0)
+        assert worker._resolve_politeness(overrides) == (8, 1.0)
+
+    def test_concurrency_is_capped_and_delay_is_floored(self, worker):
+        worker._config.politeness.max_request_concurrency = 10
+        worker._config.politeness.min_request_delay_seconds = 0.5
+        overrides = ConfigOverrides(politeness_concurrency=500, politeness_delay_seconds=0.0)
+        assert worker._resolve_politeness(overrides) == (10, 0.5)
+
+    @pytest.mark.asyncio
+    async def test_resolved_values_reach_the_controller(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=1, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")],
+            config_overrides=ConfigOverrides(
+                politeness_concurrency=7, politeness_delay_seconds=2.0
+            ),
+        )
+
+        await worker.process_job(tenant, "job-politeness-override", request)
+
+        assert worker._politeness.acquire_slot.await_args.kwargs["concurrency"] == 7
+        assert worker._politeness.wait_if_needed.await_args.kwargs["delay_seconds"] == 2.0
+
+
+class TestTimings:
+    @pytest.mark.asyncio
+    async def test_terminal_result_carries_a_phase_breakdown(self, tenant, worker):
+        """Round 63 — duration_ms is one number, written by whichever level
+        finally returned, so it cannot distinguish "the fetch is slow" from
+        "the fetch was fine and everything around it was slow"."""
+        worker._politeness.wait_if_needed = AsyncMock(return_value=250)
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=1, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-timings", request)
+
+        timings = response.results[0].timings
+        assert timings is not None
+        assert timings["politeness_wait_ms"] == 250
+        assert "level_1_ms" in timings
+        assert "slot_wait_ms" in timings
+        assert "total_ms" in timings
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_level_leaves_no_key(self, tenant, worker):
+        """Which levels ran is readable from the dict itself — that is how a
+        caller sees the level hint working."""
+        worker._redis.raw.get.return_value = "3"
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=3, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-timings-skip", request)
+
+        timings = response.results[0].timings
+        assert "level_1_ms" not in timings
+        assert "level_2_ms" not in timings
+        assert "level_3_ms" in timings
+
+
+class TestPolitenessTimeoutStreaming:
+    @pytest.mark.asyncio
+    async def test_slot_timeout_result_is_streamed_to_on_result(self, tenant, worker):
+        """A URL that never got a slot still has to reach the caller's
+        persist callback — otherwise the job's own result set silently loses
+        a URL and progress never reaches 1.0."""
+        worker._config.politeness.slot_wait_timeout_seconds = 0.0
+        worker._politeness.acquire_slot = AsyncMock(return_value=None)
+        on_result = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-slot-stream", request, on_result=on_result)
+
+        on_result.assert_awaited_once()
+        streamed = on_result.await_args.args[0]
+        assert streamed.failure_category == FailureCategory.POLITENESS_TIMEOUT
+        assert streamed.timings is not None

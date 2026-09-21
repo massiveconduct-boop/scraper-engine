@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from prometheus_client import REGISTRY, Counter, Gauge
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
@@ -34,6 +34,23 @@ if TYPE_CHECKING:
 proxy_pool_validated_count = Gauge(
     "proxy_pool_validated_count",
     "Number of proxies with reliability_score >= 40 (L1 threshold)",
+    registry=REGISTRY,
+)
+
+# Round 63 — the first real Histogram in this module. Everything else here
+# measures counts, or job duration as a bare sum/count pair, which cannot
+# answer "how long does a fetch take AT THIS LEVEL" — and that is the whole
+# question behind a job that spent 169s in PROCESSING for a 27.6s fetch. The
+# level label is what makes the escalation ladder's real cost visible: an L1
+# attempt that always fails for a domain still shows up here as time spent.
+# Buckets are stretched well past the L3 ceiling (level_3.timeout_seconds 60
+# plus ~85s of configured waits) so the slow tail is not all crammed into
+# +Inf.
+fetch_duration_seconds = Histogram(
+    "fetch_duration_seconds",
+    "Wall-clock seconds for one fetch attempt at one escalation level",
+    ["level"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180),
     registry=REGISTRY,
 )
 

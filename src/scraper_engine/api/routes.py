@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
@@ -63,7 +64,18 @@ _CRAWL_JOB_TIMEOUT_SECONDS = 1800  # bulk crawls run longer than a bounded scrap
 # (orchestrator/worker.py's _SAME_LEVEL_PROXY_RETRIES) at all. Bumped to
 # 120s/URL, matching that real sum instead of a smaller number that never
 # actually bounded the worst case it was meant to cover.
-_PER_URL_TIMEOUT_SECONDS = 120
+# Round 63 — raised from 120. That figure was the sum of the three levels'
+# OWN timeouts (base.yaml: 20+40+60), i.e. a URL's worst case when it is the
+# only thing running. Since round 49 a job dispatches URLs concurrently, and
+# a URL's WALL time now also includes waiting for a politeness slot behind
+# its siblings — measured on a real 10-URL single-domain Jumia job:
+# `slot_wait_ms` up to 88s and a worst per-URL `total_ms` of 156s, against a
+# 120s allowance. The job was killed by this timeout at 1303s having
+# successfully fetched 9 of 10 URLs, which then surfaced to the caller as a
+# FAILED job rather than a slow one. 180s covers the measured worst case
+# with margin. The real diagnosis is in each result's `timings` now, so a
+# job that trips even this is answerable rather than mysterious.
+_PER_URL_TIMEOUT_SECONDS = 180
 
 
 def _validate_uuid(value: str, name: str = "id") -> str:
@@ -512,8 +524,23 @@ async def list_jobs(
 async def get_job(
     job_id: str,
     x_api_key: str = Header(..., alias="X-API-Key"),
+    # Only return results extracted strictly after this timestamp (ISO-8601).
+    # A plain annotated default rather than FastAPI's Query(...) marker, for
+    # the reason _validate_pagination's docstring gives: this module's tests
+    # call the route functions directly, where a Query(...) default is never
+    # resolved to its plain value. FastAPI still exposes a bare scalar
+    # parameter as a query parameter.
+    since: datetime | None = None,
 ) -> JobStatusResponse:
-    """Get the status and results of a scrape job from the live database."""
+    """Get the status and results of a scrape job from the live database.
+
+    Results have always been readable while a job is still PROCESSING — rows
+    land one per URL as each completes (orchestrator/tasks.py's on_result
+    callback), and `progress` is computed from how many have landed. What was
+    missing until round 63 was a cursor: every poll of a 95-URL job re-sent
+    every result already seen, so callers avoided multi-URL jobs entirely.
+    `since` is that cursor.
+    """
     from scraper_engine.api.dependencies import _storage_pg, _tenant_resolver
     from scraper_engine.core.exceptions import AuthenticationError
 
@@ -531,7 +558,8 @@ async def get_job(
 
     rows = await _storage_pg.fetch(
         tenant_id,
-        "SELECT job_id, status, urls FROM scrape_jobs WHERE job_id = $1::uuid",
+        "SELECT job_id, status, urls, created_at, started_at, finished_at "
+        "FROM scrape_jobs WHERE job_id = $1::uuid",
         job_id,
     )
     if not rows:
@@ -540,13 +568,25 @@ async def get_job(
     row = rows[0]
     status = JobStatus(row["status"])
 
+    # progress must count the whole job even when the caller is paging with
+    # `since`, so the count is its own query rather than len(result_rows).
+    completed_rows = await _storage_pg.fetch(
+        tenant_id,
+        "SELECT COUNT(*) AS n FROM scrape_results WHERE job_id = $1::uuid",
+        job_id,
+    )
+    completed = int(completed_rows[0]["n"]) if completed_rows else 0
+
     result_rows = await _storage_pg.fetch(
         tenant_id,
-        """SELECT url, success, http_status, is_challenge_page, level_used, proxy_used,
-                  markdown, json_data, network_events, html_snapshot_url, time_taken_ms,
-                  error_message, failure_category, extracted_at
-           FROM scrape_results WHERE job_id = $1::uuid ORDER BY extracted_at""",
+        """SELECT url, success, http_status, proxy_source, is_challenge_page, level_used,
+                  proxy_used, markdown, json_data, network_events, html_snapshot_url,
+                  time_taken_ms, error_message, failure_category, extracted_at, timings
+           FROM scrape_results
+           WHERE job_id = $1::uuid AND ($2::timestamptz IS NULL OR extracted_at > $2::timestamptz)
+           ORDER BY extracted_at""",
         job_id,
+        since,
     )
     results = [
         FetchResult(
@@ -566,6 +606,11 @@ async def get_job(
             ),
             html_snapshot_url=r["html_snapshot_url"],
             fetched_at=r["extracted_at"],
+            # proxy_source and timings were both persisted but dropped on the
+            # way back out, so a caller could not see which proxy path served
+            # a URL or where its time went (round 63).
+            proxy_source=r["proxy_source"],
+            timings=json.loads(r["timings"]) if r["timings"] else None,
         )
         for r in result_rows
     ]
@@ -576,7 +621,7 @@ async def get_job(
     # callback), so len(result_rows) genuinely reflects how many of the
     # job's URLs are done, not a hardcoded stand-in.
     total_urls = len(row["urls"]) or 1
-    progress = 1.0 if status in _TERMINAL_STATUSES else min(1.0, len(result_rows) / total_urls)
+    progress = 1.0 if status in _TERMINAL_STATUSES else min(1.0, completed / total_urls)
     # Same partial_failure formula as Worker.process_job (round 34) — this
     # is a second construction site for JobStatusResponse (DB-reconstructed
     # rather than the in-memory one the worker returns), so it must be kept
@@ -593,7 +638,17 @@ async def get_job(
         results=results or None,
         error="; ".join(errors) if errors else None,
         partial_failure=partial_failure,
+        queued_ms=_elapsed_ms(row["created_at"], row["started_at"]),
+        runtime_ms=_elapsed_ms(row["started_at"], row["finished_at"]),
     )
+
+
+def _elapsed_ms(start: datetime | None, end: datetime | None) -> int | None:
+    """Milliseconds between two job-phase timestamps, or None if either has
+    not happened yet (round 63)."""
+    if start is None or end is None:
+        return None
+    return int((end - start).total_seconds() * 1000)
 
 
 @router.get("/jobs/{job_id}/dlq")

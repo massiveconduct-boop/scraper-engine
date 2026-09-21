@@ -51,7 +51,10 @@ GATED_PREFIXES = (
 
 # Ratchet. Lower this whenever the real count drops; never raise it.
 # 2026-09-20 (round 62): 33, the audit baseline.
-BRANCH_BUDGET = 33
+# 2026-09-20 (round 63): 32. Not a deliberate burn-down (that is still T2 in
+# .wolf/STATUS.md) — round 63's rewrite of orchestrator/worker.py's politeness
+# handling removed one of the partial branches it counted.
+BRANCH_BUDGET = 32
 
 
 def main() -> int:

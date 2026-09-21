@@ -15,6 +15,7 @@ create BrowserContext via browser.new_context(storage_state=blob) after launch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,23 @@ if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
 
 logger = logging.getLogger(__name__)
+
+# Round 63 — hard bounds on every budget.XVFB_LOCK critical section.
+#
+# XVFB_LOCK is process-wide and both the launch and the teardown hold it.
+# Neither was time-bounded, so a single wedged Camoufox (dead CDP pipe, an
+# Xvfb that will not exit) froze every browser operation in the worker
+# permanently — and since BROWSER_SEMAPHORE is released only after the
+# teardown's lock block, every instance's permit leaked with it. Live-caught
+# twice on a 10-URL Jumia job: 8 live browsers, an idle event loop, zero log
+# output, the job stalled mid-run.
+#
+# Generous rather than tight: these exist to convert "never" into "eventually",
+# not to police slow-but-working browsers. A launch legitimately spins up Xvfb,
+# Firefox and a geoip lookup through a proxy.
+_BROWSER_LAUNCH_TIMEOUT_SECONDS = 180
+_BROWSER_TEARDOWN_TIMEOUT_SECONDS = 60
+_CONTEXT_CLOSE_TIMEOUT_SECONDS = 30
 
 
 class CamoufoxWrapper:
@@ -87,8 +105,14 @@ class CamoufoxWrapper:
                 kwargs["storage_state"] = self._storage_state
             self._isolated_ctx = await self._context.new_context(**kwargs)
             return self._isolated_ctx
-        except Exception:
-            budget.BROWSER_SEMAPHORE.release()
+        except BaseException:
+            # Round 63 — BaseException, and a full __aexit__ rather than a
+            # bare release(). A launch cancelled mid-flight raises
+            # CancelledError, which `except Exception` let through with the
+            # permit still held; and a browser that launched but whose
+            # new_context() failed was left running with no owner. __aexit__
+            # closes whatever did come up and always releases the permit.
+            await self.__aexit__(None, None, None)
             raise
 
     # Round 49 — camoufox's fingerprint_preset (round 46) samples a random
@@ -189,7 +213,7 @@ class CamoufoxWrapper:
             # same virtual display number (core/budget.py::XVFB_LOCK
             # docstring). Held only across __aenter__, not the fetch that
             # follows — reacquired fresh on each retry below.
-            async with budget.XVFB_LOCK:
+            async with asyncio.timeout(_BROWSER_LAUNCH_TIMEOUT_SECONDS), budget.XVFB_LOCK:
                 try:
                     return await self._browser.__aenter__()
                 except InvalidIP:
@@ -236,19 +260,63 @@ class CamoufoxWrapper:
         failure) could start launching before this teardown finishes,
         colliding on the still-live display number.
         """
+        import contextlib
+
         try:
             if self._isolated_ctx is not None:
-                import contextlib
-
                 with contextlib.suppress(Exception):
-                    await self._isolated_ctx.close()
+                    # Bounded for the same reason the teardown below is: a
+                    # wedged CDP connection must not hold up the release of
+                    # this instance's BROWSER_SEMAPHORE permit.
+                    await asyncio.wait_for(
+                        self._isolated_ctx.close(), timeout=_CONTEXT_CLOSE_TIMEOUT_SECONDS
+                    )
                 self._isolated_ctx = None
         finally:
             try:
                 if self._browser is not None:
-                    async with budget.XVFB_LOCK:
-                        await self._browser.__aexit__(*exc)
+                    await self._shutdown_browser_bounded(exc)
             finally:
                 self._browser = None
                 self._context = None
                 budget.BROWSER_SEMAPHORE.release()
+
+    async def _shutdown_browser_bounded(self, exc: tuple[Any, ...]) -> None:
+        """Tear the browser down under XVFB_LOCK, but never indefinitely.
+
+        Round 63 — this whole section used to be an unbounded
+        `async with budget.XVFB_LOCK: await self._browser.__aexit__(*exc)`,
+        and `budget.BROWSER_SEMAPHORE.release()` sits AFTER it. Both the lock
+        and the teardown can hang on a wedged browser (a dead CDP pipe, an
+        Xvfb that will not die), and XVFB_LOCK is process-wide — so one stuck
+        teardown froze every launch AND every other teardown in the worker,
+        permanently, and none of those instances ever released their permit
+        either. Live-caught twice on a 10-URL Jumia job: 8 live Camoufox
+        instances, an idle event loop, zero log output, the job stalled
+        mid-run until RQ's job timeout killed the work-horse.
+
+        A timeout here can leak an OS process. That is strictly the better
+        failure: a leaked browser costs memory on one worker until the
+        container recycles, while an unbounded wait costs every remaining URL
+        of every job that worker would ever run. The permit is released by
+        the caller's `finally` either way, which is what lets the job carry
+        on.
+        """
+        try:
+            async with asyncio.timeout(_BROWSER_TEARDOWN_TIMEOUT_SECONDS):
+                async with budget.XVFB_LOCK:
+                    await self._browser.__aexit__(*exc)
+        except TimeoutError:
+            # No cleanup call here on purpose: _xvfb_cleanup.cleanup_stale_display
+            # reaches into a botasaurus Driver's private config._display and
+            # would silently no-op on a Camoufox browser. Camoufox owns its own
+            # virtual display (camoufox/virtdisplay.py), and a teardown we just
+            # gave up on is exactly the case where we cannot reach into it
+            # safely. Leaking the display is the accepted cost; the log is the
+            # signal that it happened.
+            logger.error(
+                "camoufox_teardown_timed_out_after_%ss proxy=%s — abandoning the browser "
+                "process and releasing its budget so the worker can keep running",
+                _BROWSER_TEARDOWN_TIMEOUT_SECONDS,
+                self.proxy.url() if self.proxy is not None else None,
+            )

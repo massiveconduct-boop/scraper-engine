@@ -73,6 +73,11 @@ from scraper_engine.observability.bootstrap import bootstrap_observability
 from scraper_engine.storage.postgres_client import PostgresClient
 from scraper_engine.storage.redis_client import RedisClient
 
+# Single source of truth for the queue name — orchestrator/job_queue.py is
+# what actually enqueues, so deriving both the queue key and the registry
+# keys from it keeps this check from drifting away from the real queue.
+from .job_queue import QUEUE_NAME as _RQ_QUEUE_NAME
+
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 60
@@ -92,12 +97,36 @@ _RQ_TERMINAL_STATUSES = {"failed", "finished", "stopped", "canceled"}
 # waiting. A job hash claiming "queued"/"started"/"deferred" while being
 # absent from every one of these is unreachable: no worker can ever pick it
 # up, because workers poll these structures, not the job hashes.
-_RQ_QUEUE_KEY = "rq:queue:scraper-jobs"
-_RQ_REGISTRY_ZSETS = (
-    "rq:started:scraper-jobs",
-    "rq:deferred:scraper-jobs",
-    "rq:scheduled:scraper-jobs",
-)
+_RQ_QUEUE_KEY = f"rq:queue:{_RQ_QUEUE_NAME}"
+
+
+def _rq_registry_zsets() -> tuple[str, ...]:
+    """The rq registry keys a non-terminal job can legitimately sit in.
+
+    Round 63 — these were hardcoded strings, and one of them was WRONG for
+    the installed rq. rq 2.10's StartedJobRegistry key is
+    `rq:wip:scraper-jobs`; the constant said `rq:started:scraper-jobs`, a key
+    that simply does not exist here. So every genuinely RUNNING job looked
+    unreachable, and any job still PROCESSING after the 120s grace was
+    reconciled to FAILED underneath its own live worker.
+
+    That is invisible for a single-URL job, which finishes inside the grace,
+    and fatal for a multi-URL one, which cannot: an external consumer
+    reported a 5-URL job that "never completed within ~7 minutes" and fell
+    back to 95 serialized 1-URL jobs. Live-reproduced here — a 10-URL job was
+    marked FAILED at 161s with `rq_status=started (orphaned: in no queue or
+    registry)` while its worker went on fetching and writing results.
+
+    Asking rq for its own key names removes the class of bug rather than the
+    instance: an upgrade that renames a registry can no longer silently turn
+    this check into "reap everything that is running".
+    """
+    from rq.registry import DeferredJobRegistry, ScheduledJobRegistry, StartedJobRegistry
+
+    return tuple(
+        registry(name=_RQ_QUEUE_NAME, connection=None).key
+        for registry in (StartedJobRegistry, DeferredJobRegistry, ScheduledJobRegistry)
+    )
 
 
 async def _rq_job_status(redis: RedisClient, job_id: str) -> str | None:
@@ -132,9 +161,31 @@ async def _rq_job_is_reachable(redis: RedisClient, job_id: str) -> bool:
     try:
         if await redis.raw.lpos(_RQ_QUEUE_KEY, job_id) is not None:
             return True
-        for zset in _RQ_REGISTRY_ZSETS:
+        # Round 63 — a job that is RUNNING right now has a live execution
+        # registry (rq.executions.ExecutionRegistry, `rq:executions:{job_id}`),
+        # written when the work-horse starts and deleted when it finishes.
+        # This is the cheapest and most direct "is anyone actually working on
+        # this" signal rq offers, and it is keyed by the bare job id.
+        if await redis.raw.exists(f"rq:executions:{job_id}"):
+            return True
+        for zset in _rq_registry_zsets():
             if await redis.raw.zscore(zset, job_id) is not None:
                 return True
+            # StartedJobRegistry's members are NOT bare job ids — rq's own
+            # docstring: "Each entry is a {job_id}:{execution_id}". So the
+            # zscore above structurally cannot match a started job, and this
+            # check reported every running job as an orphan even once the key
+            # name was right. Matching the prefix covers both member shapes
+            # without having to know which registry uses which.
+            cursor, found = await redis.raw.zscan(zset, 0, match=f"{job_id}:*", count=100)
+            while True:
+                if found:
+                    return True
+                if cursor == 0:
+                    break
+                cursor, found = await redis.raw.zscan(
+                    zset, cursor, match=f"{job_id}:*", count=100
+                )
     except Exception:
         logger.exception("rq_reachability_check_failed job_id=%s", job_id)
         return True
@@ -168,9 +219,14 @@ async def _reconcile_tenant(
                 continue
             rq_status = f"{rq_status} (orphaned: in no queue or registry)"
 
+        # finished_at (round 63): a reaped job is one whose worker died
+        # without running its own failure path, so this is the only place
+        # its end time will ever be recorded. Left NULL, GET /v1/jobs/{id}
+        # reports runtime_ms=None for exactly the jobs being investigated.
         await pg.execute(
             tenant,
-            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+            "UPDATE scrape_jobs SET status = $1, updated_at = NOW(), "
+            "finished_at = COALESCE(finished_at, NOW()) WHERE job_id = $2::uuid",
             JobStatus.FAILED.value,
             job_id,
         )

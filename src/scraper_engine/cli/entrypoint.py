@@ -72,6 +72,15 @@ def main() -> None:
 
     api_job = api_sub.add_parser("job", parents=[_api_common], help="GET /v1/jobs/{id}")
     api_job.add_argument("job_id")
+    api_job.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "ISO-8601 timestamp; return only results extracted after it. "
+            "Poll a long job with the previous response's newest fetched_at "
+            "to fetch just the new results instead of the whole set."
+        ),
+    )
 
     api_sub.add_parser("quota", parents=[_api_common], help="GET /v1/quota")
 
@@ -277,7 +286,10 @@ def _run_api_command(args: argparse.Namespace) -> None:
                 params["status"] = args.status
             resp = client.get("/v1/jobs", params=params)
         elif args.api_command == "job":
-            resp = client.get(f"/v1/jobs/{args.job_id}")
+            resp = client.get(
+                f"/v1/jobs/{args.job_id}",
+                params={"since": args.since} if args.since else None,
+            )
         elif args.api_command == "quota":
             resp = client.get("/v1/quota")
         elif args.api_command == "dlq":

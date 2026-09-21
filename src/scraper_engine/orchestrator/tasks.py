@@ -124,9 +124,14 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
             )
             webhook_url = row["webhook_url"]
 
+            # started_at (round 63) is set exactly once, here, where the
+            # job stops waiting and starts running: created_at -> started_at
+            # IS the queue wait, which was previously underivable because
+            # updated_at is overwritten by every later transition.
             await pg.execute(
                 tenant_id,
-                "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+                "UPDATE scrape_jobs SET status = $1, updated_at = NOW(), "
+                "started_at = NOW() WHERE job_id = $2::uuid",
                 JobStatus.PROCESSING.value,
                 job_id,
             )
@@ -158,7 +163,8 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
 
             await pg.execute(
                 tenant_id,
-                "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+                "UPDATE scrape_jobs SET status = $1, updated_at = NOW(), "
+                "finished_at = NOW() WHERE job_id = $2::uuid",
                 status.value,
                 job_id,
             )
@@ -199,9 +205,13 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
         # still sees the exception (marking our DB row correct must not
         # silently lie to rq's own tracking).
         logger.exception("scrape_job_crashed job_id=%s tenant=%s", job_id, tenant_id_raw)
+        # finished_at is set here too (round 63): a crashed job HAS stopped
+        # running, so leaving it NULL would report runtime_ms=None for the
+        # very jobs whose duration a caller most wants to see.
         await pg.execute(
             tenant_id,
-            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+            "UPDATE scrape_jobs SET status = $1, updated_at = NOW(), "
+            "finished_at = NOW() WHERE job_id = $2::uuid",
             JobStatus.FAILED.value,
             job_id,
         )
@@ -392,9 +402,9 @@ async def _persist_one_result(
         INSERT INTO scrape_results
             (job_id, url, success, http_status, is_challenge_page, level_used,
              proxy_used, proxy_source, markdown, json_data, network_events, html_snapshot_url,
-             content_hash, time_taken_ms, error_message, failure_category)
+             content_hash, time_taken_ms, error_message, failure_category, timings)
         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14,
-                $15, $16)
+                $15, $16, $17::jsonb)
         """,
         job_id,
         result.url,
@@ -412,6 +422,22 @@ async def _persist_one_result(
         result.duration_ms,
         result.error_message,
         result.failure_category.value if result.failure_category else None,
+        json.dumps(result.timings) if result.timings is not None else None,
+    )
+
+    # Round 63 — touch the job row so "stale" means "not progressing" rather
+    # than "started more than N seconds ago". orchestrator/stuck_job_reaper.py
+    # treats a PROCESSING row whose updated_at is older than its grace window
+    # as a candidate for reconciliation; updated_at was only ever written at
+    # status transitions, so a long multi-URL job looked identically stale to
+    # a job whose worker had died, and its only protection was the rq
+    # reachability check — which had itself been comparing against a registry
+    # key that does not exist in rq 2.10. Two independent signals now have to
+    # fail before live work is reconciled away.
+    await pg.execute(
+        tenant_id,
+        "UPDATE scrape_jobs SET updated_at = NOW() WHERE job_id = $1::uuid",
+        job_id,
     )
 
 

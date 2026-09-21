@@ -110,20 +110,38 @@ class Level3Fetcher:
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
+                nav_status = nav_response.status if nav_response is not None else 200
                 # CPU-bound client-side JS (e.g. PoW solvers) cannot be detected
                 # by networkidle — the browser is computing, not fetching. Use a
                 # config-driven bounded retry loop: wait an initial fixed period,
                 # then poll at retry_wait_increment_ms intervals until
                 # ChallengeDetector no longer classifies the page as a challenge
                 # interstitial, or max_total_wait_ms ceiling is hit.
-                await page.wait_for_timeout(self._post_load_fixed_wait_ms)
-                html = await poll_until_solved(
-                    page,
-                    self._challenge_detector,
-                    max_total_wait_ms=self._max_total_wait_ms,
-                    retry_wait_increment_ms=self._retry_wait_increment_ms,
-                    waited_ms=self._post_load_fixed_wait_ms,
+                #
+                # Round 63 — the fixed wait is now paid only by pages that
+                # actually look like a challenge. It used to run
+                # unconditionally, before anything had even looked at the
+                # page, so EVERY L3 fetch spent post_load_fixed_wait_ms (10s
+                # live) whether or not there was a PoW solver to wait for.
+                # Since a domain that escalates to L3 tends to stay at L3 for
+                # a whole crawl, that was 10s multiplied by every URL of the
+                # job, for the large majority of pages that render normally
+                # once a real browser asks. A page that IS an interstitial
+                # keeps the identical budget: the first read costs nothing,
+                # then the same fixed wait and the same poll ceiling.
+                html = await safe_content(page)
+                needs_settling = html is None or self._challenge_detector.is_challenge_page(
+                    html, nav_status, short_page_is_suspect=False
                 )
+                if needs_settling:
+                    await page.wait_for_timeout(self._post_load_fixed_wait_ms)
+                    html = await poll_until_solved(
+                        page,
+                        self._challenge_detector,
+                        max_total_wait_ms=self._max_total_wait_ms,
+                        retry_wait_increment_ms=self._retry_wait_increment_ms,
+                        waited_ms=self._post_load_fixed_wait_ms,
+                    )
                 # Token-grant CAPTCHA (reCAPTCHA/hCaptcha/Turnstile) won't clear
                 # by waiting — solve it (read sitekey → provider token → inject →
                 # re-poll). Best-effort, no-op without a configured solver
@@ -140,7 +158,6 @@ class Level3Fetcher:
                     html = await safe_content(page)
                 duration_ms = int((time.monotonic() - start) * 1000)
 
-                nav_status = nav_response.status if nav_response is not None else 200
                 # Round 45 — a 404 is no longer treated as an immediate
                 # definitive failure here (round 43 did that; wrong — see
                 # ChallengeDetector.CHALLENGE_STATUS_CODES's round-45

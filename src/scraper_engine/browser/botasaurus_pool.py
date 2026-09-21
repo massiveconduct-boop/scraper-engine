@@ -100,22 +100,43 @@ class BotasaurusPool:
         events_sink: list[dict[str, object]] | None = None,
     ) -> str:
         """Fetch `url`, reusing the pooled driver when it already belongs to
-        this exact (proxy, domain) pair, else (re)launching one.
+        this exact (proxy identity, domain) pair, else (re)launching one.
 
-        scroll_passes/scroll_wait_ms only apply on the fresh-launch path
-        (_new_driver_fetch) — the reuse path below fires an in-page JS
-        `fetch()` call (`driver.requests.get`), not a real navigation, so
-        the visible DOM never becomes the fetched HTML and there's nothing
-        to scroll. events_sink applies to BOTH paths — see
-        `self._active_events_sink`'s docstring above: a reused driver's
-        already-registered CDP hooks fire for its in-page fetch() too, and
-        get redirected into whichever call's events_sink is current."""
+        Round 63 — two corrections to what "reuse" meant here.
+
+        The reuse path used to fire an in-page `driver.requests.get(url)`
+        rather than navigating: no JS execution, no challenge handling, no
+        scroll. So the FIRST url of a domain got a real browser render and
+        every subsequent one got what amounts to an HTTP client that happens
+        to live inside a browser. Whether L2 succeeded therefore depended on
+        an invisible property — whether a url happened to be first in its
+        domain — which is what an external consumer reported as "same URL,
+        same parameters, sometimes L2, mostly L3", and why L2 and L3 returned
+        structurally different HTML (and therefore different `links`) for the
+        same page. Both paths navigate now; reuse still saves the launch and
+        the Xvfb display cycle, which was always the real win.
+
+        The reuse gate also keyed on `proxy.key()` (ip:port), which is
+        CONSTANT for the paid rotating gateway — every DataImpulse session
+        shares one host:port and the username selects the exit IP. A
+        deliberately rotated session (round 62's fix for a blocked exit IP)
+        therefore hit this branch and silently kept using the blocked IP.
+        Keyed on `proxy.identity_key()` now, so a new session relaunches.
+
+        events_sink applies to both paths — see `self._active_events_sink`'s
+        docstring above."""
         loop = asyncio.get_running_loop()
         async with self._lock:
             self._active_events_sink = events_sink
             entry = self._entry
-            if entry is not None and entry.proxy_key == proxy.key() and entry.domain == domain:
-                return await loop.run_in_executor(None, self._reuse_fetch, entry.driver, url)
+            if (
+                entry is not None
+                and entry.proxy_key == proxy.identity_key()
+                and entry.domain == domain
+            ):
+                return await loop.run_in_executor(
+                    None, self._reuse_fetch, entry.driver, url, scroll_passes, scroll_wait_ms
+                )
 
             # Round 41 — both eviction-close and (re)launch spin the display
             # lifecycle, serialized under one lock so a fresh launch can
@@ -136,7 +157,7 @@ class BotasaurusPool:
                     scroll_passes,
                     scroll_wait_ms,
                 )
-            self._entry = _PooledDriver(driver, proxy.key(), domain)
+            self._entry = _PooledDriver(driver, proxy.identity_key(), domain)
             return html
 
     def _new_driver_fetch(
@@ -220,12 +241,36 @@ class BotasaurusPool:
             self._close_driver(driver)
             raise
 
-    def _reuse_fetch(self, driver: Any, url: str) -> str:
-        """Synchronous — reuses the live driver's in-page fetch client."""
-        response = driver.requests.get(url)
-        if self._config.random_sleep_enabled:
+    def _reuse_fetch(
+        self, driver: Any, url: str, scroll_passes: int = 0, scroll_wait_ms: int = 1500
+    ) -> str:
+        """Synchronous — navigate the already-launched driver to `url`.
+
+        Round 63: was `driver.requests.get(url)`, an in-page HTTP call that
+        executed no JS. This is the same navigation `_new_driver_fetch` does,
+        minus the launch — see fetch()'s docstring for why that difference
+        mattered. Deliberately NOT under budget.XVFB_LOCK: no display is
+        created or destroyed here, only reused.
+        """
+        from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
+
+        cfg = self._config
+        if cfg.bypass_cloudflare:
+            driver.google_get(url, bypass_cloudflare=True)
+        else:
+            driver.get(url)
+        raise_if_navigation_failed(driver, url)
+        if cfg.random_sleep_enabled:
             driver.short_random_sleep()
-        return str(response.text)
+        if scroll_passes > 0:
+            botasaurus_autoscroll(
+                driver,
+                max_passes=scroll_passes,
+                wait_ms=scroll_wait_ms,
+                humanize=cfg.humanize_mouse,
+            )
+        return str(driver.page_html)
 
     def _close_driver(self, driver: Any) -> None:
         with contextlib.suppress(Exception):

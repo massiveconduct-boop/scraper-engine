@@ -4,6 +4,7 @@ Tests Camoufox wrapper, pool, and session state with mocks.
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -851,3 +852,306 @@ class TestSessionState:
             assert state["cookies"][0]["name"] == "sid"
 
         asyncio.run(run())
+
+
+class _FakeWrapper:
+    """Stands in for CamoufoxWrapper with the one property that matters here:
+    it holds a real BROWSER_SEMAPHORE permit from __aenter__ to __aexit__."""
+
+    instances: list["_FakeWrapper"] = []
+
+    def __init__(self, proxy=None, **_kwargs):
+        self.proxy = proxy
+        self._context = None
+        self._isolated_ctx = None
+        self._last_domain = None
+        self.closed = False
+        _FakeWrapper.instances.append(self)
+
+    async def __aenter__(self):
+        from scraper_engine.core import budget
+
+        await budget.BROWSER_SEMAPHORE.acquire()
+        self._context = object()
+        self._isolated_ctx = object()
+        return self._isolated_ctx
+
+    async def __aexit__(self, *_exc):
+        from scraper_engine.core import budget
+
+        self.closed = True
+        budget.BROWSER_SEMAPHORE.release()
+
+
+class TestParkedSparesNeverStarveALaunch:
+    """Round 63 — a pooled spare must not be able to starve a new launch.
+
+    release(healthy=True) returns a context to the queue but does NOT release
+    BROWSER_SEMAPHORE, so an idle spare goes on holding its permit. acquire()
+    keeps a non-matching spare pooled and launches a fresh instance instead,
+    so once every permit is held by idle spares the next launch blocks on the
+    semaphore forever — nothing is running, so nothing will ever release it.
+    Round 62 made this ordinary: the paid gateway presents a fresh sessid per
+    attempt, so `proxy` differs on nearly every attempt and the mismatch
+    branch is taken nearly every time.
+
+    The deadlock has two orderings and both are covered: spares already
+    parked when the launch arrives (evict them), and spares parked while the
+    launch is already waiting (release() must hand the permit on instead of
+    parking). A first fix covered only the former, keyed on the pool's own
+    instance count; live, a 10-URL job still finished 9 of 10 and then hung
+    with 8 idle instances parked behind the 10th URL's launch.
+    """
+
+    @pytest.fixture
+    def one_permit(self, monkeypatch):
+        from scraper_engine.browser import pool as pool_mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        monkeypatch.setattr(pool_mod, "CamoufoxWrapper", _FakeWrapper)
+        _FakeWrapper.instances = []
+        return sem
+
+    @staticmethod
+    def _proxy(port):
+        return Proxy(id=port, ip="10.0.0.1", port=port, protocol=ProxyProtocol.HTTP)
+
+    async def test_a_spare_parked_while_a_launch_waits_is_handed_over(
+        self, tenant, one_permit
+    ):
+        """The live deadlock: the waiter arrived while every instance was
+        leased, then a sibling finished and returned its instance healthy."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx_a = await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(pool.acquire(proxy=self._proxy(2)))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        await pool.release(ctx_a, healthy=True)
+        ctx_b = await asyncio.wait_for(waiter, timeout=1)
+
+        assert ctx_b is not ctx_a
+        assert _FakeWrapper.instances[0].closed
+        assert pool._pool.qsize() == 0
+        assert pool._launch_waiters == 0
+
+    async def test_a_spare_already_parked_is_evicted_for_a_launch(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx_a = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx_a, healthy=True)
+        assert pool._pool.qsize() == 1
+
+        await asyncio.wait_for(pool.acquire(proxy=self._proxy(2)), timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert [w.proxy.port for w in pool._active_wrappers] == [2]
+
+    async def test_release_parks_when_nobody_is_waiting(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        assert pool._pool.qsize() == 1
+        assert not _FakeWrapper.instances[0].closed
+
+    async def test_no_eviction_while_a_permit_is_free(self, tenant, monkeypatch):
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        spare = _FakeWrapper()
+        await spare.__aenter__()
+        pool._active_wrappers = [spare]
+        await pool._pool.put((spare._isolated_ctx, spare, time.monotonic()))
+
+        await pool._make_room_for_launch()
+
+        assert not spare.closed
+        assert pool._pool.qsize() == 1
+
+    async def test_no_eviction_when_every_instance_is_genuinely_leased_out(
+        self, tenant, one_permit
+    ):
+        """An empty pool with no free permit is real contention — the caller
+        must wait, not tear down a browser someone else is mid-fetch with."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.acquire(proxy=self._proxy(1))
+        await pool._make_room_for_launch()
+        assert not _FakeWrapper.instances[0].closed
+        assert one_permit.locked()
+
+    async def test_oldest_spare_goes_first(self, tenant, monkeypatch):
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        old, new = _FakeWrapper(), _FakeWrapper()
+        for w in (old, new):
+            await w.__aenter__()
+            pool._active_wrappers.append(w)
+            await pool._pool.put((w._isolated_ctx, w, time.monotonic()))
+
+        await pool._make_room_for_launch()
+
+        assert old.closed and not new.closed
+        assert pool._active_wrappers == [new]
+
+    async def test_a_failing_teardown_does_not_loop_forever(self, tenant, one_permit):
+        """Eviction exists to unblock a launch; a spare whose teardown raises
+        (and so never frees its permit) must be dropped, and the loop must
+        stop once the pool is empty rather than spin."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await one_permit.acquire()
+        spare = MagicMock()
+        spare._context = "ctx-1"
+        spare._isolated_ctx = None
+        spare.__aexit__ = AsyncMock(side_effect=RuntimeError("browser already gone"))
+        pool._active_wrappers = [spare]
+        await pool._pool.put(("ctx-1", spare, time.monotonic()))
+
+        await asyncio.wait_for(pool._make_room_for_launch(), timeout=1)
+
+        assert pool._active_wrappers == []
+        assert pool._pool.qsize() == 0
+
+    async def test_a_cancelled_launch_is_not_counted_as_a_live_browser(
+        self, tenant, one_permit
+    ):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(pool.acquire(proxy=self._proxy(2)))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert [w.proxy.port for w in pool._active_wrappers] == [1]
+        assert pool._launch_waiters == 0
+
+    async def test_a_cancelled_lease_frees_its_permit(self, tenant, one_permit):
+        """`except Exception` in lease() let CancelledError skip both the
+        teardown and the park branch, leaking the instance and its permit."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        with pytest.raises(asyncio.CancelledError):
+            async with pool.lease(proxy=self._proxy(1)):
+                raise asyncio.CancelledError
+        assert _FakeWrapper.instances[0].closed
+        assert not one_permit.locked()
+        assert pool._active_wrappers == []
+
+
+class TestCancelledLaunchReleasesPermit:
+    """Round 63 — CamoufoxWrapper.__aenter__ caught only Exception, so a
+    launch cancelled mid-flight kept its BROWSER_SEMAPHORE permit forever,
+    and a browser whose new_context() failed was left running unowned."""
+
+    async def test_cancelled_launch_releases_the_permit(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("cancel"))
+        monkeypatch.setattr(
+            wrapper,
+            "_launch_with_geoip_fallback",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await wrapper.__aenter__()
+        assert not sem.locked()
+
+    async def test_failed_new_context_closes_the_launched_browser(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("ctxfail"))
+        browser = MagicMock()
+        browser.__aexit__ = AsyncMock(return_value=None)
+        context = MagicMock()
+        context.new_context = AsyncMock(side_effect=RuntimeError("context refused"))
+
+        async def _launch():
+            wrapper._browser = browser
+            return context
+
+        monkeypatch.setattr(wrapper, "_launch_with_geoip_fallback", _launch)
+        with pytest.raises(RuntimeError, match="context refused"):
+            await wrapper.__aenter__()
+        browser.__aexit__.assert_awaited_once()
+        assert not sem.locked()
+
+
+class TestBoundedBrowserTeardown:
+    """Round 63 — no XVFB_LOCK critical section may block forever.
+
+    XVFB_LOCK is process-wide and both the launch and the teardown hold it,
+    and `budget.BROWSER_SEMAPHORE.release()` runs only AFTER the teardown's
+    lock block. So one wedged Camoufox (dead CDP pipe, an Xvfb that will not
+    exit) froze every browser operation in the worker permanently AND leaked
+    every permit. Live-caught twice on a 10-URL Jumia job: 8 live browsers,
+    an idle event loop, zero log output, the job stalled mid-run until RQ's
+    job timeout killed the work-horse.
+
+    A timeout can leak a browser process. That is the better failure: a
+    leaked browser costs memory on one worker until it recycles, an
+    unbounded wait costs every remaining URL of every job it would run.
+    """
+
+    @staticmethod
+    def _wedged_wrapper(monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+
+        monkeypatch.setattr(mod, "_BROWSER_TEARDOWN_TIMEOUT_SECONDS", 0.05)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("teardown"))
+        hung = MagicMock()
+
+        async def _never_returns(*_a, **_k):
+            await asyncio.sleep(3600)
+
+        hung.__aexit__ = _never_returns
+        wrapper._browser = hung
+        return wrapper
+
+    async def test_a_hung_teardown_releases_the_browser_permit(self, monkeypatch):
+        from scraper_engine.core import budget
+
+        wrapper = self._wedged_wrapper(monkeypatch)
+        await budget.BROWSER_SEMAPHORE.acquire()
+        before = budget.BROWSER_SEMAPHORE._value
+
+        await wrapper.__aexit__()
+
+        assert budget.BROWSER_SEMAPHORE._value == before + 1
+
+    async def test_a_hung_teardown_does_not_keep_xvfb_lock(self, monkeypatch):
+        """The load-bearing property: the NEXT browser operation must be able
+        to proceed. Holding XVFB_LOCK is what turned one stuck browser into a
+        dead worker."""
+        from scraper_engine.core import budget
+
+        wrapper = self._wedged_wrapper(monkeypatch)
+
+        await wrapper.__aexit__()
+
+        assert not budget.XVFB_LOCK.locked()
+
+    async def test_a_normal_teardown_is_unchanged(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("teardown"))
+        browser = MagicMock()
+        browser.__aexit__ = AsyncMock(return_value=None)
+        wrapper._browser = browser
+        await budget.BROWSER_SEMAPHORE.acquire()
+        before = budget.BROWSER_SEMAPHORE._value
+
+        await wrapper.__aexit__()
+
+        browser.__aexit__.assert_awaited_once()
+        assert wrapper._browser is None
+        assert budget.BROWSER_SEMAPHORE._value == before + 1
+        assert not budget.XVFB_LOCK.locked()
