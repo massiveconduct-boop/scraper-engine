@@ -10,15 +10,22 @@ The worker dequeues jobs and drives the escalation state machine:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 from scraper_engine.fetcher._failure import classify_http_status
 from scraper_engine.observability.metrics import fetch_duration_seconds
+from scraper_engine.orchestrator.host_capacity import (
+    AdmissionCancelledError,
+    AdmissionTimeoutError,
+    AdmissionUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,7 @@ if TYPE_CHECKING:
     from scraper_engine.storage.redis_client import RedisClient
 
     from .circuit_breaker import CircuitBreaker
+    from .host_capacity import HostAdmission
     from .politeness import PolitenessController
 
 LEVELS = [1, 2, 3]
@@ -121,8 +129,36 @@ TRANSIENT_FAILURE_CATEGORIES = frozenset(
         # Transient by construction, since what clears it is sibling URLs
         # finishing, so it is auto-retry eligible like the other two.
         FailureCategory.POLITENESS_TIMEOUT,
+        # Round 65 — host admission (orchestrator/host_capacity.py): our own
+        # browser capacity or our own Redis, never the target. See
+        # core/models.py for why neither may touch the circuit or level memory.
+        FailureCategory.CAPACITY_TIMEOUT,
+        FailureCategory.DEPENDENCY_UNAVAILABLE,
     }
 )
+
+
+@dataclass
+class _RenderAdmission:
+    """One URL's inputs to a host-capacity claim (round 65), threaded from
+    process_job down to every render _fetch_with_proxy makes for it.
+
+    priority_ms is the URL's FIRST enqueue time and never changes, so a URL
+    keeps its place in the host's line across levels, pool retries, gateway
+    rotations and the gateway retry — escalating must not send it to the back.
+    """
+
+    tenant_id: TenantId
+    domain: str
+    concurrency: int
+    delay_seconds: float
+    priority_ms: int
+    deadline: float  # time.monotonic() after which no new wait may start
+    is_cancelled: Callable[[], Awaitable[bool]]
+    timings: dict[str, int]
+
+    def wait_budget(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
 DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
 
 
@@ -139,8 +175,12 @@ class Worker:
         pg: PostgresClient | None = None,
         browser_pool: BrowserPool | None = None,
         botasaurus_pool: BotasaurusPool | None = None,
+        admission: HostAdmission | None = None,
     ) -> None:
         self._redis = redis
+        # Round 65 — the host-wide browser budget. None (host_capacity
+        # disabled) keeps the per-process politeness-slot path unchanged.
+        self._admission = admission
         self._circuit_breaker = circuit_breaker
         self._politeness = politeness
         self._dlq = dlq
@@ -280,6 +320,7 @@ class Worker:
         job_id: str,
         request: ScrapeRequest,
         on_result: Callable[[FetchResult], Awaitable[None]] | None = None,
+        deadline: float | None = None,
     ) -> JobStatusResponse:
         """Execute the full escalation state machine for a job.
 
@@ -288,7 +329,12 @@ class Worker:
         hit) — orchestrator/tasks.py threads this in to persist each result
         to Postgres/S3 as it lands, instead of batching everything until the
         whole job finishes. This is also what makes real per-URL progress
-        and mid-job cancellation possible (see _is_cancelled below)."""
+        and mid-job cancellation possible (see _is_cancelled below).
+
+        deadline (round 65) is the time.monotonic() instant rq will kill this
+        job at (orchestrator/tasks.py derives it from the rq job). Waits for
+        host capacity stop early enough before it that the URL still gets a
+        CAPACITY_TIMEOUT row — rq's own kill writes nothing per URL."""
         errors: list[str] = []
         bypass_cache = bool(request.config_overrides and request.config_overrides.bypass_cache)
         # Round 49 — was a strictly sequential `for url in request.urls:`
@@ -313,6 +359,13 @@ class Worker:
         semaphore = asyncio.Semaphore(self._config.politeness.max_concurrent_urls_per_job)
         levels = self._resolve_levels(request.config_overrides)
         req_concurrency, req_delay = self._resolve_politeness(request.config_overrides)
+        host_cfg = self._config.host_capacity
+        admission_deadline_cap = (
+            deadline - host_cfg.deadline_margin_seconds if deadline is not None else None
+        )
+
+        async def _job_cancelled() -> bool:
+            return await self._is_cancelled(tenant_id, job_id)
 
         async def _dispatch_one_url(index: int, url: HttpUrl) -> None:
             async with semaphore:
@@ -382,6 +435,21 @@ class Worker:
                     return
 
             domain = self._extract_domain(url_str)
+            admission: _RenderAdmission | None = None
+            if self._admission is not None:
+                url_deadline = time.monotonic() + host_cfg.per_url_admission_cap_seconds
+                if admission_deadline_cap is not None:
+                    url_deadline = min(url_deadline, admission_deadline_cap)
+                admission = _RenderAdmission(
+                    tenant_id=tenant_id,
+                    domain=domain,
+                    concurrency=req_concurrency,
+                    delay_seconds=req_delay,
+                    priority_ms=int(time.time() * 1000),
+                    deadline=url_deadline,
+                    is_cancelled=_job_cancelled,
+                    timings=timings,
+                )
             plan = await self._level_memory.plan(tenant_id, domain, levels)
             start_level = plan.start_level
             # Round 64 — a domain known to refuse the free pool goes straight
@@ -473,58 +541,72 @@ class Worker:
                     if circuit_open and level == 1:
                         continue
 
-                    # Round 63 — the inter-fetch delay is served BEFORE taking
-                    # a slot, not while holding one. Sleeping inside the slot
-                    # made every waiter pay for the delay too: with
-                    # default_concurrency slots and a per-fetch delay, the
-                    # pool's real throughput was one URL per (delay + fetch),
-                    # not one per fetch. It is also the correct order on its
-                    # own terms — the delay is about the TARGET's pacing, the
-                    # slot is about our own concurrency.
-                    timings["politeness_wait_ms"] = timings.get(
-                        "politeness_wait_ms", 0
-                    ) + await self._politeness.wait_if_needed(
-                        domain, tenant_id, delay_seconds=req_delay
+                    # Round 65 — with host admission on, a browser level takes
+                    # its politeness slot and delay inside the per-render claim
+                    # in _fetch_with_proxy, together with the browser seat.
+                    # Taking the slot out here first is what let one URL sit on
+                    # it through an untimed browser wait and starve its
+                    # same-site siblings into the 300s slot timeout.
+                    claims_per_render = admission is not None and level >= 2
+                    held: contextlib.AbstractAsyncContextManager[None] = (
+                        contextlib.nullcontext()
                     )
-                    slot_worker_id, slot_wait_ms = await self._acquire_politeness_slot(
-                        domain, tenant_id, concurrency=req_concurrency
-                    )
-                    timings["slot_wait_ms"] = timings.get("slot_wait_ms", 0) + slot_wait_ms
-                    if slot_worker_id is None:
-                        # Round 63 — this used to `continue` to the NEXT level.
-                        # A busy slot says nothing about the current level, so
-                        # advancing on it let a URL walk the whole ladder
-                        # without a single fetch and then DLQ as if the proxy
-                        # pool were exhausted. Contention is terminal for this
-                        # URL now, reported as what it actually is.
-                        message = (
-                            f"No politeness slot for {domain} within "
-                            f"{self._config.politeness.slot_wait_timeout_seconds}s"
+                    if not claims_per_render:
+                        # Round 63 — the inter-fetch delay is served BEFORE taking
+                        # a slot, not while holding one. Sleeping inside the slot
+                        # made every waiter pay for the delay too: with
+                        # default_concurrency slots and a per-fetch delay, the
+                        # pool's real throughput was one URL per (delay + fetch),
+                        # not one per fetch. It is also the correct order on its
+                        # own terms — the delay is about the TARGET's pacing, the
+                        # slot is about our own concurrency.
+                        timings["politeness_wait_ms"] = timings.get(
+                            "politeness_wait_ms", 0
+                        ) + await self._politeness.wait_if_needed(
+                            domain, tenant_id, delay_seconds=req_delay
                         )
-                        slot_result = FetchResult(
-                            url=url_str,
-                            success=False,
-                            level_used=level,
-                            duration_ms=0,
-                            failure_category=FailureCategory.POLITENESS_TIMEOUT,
-                            error_message=message,
+                        slot_worker_id, slot_wait_ms = await self._acquire_politeness_slot(
+                            domain, tenant_id, concurrency=req_concurrency
                         )
-                        await self._dlq.enqueue(
-                            tenant_id,
-                            job_id,
-                            url_str,
-                            FailureCategory.POLITENESS_TIMEOUT,
-                            message,
-                            level,
-                        )
-                        errors.append(message)
-                        results[index] = _finish(slot_result)
-                        if on_result is not None:
-                            await on_result(slot_result)
-                        break
+                        timings["slot_wait_ms"] = timings.get("slot_wait_ms", 0) + slot_wait_ms
+                        if slot_worker_id is None:
+                            # Round 63 — this used to `continue` to the NEXT level.
+                            # A busy slot says nothing about the current level, so
+                            # advancing on it let a URL walk the whole ladder
+                            # without a single fetch and then DLQ as if the proxy
+                            # pool were exhausted. Contention is terminal for this
+                            # URL now, reported as what it actually is.
+                            message = (
+                                f"No politeness slot for {domain} within "
+                                f"{self._config.politeness.slot_wait_timeout_seconds}s"
+                            )
+                            slot_result = FetchResult(
+                                url=url_str,
+                                success=False,
+                                level_used=level,
+                                duration_ms=0,
+                                failure_category=FailureCategory.POLITENESS_TIMEOUT,
+                                error_message=message,
+                            )
+                            await self._dlq.enqueue(
+                                tenant_id,
+                                job_id,
+                                url_str,
+                                FailureCategory.POLITENESS_TIMEOUT,
+                                message,
+                                level,
+                            )
+                            errors.append(message)
+                            results[index] = _finish(slot_result)
+                            if on_result is not None:
+                                await on_result(slot_result)
+                            break
+
+                        held = self._politeness.held_slot(domain, tenant_id, slot_worker_id)
 
                     level_start = time.monotonic()
-                    async with self._politeness.held_slot(domain, tenant_id, slot_worker_id):
+                    waited_before = timings.get("admission_wait_ms", 0)
+                    async with held:
                         result = await self._fetch_url(
                             tenant_id,
                             url_str,
@@ -532,8 +614,13 @@ class Worker:
                             request.config_overrides,
                             force_gateway=circuit_open or gateway_first,
                             skip_botasaurus=skip_botasaurus,
+                            admission=admission if claims_per_render else None,
                         )
-                    level_ms = int((time.monotonic() - level_start) * 1000)
+                    # level_N_ms is render time only; queueing for host
+                    # capacity is reported separately as admission_wait_ms.
+                    level_ms = int((time.monotonic() - level_start) * 1000) - (
+                        timings.get("admission_wait_ms", 0) - waited_before
+                    )
                     timings[f"level_{level}_ms"] = level_ms
                     fetch_duration_seconds.labels(level=str(level)).observe(level_ms / 1000)
 
@@ -613,6 +700,7 @@ class Worker:
                             request.config_overrides,
                             force_gateway=True,
                             skip_botasaurus=skip_botasaurus,
+                            admission=admission if claims_per_render else None,
                         )
                         timings[f"level_{level}_gateway_retry_ms"] = int(
                             (time.monotonic() - retry_start) * 1000
@@ -890,6 +978,39 @@ class Worker:
                     results[index] = _finish(exhausted_result)
                     if on_result is not None:
                         await on_result(exhausted_result)
+            except AdmissionCancelledError:
+                # The job was cancelled while this URL waited for capacity:
+                # same outcome as noticing it before starting (no result).
+                cancelled_state["value"] = True
+            except (AdmissionTimeoutError, AdmissionUnavailableError) as exc:
+                # Round 65 — our own capacity or our own Redis, never the
+                # target: no circuit_breaker.record_failure and no level
+                # memory, mirroring the POLITENESS_TIMEOUT branch above.
+                category = (
+                    FailureCategory.CAPACITY_TIMEOUT
+                    if isinstance(exc, AdmissionTimeoutError)
+                    else FailureCategory.DEPENDENCY_UNAVAILABLE
+                )
+                if isinstance(exc, AdmissionTimeoutError):
+                    timings["admission_wait_ms"] = (
+                        timings.get("admission_wait_ms", 0) + exc.waited_ms
+                    )
+                message = str(exc)
+                capacity_result = FetchResult(
+                    url=url_str,
+                    success=False,
+                    level_used=url_levels[-1],
+                    duration_ms=0,
+                    failure_category=category,
+                    error_message=message,
+                )
+                await self._dlq.enqueue(
+                    tenant_id, job_id, url_str, category, message, url_levels[-1]
+                )
+                errors.append(message)
+                results[index] = _finish(capacity_result)
+                if on_result is not None:
+                    await on_result(capacity_result)
             except Exception as exc:
                 logger.exception(
                     "process_job_unexpected_url_failure job_id=%s url=%s",
@@ -1010,6 +1131,7 @@ class Worker:
         overrides: ConfigOverrides | None = None,
         force_gateway: bool = False,
         skip_botasaurus: bool = False,
+        admission: _RenderAdmission | None = None,
     ) -> FetchResult | None:
         """Dispatch fetch to the appropriate level fetcher.
 
@@ -1038,8 +1160,22 @@ class Worker:
                     skip_botasaurus=skip_botasaurus,
                 )
 
+            host_cfg = self._config.host_capacity
+            weight = host_cfg.camoufox_weight
+            if self._l2_tries_botasaurus and not skip_botasaurus:
+                # Botasaurus first, Camoufox as fallback, sequentially inside
+                # one render claim: weigh it as the heavier of the two.
+                weight = max(weight, host_cfg.botasaurus_weight)
             return await self._fetch_with_proxy(
-                tenant_id, url, level, overrides, self._pg, _build_l2, force_gateway=force_gateway
+                tenant_id,
+                url,
+                level,
+                overrides,
+                self._pg,
+                _build_l2,
+                force_gateway=force_gateway,
+                admission=admission,
+                weight=weight,
             )
         elif level == 3:
             from scraper_engine.core.exceptions import PostgresClientMissingError
@@ -1056,7 +1192,15 @@ class Worker:
                 )
 
             return await self._fetch_with_proxy(
-                tenant_id, url, level, overrides, self._pg, _build_l3, force_gateway=force_gateway
+                tenant_id,
+                url,
+                level,
+                overrides,
+                self._pg,
+                _build_l3,
+                force_gateway=force_gateway,
+                admission=admission,
+                weight=self._config.host_capacity.camoufox_weight,
             )
         return None
 
@@ -1069,6 +1213,8 @@ class Worker:
         pg: PostgresClient,
         build_fetcher: Callable[[], Any],
         force_gateway: bool = False,
+        admission: _RenderAdmission | None = None,
+        weight: float = 1.0,
     ) -> FetchResult:
         """Shared L2/L3 lease-fetch-score cycle, with a bounded same-level
         retry (round 37, see _PROXY_RETRYABLE_CATEGORIES/
@@ -1086,7 +1232,12 @@ class Worker:
         attempt through the paid gateway regardless of `strategy` — the
         caller has already decided a free-pool attempt isn't appropriate
         (circuit open) or didn't work (still blocked after a real render),
-        not something this method re-derives."""
+        not something this method re-derives.
+
+        admission (round 65): when given, every pass of the loop below — the
+        first render, each pool retry, each gateway rotation — claims host
+        capacity first (_render_claim), BEFORE leasing a proxy, so a proxy is
+        never held idle in the host's line."""
         from scraper_engine.core.exceptions import ProxyPoolExhaustedError
         from scraper_engine.proxy.lease import ProxyLease
         from scraper_engine.proxy.manager import ProxyManager
@@ -1112,82 +1263,111 @@ class Worker:
         block_rotations_left = di_cfg.rotate_on_block_retries if di_cfg.enabled else 0
 
         while True:
-            lease: ProxyLease
-            if force_gateway:
-                gateway_proxy = self._new_gateway_proxy()
-                if gateway_proxy is None:
-                    raise RuntimeError(
-                        "force_gateway=True but DataImpulse gateway is not configured"
-                    )
-                lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
-            elif strategy == "paid_only":
-                # Skips pm.get_proxy() entirely — the scored free pool never
-                # enters the picture for this level under paid_only. Bad
-                # config was already caught at Worker.__init__ time, so a
-                # None here is unreachable; the raise is defense in depth,
-                # never a silent fallback to the free pool.
-                gateway_proxy = self._new_gateway_proxy()
-                if gateway_proxy is None:
-                    raise RuntimeError(
-                        "dataimpulse strategy=paid_only but gateway is not configured"
-                    )
-                lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
-            else:
-                try:
-                    lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
-                except ProxyPoolExhaustedError:
-                    if strategy == "free_first":
-                        gateway_proxy = self._new_gateway_proxy()
-                        if gateway_proxy is None:
-                            raise RuntimeError(
-                                "dataimpulse strategy=free_first but gateway is not configured"
-                            ) from None
-                        lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
-                    else:
-                        return FetchResult(
-                            url=url,
-                            success=False,
-                            level_used=level,
-                            duration_ms=0,
-                            failure_category=FailureCategory.PROXY_EXHAUSTED,
-                            error_message="Proxy pool exhausted",
+            async with self._render_claim(admission, weight):
+                lease: ProxyLease
+                if force_gateway:
+                    gateway_proxy = self._new_gateway_proxy()
+                    if gateway_proxy is None:
+                        raise RuntimeError(
+                            "force_gateway=True but DataImpulse gateway is not configured"
                         )
-            async with lease:
-                fetcher = build_fetcher()
-                result: FetchResult = await fetcher.fetch(
-                    url, tenant_id, proxy=lease.proxy, overrides=overrides
-                )
-                result.proxy_source = lease.proxy.source
-                # A paid-gateway lease has no proxy_pool row (see
-                # proxy/paid_gateway.py) — mark_success/mark_failure would be
-                # a harmless no-op UPDATE either way, but gating on source
-                # makes that intent explicit instead of relying on an
-                # incidental 0-row match.
-                # Round 62 — the block check runs BEFORE the success
-                # short-circuit on purpose. At L3 a Cloudflare interstitial
-                # comes back as success=True with http_status=403 (see
-                # level_3.py's closing comment: the fetcher deliberately
-                # defers that verdict to process_job's centralized
-                # is_challenge_page check). Returning early on
-                # result.success would hand that "successful" 403 straight
-                # back and rotation would never fire for the single most
-                # common block shape there is — which is exactly what the
-                # Jumia run hit.
-                blocked = self._looks_blocked(result)
-                if blocked and lease.proxy.source == "paid_gateway" and block_rotations_left > 0:
-                    block_rotations_left -= 1
-                    continue  # new sessid on the next pass == new exit IP
+                    lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+                elif strategy == "paid_only":
+                    # Skips pm.get_proxy() entirely — the scored free pool never
+                    # enters the picture for this level under paid_only. Bad
+                    # config was already caught at Worker.__init__ time, so a
+                    # None here is unreachable; the raise is defense in depth,
+                    # never a silent fallback to the free pool.
+                    gateway_proxy = self._new_gateway_proxy()
+                    if gateway_proxy is None:
+                        raise RuntimeError(
+                            "dataimpulse strategy=paid_only but gateway is not configured"
+                        )
+                    lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+                else:
+                    try:
+                        lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
+                    except ProxyPoolExhaustedError:
+                        if strategy == "free_first":
+                            gateway_proxy = self._new_gateway_proxy()
+                            if gateway_proxy is None:
+                                raise RuntimeError(
+                                    "dataimpulse strategy=free_first but gateway is not configured"
+                                ) from None
+                            lease = ProxyLease(proxy=gateway_proxy, tenant_id=tenant_id)
+                        else:
+                            return FetchResult(
+                                url=url,
+                                success=False,
+                                level_used=level,
+                                duration_ms=0,
+                                failure_category=FailureCategory.PROXY_EXHAUSTED,
+                                error_message="Proxy pool exhausted",
+                            )
+                async with lease:
+                    fetcher = build_fetcher()
+                    result: FetchResult = await fetcher.fetch(
+                        url, tenant_id, proxy=lease.proxy, overrides=overrides
+                    )
+                    result.proxy_source = lease.proxy.source
+                    # A paid-gateway lease has no proxy_pool row (see
+                    # proxy/paid_gateway.py) — mark_success/mark_failure would be
+                    # a harmless no-op UPDATE either way, but gating on source
+                    # makes that intent explicit instead of relying on an
+                    # incidental 0-row match.
+                    # Round 62 — the block check runs BEFORE the success
+                    # short-circuit on purpose. At L3 a Cloudflare interstitial
+                    # comes back as success=True with http_status=403 (see
+                    # level_3.py's closing comment: the fetcher deliberately
+                    # defers that verdict to process_job's centralized
+                    # is_challenge_page check). Returning early on
+                    # result.success would hand that "successful" 403 straight
+                    # back and rotation would never fire for the single most
+                    # common block shape there is — which is exactly what the
+                    # Jumia run hit.
+                    blocked = self._looks_blocked(result)
+                    rotate = lease.proxy.source == "paid_gateway" and block_rotations_left > 0
+                    if blocked and rotate:
+                        block_rotations_left -= 1
+                        continue  # new sessid on the next pass == new exit IP
 
-                if result.success:
+                    if result.success:
+                        if lease.proxy.source == "pool":
+                            await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                        return result
                     if lease.proxy.source == "pool":
-                        await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+                        await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
+                    retryable = result.failure_category in _PROXY_RETRYABLE_CATEGORIES
+                    if retryable and pool_retries_left > 0:
+                        pool_retries_left -= 1
+                        continue  # loop again with a freshly leased proxy
                     return result
-                if lease.proxy.source == "pool":
-                    await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
-                if result.failure_category in _PROXY_RETRYABLE_CATEGORIES and pool_retries_left > 0:
-                    pool_retries_left -= 1
-                    continue  # loop again with a freshly leased proxy
-                return result
+
+    @contextlib.asynccontextmanager
+    async def _render_claim(
+        self, admission: _RenderAdmission | None, weight: float
+    ) -> AsyncIterator[None]:
+        """Hold one host-capacity claim around one render (round 65); a no-op
+        without host admission. Raises the orchestrator/host_capacity.py
+        AdmissionError subclasses, which process_job turns into a
+        CAPACITY_TIMEOUT / DEPENDENCY_UNAVAILABLE result."""
+        if admission is None or self._admission is None:
+            yield
+            return
+        async with self._admission.claim(
+            tenant_id=admission.tenant_id,
+            domain=admission.domain,
+            weight=weight,
+            concurrency=admission.concurrency,
+            delay_seconds=admission.delay_seconds,
+            priority_ms=admission.priority_ms,
+            wait_budget_seconds=admission.wait_budget(),
+            is_cancelled=admission.is_cancelled,
+        ) as grant:
+            admission.timings["admission_wait_ms"] = (
+                admission.timings.get("admission_wait_ms", 0) + grant.wait_ms
+            )
+            yield
 
     def _new_gateway_proxy(self) -> Proxy | None:
         """Build a gateway Proxy pinned to a brand-new sticky session.

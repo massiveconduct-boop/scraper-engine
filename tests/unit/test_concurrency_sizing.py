@@ -44,3 +44,11 @@ def test_silent_when_the_ceiling_is_enough(caplog):
     with caplog.at_level(logging.WARNING, logger=tasks_module.__name__):
         tasks_module._warn_if_ceiling_below_url_concurrency(8, 5)
     assert caplog.text == ""
+
+
+def test_silent_under_host_admission_even_below_url_concurrency(caplog):
+    """Round 65 — the host-wide limit binds then; the local ceiling is only
+    a safety net, so queueing on it is expected."""
+    with caplog.at_level(logging.WARNING, logger=tasks_module.__name__):
+        tasks_module._warn_if_ceiling_below_url_concurrency(3, 5, True)
+    assert caplog.text == ""

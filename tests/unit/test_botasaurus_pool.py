@@ -620,6 +620,35 @@ class TestMultiDriverPool:
         assert budget.BROWSER_SEMAPHORE._value == 4
 
     @pytest.mark.asyncio
+    async def test_a_fetched_driver_is_parked_on_a_blank_page(self, _budget):
+        """Round 65 — a parked driver holds no permit or host seat, so it must
+        not keep the last page's scripts running while it waits."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            html = await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert html == "<html>fresh</html>"
+        driver.get.assert_called_once_with("about:blank")
+        assert len(pool._entries) == 1 and not pool._entries[0].busy
+
+    @pytest.mark.asyncio
+    async def test_a_driver_that_cannot_park_is_closed_but_the_page_is_kept(self, _budget):
+        budget = _budget
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        driver.get.side_effect = RuntimeError("tab gone")
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            html = await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert html == "<html>fresh</html>"
+        driver.close.assert_called_once()
+        assert pool._entries == []
+        assert budget.BROWSER_SEMAPHORE._value == 4
+
+    @pytest.mark.asyncio
     async def test_a_fetch_waits_when_every_driver_is_busy(self):
         import asyncio as _asyncio
         import threading

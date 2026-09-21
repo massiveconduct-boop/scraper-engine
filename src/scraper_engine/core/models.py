@@ -117,6 +117,16 @@ class FailureCategory(str, Enum):
     # consulted. Transient by nature — the contention that caused it is other
     # URLs finishing.
     POLITENESS_TIMEOUT = "politeness_timeout"
+    # Round 65 — host-wide browser admission (orchestrator/host_capacity.py).
+    # CAPACITY_TIMEOUT: no browser seat + politeness slot came free together
+    # within the URL's wait budget, so no render was attempted. Contention on
+    # OUR side, never the target's: transient, and exempt from the circuit
+    # breaker and level memory.
+    CAPACITY_TIMEOUT = "capacity_timeout"
+    # Round 65 — the shared store the admission layer runs on (Redis) failed
+    # or timed out. Also ours, also transient, also circuit-exempt: a Redis
+    # blip must not open circuits for healthy domains.
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 
 
 class FetchResult(BaseModel):

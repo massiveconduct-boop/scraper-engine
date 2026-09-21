@@ -143,7 +143,7 @@ async def test_run_scrape_on_result_callback_persists_incrementally(fake_clients
 
     captured_on_result = {}
 
-    async def fake_process_job(tenant_id, job_id, request, on_result=None):
+    async def fake_process_job(tenant_id, job_id, request, on_result=None, deadline=None):
         captured_on_result["cb"] = on_result
         return JobStatusResponse(job_id=job_id, status=JobStatus.COMPLETED)
 
@@ -778,3 +778,96 @@ async def test_run_scrape_job_tolerates_a_provider_without_force_flush(fake_clie
     await tasks_module._run_scrape_job("system", "job-noflush")
 
     assert pg.stop.await_count == 1
+
+
+def _patch_run_scrape_collaborators(monkeypatch):
+    browser_pool_cls = MagicMock(return_value=AsyncMock())
+    monkeypatch.setattr("scraper_engine.browser.pool.BrowserPool", browser_pool_cls)
+    monkeypatch.setattr(
+        "scraper_engine.browser.botasaurus_pool.BotasaurusPool",
+        MagicMock(return_value=AsyncMock()),
+    )
+    for name in (
+        "scraper_engine.browser.session_state.SessionStateManager",
+        "scraper_engine.orchestrator.circuit_breaker.CircuitBreaker",
+        "scraper_engine.orchestrator.politeness.PolitenessController",
+        "scraper_engine.storage.dlq.DeadLetterQueue",
+    ):
+        monkeypatch.setattr(name, MagicMock())
+    worker_instance = MagicMock()
+    worker_instance.process_job = AsyncMock(
+        return_value=JobStatusResponse(job_id="j", status=JobStatus.COMPLETED)
+    )
+    worker_cls = MagicMock(return_value=worker_instance)
+    monkeypatch.setattr("scraper_engine.orchestrator.worker.Worker", worker_cls)
+    return browser_pool_cls, worker_cls, worker_instance
+
+
+class TestHostAdmissionWiring:
+    """Round 65 — _run_scrape builds the host admission layer, stops
+    prewarming browsers outside it, and hands the worker rq's deadline."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_builds_admission_and_disables_prewarm(self, fake_clients, monkeypatch):
+        from scraper_engine.config.schema import HostCapacityConfig
+        from scraper_engine.orchestrator.host_capacity import HostAdmission
+
+        pg, redis, s3, cfg = fake_clients
+        cfg.host_capacity = HostCapacityConfig(enabled=True)
+        monkeypatch.setattr(tasks_module, "_job_deadline", lambda: 1234.5)
+        pool_cls, worker_cls, worker = _patch_run_scrape_collaborators(monkeypatch)
+        request = ScrapeRequest(urls=["http://example.com"])
+
+        await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
+
+        assert pool_cls.call_args.kwargs["prewarm_count"] == 0
+        assert isinstance(worker_cls.call_args.kwargs["admission"], HostAdmission)
+        assert worker.process_job.await_args.kwargs["deadline"] == 1234.5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("max_level", "prewarm"), [(None, 2), (3, 2), (1, 0)])
+    async def test_disabled_keeps_prewarm_unless_no_browser_level_is_reachable(
+        self, fake_clients, monkeypatch, max_level, prewarm
+    ):
+        from scraper_engine.config.schema import HostCapacityConfig
+        from scraper_engine.core.models import ConfigOverrides
+
+        pg, redis, s3, cfg = fake_clients
+        cfg.host_capacity = HostCapacityConfig(enabled=False)
+        pool_cls, worker_cls, _ = _patch_run_scrape_collaborators(monkeypatch)
+        overrides = ConfigOverrides(max_level=max_level) if max_level else None
+        request = ScrapeRequest(urls=["http://example.com"], config_overrides=overrides)
+
+        await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
+
+        assert pool_cls.call_args.kwargs["prewarm_count"] == prewarm
+        assert worker_cls.call_args.kwargs["admission"] is None
+
+
+class TestJobDeadline:
+    def test_none_outside_an_rq_job(self, monkeypatch):
+        monkeypatch.setattr("rq.get_current_job", lambda: None)
+        assert tasks_module._job_deadline() is None
+
+    def test_none_without_a_timeout(self, monkeypatch):
+        job = MagicMock(timeout=None)
+        monkeypatch.setattr("rq.get_current_job", lambda: job)
+        assert tasks_module._job_deadline() is None
+
+    def test_none_before_the_job_has_started(self, monkeypatch):
+        job = MagicMock(timeout=600, started_at=None)
+        monkeypatch.setattr("rq.get_current_job", lambda: job)
+        assert tasks_module._job_deadline() is None
+
+    @pytest.mark.parametrize("aware", [True, False])
+    def test_remaining_time_from_rq_start_and_timeout(self, monkeypatch, aware):
+        import time
+        from datetime import UTC, datetime, timedelta
+
+        started = datetime.now(UTC) - timedelta(seconds=100)
+        if not aware:
+            started = started.replace(tzinfo=None)  # rq stores naive UTC
+        job = MagicMock(timeout=600, started_at=started)
+        monkeypatch.setattr("rq.get_current_job", lambda: job)
+        remaining = tasks_module._job_deadline() - time.monotonic()
+        assert 495 < remaining <= 500

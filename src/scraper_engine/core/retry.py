@@ -66,6 +66,16 @@ RETRY_MATRIX: dict[FailureCategory, RetryStrategy] = {
     FailureCategory.POLITENESS_TIMEOUT: RetryStrategy(
         max_attempts=2, base_delay_seconds=30.0, max_delay_seconds=120.0, retryable=True
     ),
+    # Round 65 — host browser capacity ran out for this URL's whole wait
+    # budget. Same shape as POLITENESS_TIMEOUT, longer delays: the host was
+    # saturated, and an eager retry adds to exactly that load.
+    FailureCategory.CAPACITY_TIMEOUT: RetryStrategy(
+        max_attempts=2, base_delay_seconds=60.0, max_delay_seconds=300.0, retryable=True
+    ),
+    # Round 65 — our own Redis failed or timed out. Usually a blip; retry soon.
+    FailureCategory.DEPENDENCY_UNAVAILABLE: RetryStrategy(
+        max_attempts=3, base_delay_seconds=5.0, max_delay_seconds=60.0, retryable=True
+    ),
 }
 
 

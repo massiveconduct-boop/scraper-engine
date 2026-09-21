@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
@@ -55,12 +56,18 @@ logger = logging.getLogger(__name__)
 # module-level code is the right place to bootstrap once, rather than
 # reconfiguring logging/tracing (or resizing the budget semaphores) on every
 # single job inside _run_scrape_job.
-def _warn_if_ceiling_below_url_concurrency(browser_ceiling: int, urls_per_job: int) -> None:
+def _warn_if_ceiling_below_url_concurrency(
+    browser_ceiling: int, urls_per_job: int, host_admission_enabled: bool = False
+) -> None:
     """Round 64 — AppConfig rejects a CONFIGURED browser ceiling below the
     per-job URL concurrency, but the RAM-aware cap can lower the real ceiling
     at startup, which config validation cannot see. Say so once, loudly,
-    rather than letting jobs quietly queue on BROWSER_SEMAPHORE."""
-    if browser_ceiling < urls_per_job:
+    rather than letting jobs quietly queue on BROWSER_SEMAPHORE.
+
+    Round 65 — silent with host admission on: the per-process ceiling is
+    then only a safety net and the binding limit is the host-wide one, so a
+    URL queueing for a browser here is expected, not a misconfiguration."""
+    if browser_ceiling < urls_per_job and not host_admission_enabled:
         logger.warning(
             "browser_ceiling_below_url_concurrency ceiling=%d "
             "max_concurrent_urls_per_job=%d — the RAM-aware cap lowered the "
@@ -82,8 +89,30 @@ configure_budget(
     capsolver_max_concurrent_solves=_bootstrap_cfg.capsolver.max_concurrent_solves,
 )
 _warn_if_ceiling_below_url_concurrency(
-    _browser_ceiling, _bootstrap_cfg.politeness.max_concurrent_urls_per_job
+    _browser_ceiling,
+    _bootstrap_cfg.politeness.max_concurrent_urls_per_job,
+    _bootstrap_cfg.host_capacity.enabled,
 )
+
+
+def _job_deadline() -> float | None:
+    """The time.monotonic() instant rq will kill the current job at (round 65).
+
+    rq enforces job_timeout with a hard kill that writes no per-URL result,
+    so Worker.process_job stops waiting for host capacity comfortably before
+    it. None outside an rq work-horse (tests, direct calls) or when the job
+    has no timeout — the per-URL admission cap still bounds every wait then.
+    """
+    from rq import get_current_job
+
+    job = get_current_job()
+    if job is None or job.timeout is None or job.started_at is None:
+        return None
+    started_at = job.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    elapsed = (datetime.now(UTC) - started_at).total_seconds()
+    return time.monotonic() + float(job.timeout) - elapsed
 
 
 def run_scrape_job(tenant_id: str, job_id: str) -> None:
@@ -280,7 +309,9 @@ async def _run_scrape(
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
     from scraper_engine.browser.pool import BrowserPool
     from scraper_engine.browser.session_state import SessionStateManager
+    from scraper_engine.core.host_identity import resolve_host_id
     from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker
+    from scraper_engine.orchestrator.host_capacity import HostAdmission
     from scraper_engine.orchestrator.politeness import PolitenessController
     from scraper_engine.orchestrator.worker import Worker
     from scraper_engine.storage.dlq import DeadLetterQueue
@@ -308,8 +339,16 @@ async def _run_scrape(
     # multiple URLs on the same domain (crawls), which now reuse one hot browser
     # instead of cold-starting Camoufox per URL.
     session_mgr = SessionStateManager(pg, ttl_days=cfg.session_retention.browser_sessions_ttl_days)
+    # Round 65 — prewarm launches happened at job start, before any URL and
+    # outside every limit (2 Camoufox launches per job, with no proxy, so a
+    # proxied render never reused them anyway). Off whenever host admission
+    # is on — every launch must go through a claim — and for jobs that can
+    # never reach a browser level at all.
+    max_level = request.config_overrides.max_level if request.config_overrides else None
+    prewarm = not cfg.host_capacity.enabled and (max_level is None or max_level >= 2)
     browser_pool = BrowserPool(
         tenant_id=tenant_id,
+        prewarm_count=2 if prewarm else 0,
         session_mgr=session_mgr,
         geoip=cfg.camoufox.geoip,
         humanize=cfg.camoufox.humanize,
@@ -324,6 +363,10 @@ async def _run_scrape(
     # browser/botasaurus_pool.py for why this doesn't use botasaurus's own
     # reuse_driver=True.
     botasaurus_pool = BotasaurusPool(tenant_id=tenant_id, config=cfg.botasaurus)
+
+    admission: HostAdmission | None = None
+    if cfg.host_capacity.enabled:
+        admission = HostAdmission(redis.raw, resolve_host_id(), cfg.host_capacity)
 
     async def _on_result(result: FetchResult) -> None:
         """Persist each result the moment it lands (round 29) instead of
@@ -349,8 +392,11 @@ async def _run_scrape(
             pg=pg,
             browser_pool=browser_pool,
             botasaurus_pool=botasaurus_pool,
+            admission=admission,
         )
-        return await worker.process_job(tenant_id, job_id, request, on_result=_on_result)
+        return await worker.process_job(
+            tenant_id, job_id, request, on_result=_on_result, deadline=_job_deadline()
+        )
     finally:
         await browser_pool.shutdown()
         await botasaurus_pool.shutdown()

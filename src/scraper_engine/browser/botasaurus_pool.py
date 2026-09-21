@@ -125,11 +125,15 @@ class BotasaurusPool:
                 html = await loop.run_in_executor(
                     None, self._navigate, entry.driver, url, scroll_passes, scroll_wait_ms
                 )
+                parked_idle = await loop.run_in_executor(None, self._park, entry.driver)
             finally:
                 budget.BROWSER_SEMAPHORE.release()
         except BaseException:
             await self._discard(entry)
             raise
+        if not parked_idle:
+            await self._discard(entry)
+            return html
         await self._checkin(entry)
         return html
 
@@ -270,6 +274,21 @@ class BotasaurusPool:
                 humanize=cfg.humanize_mouse,
             )
         return str(driver.page_html)
+
+    def _park(self, driver: Any) -> bool:
+        """Leave a driver on about:blank before it goes back to the pool.
+
+        Round 65 — a parked driver holds no browser permit and no host seat,
+        on the premise that an idle browser costs no CPU. It was not idle: it
+        kept the last page open, and that page's scripts kept running. The
+        next checkout navigates for real anyway, so nothing is lost. A driver
+        that cannot even do this is not one to hand the next URL (False).
+        """
+        try:
+            driver.get("about:blank")
+        except Exception:
+            return False
+        return True
 
     def _close_driver(self, driver: Any) -> None:
         with contextlib.suppress(Exception):

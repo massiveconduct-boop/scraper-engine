@@ -1516,7 +1516,13 @@ class TestGatewayFallbackOnFailure:
         # level 1 never actually calls _fetch_url (no gateway path to force
         # it through) — the only real attempt is level 2, forced.
         worker._fetch_url.assert_awaited_once_with(
-            tenant, "http://example.com/", 2, None, force_gateway=True, skip_botasaurus=False
+            tenant,
+            "http://example.com/",
+            2,
+            None,
+            force_gateway=True,
+            skip_botasaurus=False,
+            admission=None,
         )
 
     @pytest.mark.asyncio
