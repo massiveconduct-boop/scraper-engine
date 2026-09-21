@@ -327,11 +327,34 @@ class Worker:
             timings: dict[str, int] = {}
             url_start = time.monotonic()
 
+            escalations: list[dict[str, Any]] = []
+
             def _finish(result: FetchResult) -> FetchResult:
                 """Stamp the accumulated timings onto a terminal result."""
                 timings["total_ms"] = int((time.monotonic() - url_start) * 1000)
                 result.timings = dict(timings)
+                result.escalations = list(escalations) or None
                 return result
+
+            def _reject(level: int, result: FetchResult, reason: str) -> None:
+                """Record why `level` did not produce this URL's answer (round 64)."""
+                entry = {
+                    "level": level,
+                    "reason": reason,
+                    "http_status": result.http_status,
+                    "engine": result.engine,
+                    "proxy_source": result.proxy_source,
+                }
+                escalations.append(entry)
+                logger.info(
+                    "level_rejected job_id=%s url=%s level=%d reason=%s http_status=%s engine=%s",
+                    job_id,
+                    url_str,
+                    level,
+                    reason,
+                    result.http_status,
+                    result.engine,
+                )
 
             # Checked once per task, right after this task's semaphore slot
             # comes free — same cooperative granularity the old "checked
@@ -519,14 +542,22 @@ class Worker:
                     # 403 — that domain fails as a clean fetcher-level
                     # DETECTION_BLOCK, never as a success=True challenge
                     # page, so the original (success-branch-only) version
-                    # of this retry never fired for it at all. Only at the
-                    # final level (retrying a non-final level's block is
-                    # pointless — it's about to escalate anyway) and never
-                    # on a result that already came from the gateway (one
-                    # extra attempt per URL per level, never a second).
+                    # of this retry never fired for it at all. Never on a
+                    # result that already came from the gateway (one extra
+                    # attempt per URL per level, never a second).
+                    #
+                    # Round 64 — at EVERY level, not only the final one. The
+                    # old reasoning ("retrying a non-final level's block is
+                    # pointless — it's about to escalate anyway") treated
+                    # every block as the LEVEL's fault. Live, it was the
+                    # PROXY's: Jumia 403s free-pool (datacenter) exits at L2,
+                    # while the same L2 through the gateway returned 200 with
+                    # ~600 links in 20-25s. Escalating instead paid a free-pool
+                    # L3 attempt (blocked the same way) and then this same
+                    # retry at L3 anyway — and taught level memory that the
+                    # domain needs L3, so every later URL skipped L2 too.
                     if (
-                        level == url_levels[-1]
-                        and self._gateway_fallback_eligible
+                        self._gateway_fallback_eligible
                         and result.proxy_source != "paid_gateway"
                         and (
                             result.failure_category == FailureCategory.DETECTION_BLOCK
@@ -540,12 +571,34 @@ class Worker:
                             )
                         )
                     ):
+                        # Round 64 — the attempt being retried is a rejection
+                        # like any other, and the retry is a phase like any
+                        # other. Neither was recorded: a live L2 probe showed
+                        # total_ms ~2x level_2_ms with nothing to account for
+                        # the difference, and a result whose only visible
+                        # trace was `proxy_source: paid_gateway`.
+                        _reject(
+                            level,
+                            result,
+                            f"failure:{result.failure_category.value}"
+                            if not result.success and result.failure_category is not None
+                            else self._challenge_detector.challenge_reason(
+                                result.html or "",
+                                result.http_status or 200,
+                                short_page_is_suspect=False,
+                            )
+                            or "blocked",
+                        )
+                        retry_start = time.monotonic()
                         gateway_result = await self._fetch_url(
                             tenant_id,
                             url_str,
                             level,
                             request.config_overrides,
                             force_gateway=True,
+                        )
+                        timings[f"level_{level}_gateway_retry_ms"] = int(
+                            (time.monotonic() - retry_start) * 1000
                         )
                         if gateway_result is not None:
                             result = gateway_result
@@ -584,6 +637,17 @@ class Worker:
                         still_looks_blocked = result.is_challenge_page or (
                             self._challenge_detector.looks_javascript_gated(result.html or "")
                         )
+                        if still_looks_blocked:
+                            _reject(
+                                level,
+                                result,
+                                self._challenge_detector.challenge_reason(
+                                    result.html or "",
+                                    result.http_status or 200,
+                                    short_page_is_suspect=False,
+                                )
+                                or "js_gated",
+                            )
                         if level < url_levels[-1] and still_looks_blocked:
                             continue
                         # Round 45 — the final level used to unconditionally accept
@@ -707,6 +771,13 @@ class Worker:
                         break
                     else:
                         await self._circuit_breaker.record_failure(domain)
+                        _reject(
+                            level,
+                            result,
+                            f"failure:{result.failure_category.value}"
+                            if result.failure_category is not None
+                            else "failure:unknown",
+                        )
                         if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
                             await self._dlq.enqueue(
                                 tenant_id,

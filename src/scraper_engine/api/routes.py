@@ -20,6 +20,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
@@ -520,6 +521,18 @@ async def list_jobs(
     return {"jobs": jobs, "limit": limit, "offset": offset, "count": len(jobs)}
 
 
+def _split_timings_column(
+    raw: str | None,
+) -> tuple[dict[str, int] | None, list[dict[str, Any]] | None]:
+    """Undo orchestrator/tasks.py::_timings_column — the stored JSONB holds the
+    integer phase timings plus an optional `escalations` list (round 64)."""
+    if not raw:
+        return None, None
+    payload = json.loads(raw)
+    escalations = payload.pop("escalations", None)
+    return (payload or None), escalations
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(
     job_id: str,
@@ -610,9 +623,11 @@ async def get_job(
             # way back out, so a caller could not see which proxy path served
             # a URL or where its time went (round 63).
             proxy_source=r["proxy_source"],
-            timings=json.loads(r["timings"]) if r["timings"] else None,
+            timings=timings,
+            escalations=escalations,
         )
         for r in result_rows
+        for timings, escalations in [_split_timings_column(r["timings"])]
     ]
     errors = [r.error_message for r in results if not r.success and r.error_message]
 

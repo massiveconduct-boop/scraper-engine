@@ -1480,6 +1480,31 @@ async def test_get_job_surfaces_timings_and_proxy_source(wired_deps):
 
 
 @pytest.mark.asyncio
+async def test_get_job_splits_escalations_out_of_the_timings_column(wired_deps):
+    """Round 64 — escalations are stored inside the timings JSONB (see
+    orchestrator/tasks.py::_timings_column) and must come back as their own
+    field, leaving `timings` integer-only."""
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    stored = {
+        "level_2_ms": 40000,
+        "escalations": [
+            {"level": 2, "reason": "status:403", "http_status": 403, "engine": "camoufox"}
+        ],
+    }
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "COMPLETED", ["https://a.example"])],
+        [{"n": 1}],
+        [_result_row("https://a.example", now, timings=json.dumps(stored))],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.results[0].timings == {"level_2_ms": 40000}
+    assert resp.results[0].escalations == stored["escalations"]
+
+
+@pytest.mark.asyncio
 async def test_get_job_reports_queue_wait_and_runtime(wired_deps):
     jid = uuid.uuid4()
     created = datetime.now(UTC)

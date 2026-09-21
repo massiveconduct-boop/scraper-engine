@@ -355,6 +355,23 @@ async def _run_crawl_job(config_used: dict[str, Any]) -> list[FetchResult]:
     ]
 
 
+def _timings_column(result: FetchResult) -> str | None:
+    """Serialize the `scrape_results.timings` JSONB value.
+
+    Round 64 — `escalations` rides in the same column under its own key
+    instead of a new one: it is the same kind of per-URL diagnostic, read
+    back by the same endpoint, and a column would have meant another full
+    `create_tenant_schema()` re-emit for one list. api/routes.py::get_job
+    splits it back out onto `FetchResult.escalations`.
+    """
+    if result.timings is None and not result.escalations:
+        return None
+    payload: dict[str, Any] = dict(result.timings or {})
+    if result.escalations:
+        payload["escalations"] = result.escalations
+    return json.dumps(payload)
+
+
 async def _persist_one_result(
     pg: PostgresClient,
     s3: S3Client,
@@ -422,7 +439,7 @@ async def _persist_one_result(
         result.duration_ms,
         result.error_message,
         result.failure_category.value if result.failure_category else None,
-        json.dumps(result.timings) if result.timings is not None else None,
+        _timings_column(result),
     )
 
     # Round 63 — touch the job row so "stale" means "not progressing" rather

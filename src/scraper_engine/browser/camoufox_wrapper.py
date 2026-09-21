@@ -96,7 +96,9 @@ class CamoufoxWrapper:
         Path A unavailable — AsyncCamoufox does not forward storage_state
         to Playwright context creation.
         """
-        await budget.BROWSER_SEMAPHORE.acquire()
+        # Round 64 — through the shared protocol, not a bare acquire(), so a
+        # launch blocked behind parked instances gets them reclaimed.
+        await budget.acquire_browser_permit()
         try:
             self._context = await self._launch_with_geoip_fallback()
 

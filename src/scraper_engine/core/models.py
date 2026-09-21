@@ -154,6 +154,18 @@ class FetchResult(BaseModel):
     # None means nothing was measured (e.g. a fetcher constructing a bare
     # failure result); an empty dict never occurs.
     timings: dict[str, int] | None = None
+    # Round 64 — which engine inside a level produced this result
+    # ("botasaurus" / "camoufox" / "raw_playwright" at L2). L2 tries two
+    # engines and returned no trace of which one answered, so a rejected L2
+    # result could not be attributed to either.
+    engine: str | None = None
+    # Round 64 — one entry per level this URL passed through and rejected
+    # before its terminal result: {"level", "reason", "http_status",
+    # "engine"}. `reason` is ChallengeDetector.challenge_reason()'s label
+    # ("status:403", "signature:access denied", ...), "js_gated", or
+    # "failure:<category>". A live job escalated every URL past L2 and
+    # nothing anywhere could say why.
+    escalations: list[dict[str, Any]] | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

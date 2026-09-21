@@ -118,6 +118,7 @@ class TestFetchViaBotasaurus:
 
         assert result is not None
         assert result.success is True
+        assert result.engine == "botasaurus"
         assert result.html == _REAL_HTML
         botasaurus_pool.fetch.assert_awaited_once()
 

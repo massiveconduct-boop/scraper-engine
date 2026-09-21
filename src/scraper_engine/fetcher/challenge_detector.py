@@ -158,15 +158,32 @@ class ChallengeDetector:
         the page is already loaded and the only question is "challenge solved
         yet?", and a short solved-marker page would otherwise be misclassified.
         """
+        return (
+            self.challenge_reason(html, status_code, short_page_is_suspect=short_page_is_suspect)
+            is not None
+        )
+
+    def challenge_reason(
+        self, html: str, status_code: int, *, short_page_is_suspect: bool = True
+    ) -> str | None:
+        """Which check classified the page as a challenge, or None if none did.
+
+        Round 64 — is_challenge_page() only ever said yes or no, so when a
+        level was rejected nothing recorded WHY: a live 10-URL Jumia job
+        rejected every L2 result and neither the logs nor the database could
+        say whether that was a real Cloudflare block or one of the broad
+        literal signatures below matching the site's own markup. Same checks,
+        same order; is_challenge_page() is now just `reason is not None`.
+        """
         # Quick check: HTTP status codes that signal blocking
         if status_code in self.CHALLENGE_STATUS_CODES:
-            return True
+            return f"status:{status_code}"
 
         # Content-based check: scan HTML against known challenge signatures
         html_lower = html.lower()
-        for sig_re in self._signatures_compiled:
+        for sig, sig_re in zip(self.CHALLENGE_SIGNATURES, self._signatures_compiled, strict=True):
             if sig_re.search(html_lower):
-                return True
+                return f"signature:{sig}"
 
         # Runs unconditionally (not gated on status_code or
         # short_page_is_suspect) — a gateway error page is short regardless
@@ -174,22 +191,23 @@ class ChallengeDetector:
         # poll_until_solved's mid-retry checks, both of which always pass
         # status_code=200 whether or not that's the real status.
         if self._looks_like_gateway_error(html):
-            return True
+            return "gateway_error"
 
         # Also unconditional, same rationale — see _FIREFOX_PLAINTEXT_WRAPPER_RE.
         if self._FIREFOX_PLAINTEXT_WRAPPER_RE.search(html):
-            return True
+            return "firefox_plaintext_wrapper"
 
         # Also unconditional, same rationale — see _CHROMIUM_NET_ERROR_RE.
         if self._CHROMIUM_NET_ERROR_RE.search(html):
-            return True
+            return "chromium_net_error"
 
         # Short pages with no meaningful content are suspect
         if short_page_is_suspect:
             text_content = self._strip_html(html)
-            return len(text_content) < 50 and status_code == 200
+            if len(text_content) < 50 and status_code == 200:
+                return "short_page"
 
-        return False
+        return None
 
     # Markers that a page's real content is rendered client-side (JS-gated).
     _JS_REQUIRED_MARKERS: tuple[str, ...] = (

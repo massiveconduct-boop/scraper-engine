@@ -182,6 +182,13 @@ class BotasaurusConfig(BaseModel):
     # response metadata for every network request a fetch makes, which can
     # be large and isn't needed by default.
     capture_network_events: bool = False
+    # Round 64 — how many live Botasaurus drivers one job may keep. It was
+    # exactly one, behind one lock, so a job's concurrent URLs queued
+    # single-file at L2 (live: 43s, 65s, 89s, 58s, 134s for five URLs that
+    # each took well under a minute alone). Parked drivers hold no
+    # BROWSER_SEMAPHORE permit (only an in-flight fetch does), so this is
+    # the bound on idle Chrome processes per job.
+    max_pooled_drivers: int = Field(default=2, ge=1)
 
 
 class ProxyHarvesterConfig(BaseModel):

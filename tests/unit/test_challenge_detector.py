@@ -5,6 +5,8 @@ The detector gates escalation decisions (challenge pages, and round-15's
 JS-gated-shell escalation), so it warrants direct coverage.
 """
 
+import pytest
+
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 CD = ChallengeDetector()
@@ -294,3 +296,46 @@ class TestClassifyChallengeType:
     def test_unmatched_html_returns_unknown(self):
         html = "<html><body>" + "<p>Ordinary article text.</p>" * 10 + "</body></html>"
         assert CD.classify_challenge_type(html) == "unknown"
+
+
+class TestChallengeReason:
+    """Round 64 — the reason behind a yes, so a rejected level can say which
+    check fired instead of leaving it to inference."""
+
+    @pytest.fixture
+    def detector(self):
+        return ChallengeDetector()
+
+    def test_status_code_is_named(self, detector):
+        assert detector.challenge_reason("<html>x</html>", 403) == "status:403"
+
+    def test_the_matching_signature_is_named(self, detector):
+        html = "<html><body>" + "x " * 100 + "Access Denied</body></html>"
+        assert detector.challenge_reason(html, 200) == "signature:access denied"
+
+    def test_gateway_error_is_named(self, detector):
+        assert detector.challenge_reason("502 Bad Gateway", 200) == "gateway_error"
+
+    def test_chromium_net_error_is_named(self, detector):
+        html = "<html><body>" + "x " * 100 + "net::ERR_PROXY_CONNECTION_FAILED</body></html>"
+        assert detector.challenge_reason(html, 200) == "chromium_net_error"
+
+    def test_short_page_is_named_only_when_asked(self, detector):
+        assert detector.challenge_reason("<html>hi</html>", 200) == "short_page"
+        assert (
+            detector.challenge_reason("<html>hi</html>", 200, short_page_is_suspect=False)
+            is None
+        )
+
+    def test_clean_page_has_no_reason(self, detector):
+        html = "<html><body>" + "real content " * 80 + "</body></html>"
+        assert detector.challenge_reason(html, 200) is None
+
+    def test_is_challenge_page_agrees_with_reason(self, detector):
+        for html, status in [
+            ("<html>x</html>", 429),
+            ("<html><body>" + "real content " * 80 + "</body></html>", 200),
+        ]:
+            assert detector.is_challenge_page(html, status) == (
+                detector.challenge_reason(html, status) is not None
+            )

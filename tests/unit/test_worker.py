@@ -1369,9 +1369,10 @@ class TestGatewayFallbackOnFailure:
             html="<html>real content</html>",
             proxy_source="paid_gateway",
         )
-        worker._fetch_url = AsyncMock(
-            side_effect=[direct_block, direct_block, direct_block, rescued]
-        )
+        # Round 64 — the gateway retry fires at the level that was blocked
+        # (here L1), not only at the final level, so the rescue comes on the
+        # second call instead of after climbing the whole ladder.
+        worker._fetch_url = AsyncMock(side_effect=[direct_block, rescued])
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
         response = await worker.process_job(tenant, "job-direct-block-rescue", request)
@@ -1382,6 +1383,20 @@ class TestGatewayFallbackOnFailure:
         assert response.results[0].proxy_source == "paid_gateway"
         last_call = worker._fetch_url.await_args_list[-1]
         assert last_call.kwargs["force_gateway"] is True
+        # Round 64 — the retried attempt and the retry's own time are both
+        # visible: before, the result showed only `proxy_source: paid_gateway`
+        # and a total_ms nothing else accounted for.
+        assert response.results[0].escalations == [
+            {
+                "level": 1,
+                "reason": "failure:detection_block",
+                "http_status": 403,
+                "engine": None,
+                "proxy_source": "pool",
+            }
+        ]
+        assert "level_1_gateway_retry_ms" in response.results[0].timings
+        assert worker._fetch_url.await_count == 2
 
     @pytest.mark.asyncio
     async def test_direct_fetcher_detection_block_gateway_retry_also_fails(self, tenant, worker):
@@ -1413,12 +1428,8 @@ class TestGatewayFallbackOnFailure:
             proxy_source="paid_gateway",
         )
         worker._fetch_url = AsyncMock(
-            side_effect=[
-                direct_block_pool,
-                direct_block_pool,
-                direct_block_pool,
-                direct_block_gateway,
-            ]
+            # pool attempt + one gateway retry, at each of the three levels
+            side_effect=[direct_block_pool, direct_block_gateway] * 3
         )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
@@ -1431,9 +1442,13 @@ class TestGatewayFallbackOnFailure:
         # proxy_source carried forward from last_level_result into the
         # for/else branch's constructed exhausted_result, not dropped.
         assert response.results[0].proxy_source == "paid_gateway"
-        # exactly one retry — the gateway-sourced failure must not trigger
-        # a second gateway attempt.
-        assert worker._fetch_url.await_count == 4
+        # exactly one gateway retry per level — the gateway-sourced failure
+        # must not trigger a second one.
+        assert worker._fetch_url.await_count == 6
+        assert [c.kwargs.get("force_gateway") for c in worker._fetch_url.await_args_list] == [
+            False,
+            True,
+        ] * 3
 
     @pytest.mark.asyncio
     async def test_still_blocked_gateway_retry_itself_fails(self, tenant, worker):
@@ -1588,12 +1603,7 @@ class TestGatewayFallbackOnFailure:
             proxy_source="paid_gateway",
         )
         worker._fetch_url = AsyncMock(
-            side_effect=[
-                blocked_result,
-                blocked_result,
-                blocked_result,
-                still_blocked_via_gateway,
-            ]
+            side_effect=[blocked_result, still_blocked_via_gateway] * 3
         )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
@@ -2407,6 +2417,90 @@ class TestTimings:
         assert "level_1_ms" not in timings
         assert "level_2_ms" not in timings
         assert "level_3_ms" in timings
+
+
+class TestEscalationReasons:
+    """Round 64 — a live 10-URL Jumia job rejected every L2 result and
+    nothing (logs, database, API) could say why. Every rejected level now
+    leaves an entry on the terminal result."""
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_level_records_the_exact_reason(self, tenant, worker):
+        blocked = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=1,
+            http_status=403,
+            html="<html>forbidden</html>",
+            duration_ms=10,
+        )
+        good = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=10,
+            engine="camoufox",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[blocked, good])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-escalations", request)
+
+        result = response.results[0]
+        assert result.level_used == 2
+        assert result.escalations == [
+            {
+                "level": 1,
+                "reason": "status:403",
+                "http_status": 403,
+                "engine": None,
+                "proxy_source": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_level_records_its_category(self, tenant, worker):
+        failed = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=1,
+            duration_ms=10,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+        )
+        good = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=10,
+        )
+        worker._fetch_url = AsyncMock(side_effect=[failed, good])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-escalations-fail", request)
+
+        assert response.results[0].escalations[0]["reason"] == "failure:network_timeout"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_first_level_records_nothing(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com",
+                success=True,
+                level_used=1,
+                http_status=200,
+                html="<html><body>" + "real content " * 80 + "</body></html>",
+                duration_ms=10,
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-escalations-none", request)
+
+        assert response.results[0].escalations is None
 
 
 class TestPolitenessTimeoutStreaming:

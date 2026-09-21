@@ -11,6 +11,7 @@ import pytest
 
 from scraper_engine.browser.pool import BrowserPool
 from scraper_engine.browser.session_state import SessionStateManager
+from scraper_engine.core import budget
 from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
 
@@ -871,7 +872,7 @@ class _FakeWrapper:
     async def __aenter__(self):
         from scraper_engine.core import budget
 
-        await budget.BROWSER_SEMAPHORE.acquire()
+        await budget.acquire_browser_permit()
         self._context = object()
         self._isolated_ctx = object()
         return self._isolated_ctx
@@ -910,6 +911,7 @@ class TestParkedSparesNeverStarveALaunch:
 
         sem = asyncio.Semaphore(1)
         monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        monkeypatch.setattr(budget, "_reclaimers", [])
         monkeypatch.setattr(pool_mod, "CamoufoxWrapper", _FakeWrapper)
         _FakeWrapper.instances = []
         return sem
@@ -935,7 +937,7 @@ class TestParkedSparesNeverStarveALaunch:
         assert ctx_b is not ctx_a
         assert _FakeWrapper.instances[0].closed
         assert pool._pool.qsize() == 0
-        assert pool._launch_waiters == 0
+        assert budget.permit_waiters() == 0
 
     async def test_a_spare_already_parked_is_evicted_for_a_launch(self, tenant, one_permit):
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
@@ -948,6 +950,41 @@ class TestParkedSparesNeverStarveALaunch:
         assert _FakeWrapper.instances[0].closed
         assert [w.proxy.port for w in pool._active_wrappers] == [2]
 
+    async def test_another_engine_reclaims_a_parked_spare(self, tenant, one_permit):
+        """Round 64 — Botasaurus takes permits too. A Botasaurus fetch waiting
+        behind a parked Camoufox spare must get it reclaimed, or the round-63
+        deadlock returns across engines."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        await asyncio.wait_for(budget.acquire_browser_permit(), timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert pool._active_wrappers == []
+
+    async def test_another_engine_waiting_gets_a_returning_instance_handed_over(
+        self, tenant, one_permit
+    ):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(budget.acquire_browser_permit())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert budget.permit_waiters() == 1
+
+        await pool.release(ctx, healthy=True)
+        await asyncio.wait_for(waiter, timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert pool._pool.qsize() == 0
+
+    async def test_a_shut_down_pool_is_no_longer_asked_to_reclaim(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        assert len(budget._reclaimers) == 1
+        await pool.shutdown()
+        assert budget._reclaimers == []
+
     async def test_release_parks_when_nobody_is_waiting(self, tenant, one_permit):
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         ctx = await pool.acquire(proxy=self._proxy(1))
@@ -959,13 +996,14 @@ class TestParkedSparesNeverStarveALaunch:
         from scraper_engine.core import budget
 
         monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(budget, "_reclaimers", [])
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         spare = _FakeWrapper()
         await spare.__aenter__()
         pool._active_wrappers = [spare]
         await pool._pool.put((spare._isolated_ctx, spare, time.monotonic()))
 
-        await pool._make_room_for_launch()
+        await budget.acquire_browser_permit()
 
         assert not spare.closed
         assert pool._pool.qsize() == 1
@@ -975,9 +1013,12 @@ class TestParkedSparesNeverStarveALaunch:
     ):
         """An empty pool with no free permit is real contention — the caller
         must wait, not tear down a browser someone else is mid-fetch with."""
+        from scraper_engine.core import budget
+
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         await pool.acquire(proxy=self._proxy(1))
-        await pool._make_room_for_launch()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budget.acquire_browser_permit(), timeout=0.1)
         assert not _FakeWrapper.instances[0].closed
         assert one_permit.locked()
 
@@ -985,6 +1026,7 @@ class TestParkedSparesNeverStarveALaunch:
         from scraper_engine.core import budget
 
         monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(budget, "_reclaimers", [])
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         old, new = _FakeWrapper(), _FakeWrapper()
         for w in (old, new):
@@ -992,7 +1034,7 @@ class TestParkedSparesNeverStarveALaunch:
             pool._active_wrappers.append(w)
             await pool._pool.put((w._isolated_ctx, w, time.monotonic()))
 
-        await pool._make_room_for_launch()
+        await asyncio.wait_for(budget.acquire_browser_permit(), timeout=1)
 
         assert old.closed and not new.closed
         assert pool._active_wrappers == [new]
@@ -1010,7 +1052,13 @@ class TestParkedSparesNeverStarveALaunch:
         pool._active_wrappers = [spare]
         await pool._pool.put(("ctx-1", spare, time.monotonic()))
 
-        await asyncio.wait_for(pool._make_room_for_launch(), timeout=1)
+        from scraper_engine.core import budget
+
+        # The spare is dropped even though its teardown never frees the
+        # permit; with nothing left to evict the caller then waits (bounded
+        # here by the timeout) instead of spinning.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budget.acquire_browser_permit(), timeout=0.1)
 
         assert pool._active_wrappers == []
         assert pool._pool.qsize() == 0
@@ -1026,7 +1074,9 @@ class TestParkedSparesNeverStarveALaunch:
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert [w.proxy.port for w in pool._active_wrappers] == [1]
-        assert pool._launch_waiters == 0
+        from scraper_engine.core import budget
+
+        assert budget.permit_waiters() == 0
 
     async def test_a_cancelled_lease_frees_its_permit(self, tenant, one_permit):
         """`except Exception` in lease() let CancelledError skip both the

@@ -78,12 +78,11 @@ class BrowserPool:
         self._max_total_instances = max_total_instances
         self._pool: asyncio.Queue[Any] = asyncio.Queue()
         self._active_wrappers: list[CamoufoxWrapper] = []
-        # Callers of acquire() currently blocked launching a browser, i.e.
-        # waiting on a BROWSER_SEMAPHORE permit. release(healthy=True) reads
-        # this to decide between parking an instance and handing its permit
-        # on (round 63 — see release()).
-        self._launch_waiters = 0
         self._started = False
+        # Round 64 — lets any engine's permit request (not just this pool's
+        # own launches) reclaim a parked spare; see
+        # core/budget.py::acquire_browser_permit. Held weakly there.
+        budget.register_permit_reclaimer(self._evict_oldest_spare)
 
     async def start(self) -> None:
         """Launch prewarm_count browsers and store their live contexts."""
@@ -231,20 +230,19 @@ class BrowserPool:
         # branch is taken nearly every time.
         #
         # Two halves, because the deadlock has two orderings:
-        #  1. Spares already parked when we arrive: evict them (oldest
-        #     first) until a permit is free or none are left. Keyed on the
-        #     semaphore itself, not on this pool's own instance count — the
-        #     semaphore is shared with Botasaurus and sized by
-        #     resolve_browser_max_total_instances(), so a count-vs-config
-        #     check (the first version of this fix) could sit below the
-        #     real ceiling and never fire.
-        #  2. Spares parked AFTER we started waiting (a sibling URL finishes
-        #     and returns its instance healthy): release() sees
-        #     `_launch_waiters` and tears the instance down instead of
-        #     parking it, handing its permit to us. Live-reproduced without
-        #     this half: 9 of 10 URLs done, the 10th blocked on the
-        #     semaphore with 8 idle instances parked behind it.
-        await self._make_room_for_launch()
+        #  1. Spares already parked when a launch arrives: evicted (oldest
+        #     first) until a permit is free or none are left.
+        #  2. Spares parked AFTER a launch started waiting (a sibling URL
+        #     finishes and returns its instance healthy): release() sees a
+        #     waiter and tears the instance down instead of parking it,
+        #     handing its permit over. Live-reproduced without this half: 9
+        #     of 10 URLs done, the 10th blocked on the semaphore with 8 idle
+        #     instances parked behind it.
+        # Round 64 moved both halves into core/budget.py
+        # (acquire_browser_permit / permit_waiters) so they hold for EVERY
+        # engine that takes a permit — Botasaurus included — not only for
+        # this pool's own launches. CamoufoxWrapper.__aenter__ takes its
+        # permit that way, and this pool is registered as a reclaimer.
 
         session_state = None
         if domain is not None and self._session_mgr is not None:
@@ -261,7 +259,6 @@ class BrowserPool:
             os=self._os,
         )
         self._active_wrappers.append(wrapper)
-        self._launch_waiters += 1
         try:
             ctx = await wrapper.__aenter__()
         except BaseException:
@@ -271,25 +268,16 @@ class BrowserPool:
             with contextlib.suppress(ValueError):
                 self._active_wrappers.remove(wrapper)
             raise
-        finally:
-            self._launch_waiters -= 1
         return ctx
 
-    async def _make_room_for_launch(self) -> None:
-        """Evict parked spares, oldest first, until a BROWSER_SEMAPHORE
-        permit is free or no spare is left (round 63).
-
-        With the pool empty this returns with the semaphore still locked —
-        every instance is genuinely leased out and in use, which is real
-        contention the semaphore should absorb by making the caller wait.
-        This only reclaims instances that are parked, not ones doing work.
-        """
-        while budget.BROWSER_SEMAPHORE.locked():
-            if not await self._evict_oldest_spare():
-                return
-
     async def _evict_oldest_spare(self) -> bool:
-        """Tear down one parked spare. False when there is none to evict."""
+        """Tear down one parked spare. False when there is none to evict.
+
+        Registered with core.budget as a permit reclaimer. Only ever touches
+        PARKED instances — with the pool empty every instance is genuinely
+        leased out and in use, which is real contention the semaphore should
+        absorb by making the caller wait.
+        """
         try:
             ctx, wrapper, _idle_since = self._pool.get_nowait()
         except asyncio.QueueEmpty:
@@ -352,8 +340,8 @@ class BrowserPool:
 
         for w in self._active_wrappers:
             if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
-                if self._launch_waiters and budget.BROWSER_SEMAPHORE.locked():
-                    # Someone in acquire() is blocked on a permit this
+                if budget.permit_waiters() and budget.BROWSER_SEMAPHORE.locked():
+                    # Someone (any engine) is blocked on a permit this
                     # instance holds. Parking it would keep that permit idle
                     # while they wait forever (round 63); close it instead.
                     self._active_wrappers.remove(w)
@@ -366,6 +354,7 @@ class BrowserPool:
 
     async def shutdown(self) -> None:
         """Close all live browser contexts."""
+        budget.unregister_permit_reclaimer(self._evict_oldest_spare)
         while not self._pool.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
                 ctx, wrapper, _ = self._pool.get_nowait()

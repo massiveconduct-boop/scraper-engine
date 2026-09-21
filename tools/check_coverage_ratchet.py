@@ -54,7 +54,11 @@ GATED_PREFIXES = (
 # 2026-09-20 (round 63): 32. Not a deliberate burn-down (that is still T2 in
 # .wolf/STATUS.md) — round 63's rewrite of orchestrator/worker.py's politeness
 # handling removed one of the partial branches it counted.
-BRANCH_BUDGET = 32
+# 2026-09-21 (round 64): 28. Side effect of round 64's L2 work, not a
+# burn-down: the gateway retry lost its `level == url_levels[-1]` clause, and
+# BrowserPool's eviction moved into core/budget.py, which is tested
+# directly.
+BRANCH_BUDGET = 28
 
 
 def main() -> int:

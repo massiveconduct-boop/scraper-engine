@@ -138,18 +138,25 @@ class BotasaurusWrapper:
         scroll support into this path (previously only the Camoufox fallback
         pipeline scrolled; see browser/_botasaurus_scroll.py).
         """
-        async with budget.BROWSER_SEMAPHORE, budget.XVFB_LOCK:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None,
-                self._botasaurus_fetch,
-                url,
-                proxy.auth_url(),
-                session_id,
-                scroll_passes,
-                scroll_wait_ms,
-                events_sink,
-            )
+        # Round 64 — the permit goes through the shared protocol so a fetch
+        # blocked behind parked browsers gets them reclaimed (see
+        # core/budget.py::acquire_browser_permit).
+        await budget.acquire_browser_permit()
+        try:
+            async with budget.XVFB_LOCK:
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self._botasaurus_fetch,
+                    url,
+                    proxy.auth_url(),
+                    session_id,
+                    scroll_passes,
+                    scroll_wait_ms,
+                    events_sink,
+                )
+        finally:
+            budget.BROWSER_SEMAPHORE.release()
 
     def _botasaurus_fetch(
         self,

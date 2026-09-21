@@ -64,7 +64,9 @@ class TestBotasaurusPool:
             await pool.fetch(
                 "https://a.example/1", proxy=gateway_proxy, domain="a.example", session_id="s1"
             )
-        assert driver_cls.call_args.kwargs["proxy"] == "http://user123:pass456@gw.dataimpulse.com:823"
+        assert (
+            driver_cls.call_args.kwargs["proxy"] == "http://user123:pass456@gw.dataimpulse.com:823"
+        )
 
     @pytest.mark.asyncio
     async def test_second_same_domain_fetch_reuses_driver_by_navigating(self):
@@ -98,7 +100,7 @@ class TestBotasaurusPool:
         rotated session (round 62's fix for a blocked exit IP) hit the reuse
         branch and silently kept the blocked IP. A new session must relaunch.
         """
-        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=1))
         driver = _fake_driver()
 
         def _gateway(session: str) -> Proxy:
@@ -174,7 +176,7 @@ class TestBotasaurusPool:
 
     @pytest.mark.asyncio
     async def test_domain_mismatch_closes_old_driver_and_builds_new(self):
-        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=1))
         driver_a = _fake_driver()
         driver_b = _fake_driver(html="<html>b</html>")
         with patch("botasaurus.browser.Driver", side_effect=[driver_a, driver_b]):
@@ -190,7 +192,7 @@ class TestBotasaurusPool:
 
     @pytest.mark.asyncio
     async def test_proxy_mismatch_closes_old_driver_and_builds_new(self):
-        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=1))
         driver_a = _fake_driver()
         driver_b = _fake_driver(html="<html>b</html>")
         with patch("botasaurus.browser.Driver", side_effect=[driver_a, driver_b]):
@@ -238,9 +240,7 @@ class TestBotasaurusPool:
         failing, or a CDP command throwing) must still close the driver
         instead of leaking it and its Xvfb display (round 41's
         display-contention crash precondition)."""
-        pool = BotasaurusPool(
-            tenant_id=TENANT, config=BotasaurusConfig(humanize_mouse=True)
-        )
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(humanize_mouse=True))
         driver = _fake_driver()
         driver.enable_human_mode.side_effect = RuntimeError("humancursor import failed")
         with (
@@ -281,9 +281,7 @@ class TestBotasaurusPool:
         driver = _fake_driver()
         with (
             patch("botasaurus.browser.Driver", return_value=driver),
-            patch(
-                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
-            ) as autoscroll,
+            patch("scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll") as autoscroll,
         ):
             html = await pool.fetch(
                 "https://a.example/1",
@@ -302,9 +300,7 @@ class TestBotasaurusPool:
         driver = _fake_driver()
         with (
             patch("botasaurus.browser.Driver", return_value=driver),
-            patch(
-                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
-            ) as autoscroll,
+            patch("scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll") as autoscroll,
         ):
             await pool.fetch(
                 "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
@@ -323,9 +319,7 @@ class TestBotasaurusPool:
         driver = _fake_driver()
         with (
             patch("botasaurus.browser.Driver", return_value=driver),
-            patch(
-                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
-            ) as autoscroll,
+            patch("scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll") as autoscroll,
         ):
             await pool.fetch(
                 "https://a.example/1",
@@ -511,3 +505,161 @@ class TestBotasaurusPool:
             )
         driver.before_request_sent.assert_not_called()
         driver.after_response_received.assert_not_called()
+
+
+class TestMultiDriverPool:
+    """Round 64 — up to max_pooled_drivers drivers per job; the display lock
+    covers launch/close only; a fetch holds a browser permit only while it
+    runs. Live motivation: five concurrent L2 URLs took 43/65/89/58/134s
+    because they queued single-file behind one driver, and every relaunch
+    held XVFB_LOCK through its whole navigation, stalling Camoufox too."""
+
+    @pytest.fixture(autouse=True)
+    def _budget(self, monkeypatch):
+        import asyncio as _asyncio
+
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", _asyncio.Semaphore(4))
+        monkeypatch.setattr(budget, "XVFB_LOCK", _asyncio.Lock())
+        monkeypatch.setattr(budget, "_reclaimers", [])
+        return budget
+
+    @pytest.mark.asyncio
+    async def test_a_second_pair_gets_its_own_driver_and_keeps_the_first(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=2))
+        a, b = _fake_driver(), _fake_driver(html="<html>b</html>")
+        with patch("botasaurus.browser.Driver", side_effect=[a, b]):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://b.example/1", proxy=_proxy(), domain="b.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://a.example/2", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        a.close.assert_not_called()
+        b.close.assert_not_called()
+        assert a.google_get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_over_the_cap_the_oldest_idle_driver_is_closed(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=2))
+        a, b, c = _fake_driver(), _fake_driver(), _fake_driver()
+        with patch("botasaurus.browser.Driver", side_effect=[a, b, c]):
+            for d in ("a", "b", "c"):
+                await pool.fetch(
+                    f"https://{d}.example/", proxy=_proxy(), domain=f"{d}.example", session_id="s1"
+                )
+        a.close.assert_called_once()
+        b.close.assert_not_called()
+        assert len(pool._entries) == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fetches_run_in_parallel(self):
+        import asyncio as _asyncio
+        import threading
+
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=2))
+        both_navigating = threading.Barrier(2, timeout=2)
+
+        def _driver():
+            d = _fake_driver()
+            d.google_get.side_effect = lambda *a, **k: both_navigating.wait()
+            return d
+
+        with patch("botasaurus.browser.Driver", side_effect=[_driver(), _driver()]):
+            await _asyncio.wait_for(
+                _asyncio.gather(
+                    pool.fetch(
+                        "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+                    ),
+                    pool.fetch(
+                        "https://b.example/", proxy=_proxy(), domain="b.example", session_id="s1"
+                    ),
+                ),
+                timeout=5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_navigation_runs_outside_the_display_lock_but_inside_a_permit(self, _budget):
+        budget = _budget
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        seen: dict[str, object] = {}
+        driver = _fake_driver()
+
+        def _nav(*_a, **_k):
+            seen["xvfb_locked"] = budget.XVFB_LOCK.locked()
+            seen["permits_left"] = budget.BROWSER_SEMAPHORE._value
+
+        driver.google_get.side_effect = _nav
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+
+        assert seen == {"xvfb_locked": False, "permits_left": 3}
+        assert budget.BROWSER_SEMAPHORE._value == 4  # released after, not held while parked
+
+    @pytest.mark.asyncio
+    async def test_a_failed_navigation_discards_the_driver_and_frees_the_permit(self, _budget):
+        budget = _budget
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
+        driver = _fake_driver()
+        driver.google_get.side_effect = RuntimeError("nav failed")
+        with (
+            patch("botasaurus.browser.Driver", return_value=driver),
+            pytest.raises(RuntimeError, match="nav failed"),
+        ):
+            await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        driver.close.assert_called_once()
+        assert pool._entries == []
+        assert budget.BROWSER_SEMAPHORE._value == 4
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_waits_when_every_driver_is_busy(self):
+        import asyncio as _asyncio
+        import threading
+
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=1))
+        release = threading.Event()
+        first = _fake_driver()
+        first.google_get.side_effect = lambda *a, **k: release.wait(2)
+        second = _fake_driver(html="<html>second</html>")
+        with patch("botasaurus.browser.Driver", side_effect=[first, second]):
+            busy = _asyncio.create_task(
+                pool.fetch(
+                    "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+                )
+            )
+            await _asyncio.sleep(0.05)
+            waiting = _asyncio.create_task(
+                pool.fetch(
+                    "https://b.example/", proxy=_proxy(), domain="b.example", session_id="s1"
+                )
+            )
+            await _asyncio.sleep(0.05)
+            assert not waiting.done()
+            release.set()
+            await _asyncio.wait_for(busy, timeout=2)
+            assert await _asyncio.wait_for(waiting, timeout=2) == "<html>second</html>"
+        first.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_every_driver(self):
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(max_pooled_drivers=2))
+        a, b = _fake_driver(), _fake_driver()
+        with patch("botasaurus.browser.Driver", side_effect=[a, b]):
+            await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://b.example/", proxy=_proxy(), domain="b.example", session_id="s1"
+            )
+        await pool.shutdown()
+        a.close.assert_called_once()
+        b.close.assert_called_once()
+        assert pool._entries == []

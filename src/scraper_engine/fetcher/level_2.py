@@ -176,6 +176,7 @@ class Level2Fetcher:
         if self._challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False):
             return None
         return FetchResult(
+            engine="botasaurus",
             url=url,
             success=True,
             http_status=200,
@@ -266,6 +267,7 @@ class Level2Fetcher:
                 # already goes through. Only if it's STILL present after the
                 # final level does worker.py convert it to a real failure.
                 return FetchResult(
+                    engine="camoufox",
                     url=url,
                     success=True,
                     # The real navigation status, not a hardcoded 200 — a
@@ -286,6 +288,7 @@ class Level2Fetcher:
                 )
         except Exception as exc:
             return FetchResult(
+                engine="camoufox",
                 url=url,
                 success=False,
                 level_used=2,
@@ -365,6 +368,7 @@ class Level2Fetcher:
                 await browser.close()
                 duration_ms = int((time.monotonic() - start) * 1000)
                 return FetchResult(
+                    engine="raw_playwright",
                     url=url,
                     success=True,
                     http_status=200,
@@ -375,6 +379,7 @@ class Level2Fetcher:
                 )
         except Exception as exc:
             return FetchResult(
+                engine="raw_playwright",
                 url=url,
                 success=False,
                 level_used=2,

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import weakref
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,6 +53,66 @@ CAPSOLVER_CONCURRENCY = asyncio.Semaphore(10)
 # bundles launch+navigate+close with no seam to split, so it holds this for
 # its whole call instead — an accepted throughput trade for correctness.
 XVFB_LOCK = asyncio.Lock()
+
+# Round 64 — one way to take a BROWSER_SEMAPHORE permit, for every engine.
+#
+# A pooled browser that is PARKED (idle, kept warm for reuse) still holds its
+# permit. Round 63 found that this deadlocks a launch that needs a permit
+# while every permit sits on an idle spare, and fixed it inside
+# browser/pool.py::BrowserPool (evict parked spares on arrival, hand a
+# returning instance's permit to a waiting launch). That fix only knew about
+# BrowserPool's OWN launches. Once a second engine (Botasaurus) takes permits
+# too, a Botasaurus fetch waiting behind parked Camoufox spares would hang in
+# exactly the same way, because nothing on its path could evict them.
+#
+# So the protocol lives here instead: every permit is taken through
+# acquire_browser_permit(), which (1) asks registered reclaimers — pools that
+# can close a parked instance — to free permits while none is free, and
+# (2) counts itself as a waiter while blocked, so a pool that is about to
+# park an instance can see someone is waiting (permit_waiters()) and close it
+# instead. Reclaimers are held by weak reference: a pool that is dropped
+# without shutdown() must not be kept alive, or called, by this module.
+_permit_waiters = 0
+_reclaimers: list[weakref.WeakMethod[Callable[[], Awaitable[bool]]]] = []
+
+
+def register_permit_reclaimer(reclaim: Callable[[], Awaitable[bool]]) -> None:
+    """Register a bound async method that closes one parked instance and
+    returns True, or returns False when it has none to close."""
+    _reclaimers.append(weakref.WeakMethod(reclaim))
+
+
+def unregister_permit_reclaimer(reclaim: Callable[[], Awaitable[bool]]) -> None:
+    _reclaimers[:] = [r for r in _reclaimers if r() is not None and r() != reclaim]
+
+
+def permit_waiters() -> int:
+    """How many callers are blocked in acquire_browser_permit() right now."""
+    return _permit_waiters
+
+
+async def acquire_browser_permit() -> None:
+    """Take one BROWSER_SEMAPHORE permit, reclaiming parked instances first.
+
+    Returns once a permit is held. The caller releases it with
+    `BROWSER_SEMAPHORE.release()`, exactly as before. With every permit held
+    by an instance that is genuinely mid-fetch, this waits — that is real
+    contention the ceiling exists to absorb.
+    """
+    global _permit_waiters
+    while BROWSER_SEMAPHORE.locked():
+        _reclaimers[:] = [r for r in _reclaimers if r() is not None]
+        for ref in list(_reclaimers):
+            reclaim = ref()
+            if reclaim is not None and await reclaim():
+                break
+        else:
+            break
+    _permit_waiters += 1
+    try:
+        await BROWSER_SEMAPHORE.acquire()
+    finally:
+        _permit_waiters -= 1
 
 
 def resolve_browser_max_total_instances(

@@ -584,3 +584,24 @@ async def test_dispatch_webhook_logs_exception_when_delivery_raises(monkeypatch)
 
     deliver_mock.assert_awaited_once()
     redis.raw.incr.assert_awaited_once_with("metrics:webhook_delivery_failures_total")
+
+
+class TestTimingsColumn:
+    """Round 64 — escalations share the timings JSONB column."""
+
+    def _result(self, **kw):
+        return FetchResult(url="http://x.example", success=True, level_used=1, duration_ms=1, **kw)
+
+    def test_nothing_measured_stores_null(self):
+        assert tasks_module._timings_column(self._result()) is None
+
+    def test_timings_only(self):
+        stored = tasks_module._timings_column(self._result(timings={"total_ms": 5}))
+        assert json.loads(stored) == {"total_ms": 5}
+
+    def test_escalations_ride_along(self):
+        esc = [{"level": 1, "reason": "status:403", "http_status": 403, "engine": None}]
+        stored = tasks_module._timings_column(
+            self._result(timings={"total_ms": 5}, escalations=esc)
+        )
+        assert json.loads(stored) == {"total_ms": 5, "escalations": esc}
