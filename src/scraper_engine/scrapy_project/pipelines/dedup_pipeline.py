@@ -1,47 +1,38 @@
 # scrapy_project/pipelines/dedup_pipeline.py
-"""Scrapy item pipeline — deduplication via DeduplicationEngine.
+"""Drop an item whose URL this crawl already produced.
 
-Design invariant §1.1.5: only successful, non-challenge results are cached.
-Items that match a previously cached result are dropped to avoid duplicate work.
+Round 64 — this was a stub that only bumped a stats counter ("Deferred:
+actual dedup check") and passed everything through. A crawl whose seeds
+redirect to the same final URL, or that lists a URL twice, returned
+duplicate items and so persisted duplicate scrape_results rows. One crawl
+runs in one subprocess, so an in-memory set is exactly the right scope.
 """
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
+
+from scrapy.exceptions import DropItem
 
 if TYPE_CHECKING:
     from scrapy import Spider
     from scrapy.crawler import Crawler
 
-logger = logging.getLogger(__name__)
-
 
 class DedupPipeline:
-    """Drop duplicate items using the DeduplicationEngine.
-
-    Checks each item against the success-gated dedup cache before
-    allowing it through to storage. Drops items that haven't changed
-    since the last successful scrape.
-    """
-
     def __init__(self, crawler: Crawler) -> None:
-        self._crawler = crawler
         self._stats = crawler.stats
-        # DeduplicationEngine injected via crawler.settings["DEDUP_ENGINE"]
+        self._seen: set[str] = set()
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> DedupPipeline:
         return cls(crawler)
 
-    def process_item(self, item: dict[str, Any], spider: Spider) -> dict[str, Any]:
-        """Check item against dedup cache. Drop if unchanged.
-
-        Only caches successful items (§1.1.5). Failed items always pass through
-        (they may succeed on retry with a different proxy/level).
-        """
-        # Deferred: actual dedup check via DeduplicationEngine
-        # For now, pass all items through
-        if self._stats:
-            self._stats.inc_value("pipeline/dedup_checked")
+    def process_item(self, item: Any, spider: Spider) -> Any:
+        url = str(item.get("url", ""))
+        if url in self._seen:
+            if self._stats:
+                self._stats.inc_value("pipeline/dedup_dropped")
+            raise DropItem(f"duplicate url: {url}")
+        self._seen.add(url)
         return item

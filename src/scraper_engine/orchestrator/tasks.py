@@ -159,7 +159,7 @@ async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:
             error: str | None
             partial_failure = False
             if config_used.get("_job_type") == "crawl":
-                results = await _run_crawl_job(config_used)
+                results = await _run_crawl_job(config_used, tenant_id, cfg, pg, redis)
                 status = JobStatus.COMPLETED
                 error = None
                 # Batch persist — ScrapyAdapter.run_spider returns a full
@@ -356,12 +356,68 @@ async def _run_scrape(
         await botasaurus_pool.shutdown()
 
 
-async def _run_crawl_job(config_used: dict[str, Any]) -> list[FetchResult]:
+async def _run_crawl_job(
+    config_used: dict[str, Any],
+    tenant_id: TenantId,
+    cfg: AppConfig,
+    pg: PostgresClient,
+    redis: RedisClient,
+) -> list[FetchResult]:
+    """Run a bulk crawl through one leased proxy.
+
+    Round 64 — crawls used to leave from the server's own IP: the Scrapy
+    ProxyMiddleware set `meta["proxy"] = None` under a "Deferred" comment. The
+    crawl subprocess cannot reach the async ProxyManager, so the proxy is
+    leased here, in the same order the scrape ladder uses
+    (orchestrator/worker.py::_fetch_with_proxy): the scored free pool first,
+    the paid gateway on exhaustion under `free_first`, the gateway only under
+    `paid_only`. Its URL goes into the subprocess as CRAWL_PROXY_URL.
+    """
+    from urllib.parse import urlparse
+
+    from scraper_engine.core.exceptions import ProxyPoolExhaustedError
+    from scraper_engine.proxy.lease import ProxyLease
+    from scraper_engine.proxy.manager import ProxyManager
+    from scraper_engine.proxy.paid_gateway import build_gateway_proxy, new_session_id
     from scraper_engine.services.scrapy_adapter import ScrapyAdapter
 
     spider_name = str(config_used["spider_name"])
     start_urls = [str(u) for u in config_used.get("start_urls", [])]
-    items = await ScrapyAdapter().run_spider(spider_name, start_urls)
+    domain = (urlparse(start_urls[0]).hostname or "unknown") if start_urls else "unknown"
+
+    di_cfg = cfg.dataimpulse
+    strategy = di_cfg.strategy if di_cfg.enabled else "free_only"
+    pm = ProxyManager(redis=redis, pg=pg, tier_config=cfg.proxy_tiers)
+
+    def _gateway_lease() -> ProxyLease:
+        proxy = build_gateway_proxy(
+            country=di_cfg.country or None, session_id=new_session_id(), asn=di_cfg.asn
+        )
+        if proxy is None:
+            raise RuntimeError(f"dataimpulse strategy={strategy} but gateway is not configured")
+        return ProxyLease(proxy=proxy, tenant_id=tenant_id)
+
+    lease: ProxyLease
+    if strategy == "paid_only":
+        lease = _gateway_lease()
+    else:
+        try:
+            lease = await pm.get_proxy(tenant_id, level=1, domain=domain)
+        except ProxyPoolExhaustedError:
+            if strategy != "free_first":
+                raise
+            lease = _gateway_lease()
+
+    async with lease:
+        items = await ScrapyAdapter().run_spider(
+            spider_name, start_urls, proxy_url=lease.proxy.auth_url()
+        )
+        if lease.proxy.source == "pool":
+            if items:
+                await pm.mark_success(tenant_id, lease.proxy.ip, lease.proxy.port)
+            elif start_urls:
+                await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
+
     return [
         FetchResult(
             url=str(item.get("url", "")),
@@ -369,6 +425,8 @@ async def _run_crawl_job(config_used: dict[str, Any]) -> list[FetchResult]:
             level_used=0,
             duration_ms=0,
             extracted=item,
+            proxy_used=lease.proxy.key(),
+            proxy_source=lease.proxy.source,
         )
         for item in items
     ]

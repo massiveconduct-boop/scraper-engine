@@ -139,3 +139,27 @@ class TestSSRFGuard:
         guard = SSRFGuard()
         with pytest.raises(ValueError):
             await guard._resolve_hosts("not-a-valid-url://")
+
+
+class TestValidateSync:
+    """Round 64 — the blocking twin the Scrapy crawl subprocess uses. Same
+    resolution and deny list as validate(), so the two cannot drift."""
+
+    def test_blocks_a_denied_address(self):
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.1.2.3", 0))]),
+            pytest.raises(SSRFBlockedError),
+        ):
+            SSRFGuard().validate_sync("http://internal.example/")
+
+    def test_allows_a_public_address(self):
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            SSRFGuard().validate_sync("http://example.com/")
+
+    def test_any_denied_record_blocks(self):
+        records = [(2, 1, 6, "", ("93.184.216.34", 0)), (2, 1, 6, "", ("127.0.0.1", 0))]
+        with (
+            patch("socket.getaddrinfo", return_value=records),
+            pytest.raises(SSRFBlockedError),
+        ):
+            SSRFGuard().validate_sync("http://rebind.example/")

@@ -302,12 +302,15 @@ async def test_run_scrape_job_crawl_type_routes_to_scrapy_adapter(fake_clients, 
     monkeypatch.setattr(
         "scraper_engine.services.scrapy_adapter.ScrapyAdapter.run_spider", run_spider_mock
     )
+    _FakeProxyManager.install(monkeypatch)
     run_scrape_mock = AsyncMock()
     monkeypatch.setattr(tasks_module, "_run_scrape", run_scrape_mock)
 
     await tasks_module._run_scrape_job("system", "job-crawl")
 
-    run_spider_mock.assert_awaited_once_with("titles", ["http://example.com"])
+    run_spider_mock.assert_awaited_once_with(
+        "titles", ["http://example.com"], proxy_url=_POOL_PROXY.auth_url()
+    )
     run_scrape_mock.assert_not_awaited()
 
     insert_calls = [
@@ -605,3 +608,146 @@ class TestTimingsColumn:
             self._result(timings={"total_ms": 5}, escalations=esc)
         )
         assert json.loads(stored) == {"total_ms": 5, "escalations": esc}
+
+
+# --- Round 64: crawl proxy leasing -------------------------------------------
+
+from scraper_engine.config.schema import AppConfig, DataImpulseConfig  # noqa: E402
+from scraper_engine.core.exceptions import ProxyPoolExhaustedError  # noqa: E402
+from scraper_engine.core.models import Proxy, ProxyProtocol  # noqa: E402
+from scraper_engine.proxy.lease import ProxyLease  # noqa: E402
+
+_POOL_PROXY = Proxy(id=7, ip="203.0.113.7", port=3128, protocol=ProxyProtocol.HTTP, source="pool")
+
+
+class _FakeProxyManager:
+    exhausted = False
+    instance: "_FakeProxyManager | None" = None
+
+    def __init__(self, **_kw):
+        self.get_proxy = AsyncMock(side_effect=self._get)
+        self.mark_success = AsyncMock()
+        self.mark_failure = AsyncMock()
+        _FakeProxyManager.instance = self
+
+    async def _get(self, tenant_id, level, domain):
+        if _FakeProxyManager.exhausted:
+            raise ProxyPoolExhaustedError(domain, level, 1)
+        return ProxyLease(proxy=_POOL_PROXY, tenant_id=tenant_id)
+
+    @classmethod
+    def install(cls, monkeypatch, *, exhausted=False):
+        cls.exhausted = exhausted
+        monkeypatch.setattr("scraper_engine.proxy.manager.ProxyManager", cls)
+
+
+class TestCrawlProxy:
+    """Round 64 — crawls used to leave from the server's own IP. They lease a
+    proxy the way scrapes do: free pool first, gateway on exhaustion under
+    free_first, gateway only under paid_only."""
+
+    CONFIG = {"spider_name": "titles", "start_urls": ["https://example.com/a"]}
+
+    def _run(self, monkeypatch, cfg, items):
+        run_spider = AsyncMock(return_value=items)
+        monkeypatch.setattr(
+            "scraper_engine.services.scrapy_adapter.ScrapyAdapter.run_spider", run_spider
+        )
+        coro = tasks_module._run_crawl_job(
+            self.CONFIG, TenantId("crawler"), cfg, MagicMock(), MagicMock()
+        )
+        return coro, run_spider
+
+    @pytest.mark.asyncio
+    async def test_free_pool_proxy_is_used_and_scored_on_success(self, monkeypatch):
+        _FakeProxyManager.install(monkeypatch)
+        coro, run_spider = self._run(monkeypatch, AppConfig(), [{"url": "https://example.com/a"}])
+        results = await coro
+        assert run_spider.await_args.kwargs["proxy_url"] == _POOL_PROXY.auth_url()
+        assert results[0].proxy_source == "pool"
+        assert results[0].proxy_used == _POOL_PROXY.key()
+        _FakeProxyManager.instance.mark_success.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_crawl_marks_the_pool_proxy_failed(self, monkeypatch):
+        _FakeProxyManager.install(monkeypatch)
+        coro, _ = self._run(monkeypatch, AppConfig(), [])
+        assert await coro == []
+        _FakeProxyManager.instance.mark_failure.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_pool_falls_back_to_the_gateway_under_free_first(self, monkeypatch):
+        _FakeProxyManager.install(monkeypatch, exhausted=True)
+        gateway = Proxy(
+            id=-1,
+            ip="gw.example",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="u",
+            password="p",
+            source="paid_gateway",
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", lambda **_k: gateway
+        )
+        cfg = AppConfig(dataimpulse=DataImpulseConfig(enabled=True, strategy="free_first"))
+        coro, run_spider = self._run(monkeypatch, cfg, [{"url": "https://example.com/a"}])
+        results = await coro
+        assert run_spider.await_args.kwargs["proxy_url"] == "http://u:p@gw.example:823"
+        assert results[0].proxy_source == "paid_gateway"
+        _FakeProxyManager.instance.mark_success.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_pool_without_a_gateway_fails_instead_of_going_direct(
+        self, monkeypatch
+    ):
+        _FakeProxyManager.install(monkeypatch, exhausted=True)
+        coro, run_spider = self._run(monkeypatch, AppConfig(), [])
+        with pytest.raises(ProxyPoolExhaustedError):
+            await coro
+        run_spider.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_paid_only_never_touches_the_pool(self, monkeypatch):
+        _FakeProxyManager.install(monkeypatch)
+        gateway = Proxy(
+            id=-1, ip="gw.example", port=823, protocol=ProxyProtocol.HTTP, source="paid_gateway"
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", lambda **_k: gateway
+        )
+        cfg = AppConfig(dataimpulse=DataImpulseConfig(enabled=True, strategy="paid_only"))
+        coro, _ = self._run(monkeypatch, cfg, [])
+        await coro
+        _FakeProxyManager.instance.get_proxy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_gateway_is_a_loud_error(self, monkeypatch):
+        _FakeProxyManager.install(monkeypatch)
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy", lambda **_k: None
+        )
+        cfg = AppConfig(dataimpulse=DataImpulseConfig(enabled=True, strategy="paid_only"))
+        coro, _ = self._run(monkeypatch, cfg, [])
+        with pytest.raises(RuntimeError, match="gateway is not configured"):
+            await coro
+
+
+@pytest.mark.asyncio
+async def test_a_crawl_with_no_seeds_scores_no_proxy(monkeypatch):
+    """Nothing was asked of the proxy, so an empty result says nothing about it."""
+    _FakeProxyManager.install(monkeypatch)
+    monkeypatch.setattr(
+        "scraper_engine.services.scrapy_adapter.ScrapyAdapter.run_spider",
+        AsyncMock(return_value=[]),
+    )
+    results = await tasks_module._run_crawl_job(
+        {"spider_name": "titles", "start_urls": []},
+        TenantId("crawler"),
+        AppConfig(),
+        MagicMock(),
+        MagicMock(),
+    )
+    assert results == []
+    _FakeProxyManager.instance.mark_success.assert_not_awaited()
+    _FakeProxyManager.instance.mark_failure.assert_not_awaited()
