@@ -107,6 +107,8 @@ class Level1Fetcher:
                     await self._ssrf_guard.validate(next_url)
                     current_url = next_url
                     response = await client.get(current_url)
+                if response.is_redirect:
+                    return self._redirect_limit_result(url, proxy, response.status_code, start)
 
                 html = response.text
                 success = response.status_code < 400
@@ -145,6 +147,28 @@ class Level1Fetcher:
                 error_message=str(exc),
             )
 
+    @staticmethod
+    def _redirect_limit_result(
+        url: str, proxy: Proxy | None, status: int, start: float
+    ) -> FetchResult:
+        """Round 64 — every engine's redirect loop used to fall out of its
+        `for _ in range(MAX_REDIRECTS)` with the last hop still a 3xx and then
+        compute `success = status < 400`: an endless redirect was reported as
+        a SUCCESSFUL fetch whose content was the redirect body. At the
+        plain-HTTP level a redirect loop is almost always a cookie or JS gate
+        that a real browser clears, so it is a DETECTION_BLOCK — the
+        category that escalates to L2 rather than landing in the DLQ."""
+        return FetchResult(
+            url=url,
+            success=False,
+            http_status=status,
+            level_used=1,
+            proxy_used=proxy.key() if proxy else None,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message=f"Redirect limit ({MAX_REDIRECTS}) exceeded",
+        )
+
     async def _fetch_via_ja3(
         self, url: str, proxy: Proxy | None, timeout: int, start: float
     ) -> FetchResult | None:
@@ -173,6 +197,8 @@ class Level1Fetcher:
                 await self._ssrf_guard.validate(next_url)
                 current_url = next_url
                 response = await session.get(current_url, proxy=proxy_url)
+            if response.status_code in (301, 302, 303, 307, 308) and response.location:
+                return self._redirect_limit_result(url, proxy, response.status_code, start)
 
             success = response.status_code < 400
 
@@ -214,6 +240,8 @@ class Level1Fetcher:
                 response = await self._scrapling_client.fetch(current_url, timeout, proxy=proxy_url)
                 if response is None:
                     return None
+            if response.location is not None:
+                return self._redirect_limit_result(url, proxy, response.status_code, start)
 
             success = response.status_code < 400
 

@@ -254,3 +254,68 @@ class TestScraplingWiring:
 
         assert result.success is True
         assert result.html == "<html>final</html>"
+
+
+class _EndlessRedirectClient:
+    def __init__(self, *a, **kw):
+        self.calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        self.calls += 1
+        return _FakeResponse(302, text="<html>moved</html>", location="/again", is_redirect=True)
+
+
+class TestRedirectLimit:
+    """Round 64 — each engine's redirect loop fell out of
+    `for _ in range(MAX_REDIRECTS)` with a 3xx still in hand and then computed
+    `success = status < 400`, so an endless redirect was a SUCCESS whose
+    content was the redirect body. It must be a DETECTION_BLOCK (escalates to
+    a real browser) instead."""
+
+    def _assert_redirect_limit(self, result):
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.http_status == 302
+        assert "Redirect limit" in (result.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_httpx_endless_redirect_is_a_failure(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _EndlessRedirectClient)
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_ja3_endless_redirect_is_a_failure(self):
+        response = AsyncMock()
+        response.status_code = 302
+        response.location = "/again"
+        response.text = "<html>moved</html>"
+        session = AsyncMock()
+        session.get.return_value = response
+        ja3 = AsyncMock()
+        ja3.open_session.return_value = session
+        result = await Level1Fetcher(ja3_client=ja3).fetch("http://example.com", TenantId("system"))
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_scrapling_endless_redirect_is_a_failure(self):
+        scrapling = AsyncMock()
+        scrapling.fetch.return_value = ScraplingResponse(
+            status_code=302, text="<html>moved</html>", location="/again"
+        )
+        result = await Level1Fetcher(scrapling_client=scrapling).fetch(
+            "http://example.com", TenantId("system")
+        )
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_a_chain_that_ends_inside_the_limit_still_succeeds(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _RedirectThenFinalClient)
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+        assert result.success is True
