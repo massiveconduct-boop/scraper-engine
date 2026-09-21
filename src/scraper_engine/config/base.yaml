@@ -183,7 +183,7 @@ politeness:
 
 escalation:
   level_memory_enabled: true
-  level_memory_ttl_seconds: 3600
+  level_memory_ttl_seconds: 86400
   reprobe_every: 20
 
 extraction:

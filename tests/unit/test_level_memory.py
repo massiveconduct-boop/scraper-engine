@@ -88,7 +88,7 @@ class TestReprobe:
         memory, redis = _memory(EscalationConfig(reprobe_every=5), hint="3", count=1)
         await memory.start_level(TENANT, "a.example", LEVELS)
         redis.raw.expire.assert_awaited_once()
-        assert redis.raw.expire.await_args.args[1] == 3600
+        assert redis.raw.expire.await_args.args[1] == 86400
 
     @pytest.mark.asyncio
     async def test_later_urls_do_not_re_arm_the_ttl(self):
@@ -108,7 +108,7 @@ class TestRecordSuccess:
     async def test_records_a_browser_level_with_the_configured_ttl(self):
         memory, redis = _memory()
         await memory.record_success(TENANT, "a.example", 3)
-        redis.raw.set.assert_awaited_once_with("levelhint:levelmem:a.example", "3", ex=3600)
+        redis.raw.set.assert_awaited_once_with("levelhint:levelmem:a.example", "3", ex=86400)
 
     @pytest.mark.asyncio
     async def test_level_1_deletes_rather_than_records(self):
@@ -132,3 +132,11 @@ class TestRecordSuccess:
         memory, redis = _memory()
         redis.raw.set.side_effect = ConnectionError("redis down")
         await memory.record_success(TENANT, "a.example", 3)  # must not raise
+
+
+def test_default_hint_lifetime_is_a_day():
+    """Round 64 — staleness is the re-probe's job; the TTL only decides
+    whether a crawl started later the same day starts from scratch."""
+    config = EscalationConfig()
+    assert config.level_memory_ttl_seconds == 86400
+    assert config.reprobe_every == 20

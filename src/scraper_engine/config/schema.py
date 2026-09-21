@@ -303,11 +303,15 @@ class EscalationConfig(BaseModel):
     """
 
     level_memory_enabled: bool = True
-    # Short on purpose. A hint is a claim about a target's CURRENT bot
-    # posture, which is exactly the thing that changes without warning; an
-    # hour is long enough to carry a bulk crawl of one domain end to end and
-    # short enough that a stale hint costs at most an hour of unnecessary L3.
-    level_memory_ttl_seconds: int = 3600
+    # Round 64: 3600 -> 86400. Round 63 kept this short so a stale hint
+    # could cost at most an hour of unnecessary high levels, but that job is
+    # already done by `reprobe_every` (every Nth URL runs the full ladder and
+    # rewrites the hint), independently of the TTL. The short TTL only
+    # bought a full-ladder climb on every URL of any crawl that started more
+    # than an hour after the last one — live, a 10-URL Jumia rerun paid
+    # L1+L2 on every URL for exactly that reason. A day covers the common
+    # "same site again later today" shape; the re-probe covers staleness.
+    level_memory_ttl_seconds: int = 86400
     # Staleness guard: every Nth URL for a domain ignores the hint and runs
     # the full ladder, so a target that gets EASIER (challenge lifted, WAF
     # rule relaxed) is rediscovered instead of paying L3 forever. Without
