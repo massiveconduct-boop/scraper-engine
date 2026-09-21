@@ -27,6 +27,10 @@ The budget is a ratchet. It may only ever be lowered. When the real count
 drops below it this script FAILS and tells you to lower the constant —
 otherwise a budget set once silently becomes permission to regress back up
 to it later.
+
+Round 64: budget 0 and the gate widened to scrapy_project, cli and
+observability, so the blended percentage is 100% and pyproject's
+fail_under is 100 again. This script is still the authoritative gate.
 """
 
 from __future__ import annotations

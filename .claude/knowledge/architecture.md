@@ -430,11 +430,11 @@ teardown across both engines:
   call. Botasaurus's `@browser` decorator bundles launch+navigate+close
   into one synchronous call with no seam to release early — an accepted
   throughput trade for correctness.
-- `browser/botasaurus_pool.py::fetch()` — held across both the
-  evict-and-close-old-entry step and the construct-new-driver step
-  together (one `async with` spanning both), so a new launch can never
-  start while a just-evicted driver's Xvfb teardown is still in flight.
-  The reuse path (`_reuse_fetch`, no display touched) stays lock-free.
+- `browser/botasaurus_pool.py` — held around launching a driver and
+  around closing one (`_close_entry`), never across navigation (round 64:
+  it used to wrap launch + navigate + scroll, and since every gateway
+  attempt is a new identity, every L2 fetch relaunched and stalled all
+  other browser launches in the worker for 40-130s).
 
 **Fix — `browser/_xvfb_cleanup.py::cleanup_stale_display()`** — new,
 best-effort proactive removal of a just-closed Botasaurus driver's
@@ -903,12 +903,14 @@ the tenant-isolation invariant (spec §1.1 #3). `BotasaurusPool` instead
 constructs raw `botasaurus.browser.Driver` instances itself (bypassing the
 `@browser` decorator and botasaurus's pool entirely) and keys reuse the same
 safe way `browser/pool.py::BrowserPool` already keys Camoufox contexts:
-proxy + domain match → reuse via `driver.requests.get(url)` (verified: this
-runs as an in-page JS `fetch()` through the driver's own tab, so it inherits
-that tab's live cookies/TLS session natively — no separate cookie-jar
-plumbing needed); mismatch → close the old driver, build a new one. One
-instance per rq job, same construction/shutdown bracket as `BrowserPool` in
-`orchestrator/tasks.py::_run_scrape`. Wired opt-in through
+proxy identity (`Proxy.identity_key()`, round 63) + domain match → reuse
+the live driver and NAVIGATE it (round 63: it used to be an in-page
+`driver.requests.get(url)` with no JS, which made L2 results depend on URL
+order); otherwise launch a new driver, evicting the oldest idle one once
+`botasaurus.max_pooled_drivers` (default 2, round 64) are held. One pool
+per rq job, same construction/shutdown bracket as `BrowserPool` in
+`orchestrator/tasks.py::_run_scrape`. A fetch holds a `BROWSER_SEMAPHORE`
+permit only while it runs (see "Browser Permits Across Engines"). Wired opt-in through
 `Worker`/`fetcher/factory.py::build_level2_fetcher()`/`Level2Fetcher` —
 `None` (default off in tests) preserves exactly the pre-round-26 one-shot
 behavior.
@@ -967,8 +969,9 @@ against `challenge-mirror` returns real content
 (`<h1>Verified Content</h1>`) with `google_get(bypass_cloudflare=True)` and
 `short_random_sleep()` both genuinely executing, and a 2-URL same-domain
 `BotasaurusPool.fetch()` run confirms exactly one `Driver()` construction
-across both calls (the 2nd fetch used `driver.requests.get()`, not a new
-browser launch) — both are now real, not just source-cited + mocked.
+across both calls (the 2nd fetch reused the driver; at the time it used
+`driver.requests.get()`, replaced by real navigation in round 63) — both
+are now real, not just source-cited + mocked.
 
 **Silent-false-success on a Chromium internal error page (Round 57).**
 `botasaurus_driver`'s navigation never raises when Chromium lands on its own

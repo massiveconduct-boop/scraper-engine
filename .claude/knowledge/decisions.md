@@ -33,7 +33,9 @@ failure), and `escalation.reprobe_every` (20) URLs one ignores the hint and
 runs the full ladder. The TTL alone would not re-probe — a continuously
 crawled domain refreshes its hint before it can expire — so the counter, not
 the TTL, is what keeps this from being a one-way ratchet. Worst case of a
-stale hint is an hour of unnecessary L3, not a wrong result.
+stale hint is unnecessary higher-level work until the next re-probe (at
+most 19 URLs, or the TTL — 1 h at the time, 24 h since round 64, when the
+re-probe alone was judged sufficient), never a wrong result.
 
 **Alternatives:** Deriving the start level from `scrape_results` per URL
 (rejected — a DB round trip per URL for something that is a per-domain fact,
@@ -1060,10 +1062,10 @@ match CI instead of the reverse.
 
 **Date:** 2026-07-29 | **Round:** 28
 **Status:** the one-combined-run shape below still holds. The
-`--cov-fail-under=100` figure does NOT — round 62 enabled branch coverage
-and moved the real gate to `tools/check_coverage_ratchet.py`; the flag is
-now a coarse `99` safety net. See "Two Separate Gates, Not One Percentage
-(Round 62)" at the end of this file.
+`--cov-fail-under` figure went 100 -> 99 in round 62 (branch coverage on,
+real gate moved to `tools/check_coverage_ratchet.py`) and back to 100 in
+round 64 once the branch budget reached 0. See "Two Separate Gates, Not
+One Percentage (Round 62)" at the end of this file.
 
 **What:** `--cov=src/scraper_engine --cov-fail-under=100` runs once, in the
 `chaos` job's final pytest invocation (`tests/unit/ tests/integration/
@@ -3340,8 +3342,10 @@ the line gate came to overstate its own strength in the first place.
 (needs a real Firefox CI runners lack — pre-existing, documented), and
 `cli`/`config`/`observability`/`scrapy_project` stay outside the gate for
 now. Widening scope and adding branch enforcement in one step would have
-made the CI failure impossible to attribute. Widening is tracked as T1/T3
-in `.wolf/STATUS.md`.
+made the CI failure impossible to attribute. **Superseded round 64:**
+`cli`, `observability` and `scrapy_project` joined the gate and the branch
+budget reached 0, so `fail_under` went back to 100; `config/` and
+`browser/` remain outside it.
 
 ## Browser Permits: One Protocol in core/budget.py, Not Per Pool (Round 64)
 

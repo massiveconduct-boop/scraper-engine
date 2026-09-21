@@ -233,22 +233,20 @@ round 28 (PR #15).
   project's own `pgbouncer-init` dependency chain from `docker-compose.yml`),
   polls `:6432` for TCP readiness, then runs the combined
   `tests/unit/ tests/integration/ tests/chaos/` suite with `--cov=
-  src/scraper_engine --cov-fail-under=99 --cov-report=json:coverage.json`,
+  src/scraper_engine --cov-fail-under=100 --cov-report=json:coverage.json`,
   followed by a second step running `tools/check_coverage_ratchet.py
   coverage.json` (round 28 wired the gate; round 62 split it in two). The
   other two jobs run without `--cov` since this job re-runs everything
   anyway with full infra up.
 
-  **`--cov-fail-under` is NOT the gate and is deliberately not 100.**
-  Round 62 enabled `branch = true`, which drops the blended figure to
-  ~99.3%, so the percentage is a coarse safety net only. The real gate is
-  the ratchet script: zero missed LINES (no tolerance, the pre-round-62
-  guarantee unchanged) plus an absolute missed-BRANCH budget that may only
-  ever shrink — the script fails if the count rises AND if it falls without
-  `BRANCH_BUDGET` being lowered, so improvements get locked in. Anyone
-  "fixing" the 99 back to 100 will break the build and silently re-hide the
-  branch gaps. See Known Operational Gaps #14 and
-  `.claude/knowledge/technical-debt.md`'s round-62 coverage audit.
+  **The ratchet script is the gate; `--cov-fail-under` is a backstop.**
+  The ratchet enforces zero missed LINES plus an absolute missed-BRANCH
+  budget that may only shrink — it fails if the count rises AND if it falls
+  without `BRANCH_BUDGET` being lowered. Round 62 introduced it at 33
+  branches (blended ~99.3%, so `fail_under` was lowered to 99); round 64
+  burned the budget to **0** and widened the gate to 10 packages, so
+  `fail_under` is **100** again (pyproject.toml; CI passes the same value).
+  See `.claude/knowledge/technical-debt.md` rounds 62 and 64.
 - **build-and-push (round 22):** builds the root `Dockerfile`, pushes to GHCR
   (`ghcr.io/<owner>/<repo>:<sha>` and `:latest`) via the automatic
   `GITHUB_TOKEN` — no new secret needed. Gated `if: github.event_name ==
