@@ -32,13 +32,13 @@ class TestPolitenessRace:
     async def test_slots_never_exceed_max_concurrent(self, redis):
         """10 concurrent tasks (simulating 10 worker processes) racing for 2 slots.
 
-        At every sampled instant, SCARD must never exceed 2.
+        At every sampled instant, ZCARD must never exceed 2.
         """
         from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
 
         domain = "racetest.internal"
         tenant = TenantId("g06test")
-        slot_key = f"politeness:slots:{tenant}:{domain}"
+        slot_key = f"politeness:turns:{tenant}:{domain}"
         max_concurrent = 2
         worker_id_prefix = "worker-"
 
@@ -62,7 +62,7 @@ class TestPolitenessRace:
                 )
                 if result == 1:
                     await asyncio.sleep(0.01)
-                    card = await redis.scard(slot_key)
+                    card = await redis.zcard(slot_key)
                     if card > max_observed:
                         max_observed = card
                     await redis.eval(RELEASE_SLOT_LUA, 1, slot_key, worker_id)

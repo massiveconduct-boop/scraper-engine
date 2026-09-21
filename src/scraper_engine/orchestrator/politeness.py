@@ -15,43 +15,78 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
 
-# Lua script: atomically acquire a concurrency slot with TTL deadman's switch
-ACQUIRE_SLOT_LUA = """
+# Round 65 — every slot carries its OWN expiry. Slots used to be members of a
+# plain SET with one TTL on the whole key, re-armed by every acquire and every
+# refresh. That deadman switch only fired once the domain went fully idle: on
+# a busy domain some live holder was always re-arming the key, so a slot left
+# behind by a crashed worker was never freed and the domain ran one slot short
+# for as long as it stayed busy. A sorted set scored by expiry (Redis's own
+# clock, like RESERVE_DELAY_LUA below) lets every script drop exactly the
+# members whose holder stopped refreshing, and nothing else.
+#
+# The key name changed with the type (`slots` -> `turns`): a SET and a ZSET
+# under one name would make old and new workers fail each other's calls with
+# WRONGTYPE for as long as both were running.
+_NOW_MS_LUA = """
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+"""
+
+ACQUIRE_SLOT_LUA = (
+    _NOW_MS_LUA
+    + """
 local key = KEYS[1]
 local worker_id = ARGV[1]
 local max_concurrent = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
-if redis.call('SCARD', key) < max_concurrent then
-    redis.call('SADD', key, worker_id)
-    redis.call('EXPIRE', key, ttl)
+local ttl_ms = tonumber(ARGV[3]) * 1000
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms)
+if redis.call('ZCARD', key) < max_concurrent then
+    redis.call('ZADD', key, now_ms + ttl_ms, worker_id)
+    redis.call('PEXPIRE', key, ttl_ms)
     return 1
 end
 return 0
 """
+)
 
 RELEASE_SLOT_LUA = """
 local key = KEYS[1]
 local worker_id = ARGV[1]
-redis.call('SREM', key, worker_id)
+redis.call('ZREM', key, worker_id)
 return 1
 """
 
-# Round 63 — extends the deadman TTL while a slot is genuinely still held.
-# slot_ttl_seconds (120) is shorter than a worst-case Level-3 attempt, so the
-# deadman switch could expire the whole slot SET under a live holder and hand
-# its slot to someone else while it was still fetching. Only refreshes when
-# the caller is still a member, so a released or already-expired slot is never
-# resurrected.
-REFRESH_SLOT_LUA = """
+# Round 63 — extends a slot's expiry while it is genuinely still held.
+# slot_ttl_seconds (120) is shorter than a worst-case Level-3 attempt, so
+# without this the slot would expire under a live holder and be handed to
+# someone else while it was still fetching. Only refreshes a slot the caller
+# still holds and that has not already expired, so a released or expired slot
+# is never resurrected. The key's own TTL is re-armed too: it only has to
+# outlive the newest member, which this refresh just became.
+REFRESH_SLOT_LUA = (
+    _NOW_MS_LUA
+    + """
 local key = KEYS[1]
 local worker_id = ARGV[1]
-local ttl = tonumber(ARGV[2])
-if redis.call('SISMEMBER', key, worker_id) == 1 then
-    redis.call('EXPIRE', key, ttl)
+local ttl_ms = tonumber(ARGV[2]) * 1000
+local expires_at = tonumber(redis.call('ZSCORE', key, worker_id) or '0')
+if expires_at > now_ms then
+    redis.call('ZADD', key, 'XX', now_ms + ttl_ms, worker_id)
+    redis.call('PEXPIRE', key, ttl_ms)
     return 1
 end
 return 0
 """
+)
+
+# Live (unexpired) slots only, on Redis's clock — a crashed holder's leftover
+# member must not make a domain look busy.
+ACTIVE_SLOTS_LUA = (
+    _NOW_MS_LUA
+    + """
+return redis.call('ZCOUNT', KEYS[1], '(' .. now_ms, '+inf')
+"""
+)
 
 # Round 63 — the inter-fetch delay as an atomic *reservation* rather than a
 # read-sleep-write. The old shape read the last-fetch timestamp, slept the
@@ -108,7 +143,7 @@ class PolitenessController:
         self._slot_ttl = slot_ttl_seconds
 
     def _slot_key(self, domain: str, tenant_id: TenantId) -> str:
-        return f"politeness:slots:{tenant_id}:{domain}"
+        return f"politeness:turns:{tenant_id}:{domain}"
 
     def _last_fetch_key(self, domain: str, tenant_id: TenantId) -> str:
         return f"politeness:last:{tenant_id}:{domain}"
@@ -155,6 +190,11 @@ class PolitenessController:
         slot_key = self._slot_key(domain, tenant_id)
         result = await self._redis.eval(REFRESH_SLOT_LUA, 1, slot_key, worker_id, self._slot_ttl)
         return bool(result)
+
+    async def active_slots(self, domain: str, tenant_id: TenantId) -> int:
+        """How many slots on this domain are held right now by a live holder."""
+        slot_key = self._slot_key(domain, tenant_id)
+        return int(await self._redis.eval(ACTIVE_SLOTS_LUA, 1, slot_key))
 
     @contextlib.asynccontextmanager
     async def held_slot(

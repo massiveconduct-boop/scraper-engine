@@ -41,6 +41,7 @@ from scraper_engine.core.tenant import TenantId
 from scraper_engine.observability.bootstrap import bootstrap_observability
 from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker, CircuitState
 from scraper_engine.orchestrator.job_queue import build_queue
+from scraper_engine.orchestrator.politeness import PolitenessController
 from scraper_engine.proxy.pool_health import current_state as pool_current_state
 from scraper_engine.storage.dlq import DeadLetterEntry, DeadLetterQueue
 from scraper_engine.storage.postgres_client import PostgresClient
@@ -77,6 +78,12 @@ _TRANSIENT_CATEGORIES = [
     FailureCategory.CIRCUIT_OPEN,
     FailureCategory.BROWSER_CRASH,
     FailureCategory.NETWORK_TIMEOUT,
+    # Round 65 — worker.py has always listed POLITENESS_TIMEOUT as transient
+    # and "auto-retry eligible", but it was missing HERE, the only list the
+    # reaper actually selects from, so no politeness-timeout DLQ entry was
+    # ever retried. It is contention for this tenant's slots on one domain,
+    # so it is eligible once that domain has no live slot holder left.
+    FailureCategory.POLITENESS_TIMEOUT,
 ]
 
 
@@ -147,6 +154,10 @@ async def _is_eligible(
     if entry.failure_category == FailureCategory.CIRCUIT_OPEN:
         circuit_state = await circuit_breaker.state(_domain(entry.url))
         return circuit_state == CircuitState.CLOSED
+    if entry.failure_category == FailureCategory.POLITENESS_TIMEOUT:
+        politeness = PolitenessController(redis.raw)
+        active = await politeness.active_slots(_domain(entry.url), TenantId(entry.tenant_id))
+        return active == 0
     return False
 
 

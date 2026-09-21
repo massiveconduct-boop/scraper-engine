@@ -129,8 +129,8 @@ class TestPoliteness:
                 await real_sleep(0.05)
 
         scripts = [call.args[0] for call in redis.eval.call_args_list]
-        assert any("SISMEMBER" in s for s in scripts), "slot TTL was never refreshed"
-        assert "SREM" in scripts[-1], "slot was not released on exit"
+        assert any("ZSCORE" in s for s in scripts), "slot TTL was never refreshed"
+        assert "ZREM" in scripts[-1], "slot was not released on exit"
 
     @pytest.mark.asyncio
     async def test_held_slot_releases_even_when_the_body_raises(self, tenant):
@@ -142,7 +142,7 @@ class TestPoliteness:
             async with pc.held_slot("example.com", tenant, "abc123"):
                 raise RuntimeError("boom")
 
-        assert "SREM" in redis.eval.call_args_list[-1].args[0]
+        assert "ZREM" in redis.eval.call_args_list[-1].args[0]
 
     @pytest.mark.asyncio
     async def test_held_slot_survives_a_failing_refresh(self, tenant):
@@ -158,3 +158,25 @@ class TestPoliteness:
         with patch.object(asyncio, "sleep", _fast_sleep), contextlib.suppress(ConnectionError):
             async with pc.held_slot("example.com", tenant, "abc123"):
                 await real_sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_active_slots_counts_only_live_holders():
+    """Round 65 — real Redis: an expired (crashed) slot is not counted."""
+    import time
+
+    from redis.asyncio import Redis
+
+    r = Redis(host="localhost", port=6379, decode_responses=True)
+    pc = PolitenessController(redis=r, slot_ttl_seconds=60)
+    tenant = TenantId("activeslots")
+    key = pc._slot_key("live.example", tenant)
+    await r.delete(key)
+    try:
+        assert await pc.active_slots("live.example", tenant) == 0
+        assert await pc.acquire_slot("live.example", tenant) is not None
+        await r.zadd(key, {"crashed": int(time.time() * 1000) - 1000})
+        assert await pc.active_slots("live.example", tenant) == 1
+    finally:
+        await r.delete(key)
+        await r.aclose()

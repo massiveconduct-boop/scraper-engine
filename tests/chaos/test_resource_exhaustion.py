@@ -41,60 +41,49 @@ class TestBrowserSemaphore:
 class TestAtomicLua:
     """F-06/F-07: Lua scripts are crash-safe with TTL deadman's switch."""
 
-    def test_acquire_slot_lua_exists(self):
-        """Verify the ACQUIRE_SLOT_LUA script is defined and well-formed."""
-        from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA
+    @pytest.fixture
+    async def redis(self):
+        from redis.asyncio import Redis
 
-        assert "SCARD" in ACQUIRE_SLOT_LUA
-        assert "SADD" in ACQUIRE_SLOT_LUA
-        assert "EXPIRE" in ACQUIRE_SLOT_LUA
-        assert "return 1" in ACQUIRE_SLOT_LUA
-        assert "return 0" in ACQUIRE_SLOT_LUA
+        r = Redis(host="localhost", port=6379, decode_responses=True)
+        yield r
+        await r.aclose()
 
     @pytest.mark.asyncio
-    async def test_slot_expiry_prevents_leak(self):
-        """Simulate a worker crash — TTL must release the slot."""
-        from fakeredis import FakeAsyncRedis
+    async def test_crashed_holder_expires_while_domain_stays_busy(self, redis):
+        """Round 65 — a slot whose holder stopped refreshing is freed even
+        though a live sibling keeps refreshing its own slot on the same key.
 
-        redis = FakeAsyncRedis(decode_responses=True)
-        from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA
+        The old SET-with-one-TTL shape failed exactly this: the live
+        sibling's refresh re-armed the whole key, so the crashed slot never
+        expired and the domain ran one slot short while it stayed busy.
+        """
+        from scraper_engine.orchestrator.politeness import (
+            ACQUIRE_SLOT_LUA,
+            REFRESH_SLOT_LUA,
+        )
 
-        tenant = TenantId("test")
-        slot_key = f"politeness:slots:{tenant}:chaos.com"
+        slot_key = f"politeness:turns:{TenantId('chaos')}:crash.example"
+        await redis.delete(slot_key)
+        try:
+            assert await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "crashed", 2, 1) == 1
+            assert await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "alive", 2, 1) == 1
+            # Full: a third caller is refused.
+            assert await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "third", 2, 1) == 0
 
-        # Mock eval to route to FakeRedis SADD/SCARD
-        async def mock_eval(script, num_keys, *args):
-            if "SCARD" in script and "SADD" in script:
-                # ACQUIRE_SLOT_LUA — simulate with real SADD/SCARD
-                key = args[0]
-                worker = args[1]
-                max_conc = int(args[2])
-                ttl = int(args[3])
-                current = await redis.scard(key)
-                if current < max_conc:
-                    await redis.sadd(key, worker)
-                    await redis.expire(key, ttl)
-                    return 1
-                return 0
-            return 0
+            # "alive" keeps refreshing past the 1s TTL; "crashed" never does.
+            for _ in range(3):
+                await asyncio.sleep(0.5)
+                assert await redis.eval(REFRESH_SLOT_LUA, 1, slot_key, "alive", 1) == 1
 
-        redis.eval = mock_eval  # type: ignore[method-assign]
-
-        # Acquire a slot
-        result = await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "worker-1", "2", "120")
-        assert result == 1
-
-        # Verify slot is held
-        card = await redis.scard(slot_key)
-        assert card == 1
-
-        # Simulate TTL expiry by setting a short TTL and waiting
-        await redis.expire(slot_key, 1)
-        await asyncio.sleep(1.1)
-
-        # Slot should have expired (deadman's switch)
-        card = await redis.scard(slot_key)
-        assert card == 0, "TTL deadman's switch must release crashed worker slots"
+            # The crashed slot is gone; the live one is not.
+            assert await redis.eval(ACQUIRE_SLOT_LUA, 1, slot_key, "third", 2, 1) == 1
+            members = set(await redis.zrange(slot_key, 0, -1))
+            assert members == {"alive", "third"}
+            # An expired slot is never resurrected by a late refresh.
+            assert await redis.eval(REFRESH_SLOT_LUA, 1, slot_key, "crashed", 1) == 0
+        finally:
+            await redis.delete(slot_key)
 
     @pytest.mark.asyncio
     async def test_capsolver_budget_atomic(self):

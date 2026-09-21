@@ -236,6 +236,29 @@ class TestIsEligible:
         assert await dlq_reaper._is_eligible(entry, redis, cb, tier_config) is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("active", "eligible"), [(0, True), (2, False)])
+    async def test_politeness_timeout_eligible_only_once_the_domain_is_idle(
+        self, active, eligible
+    ):
+        """Round 65 — POLITENESS_TIMEOUT is contention for this tenant's slots
+        on one domain; retrying while the domain still has live holders would
+        just time out again."""
+        redis = MagicMock()
+        redis.raw.eval = AsyncMock(return_value=active)
+        entry = make_entry(
+            category=FailureCategory.POLITENESS_TIMEOUT, url="http://busy.example/p"
+        )
+        assert (
+            await dlq_reaper._is_eligible(entry, redis, AsyncMock(), ProxyTierConfig())
+            is eligible
+        )
+        key = redis.raw.eval.await_args.args[2]
+        assert key == "politeness:turns:test:busy.example"
+
+    def test_politeness_timeout_is_a_reaped_category(self):
+        assert FailureCategory.POLITENESS_TIMEOUT in dlq_reaper._TRANSIENT_CATEGORIES
+
+    @pytest.mark.asyncio
     async def test_unknown_category_is_never_eligible(self):
         redis = AsyncMock()
         cb = AsyncMock()

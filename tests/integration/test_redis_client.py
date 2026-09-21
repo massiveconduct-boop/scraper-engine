@@ -138,3 +138,15 @@ class TestRedisClientConnected:
     async def test_eval(self, redis: RedisClient) -> None:
         result = await redis.eval("return ARGV[1]", 0, "echoed")
         assert result == "echoed"
+
+
+@pytest.mark.integration
+class TestRedisClientTimeouts:
+    @pytest.mark.asyncio
+    async def test_connection_has_bounded_socket_timeouts(self, redis: RedisClient) -> None:
+        """Round 65 — a Redis that stops answering must fail a call within
+        seconds, not block it forever."""
+        kwargs = redis.raw.connection_pool.connection_kwargs
+        assert kwargs["socket_timeout"] == 5.0
+        assert kwargs["socket_connect_timeout"] == 5.0
+        assert kwargs["health_check_interval"] == 30
