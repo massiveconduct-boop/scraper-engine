@@ -146,7 +146,10 @@ async def scrape(
     # a URL that only redirects into a private range after enqueue already
     # goes through. Reusing that existing, tested machinery here instead of
     # duplicating it avoids a second, divergent SSRF-failure code path.
-    if _ssrf_guard is None:
+    # Round 64 — storage, Redis (quota) and the queue are required, not
+    # optional: with any of them missing this used to answer 200 with a job
+    # id it never saved, never charged, or never queued.
+    if _ssrf_guard is None or _storage_pg is None or _storage_redis is None or _queue is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     blocked: list[SSRFBlockedError] = []
     valid_count = 0
@@ -177,7 +180,7 @@ async def scrape(
     # of enqueuing a duplicate and double-charging quota. Excludes dead
     # terminal states (FAILED/CANCELLED/DEAD_LETTER) — a retry after one of
     # those should get a fresh attempt, not be pinned to a dead one forever.
-    if idempotency_key and _storage_pg is not None:
+    if idempotency_key:
         existing = await _storage_pg.fetchrow(
             tenant_id,
             """SELECT job_id, status FROM scrape_jobs
@@ -194,86 +197,80 @@ async def scrape(
             }
 
     # Quota enforcement
-    if _storage_redis is not None and _storage_pg is not None:
-        from scraper_engine.core.exceptions import QuotaExceededError
-        from scraper_engine.core.quota import QuotaManager
+    from scraper_engine.core.exceptions import QuotaExceededError
+    from scraper_engine.core.quota import QuotaManager
 
-        daily_limit = None
-        row = await _storage_pg.fetchrow(
-            tenant_id,
-            "SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1",
-            str(tenant_id),
-        )
-        if row is not None:
-            daily_limit = row["quota_daily_limit"]
-        try:
-            await QuotaManager(
-                redis=_storage_redis,
-                daily_limit=daily_limit,
-            ).check_and_increment(tenant_id, count=valid_count)
-        except QuotaExceededError:
-            from scraper_engine.core.quota import seconds_until_quota_reset
+    daily_limit = None
+    row = await _storage_pg.fetchrow(
+        tenant_id,
+        "SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1",
+        str(tenant_id),
+    )
+    if row is not None:
+        daily_limit = row["quota_daily_limit"]
+    try:
+        await QuotaManager(
+            redis=_storage_redis,
+            daily_limit=daily_limit,
+        ).check_and_increment(tenant_id, count=valid_count)
+    except QuotaExceededError:
+        from scraper_engine.core.quota import seconds_until_quota_reset
 
-            raise HTTPException(
-                status_code=429,
-                detail="Daily quota exceeded",
-                headers={"Retry-After": str(seconds_until_quota_reset())},
-            ) from None
+        raise HTTPException(
+            status_code=429,
+            detail="Daily quota exceeded",
+            headers={"Retry-After": str(seconds_until_quota_reset())},
+        ) from None
 
     # Persist job
     job_id = str(uuid.uuid4())
-    if _storage_pg is not None:
-        config_json = json.dumps(
-            request.config_overrides.model_dump() if request.config_overrides else {}
+    config_json = json.dumps(
+        request.config_overrides.model_dump() if request.config_overrides else {}
+    )
+    await _storage_pg.execute(
+        tenant_id,
+        """INSERT INTO scrape_jobs
+               (job_id, urls, config_used, status, webhook_url, idempotency_key)
+           VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
+        job_id,
+        [str(u) for u in request.urls],
+        config_json,
+        JobStatus.PENDING.value,
+        str(request.webhook) if request.webhook else None,
+        idempotency_key,
+    )
+
+    # Round 54 — this INSERT and the enqueue below are two separate
+    # operations, not one transaction. Before this fix, a transient
+    # Redis blip here (or any other exception from .enqueue()) left
+    # the row already committed as PENDING with no corresponding rq
+    # job ever created — invisible to stuck_job_reaper (which only
+    # ever looked at PROCESSING) and to the caller, who'd just see a
+    # 500 and have no way to know whether the job existed. Live-
+    # found: 17 real research_agent jobs stuck at PENDING for days,
+    # none with a matching rq:job:* Redis key. Fail loud and clean
+    # instead: mark the row FAILED so it's not silently orphaned,
+    # and tell the caller plainly that nothing was queued.
+    try:
+        _queue.enqueue(
+            "scraper_engine.orchestrator.tasks.run_scrape_job",
+            str(tenant_id),
+            job_id,
+            job_id=job_id,
+            job_timeout=max(_SCRAPE_JOB_TIMEOUT_SECONDS, valid_count * _PER_URL_TIMEOUT_SECONDS),
         )
+    except Exception:
+        logger.exception("scrape_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
         await _storage_pg.execute(
             tenant_id,
-            """INSERT INTO scrape_jobs
-                   (job_id, urls, config_used, status, webhook_url, idempotency_key)
-               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
+            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+            JobStatus.FAILED.value,
             job_id,
-            [str(u) for u in request.urls],
-            config_json,
-            JobStatus.PENDING.value,
-            str(request.webhook) if request.webhook else None,
-            idempotency_key,
         )
-
-        if _queue is not None:
-            # Round 54 — this INSERT and the enqueue below are two separate
-            # operations, not one transaction. Before this fix, a transient
-            # Redis blip here (or any other exception from .enqueue()) left
-            # the row already committed as PENDING with no corresponding rq
-            # job ever created — invisible to stuck_job_reaper (which only
-            # ever looked at PROCESSING) and to the caller, who'd just see a
-            # 500 and have no way to know whether the job existed. Live-
-            # found: 17 real research_agent jobs stuck at PENDING for days,
-            # none with a matching rq:job:* Redis key. Fail loud and clean
-            # instead: mark the row FAILED so it's not silently orphaned,
-            # and tell the caller plainly that nothing was queued.
-            try:
-                _queue.enqueue(
-                    "scraper_engine.orchestrator.tasks.run_scrape_job",
-                    str(tenant_id),
-                    job_id,
-                    job_id=job_id,
-                    job_timeout=max(
-                        _SCRAPE_JOB_TIMEOUT_SECONDS, valid_count * _PER_URL_TIMEOUT_SECONDS
-                    ),
-                )
-            except Exception:
-                logger.exception("scrape_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
-                await _storage_pg.execute(
-                    tenant_id,
-                    "UPDATE scrape_jobs SET status = $1, updated_at = NOW() "
-                    "WHERE job_id = $2::uuid",
-                    JobStatus.FAILED.value,
-                    job_id,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Failed to enqueue job — no work was queued, safe to retry",
-                ) from None
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to enqueue job — no work was queued, safe to retry",
+        ) from None
 
     return {
         "job_id": job_id,
@@ -315,7 +312,10 @@ async def crawl(
     # (it's a subprocess-isolated Scrapy spider, not the L1->L2->L3 ladder),
     # so a blocked seed can't be safely let through and left to self-reject
     # downstream — it must actually be filtered out of start_urls here.
-    if _ssrf_guard is None:
+    # Round 64 — storage, Redis (quota) and the queue are required, not
+    # optional: with any of them missing this used to answer 200 with a job
+    # id it never saved, never charged, or never queued.
+    if _ssrf_guard is None or _storage_pg is None or _storage_redis is None or _queue is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     blocked: list[SSRFBlockedError] = []
     valid_start_urls: list[str] = []
@@ -337,7 +337,7 @@ async def crawl(
             raise HTTPException(status_code=403, detail=f"webhook blocked: {exc}") from None
 
     # Idempotency-Key dedup — same rationale as POST /v1/scrape above.
-    if idempotency_key and _storage_pg is not None:
+    if idempotency_key:
         existing = await _storage_pg.fetchrow(
             tenant_id,
             """SELECT job_id, status FROM scrape_jobs
@@ -353,109 +353,105 @@ async def crawl(
                 "tenant": str(tenant_id),
             }
 
-    if _storage_redis is not None and _storage_pg is not None:
-        from scraper_engine.core.exceptions import QuotaExceededError
-        from scraper_engine.core.quota import QuotaManager
+    from scraper_engine.core.exceptions import QuotaExceededError
+    from scraper_engine.core.quota import QuotaManager
 
-        daily_limit = None
-        row = await _storage_pg.fetchrow(
-            tenant_id,
-            "SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1",
-            str(tenant_id),
-        )
-        if row is not None:
-            daily_limit = row["quota_daily_limit"]
-        try:
-            await QuotaManager(
-                redis=_storage_redis,
-                daily_limit=daily_limit,
-            ).check_and_increment(tenant_id, count=len(valid_start_urls))
-        except QuotaExceededError:
-            from scraper_engine.core.quota import seconds_until_quota_reset
+    daily_limit = None
+    row = await _storage_pg.fetchrow(
+        tenant_id,
+        "SELECT quota_daily_limit FROM public.tenants WHERE tenant_id = $1",
+        str(tenant_id),
+    )
+    if row is not None:
+        daily_limit = row["quota_daily_limit"]
+    try:
+        await QuotaManager(
+            redis=_storage_redis,
+            daily_limit=daily_limit,
+        ).check_and_increment(tenant_id, count=len(valid_start_urls))
+    except QuotaExceededError:
+        from scraper_engine.core.quota import seconds_until_quota_reset
 
-            raise HTTPException(
-                status_code=429,
-                detail="Daily quota exceeded",
-                headers={"Retry-After": str(seconds_until_quota_reset())},
-            ) from None
+        raise HTTPException(
+            status_code=429,
+            detail="Daily quota exceeded",
+            headers={"Retry-After": str(seconds_until_quota_reset())},
+        ) from None
 
     job_id = str(uuid.uuid4())
-    if _storage_pg is not None:
-        config_json = json.dumps(
-            {
-                "_job_type": "crawl",
-                "spider_name": request.spider_name,
-                "start_urls": valid_start_urls,
-            }
+    config_json = json.dumps(
+        {
+            "_job_type": "crawl",
+            "spider_name": request.spider_name,
+            "start_urls": valid_start_urls,
+        }
+    )
+    await _storage_pg.execute(
+        tenant_id,
+        """INSERT INTO scrape_jobs
+               (job_id, urls, config_used, status, webhook_url, idempotency_key)
+           VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
+        job_id,
+        valid_start_urls,
+        config_json,
+        JobStatus.PENDING.value,
+        str(request.webhook) if request.webhook else None,
+        idempotency_key,
+    )
+
+    # Blocked seeds never reach ScrapyAdapter (filtered above), so unlike
+    # /v1/scrape's blocked URLs — which still get a real per-URL result
+    # once the escalation pipeline itself rejects them — these would
+    # otherwise vanish with zero trace in GET /v1/jobs/{id}. Persist a
+    # result row for each directly, matching the same failure shape
+    # (level_used=0 — blocked before any level/spider ever ran).
+    #
+    # SSRFGuard raises SSRFBlockedError for two different situations — a
+    # real block and an unresolvable/dead domain (see
+    # exceptions.py::SSRFBlockedError) — so the category must follow
+    # `is_unresolvable`, same as fetcher/_failure.py's
+    # classify_fetch_exception, rather than hardcoding SSRF_BLOCKED for
+    # both.
+    for blocked_exc in blocked:
+        category = (
+            FailureCategory.HOST_UNREACHABLE
+            if blocked_exc.is_unresolvable
+            else FailureCategory.SSRF_BLOCKED
         )
         await _storage_pg.execute(
             tenant_id,
-            """INSERT INTO scrape_jobs
-                   (job_id, urls, config_used, status, webhook_url, idempotency_key)
-               VALUES ($1::uuid, $2::text[], $3::jsonb, $4, $5, $6)""",
+            """INSERT INTO scrape_results
+                   (job_id, url, success, level_used, error_message, failure_category)
+               VALUES ($1::uuid, $2, FALSE, 0, $3, $4)""",
             job_id,
-            valid_start_urls,
-            config_json,
-            JobStatus.PENDING.value,
-            str(request.webhook) if request.webhook else None,
-            idempotency_key,
+            blocked_exc.url,
+            str(blocked_exc),
+            category.value,
         )
 
-        # Blocked seeds never reach ScrapyAdapter (filtered above), so unlike
-        # /v1/scrape's blocked URLs — which still get a real per-URL result
-        # once the escalation pipeline itself rejects them — these would
-        # otherwise vanish with zero trace in GET /v1/jobs/{id}. Persist a
-        # result row for each directly, matching the same failure shape
-        # (level_used=0 — blocked before any level/spider ever ran).
-        #
-        # SSRFGuard raises SSRFBlockedError for two different situations — a
-        # real block and an unresolvable/dead domain (see
-        # exceptions.py::SSRFBlockedError) — so the category must follow
-        # `is_unresolvable`, same as fetcher/_failure.py's
-        # classify_fetch_exception, rather than hardcoding SSRF_BLOCKED for
-        # both.
-        for blocked_exc in blocked:
-            category = (
-                FailureCategory.HOST_UNREACHABLE
-                if blocked_exc.is_unresolvable
-                else FailureCategory.SSRF_BLOCKED
-            )
-            await _storage_pg.execute(
-                tenant_id,
-                """INSERT INTO scrape_results
-                       (job_id, url, success, level_used, error_message, failure_category)
-                   VALUES ($1::uuid, $2, FALSE, 0, $3, $4)""",
-                job_id,
-                blocked_exc.url,
-                str(blocked_exc),
-                category.value,
-            )
-
-        if _queue is not None:
-            # Round 54 — same fix as /v1/scrape above: enqueue isn't atomic
-            # with the INSERT above it, so a transient Redis error here must
-            # not leave this row permanently PENDING with nothing queued.
-            try:
-                _queue.enqueue(
-                    "scraper_engine.orchestrator.tasks.run_scrape_job",
-                    str(tenant_id),
-                    job_id,
-                    job_id=job_id,
-                    job_timeout=_CRAWL_JOB_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                logger.exception("crawl_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
-                await _storage_pg.execute(
-                    tenant_id,
-                    "UPDATE scrape_jobs SET status = $1, updated_at = NOW() "
-                    "WHERE job_id = $2::uuid",
-                    JobStatus.FAILED.value,
-                    job_id,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Failed to enqueue job — no work was queued, safe to retry",
-                ) from None
+    # Round 54 — same fix as /v1/scrape above: enqueue isn't atomic
+    # with the INSERT above it, so a transient Redis error here must
+    # not leave this row permanently PENDING with nothing queued.
+    try:
+        _queue.enqueue(
+            "scraper_engine.orchestrator.tasks.run_scrape_job",
+            str(tenant_id),
+            job_id,
+            job_id=job_id,
+            job_timeout=_CRAWL_JOB_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("crawl_job_enqueue_failed job_id=%s tenant=%s", job_id, tenant_id)
+        await _storage_pg.execute(
+            tenant_id,
+            "UPDATE scrape_jobs SET status = $1, updated_at = NOW() WHERE job_id = $2::uuid",
+            JobStatus.FAILED.value,
+            job_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to enqueue job — no work was queued, safe to retry",
+        ) from None
 
     return {
         "job_id": job_id,
@@ -485,9 +481,7 @@ async def list_jobs(
         try:
             JobStatus(status)
         except ValueError:
-            raise HTTPException(
-                status_code=422, detail=f"Invalid status: '{status}'"
-            ) from None
+            raise HTTPException(status_code=422, detail=f"Invalid status: '{status}'") from None
 
     if _tenant_resolver is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
