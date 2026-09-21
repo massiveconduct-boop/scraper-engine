@@ -12,8 +12,10 @@ if TYPE_CHECKING:
     import httpx
 
 
-def main() -> None:
-    """Main CLI entry point."""
+def main(argv: list[str] | None = None) -> None:
+    """Main CLI entry point. `argv` defaults to sys.argv[1:] (argparse's own
+    default); passing it explicitly is what lets every subcommand's dispatch
+    be tested without a subprocess."""
     parser = argparse.ArgumentParser(
         prog="scraper-engine",
         description="Search & Scraper Engine management CLI",
@@ -88,7 +90,7 @@ def main() -> None:
     api_dlq.add_argument("--limit", type=int, default=100)
     api_dlq.add_argument("--offset", type=int, default=0)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     from scraper_engine.config.loader import load_config
     from scraper_engine.observability.bootstrap import bootstrap_observability
@@ -224,13 +226,15 @@ async def _create_tenant(tenant_slug: str) -> None:
 
     pg = PostgresClient(load_config().storage.database_url)
     await pg.start()
-
-    resolver = TenantResolver(pg)
-    tenant_id, api_key = await resolver.create_tenant(tenant_slug)
-    print(f"Tenant created: {tenant_id}")
-    print(f"API key: {api_key}")
-
-    await pg.stop()
+    # Round 64 — stop() was after the prints, not in a finally, so a failed
+    # create (duplicate slug, schema error) leaked the pool; every other
+    # one-shot command here already used try/finally.
+    try:
+        tenant_id, api_key = await TenantResolver(pg).create_tenant(tenant_slug)
+        print(f"Tenant created: {tenant_id}")
+        print(f"API key: {api_key}")
+    finally:
+        await pg.stop()
 
 
 def _api_client(base_url: str, api_key: str | None) -> httpx.Client:
@@ -305,5 +309,5 @@ def _run_api_command(args: argparse.Namespace) -> None:
     _print_api_response(resp)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover — `python -m` entry only
     main()

@@ -1571,7 +1571,9 @@ async def test_missing_storage_or_queue_is_503_not_a_phantom_job(
 
 
 @pytest.mark.asyncio
-async def test_cancel_job_without_a_queue_still_cancels_cooperatively(wired_cancel_deps, monkeypatch):
+async def test_cancel_job_without_a_queue_still_cancels_cooperatively(
+    wired_cancel_deps, monkeypatch
+):
     pg, _queue = wired_cancel_deps
     pg.fetchrow.return_value = {"status": "CANCELLED"}
     monkeypatch.setattr(deps, "_queue", None)

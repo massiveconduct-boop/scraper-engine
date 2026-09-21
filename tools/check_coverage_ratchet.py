@@ -50,6 +50,10 @@ GATED_PREFIXES = (
     # Round 64 — the crawl middlewares/pipeline run on every POST /v1/crawl
     # and ran untested (round-62 audit T1); gated once they got real tests.
     "scrapy_project/",
+    # Round 64 — caller-facing CLI and the metrics/logging/tracing layer
+    # (round-62 audit T3: 33% and 44% covered, and outside the gate).
+    "cli/",
+    "observability/",
 )
 
 # Ratchet. Lower this whenever the real count drops; never raise it.

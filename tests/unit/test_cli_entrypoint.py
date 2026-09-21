@@ -210,3 +210,215 @@ def test_run_api_command_closes_client_even_on_error_response(monkeypatch):
         _run_api_command(_args("quota"))
 
     assert fake.closed
+
+
+# --- Round 64: main() dispatch and the ops subcommands (round-62 audit T3) ---
+
+import sys  # noqa: E402
+import types  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+import scraper_engine.cli.entrypoint as cli  # noqa: E402
+
+
+@pytest.fixture
+def no_bootstrap(monkeypatch):
+    monkeypatch.setattr(
+        "scraper_engine.observability.bootstrap.bootstrap_observability", lambda _cfg: None
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "target", "expected_args"),
+    [
+        (["create-tenant", "acme"], "_create_tenant", ("acme",)),
+        (["harvest"], "_harvest_once", ()),
+        (["reap"], "_reap_once", ()),
+        (["check"], "_check_health", ()),
+    ],
+)
+def test_main_dispatches_async_ops_commands(monkeypatch, no_bootstrap, argv, target, expected_args):
+    seen = {}
+
+    async def _fake(*args):
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, target, _fake)
+    cli.main(argv)
+    assert seen["args"] == expected_args
+
+
+def test_main_dispatches_worker(monkeypatch, no_bootstrap):
+    run_worker = MagicMock()
+    monkeypatch.setattr(cli, "_run_worker", run_worker)
+    cli.main(["worker", "--queues", "a,b"])
+    run_worker.assert_called_once_with("a,b")
+
+
+def test_main_dispatches_api(monkeypatch, no_bootstrap):
+    run_api = MagicMock()
+    monkeypatch.setattr(cli, "_run_api_command", run_api)
+    cli.main(["api", "quota", "--api-key", "k"])
+    assert run_api.call_args.args[0].api_command == "quota"
+
+
+def test_main_serve_runs_uvicorn(monkeypatch, no_bootstrap):
+    fake_uvicorn = types.SimpleNamespace(run=MagicMock())
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    cli.main(["serve", "--port", "9001"])
+    assert fake_uvicorn.run.call_args.kwargs["port"] == 9001
+    assert fake_uvicorn.run.call_args.args[0] == "scraper_engine.api.main:app"
+
+
+def test_main_without_a_command_exits_1(no_bootstrap, capsys):
+    with pytest.raises(SystemExit) as ei:
+        cli.main([])
+    assert ei.value.code == 1
+    assert "not yet implemented" in capsys.readouterr().out
+
+
+def test_run_worker_execs_rq(monkeypatch):
+    execvp = MagicMock()
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/rq")
+    monkeypatch.setattr("os.execvp", execvp)
+    cli._run_worker("q1,q2")
+    execvp.assert_called_once_with("/usr/bin/rq", ["/usr/bin/rq", "worker", "q1", "q2"])
+
+
+def test_run_worker_without_rq_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    with pytest.raises(SystemExit):
+        cli._run_worker("q")
+    assert "'rq' executable not found" in capsys.readouterr().out
+
+
+def _fake_pg(monkeypatch):
+    pg = MagicMock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(
+        "scraper_engine.storage.postgres_client.PostgresClient", MagicMock(return_value=pg)
+    )
+    return pg
+
+
+@pytest.mark.asyncio
+async def test_harvest_once_prints_count_and_closes_pg(monkeypatch, capsys):
+    pg = _fake_pg(monkeypatch)
+    harvester = MagicMock(harvest_once=AsyncMock(return_value=42))
+    monkeypatch.setattr(
+        "scraper_engine.proxy.harvester.ProxyHarvester", MagicMock(return_value=harvester)
+    )
+    monkeypatch.setattr("scraper_engine.proxy.asn_classifier.build_asn_classifier", lambda: None)
+    await cli._harvest_once()
+    assert "42 proxies collected" in capsys.readouterr().out
+    pg.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reap_once_prints_result_and_closes_pg(monkeypatch, capsys):
+    pg = _fake_pg(monkeypatch)
+    reaper = MagicMock(run_once=AsyncMock(return_value={"deleted": 3}))
+    monkeypatch.setattr(
+        "scraper_engine.proxy.retention_reaper.RetentionReaper", MagicMock(return_value=reaper)
+    )
+    await cli._reap_once()
+    assert "Reap complete" in capsys.readouterr().out
+    pg.stop.assert_awaited_once()
+
+
+def _health(healthy, checks):
+    return types.SimpleNamespace(
+        healthy=healthy,
+        pgbouncer_reachable=healthy,
+        redis_reachable=True,
+        s3_reachable=True,
+        proxy_pool_size=5,
+        checks=checks,
+    )
+
+
+def _fake_storage(monkeypatch):
+    clients = {}
+    for mod, cls in [
+        ("postgres_client", "PostgresClient"),
+        ("redis_client", "RedisClient"),
+        ("s3_client", "S3Client"),
+    ]:
+        client = MagicMock(start=AsyncMock(), stop=AsyncMock())
+        clients[cls] = client
+        monkeypatch.setattr(f"scraper_engine.storage.{mod}.{cls}", MagicMock(return_value=client))
+    return clients
+
+
+@pytest.mark.asyncio
+async def test_check_health_healthy_prints_ok(monkeypatch, capsys):
+    clients = _fake_storage(monkeypatch)
+    monkeypatch.setattr(
+        "scraper_engine.api.health.check_health", AsyncMock(return_value=_health(True, {}))
+    )
+    await cli._check_health()
+    out = capsys.readouterr().out
+    assert "status: ok" in out
+    assert "failures" not in out
+    for client in clients.values():
+        client.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_health_degraded_prints_failures_and_exits_1(monkeypatch, capsys):
+    _fake_storage(monkeypatch)
+    monkeypatch.setattr(
+        "scraper_engine.api.health.check_health",
+        AsyncMock(return_value=_health(False, {"pgbouncer": "refused"})),
+    )
+    with pytest.raises(SystemExit) as ei:
+        await cli._check_health()
+    assert ei.value.code == 1
+    assert "failures:" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_create_tenant_prints_key_and_closes_pg(monkeypatch, capsys):
+    pg = _fake_pg(monkeypatch)
+    resolver = MagicMock(create_tenant=AsyncMock(return_value=("t-1", "sk-new")))
+    monkeypatch.setattr("scraper_engine.api.auth.TenantResolver", MagicMock(return_value=resolver))
+    await cli._create_tenant("acme")
+    assert "API key: sk-new" in capsys.readouterr().out
+    pg.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_tenant_failure_still_closes_pg(monkeypatch):
+    """Round 64 — stop() used to run only after a successful create."""
+    pg = _fake_pg(monkeypatch)
+    resolver = MagicMock(create_tenant=AsyncMock(side_effect=RuntimeError("duplicate slug")))
+    monkeypatch.setattr("scraper_engine.api.auth.TenantResolver", MagicMock(return_value=resolver))
+    with pytest.raises(RuntimeError):
+        await cli._create_tenant("acme")
+    pg.stop.assert_awaited_once()
+
+
+def test_print_api_response_non_json_body_prints_text(capsys):
+    class _TextResponse(FakeResponse):
+        def json(self):
+            raise ValueError("not json")
+
+    _print_api_response(_TextResponse(200, "plain body"))
+    assert "plain body" in capsys.readouterr().out
+
+
+def test_run_api_command_unknown_subcommand_exits_1(monkeypatch, capsys):
+    client = FakeClient()
+    monkeypatch.setattr(cli, "_api_client", lambda *_a: client)
+    with pytest.raises(SystemExit):
+        _run_api_command(_args("bogus"))
+    assert "Unknown api subcommand" in capsys.readouterr().err
+    assert client.closed
+
+
+def test_api_client_sends_the_key_and_base_url():
+    client = _api_client("http://api.example:8010", "sk-live")
+    try:
+        assert client.headers["X-API-Key"] == "sk-live"
+        assert str(client.base_url) == "http://api.example:8010"
+    finally:
+        client.close()
