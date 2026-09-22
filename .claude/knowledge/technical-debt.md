@@ -69,7 +69,7 @@ account is topped up.
 - **Gotcha found on the way:** `Proxy.url()` has no credentials; an httpx
   probe through it gets `407 NO_USER` from the gateway regardless of account
   state. Use `auth_url()`.
-- Gate: 1404 tests, 0 missed lines, 0 missed branches, ruff + mypy clean.
+- Gate: 1416 tests, 0 missed lines, 0 missed branches, ruff + mypy clean.
 - **OPEN — after a top-up,** confirm the reaper re-drives these entries on
   its own (probe → True → `retried>0`). My own live-test entry was deleted
   so a top-up cannot re-drive it onto the paid gateway.
@@ -108,13 +108,40 @@ account is topped up.
   the gap is closes in flight).
   **Verdict on this workload:** the host was never under pressure (PSI 27
   without admission), so admission had nothing to protect and its 8-seat
-  ceiling (`max_units` default = 2 × CPUs) only cut parallelism: +60% to
-  +100% wall time. Single runs through a free pool, so run-to-run noise is
-  real (B2's render median rose 20.3s → 27.7s). It does NOT show whether
-  admission helps on heavy pages (Jumia: load 40, PSI 93) — that needs heavy
-  targets. Left OFF. If it is ever turned on: the 2 × CPU ceiling is a static
-  cap on top of a pressure controller, and on light pages it is the binding
-  limit.
+  ceiling only cut parallelism: +60% to +100% wall time. That led to the
+  controller rewrite below.
+
+- **Heavy free targets, and the controller rewrite** (user: "find a way to
+  make the limiter actually useful, and stop confining tests to Jumia").
+  Heavy set: the 97 longest articles across en/de/fr/es/it Wikipedia
+  (400-900 KB of wikitext each, 5 politeness domains), free pool, gateway
+  off, `min_level: 2`. Unlimited, they overload this 4-core host: load median
+  18 (max 76), PSI median 66.
+
+  | Run | Wall | OK | Load med | PSI med | Browsers med/max |
+  |---|---|---|---|---|---|
+  | Heavy, admission off | 2182s | 80/97 | 18.2 | 66 | 20 / 31 |
+  | Heavy, round-65 controller | 2628s | 79/97 | 23.4 | 69 | 6 / 20 |
+  | Heavy, round-66 controller | 1808s | 83/97 | 29.4 | 84 | 17 / 24 |
+  | Light, admission off | 528s | 97/97 | 5.0 | 15 | 14 / 21 |
+  | Light, round-66 controller | 982s | 97/97 | 5.1 | 19 | 9 / 16 |
+
+  Failures in every heavy run are Wikipedia refusing free-pool exits
+  (`detection_block` 12-14), not load. **Root cause of the round-65
+  controller's throttling:** it raised only below `cpu_pressure_low` and held
+  between the marks, so one cut left it frozen where real work sits — live,
+  2-4 browsers while the host idled at load 3 and 97 light URLs did not
+  finish in 9 minutes. Rewrite: see decisions.md → "A Limiter That Only
+  Limits When the Host Is Actually Strained".
+- **OPEN — the remaining light-page gap is the cold browser per render.**
+  Under admission both pools close on release (round 65 for Camoufox, round
+  66 for Botasaurus), because a parked browser holds no seat. Measured cost:
+  render median 32s → 60s on light pages through the free pool, which is the
+  whole 528s → 982s difference. Proposed fix: a parked browser holds its seat
+  and is evicted when someone waits — not started, user decision pending.
+- **Free-proxy noise is large:** the same unlimited light run took 227s,
+  528s and 666s across one afternoon. Differences under ~30% from single runs
+  are not evidence.
 
   2026-09-22). The plan ran out during round 65's repeated 97-URL Jumia
   benchmark runs. Any future A/B must be approved per run with a cost
@@ -173,15 +200,14 @@ Host, Claimed Together With the Politeness Slot".
   started in 2-15s (worker pool) and was served while a 97-URL run held the
   host. With the parking fix, live browsers tracked seats (2-5 vs target 5)
   and load fell to ~13. Rollback (flag off) → 9/9 through the old slot path.
-- **Baseline for the pending A/B (old code, warm hints, same 97 URLs):**
+- **Round-65 Jumia baseline (paid gateway, superseded as the A/B target by
+  round 66's free heavy set):**
   1760s, 87/97 ok, 8 POLITENESS_TIMEOUT, 40 URLs at L3, load avg median 40
   (max 81), CPU PSI median 93 (≤80 only 12% of samples), 17 live browsers
   median (max 25).
-- **OPEN — the A/B itself.** The DataImpulse account ran out of traffic
-  (`407 TRAFFIC_EXHAUSTED`) at ~03:35Z on 2026-09-22, during the corrected
-  run, so no new-code throughput number exists yet. Needs a top-up, then
-  `HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2` and the same run.
-  Deployed state was rolled back to off until then.
+- **CLOSED in round 66 — the A/B.** Run on free targets instead (Jumia was
+  only ever one use case, and paid traffic needs the user's permission per
+  run): see the round-66 entry. Admission stays OFF.
 - **CLOSED in round 66 — gateway traffic exhaustion was labelled
   BROWSER_CRASH.** Now `proxy_auth_failed`; see the round-66 entry.
 - **MEASURED in round 66 — close-on-release** (~2.4s serialized launch +

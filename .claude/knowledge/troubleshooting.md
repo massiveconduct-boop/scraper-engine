@@ -263,6 +263,15 @@ browsers outside a claim. The one found live was parked BrowserPool spares
 (fixed: `park_spares=False` under admission). A low `target_units` with high
 load is the controller reacting to that outside load, not the cause.
 
+Round 66 found the second cause of "limited but still slow": the controller
+itself. It raised one unit per 30s and only below `cpu_pressure_low`, so
+after any cut it froze between the marks — live, 2-4 browsers on a host
+idling at load 3, pages queued for minutes. Fixed (see decisions.md → "A
+Limiter That Only Limits When the Host Is Actually Strained"); the same
+symptom now means a real strain reading, so check what else runs on the
+host. `docker compose logs api | grep host_capacity_target` prints every
+change with the pressure, waiters and in-use numbers behind it.
+
 ## The API Is Not On Port 8000 (Round 62)
 
 **Symptom:** `curl http://localhost:8000/v1/health` returns

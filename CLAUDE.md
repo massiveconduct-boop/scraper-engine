@@ -1,17 +1,13 @@
 # Scraper Engine — CLAUDE.md
 
 Project identity, operating rules, and navigation. Currently at round 66.
-This paragraph is deliberately a one-liner, not a round-by-round diary —
-a round-28 knowledge-architecture audit removed 7 growing dated paragraphs
-from this exact spot once already (see "Evolution history" below); the
-pattern crept back in over rounds 37-57 and a round-57 knowledge audit
-removed it again (see `decisions.md` → "Knowledge-Audit: Round-57 CLAUDE.md
-Diary Regression"). If you're about to prepend a new round's narrative
-here, it belongs in `.claude/knowledge/technical-debt.md` and, if terse,
-the "Evolution history" bullet below — not here. Full round-by-round
-narrative, every open thread, every decision: `.claude/knowledge/
-technical-debt.md` (start there, not here — this file is navigation
-only). Source code is fully implemented — not blueprint phase.
+**Never a diary.** Audits at rounds 28, 57 and 66 each removed dated
+per-round narrative from this exact spot (`decisions.md` →
+"Knowledge-Audit: Round-57 CLAUDE.md Diary Regression"); a 1800-word gate
+(`tools/check_claude_md_size.sh`) now fails the build on regrowth. A new
+round's story goes in `.claude/knowledge/technical-debt.md` — start there,
+not here — and, if it fits in a clause, in "Evolution history" below.
+Source code is fully implemented, not blueprint phase.
 
 ## Project Identity
 
@@ -54,50 +50,35 @@ openwolf cron        # cron task management
 - **Browser:** Camoufox v0.5.4 (Firefox 152), semaphore-gated pool with `lease()` context manager
 - **Proxy:** 8-URL sources across 6 operators, TCP probe + HTTP validation, two-tier scoring
 - **Storage:** PostgreSQL 16 (PgBouncer transaction-pooling), Redis 7, S3/MinIO
-- **Testing:** pytest 9.1.1, unit+integration+chaos suite + 18 live + load suite (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate (round 62, widened round 64): the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES (no tolerance) plus an absolute missed-BRANCH budget that may only shrink, now at 0. `fail_under` is back at 100 as a backstop (it was 99 while branches were short of 100%); the ratchet is still the authoritative gate.** Gate covers 10 packages (core, proxy, orchestrator, fetcher, services, storage, api, scrapy_project, cli, observability); `browser/` is measured-but-ungated (needs a real Firefox) and `config/` is outside it — see `.claude/knowledge/technical-debt.md` round-62 coverage audit and round 64. Two former local-environment exclusions were closed in round 35, both root-caused as sandbox/venv corruption rather than real gaps (a wrong-arch native `.so` accepted by an upstream `check_library()` bug, and wrong-arch `playwright`/Camoufox binaries) — full mechanism in `.claude/knowledge/technical-debt.md`'s round-35 entry. The chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. A round-34 knowledge audit caught and same-day-closed a regression to 97.91%; see `.claude/knowledge/technical-debt.md` round-34 entry, "Coverage gap" note, for detail.
+- **Testing:** pytest 9.1.1, unit+integration+chaos suite + 18 live + load suite (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate: the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES plus an absolute missed-BRANCH budget that may only shrink, at 0 since round 64; `--cov-fail-under=100` is a backstop.** It covers 10 packages (core, proxy, orchestrator, fetcher, services, storage, api, scrapy_project, cli, observability); `browser/` is measured-but-ungated (needs a real Firefox) and `config/` is outside it. Chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. History of the gate's exclusions, regressions and audits (rounds 34, 35, 62, 64): `.claude/knowledge/technical-debt.md`.
 - **Linting:** ruff (clean), mypy `--strict` clean (baseline retired round 18)
 - **Evolution history (one clause per round; a round-28 audit moved the
-  full narrative out of this file once, a round-57 audit re-trimmed a
-  regrowth, and this list itself was re-trimmed again — see decisions.md
-  → "STATUS.md Stale Zero-Concurrency Claim" for the latest audit):**
-  execution pipeline + SSRF hardening (22), observability/tracing (24),
-  BrowserPool/CapSolver/Botasaurus wiring (25), Botasaurus capability
-  upgrade (26), src/ layout consolidation (27), coverage gate + dead-code
-  wiring (28), caller-experience gap closure + caching (29), proxy
-  self-healing + notification rewrite + DLQ auto-retry (34, rounds 30-33
-  not backfilled), proxy_exhausted root-cause fix via ASN classification
-  (35), `/v1/health` daemon-liveness checks (36), L2/L3 proxy-leasing
-  reliability fix (37), free-harvest-source growth + 2 scoring bugs fixed
-  (38), proxy-scoring correction + leasing hardening (39), toggleable
-  paid gateway proxy (40), Xvfb display-contention fix (41),
-  `proxy_exhausted` root-caused to a schema regression (42), 4 issues
-  from a live rerun (43), failure-category + circuit-breaker fixes (44),
-  404 reverted to escalate through a real browser (45), ChallengeDetector
-  + fingerprint pinning fixes (46), config toggles made env-overridable
-  (47-48), gateway-fallback gaps fixed + concurrent URL dispatch shipped
-  (49), fingerprint WebGL-crash fix (50), DLQ/orphaned-job/enqueue
-  reliability fixes (51-55), 4 unrouted capabilities surfaced as API/CLI
-  phases (56), Botasaurus silent-false-success fix (57), Botasaurus
-  autoscroll fix (58), `block_images` + RAM-aware concurrency cap (59),
-  Botasaurus extensions/lang/locale/timezone/mouse/network-capture (60),
-  CAPTCHA no-active-plan check wired into the real solve path + politeness
-  slot-retry fix (61), paid-gateway exit-IP rotation + measured ASN pin +
-  startup/compose self-healing + stuck-job reaper reachability fix +
-  branch-coverage ratchet (62), bulk-crawl throughput from a second
-  consumer report — per-domain level memory, politeness rewrite, a
-  live-job-reaping stuck-job reaper, a browser-pool permit deadlock, the
-  100-link cap, L2 driver-reuse determinism and per-phase job timing (63),
-  a remaining-issues sweep — L2 lost to proxy blocks (gateway retry at every
-  level) and hid why (`escalations`), a cross-engine browser-permit
-  protocol, Botasaurus display-lock scope, an L1 redirect loop reported as
-  success, crawl SSRF on redirects + proxied crawls, required-deps 503s,
-  level-hint lifetime, per-domain skip-the-pool / skip-Botasaurus hints,
-  and a 0-branch coverage gate widened to
-  `cli`/`observability`/`scrapy_project` (64), host-wide browser admission
-  (seat + politeness slot claimed together, pressure-sized, off by default)
-  plus per-slot politeness expiry and re-drive fixes (65), a proxy's 407
-  as its own `proxy_auth_failed` category — terminal on the paid gateway,
-  re-driven only after a probe through it succeeds (66).
+  full narrative out of this file, round-57 and round-66 audits re-trimmed
+  regrowths — see decisions.md → "Knowledge-Audit: Round-57 CLAUDE.md Diary
+  Regression". Rounds 22-62 are one line each here; the story is in
+  technical-debt.md):** pipeline + SSRF + observability + pools + src/
+  layout + coverage gate + caching (22-29), proxy self-healing, ASN
+  classification, daemon liveness and L2/L3 leasing (34-37), harvest growth
+  and scoring fixes (38-39), paid gateway + Xvfb contention (40-41),
+  failure-category, circuit-breaker and challenge-detection fixes (42-46),
+  env-overridable toggles + gateway-fallback gaps + concurrent dispatch
+  (47-49), fingerprint crash + DLQ/orphan-job reliability (50-55),
+  unrouted capabilities as API/CLI (56), Botasaurus false-success,
+  autoscroll, `block_images`, extensions/locale/mouse/network capture
+  (57-60), CAPTCHA no-plan check + politeness slot retry (61),
+  gateway exit-IP rotation + measured ASN pin + branch-coverage ratchet
+  (62), bulk-crawl throughput — per-domain level memory, politeness
+  rewrite, stuck-job reaper, browser-permit deadlock, per-phase timing
+  (63), a remaining-issues sweep — gateway retry at every level,
+  `escalations`, cross-engine browser permits, crawl SSRF on redirects,
+  per-domain skip hints, 0-branch gate over 10 packages (64), host-wide
+  browser admission — seat + politeness slot claimed together,
+  pressure-sized, off by default (65), a proxy's 407 as its own
+  `proxy_auth_failed` category (terminal on the gateway, re-driven only
+  after a probe succeeds), a host-admission controller that only limits a
+  strained host (measured on free heavy targets, not paid Jumia runs),
+  `display_lock_wait_ms`, and Botasaurus drivers closing on release under
+  admission (66).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:

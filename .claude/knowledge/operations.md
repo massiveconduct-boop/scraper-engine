@@ -308,6 +308,19 @@ HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2 \
 - Only raise `RQ_WORKERS_PER_CONTAINER` above 1 together with
   `HOST_CAPACITY_ENABLED=true`: without the host limit, more workers means
   more concurrent renders.
+- Round 66 — what the controller does now: raises to `in_use + waiters`
+  below `cpu_pressure_low`, +25% of itself between the marks, never past the
+  whole browsers free memory holds; cuts x0.7 only above `cpu_pressure_high`
+  (90) or under `mem_available_floor_mb`; ceiling = MemTotal /
+  `browser_memory_mb` (1200) unless `max_units` is set. Every change is
+  logged: `docker compose logs api | grep host_capacity_target`.
+- Round 66 — measured cost of turning it on: both browser pools close on
+  release (nothing runs outside a seat), so every render starts a cold
+  browser. On light pages through the free pool that doubled render time
+  (32s -> 60s median). It paid off on heavy pages (1808s/83 ok vs 2182s/80
+  ok unlimited) and did not on light ones (982s vs 528s) — leave it off for
+  light workloads until the parked-seat change lands (technical-debt.md,
+  round 66, OPEN).
 - Watch: `/v1/health` → `browser_capacity` (`in_use_units`, `target_units`,
   `waiters`); `/metrics` → `host_capacity_*`, `host_admission_*`,
   `host_cpu_pressure`. Target changes are logged by the api container's

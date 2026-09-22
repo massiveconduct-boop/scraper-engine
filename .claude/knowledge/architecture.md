@@ -667,14 +667,24 @@ sized its own semaphore as if it owned the machine.
 - **Sizing — `orchestrator/capacity_controller.py`.** A supervisord program in
   the api container; one leader per host (`hc:{host}:leader`). Every 5s:
   CPU PSI "some avg10" (host-wide inside containers; load/core fallback) and
-  MemAvailable → +1 unit when calm and someone waits (30s dwell), ×0.7 when
-  strained (15s dwell), clamped to `[min_units, max_units or 2×cores]`. The
-  target key has a TTL; missing → `default_units or cores`. Other programs'
+  MemAvailable, with someone waiting and a 10s dwell → below
+  `cpu_pressure_low` straight to `in_use + waiters`, between the marks
+  +`raise_step_fraction` (25%) of itself, either way never past the whole
+  browsers `MemAvailable - mem_available_floor_mb` holds
+  (`browser_memory_mb`, 1200). Over `cpu_pressure_high` (90) or under the
+  memory floor: ×0.7, 15s dwell. Clamped to `[min_units, max_units or
+  MemTotal / browser_memory_mb]`. Round 66 rewrote all of that — see
+  decisions.md → "A Limiter That Only Limits When the Host Is Actually
+  Strained". The target key has a TTL; missing → `default_units or cores`. Other programs'
   load shrinks our share — we yield, we cannot control them.
 - **Host id** (`core/host_identity.py`): `SCRAPER_HOST_ID`, else the kernel
   `boot_id` every container on a host shares.
 - **Around it.** BrowserPool prewarm is off under admission (and for
-  `max_level < 2`); parked Botasaurus drivers sit on `about:blank`;
+  `max_level < 2`); under admission BOTH pools close on release
+  (`park_spares=False`, and round 66's `park_drivers=False` for
+  `BotasaurusPool`) so no browser runs outside a seat — measured cost: a
+  cold browser per render, which on light pages through the free pool
+  doubled render time (32s → 60s median);
   `RQ_WORKERS_PER_CONTAINER` > 1 runs `rq worker-pool` so a small job starts
   without waiting for a big one — only with admission on. Timings gain
   `admission_wait_ms`; `level_N_ms` becomes render time only.

@@ -12,6 +12,53 @@ round it shipped in.
 
 ---
 
+## Decision: A Limiter That Only Limits When the Host Is Actually Strained
+
+**Date:** 2026-09-22 | **Round:** 66
+
+**What:** `orchestrator/capacity_controller.py` now raises the browser target
+to `in_use + waiters` in one step below `cpu_pressure_low`, keeps climbing by
+25% of itself between the marks, bounds every raise by the whole browsers free
+memory holds, derives its ceiling from total memory (`browser_memory_mb`,
+1200) instead of 2 x CPUs, cuts only above a `cpu_pressure_high` raised from
+80 to 90, and waits 10s (one PSI window) instead of 30 between raises.
+`BotasaurusPool` also closes drivers on release under admission, like
+`BrowserPool`.
+
+**Why:** measured, on free proxies. The round-65 controller made every
+workload slower and protected nothing that needed protecting. Light pages
+(toscrape, 97 URLs): 227s off vs 364s on. Heavy pages (Wikipedia long
+articles, 97 URLs, 5 language domains): the host ran 20 browsers at CPU PSI
+median 66 with zero load-caused failures unlimited, while the limiter held it
+to 2-4 browsers on a host idling at load 3 — because it only raised below 40,
+so after one cut it froze in the 40-80 band that real work sits in, and its
+2 x CPU ceiling (8 here) bound long before pressure did. After the rewrite,
+heavy pages: 1808s / 83 ok limited vs 2182s / 80 ok unlimited.
+
+**Tradeoffs:** CPU PSI "some avg10" is a brake, not a gauge; 90 is close
+enough to saturation that short spikes pass through, which is the intent —
+the harmful overload (Jumia, round 65) sat at a median of 93 for a whole run.
+Jumping to `in_use + waiters` can overshoot for one PSI window, and the cut
+that follows costs a cycle. The memory bound assumes 1200 MB per browser
+(measured peaks 916 MiB Camoufox / 1167 MiB Botasaurus on a trivial page);
+heavier pages need more, and the `mem_available_floor_mb` cut is what catches
+that. Free-proxy runs vary up to 2x hour to hour (227s / 528s / 666s for the
+same unlimited light run), so single-run differences under ~30% mean nothing.
+
+**Alternatives rejected:** raising `max_units` alone (the 40-80 freeze would
+still hold it down); cutting at 80 (it cut a host that was working fine);
+keeping the +1/30s ramp (a 4-minute job ends before the target arrives);
+throughput-gradient control, i.e. sizing by completed renders per minute
+(the honest fit for "find the fastest setting", but it needs a stable
+workload to sample and free-proxy noise is larger than the signal).
+
+**Still open:** under admission every render pays a cold browser, because a
+parked browser holds no seat. On light pages that doubled render time
+(32s → 60s median), which is the whole remaining gap. The fix is to let a
+parked browser hold its seat and be evicted when someone waits.
+
+---
+
 ## Decision: A Gateway Credential Refusal Ends the URL; a Probe Gates the Re-drive
 
 **Date:** 2026-09-22 | **Round:** 66

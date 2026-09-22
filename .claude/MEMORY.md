@@ -79,6 +79,7 @@ Both halves are listed here now; the division of labour is in
 | `tools/mypy-baseline.txt` | EMPTY since round 18 — mypy `--strict` clean; CI fails on any error | mypy strict gate |
 | `tools/check_coverage_ratchet.py` | THE coverage gate (round 62). Enforces zero missed LINES plus an absolute missed-BRANCH budget (`BRANCH_BUDGET`) that may only shrink; fails if the count rises OR falls without the constant being lowered. Budget is 0 since round 64 (10 gated packages), so `--cov-fail-under=100` is back as a backstop; the ratchet stays authoritative | Changing coverage config; a coverage CI failure; lowering the branch budget after covering branches |
 | `tools/check_claude_md_size.sh` | CLAUDE.md size gate (1800 words) — fails the build on diary regrowth | Editing CLAUDE.md |
+| `tools/openwolf/repair-hooks.mjs` + `tools/openwolf/hooks/` | Re-applies this repo's patches to OpenWolf's `.wolf/hooks/` scripts (untracked, overwritten by `openwolf update`/`init`): the stop hook writes its own `memory.md` summary instead of nagging every turn, and `countSemanticEntries` counts `\| HH:MM \|` rows. Runs as a SessionStart hook registered outside `.wolf/hooks/`, restores only a file matching the openwolf 2.0.1 hash, warns instead of downgrading a newer OpenWolf | A returning OpenWolf reminder; after `openwolf update`; porting the patch to a new OpenWolf |
 
 ## Technical Debt & Round History
 
