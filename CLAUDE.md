@@ -1,6 +1,6 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Currently at round 65.
+Project identity, operating rules, and navigation. Currently at round 66.
 This paragraph is deliberately a one-liner, not a round-by-round diary —
 a round-28 knowledge-architecture audit removed 7 growing dated paragraphs
 from this exact spot once already (see "Evolution history" below); the
@@ -95,7 +95,9 @@ openwolf cron        # cron task management
   and a 0-branch coverage gate widened to
   `cli`/`observability`/`scrapy_project` (64), host-wide browser admission
   (seat + politeness slot claimed together, pressure-sized, off by default)
-  plus per-slot politeness expiry and re-drive fixes (65).
+  plus per-slot politeness expiry and re-drive fixes (65), a proxy's 407
+  as its own `proxy_auth_failed` category — terminal on the paid gateway,
+  re-driven only after a probe through it succeeds (66).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:

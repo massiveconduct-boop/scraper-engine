@@ -231,24 +231,28 @@ convention only needed two call sites fixed.
 
 ---
 
-## Every Jumia URL Suddenly Fails as `browser_crash` (Round 65)
+## Every Jumia URL Suddenly Fails as `proxy_auth_failed` (Round 65, relabelled Round 66)
 
 **Symptom:** a run that was working starts failing every URL, all
-`failure_category: browser_crash`, error
-`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`; the DLQ reaper keeps
-re-driving them.
+`failure_category: proxy_auth_failed`, `proxy_source: paid_gateway`, error
+`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`, each after one ~5s
+attempt. Before round 66 the same thing was labelled `browser_crash`,
+retried, escalated through every level and re-driven by the DLQ reaper.
 
 **Cause:** the paid gateway (DataImpulse) refuses our credentials — seen
 live as `407 TRAFFIC_EXHAUSTED` when the plan ran out of traffic. Level
 memory sends Jumia straight to the gateway (`levelhint:poolblock:*`) and the
-free pool is refused there, so nothing gets through. It is labelled
-`browser_crash` because that is how Camoufox reports a proxy auth failure
-(open item: give it its own category).
+free pool is refused there, so nothing gets through. Since round 66 the
+refusal is terminal for the URL, and the DLQ reaper holds these entries
+until its gateway probe (`paid_gateway.gateway_accepts_credentials`, cached
+120s) gets a 200 — after a top-up they re-drive on their own.
 
 **Check:** one direct request through the gateway from inside a worker:
 `docker compose exec -T worker-l1 python -c "…build_gateway_proxy(…)…
-httpx.get('https://api.ipify.org', proxy=…)"` — a 407 with
-`TRAFFIC_EXHAUSTED` is the account, not the code. Fix: top up the plan.
+httpx.get('https://api.ipify.org', proxy=p.auth_url())"` — use `auth_url()`,
+not `url()`: without credentials every answer is `407 NO_USER`, which proves
+nothing. A 407 with `TRAFFIC_EXHAUSTED` is the account, not the code. Fix:
+top up the plan.
 
 ## Host Admission On but Load Still High (Round 65)
 

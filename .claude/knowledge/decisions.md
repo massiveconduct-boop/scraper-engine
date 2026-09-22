@@ -12,6 +12,40 @@ round it shipped in.
 
 ---
 
+## Decision: A Gateway Credential Refusal Ends the URL; a Probe Gates the Re-drive
+
+**Date:** 2026-09-22 | **Round:** 66
+
+**What:** A proxy's 407 gets its own `PROXY_AUTH_FAILED` category. When the
+proxy was the paid gateway, the URL is DLQ'd at the level it happened on, and
+the DLQ reaper re-drives it only after one request through the gateway
+succeeds. When it was a free proxy, it gets the existing fresh-lease retry and
+escalates normally. Neither case touches the circuit breaker.
+
+**Why:** With the DataImpulse plan out of traffic, every gateway render failed
+as `browser_crash`: retried on a new session, escalated to L3 on the same
+account, counted against Jumia's circuit, and auto-re-driven — all certain to
+fail again. The refusal is about our account, not the page, the level or the
+site.
+
+**Tradeoffs:** Under `free_first` a URL whose L2 pool attempt was blocked and
+whose gateway retry was refused no longer tries a free proxy at L3. Round 64
+showed that a pool block is usually the proxy's, not the level's, so L3 on the
+pool would most likely be blocked too; the reaper retries the whole URL once
+the gateway is back. The probe spends a few hundred bytes of plan traffic per
+120s while such entries exist. The DLQ row does not record the proxy source,
+so the reaper decides by configuration: gateway in play → probe; `free_only` →
+tier health.
+
+**Alternatives rejected:** keep `browser_crash` and lower its retries (the
+label stays wrong and the reaper still re-drives it); make the category
+permanent (a top-up would then need a manual re-drive of every URL); re-drive
+on a timer (spends renders repeatedly while the account stays empty); classify
+Botasaurus's error too (its Chromium signature was never captured, and
+Camoufox, which L2 falls back to, reports the refusal in ~1s anyway).
+
+---
+
 ## Decision: One Browser Budget per Host, Claimed Together With the Politeness Slot
 
 **Date:** 2026-09-22 | **Round:** 65

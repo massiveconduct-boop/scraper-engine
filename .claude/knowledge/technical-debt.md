@@ -32,6 +32,47 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 66)
+
+Origin: round 65's open item — with the DataImpulse plan out of traffic,
+every gateway render failed as `browser_crash`
+(`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`), which is
+proxy-retryable, escalates, counts against the domain's circuit and is
+auto-re-driven by the DLQ reaper. None of that can succeed until the
+account is topped up.
+
+- **New category `PROXY_AUTH_FAILED` (`proxy_auth_failed`).**
+  `fetcher/_failure.py::classify_fetch_exception` maps the two refusal
+  shapes captured live against the exhausted gateway: Camoufox's
+  `NS_ERROR_PROXY_AUTHENTICATION_FAILED` and httpx's `ProxyError` starting
+  with `407` (`407 TRAFFIC_EXHAUSTED`). Non-retryable in `RETRY_MATRIX`.
+- **Policy depends on the proxy source.** From the paid gateway it is the
+  account: `_fetch_with_proxy` returns at once (no new-session retry, no
+  rotation) and `process_job` DLQs the URL right there, no later level.
+  From a free proxy it is that proxy: `mark_failure` + one fresh-lease
+  retry, then normal escalation. Neither touches the circuit breaker.
+- **DLQ reaper re-drives only once the gateway accepts credentials again.**
+  `paid_gateway.gateway_accepts_credentials()` makes one request through
+  the gateway (fresh `sessid`) and is True only on a 200; the reaper caches
+  the answer for 120s so one probe covers every entry in a cycle. Under
+  `free_only` (or dataimpulse disabled) the entry can only be a free
+  proxy's refusal and uses the tier-health check, like BROWSER_CRASH.
+- **Botasaurus not classified.** Its 407 surfaces as
+  `BotasaurusNavigationError` after ~3.6s and L2 falls back to Camoufox,
+  whose error is what gets classified. The Chromium-side signature was not
+  captured, so nothing was guessed for it.
+- **Live (2026-09-22, plan exhausted, one Jumia catalog URL, bypass_cache):**
+  FAILED in 12s wall, `proxy_auth_failed`, `proxy_source: paid_gateway`,
+  one L2 attempt (`level_2_ms` 5234), no L3. DLQ row `auto_retry_count` 0
+  across 3 reaper cycles (`retried=0`); `_gateway_ok()` in the api
+  container → False. Direct probe: `ProxyError 407 TRAFFIC_EXHAUSTED`.
+- **Gotcha found on the way:** `Proxy.url()` has no credentials; an httpx
+  probe through it gets `407 NO_USER` from the gateway regardless of account
+  state. Use `auth_url()`.
+- Gate: 1404 tests, 0 missed lines, 0 missed branches, ruff + mypy clean.
+- **OPEN — after a top-up,** confirm the reaper re-drives these entries on
+  its own (probe → True → `retried>0`).
+
 ## Technical Debt / Open Threads (as of round 65)
 
 Origin: a live re-run of the consumer's Jumia scrape (97 URLs) on round-64
@@ -94,10 +135,8 @@ Host, Claimed Together With the Politeness Slot".
   run, so no new-code throughput number exists yet. Needs a top-up, then
   `HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2` and the same run.
   Deployed state was rolled back to off until then.
-- **OPEN — gateway traffic exhaustion is labelled BROWSER_CRASH.** Camoufox
-  reports it as `NS_ERROR_PROXY_AUTHENTICATION_FAILED`; it is treated as
-  proxy-retryable and auto-re-driven, burning renders on something no retry
-  fixes. Separate item — not bundled.
+- **CLOSED in round 66 — gateway traffic exhaustion was labelled
+  BROWSER_CRASH.** Now `proxy_auth_failed`; see the round-66 entry.
 - **OPEN — close-on-release pays a launch + teardown per render,** serialized
   per process under `XVFB_LOCK`; seats wait on it (seen: 8 seats vs 3 live
   browsers on short example.com renders). Measure on Jumia after the top-up.
