@@ -88,7 +88,34 @@ account is topped up.
   — opposite directions on a trivial page, so the 1.0/1.0 weights were left
   alone. Closes round 65's two "measure after the top-up" items; neither
   needed the gateway.
-- **No paid traffic without the user's explicit permission** (user,
+- **Host-admission speed test on free proxies (user-requested, 2026-09-22).**
+  Paid gateway switched OFF for the test (`DATAIMPULSE_ENABLED=false`,
+  verified in-worker; restored after). 97 URLs (books.toscrape.com catalog
+  + 27 category pages, quotes.toscrape.com `/page/` + `/js/page/`), 5 jobs,
+  `min_level: 2` so every URL renders, politeness 6 / 1.0s as the Jumia
+  baseline, level hints cleared before each run, test DLQ rows deleted after:
+
+  | Run | Wall | OK | Load med | CPU PSI med | Live browsers med / max |
+  |---|---|---|---|---|---|
+  | A: admission off, 1 rq worker/container | 227s | 97/97 | 8.9 | 27 | 12 / 18 |
+  | B: admission on, 2 rq workers/container | 364s | 97/97 | 5.6 | 25 | 20 / 20 |
+  | B2: as B + Botasaurus close-on-release | 455s | 97/97 | 6.2 | 29 | 10 / 14 |
+
+  **Bug found (fixed):** in B the host budget granted at most 8 seats while
+  20 browsers ran — `BotasaurusPool` parked drivers outside any seat, the
+  same leak round 65 fixed for `BrowserPool`. Now `park_drivers=False` under
+  admission; B2 shows live browsers tracking seats (10 median vs 6-8 seats;
+  the gap is closes in flight).
+  **Verdict on this workload:** the host was never under pressure (PSI 27
+  without admission), so admission had nothing to protect and its 8-seat
+  ceiling (`max_units` default = 2 × CPUs) only cut parallelism: +60% to
+  +100% wall time. Single runs through a free pool, so run-to-run noise is
+  real (B2's render median rose 20.3s → 27.7s). It does NOT show whether
+  admission helps on heavy pages (Jumia: load 40, PSI 93) — that needs heavy
+  targets. Left OFF. If it is ever turned on: the 2 × CPU ceiling is a static
+  cap on top of a pressure controller, and on light pages it is the binding
+  limit.
+
   2026-09-22). The plan ran out during round 65's repeated 97-URL Jumia
   benchmark runs. Any future A/B must be approved per run with a cost
   estimate, or designed on free targets.
