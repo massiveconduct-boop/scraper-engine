@@ -50,7 +50,16 @@ services:
   worker-l1:
     restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -80,7 +89,16 @@ services:
   worker-l2:
     restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -110,7 +128,16 @@ services:
   worker-l3:
     restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0

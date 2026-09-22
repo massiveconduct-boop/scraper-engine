@@ -184,7 +184,7 @@ politeness:
 # Round 65 — host-wide browser admission (orchestrator/host_capacity.py). Off until
 # live-verified; see config/schema.py::HostCapacityConfig for every knob.
 host_capacity:
-  enabled: false
+  enabled: ${HOST_CAPACITY_ENABLED:false}
   min_units: 1.0
   tenant_share: 0.6
   lease_ttl_seconds: 90
