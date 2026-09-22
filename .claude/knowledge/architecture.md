@@ -609,7 +609,67 @@ worst case is containers × `camoufox.max_total_instances`.
 `AppConfig` rejects `politeness.max_concurrent_urls_per_job` above
 `camoufox.max_total_instances`; the RAM-aware cap can still lower the real
 ceiling at startup, and `orchestrator/tasks.py` logs
-`browser_ceiling_below_url_concurrency` when it does.
+`browser_ceiling_below_url_concurrency` when it does. Round 65 adds the
+host-wide limit below; with it on, this per-process ceiling is only a
+safety net and the warning is silent.
+
+### Host-Wide Browser Admission (Round 65)
+
+One browser budget per **host**, shared by every worker process on it, in
+`orchestrator/host_capacity.py`. Off unless `HOST_CAPACITY_ENABLED=true`
+(`host_capacity.enabled`). Why: 3 worker containers × 5 concurrent URLs put
+15 renders on a 4-core host (load avg 58-69 measured), because each process
+sized its own semaphore as if it owned the machine.
+
+- **One claim per render, three things at once.** Before every browser
+  render — each pass of `Worker._fetch_with_proxy` (first render, pool
+  retry, gateway rotation) and process_job's gateway retry — the worker
+  claims, in one Lua script (`CLAIM_LUA`): a seat of `weight` units, the
+  website's politeness slot (same `politeness:turns:{tenant}:{domain}` key
+  as `politeness.py`, against this request's own cap), and the website's
+  delay (`politeness:last:…`). All or nothing, so nothing is held while
+  waiting for something else. The claim is taken before the proxy lease.
+  L1 keeps the old slot path; browser levels skip it when admission is on.
+- **The line.** Waiters sit in `hc:{host}:waiters` ordered by the URL's
+  first-enqueue time (kept across levels and retries). A caller wins only if
+  no older waiter could claim right now; waiters whose site is full or still
+  inside its delay are skipped; while another tenant waits, one tenant holds
+  at most `ceil(target × tenant_share)` units; the first render on an idle
+  host is always admitted. Self-claim only — the script never grants to
+  anyone but its caller, so a dead waiter is never handed a seat. Waiters
+  poll every 0.5-1.0s (no pub/sub).
+- **Leases.** Seats, slots and waiters carry their own Redis-`TIME` expiry,
+  purged by every script: a killed process's seats return within
+  `lease_ttl_seconds` (90). Holders renew every 20s; past
+  `max_hold_seconds` (900) renewal stops and `seat_overheld` is logged — work
+  is never cancelled from here. A claim inside a claim (same task) raises
+  `NestedClaimError`: it could deadlock a full host.
+- **Bounded waiting.** `min(per_url_admission_cap_seconds, rq deadline −
+  deadline_margin_seconds)`; `tasks.py::_job_deadline` reads the rq job. On
+  expiry the URL gets a `CAPACITY_TIMEOUT` row before rq's hard kill (which
+  writes nothing per URL). Redis failures → `DEPENDENCY_UNAVAILABLE`. Neither
+  touches the circuit breaker or level memory. The DLQ reaper re-drives
+  `CAPACITY_TIMEOUT` only when the host has spare capacity, with a
+  60s × 2^n backoff shared with the other contention categories.
+- **Sizing — `orchestrator/capacity_controller.py`.** A supervisord program in
+  the api container; one leader per host (`hc:{host}:leader`). Every 5s:
+  CPU PSI "some avg10" (host-wide inside containers; load/core fallback) and
+  MemAvailable → +1 unit when calm and someone waits (30s dwell), ×0.7 when
+  strained (15s dwell), clamped to `[min_units, max_units or 2×cores]`. The
+  target key has a TTL; missing → `default_units or cores`. Other programs'
+  load shrinks our share — we yield, we cannot control them.
+- **Host id** (`core/host_identity.py`): `SCRAPER_HOST_ID`, else the kernel
+  `boot_id` every container on a host shares.
+- **Around it.** BrowserPool prewarm is off under admission (and for
+  `max_level < 2`); parked Botasaurus drivers sit on `about:blank`;
+  `RQ_WORKERS_PER_CONTAINER` > 1 runs `rq worker-pool` so a small job starts
+  without waiting for a big one — only with admission on. Timings gain
+  `admission_wait_ms`; `level_N_ms` becomes render time only.
+  `/v1/health` → `browser_capacity`; `/metrics` → `host_capacity_*`,
+  `host_admission_*`, `host_cpu_pressure`.
+- **Not covered:** `/v1/crawl` (Scrapy, no browser); process-local waits
+  inside a held seat (`XVFB_LOCK`, CapSolver) are not reported separately.
+  Scripts build some keys from waiter data: not Redis Cluster/ACL-key safe.
 
 ## PgBouncer
 

@@ -294,6 +294,30 @@ were once excluded.
 | Prometheus | 1 instance | Federation for multi-DC |
 | Alertmanager | 1 instance | Cluster mode for HA |
 
+### Host-wide browser admission (round 65)
+
+Off by default. Turn on per deploy, all workers together (stop them first —
+old and new workers must not run side by side):
+
+```bash
+docker compose stop worker-l1 worker-l2 worker-l3
+HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2 \
+  docker compose up -d --force-recreate --no-deps api worker-l1 worker-l2 worker-l3
+```
+
+- Only raise `RQ_WORKERS_PER_CONTAINER` above 1 together with
+  `HOST_CAPACITY_ENABLED=true`: without the host limit, more workers means
+  more concurrent renders.
+- Watch: `/v1/health` → `browser_capacity` (`in_use_units`, `target_units`,
+  `waiters`); `/metrics` → `host_capacity_*`, `host_admission_*`,
+  `host_cpu_pressure`. Target changes are logged by the api container's
+  `capacity-controller` program (`host_capacity_target up/down`).
+- Rollback: redeploy the same services without the two variables; old and
+  new Redis keys expire on their own.
+- Failure signatures: `capacity_timeout` (no seat within the URL's wait
+  budget — host saturated), `dependency_unavailable` (Redis failed or timed
+  out). Both are transient and re-driven by the DLQ reaper.
+
 ---
 
 ## Config-Driven Timeouts

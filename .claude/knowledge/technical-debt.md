@@ -32,6 +32,79 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 65)
+
+Origin: a live re-run of the consumer's Jumia scrape (97 URLs) on round-64
+code finished 96/97 in 1290s but showed the host oversubscribed — 3 worker
+containers × 5 concurrent URLs = 15 renders on 4 cores, load avg 58-69 —
+because every rq work-horse sized `core.budget.BROWSER_SEMAPHORE` as if it
+owned the machine. User asked for a host-wide limit resolving 8 named
+limitations; the plan went through an adversarial review (34 confirmed
+findings) before implementation. Design: `architecture.md` → "Host-Wide
+Browser Admission (Round 65)"; why: `decisions.md` → "One Browser Budget per
+Host, Claimed Together With the Politeness Slot".
+
+- **SHIPPED (off by default) — host-wide browser admission.**
+  `orchestrator/host_capacity.py` (claim seat + politeness slot + delay in
+  one Lua call per render; leases with their own expiry; fair line;
+  tenant share cap; nested-claim guard), `orchestrator/capacity_controller.py`
+  (PSI/MemAvailable AIMD, leader per host, supervisord program in the api
+  container), `core/host_identity.py` (boot_id). `HOST_CAPACITY_ENABLED` /
+  `RQ_WORKERS_PER_CONTAINER` in compose. New transient categories
+  `CAPACITY_TIMEOUT` / `DEPENDENCY_UNAVAILABLE` (circuit- and
+  level-memory-exempt); waits bounded by the rq deadline
+  (`tasks.py::_job_deadline`); timings gain `admission_wait_ms`.
+- **FIXED — crashed politeness slots never expired on a busy domain.** Slots
+  were one SET with a key-wide TTL re-armed by every acquire/refresh. Now a
+  ZSET with per-member Redis-TIME expiry, on a new key name
+  (`politeness:turns:…`) so a mixed deploy cannot hit WRONGTYPE.
+- **FIXED — the DLQ reaper never retried POLITENESS_TIMEOUT** (listed as
+  transient in worker.py, missing from the reaper's own list). Contention
+  categories now back off 60s × 2^n; CAPACITY_TIMEOUT waits for spare host
+  capacity.
+- **FIXED — a DLQ re-drive re-rendered every finished URL of a
+  bypass_cache job.** The worker now skips URLs this job already scraped
+  successfully. Live: 4 re-driven jobs fetched 9 URLs, not ~80.
+- **FIXED — no Redis socket timeouts** (a hung Redis blocked every call
+  forever); 5s read/connect.
+- **FIXED — a Redis outage anywhere on the fetch path became PARSE_ERROR and
+  blamed the domain's circuit.** Now DEPENDENCY_UNAVAILABLE, breaker untouched.
+- **FIXED (found live) — parked Camoufox spares ran outside the host budget.**
+  With admission on, one work-horse held 5 parked instances for 10+ minutes,
+  each still running its last page, none reused (a rotated gateway session
+  makes every render's proxy new). Load stayed high, the controller cut the
+  target to ~2.4, and the run managed 64/97 in ~2100s before it was stopped.
+  `BrowserPool(park_spares=False)` under admission closes on release.
+  Also: prewarm off under admission, parked Botasaurus drivers park on
+  `about:blank`, `timeout_seconds` clamped at 300.
+- **Live-verified:** all three worker containers SIGKILLed while holding
+  seats → every seat lapsed within 93s (lease 90s). Redis paused 20s
+  mid-run → 11 claims failed as DEPENDENCY_UNAVAILABLE, 15 URLs succeeded
+  after, circuit never opened, workers stayed up (4 other URLs hit the
+  PARSE_ERROR mislabel, then fixed). Fairness: a second tenant's 1-URL job
+  started in 2-15s (worker pool) and was served while a 97-URL run held the
+  host. With the parking fix, live browsers tracked seats (2-5 vs target 5)
+  and load fell to ~13. Rollback (flag off) → 9/9 through the old slot path.
+- **Baseline for the pending A/B (old code, warm hints, same 97 URLs):**
+  1760s, 87/97 ok, 8 POLITENESS_TIMEOUT, 40 URLs at L3, load avg median 40
+  (max 81), CPU PSI median 93 (≤80 only 12% of samples), 17 live browsers
+  median (max 25).
+- **OPEN — the A/B itself.** The DataImpulse account ran out of traffic
+  (`407 TRAFFIC_EXHAUSTED`) at ~03:35Z on 2026-09-22, during the corrected
+  run, so no new-code throughput number exists yet. Needs a top-up, then
+  `HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2` and the same run.
+  Deployed state was rolled back to off until then.
+- **OPEN — gateway traffic exhaustion is labelled BROWSER_CRASH.** Camoufox
+  reports it as `NS_ERROR_PROXY_AUTHENTICATION_FAILED`; it is treated as
+  proxy-retryable and auto-re-driven, burning renders on something no retry
+  fixes. Separate item — not bundled.
+- **OPEN — close-on-release pays a launch + teardown per render,** serialized
+  per process under `XVFB_LOCK`; seats wait on it (seen: 8 seats vs 3 live
+  browsers on short example.com renders). Measure on Jumia after the top-up.
+- **OPEN — engine weights are 1.0/1.0 (unmeasured); `local_wait_ms` (time
+  inside a held seat spent on XVFB_LOCK / CapSolver) was planned and not
+  built.**
+
 ## Technical Debt / Open Threads (as of round 64)
 
 Origin: the user asked for every remaining known issue to be fixed after

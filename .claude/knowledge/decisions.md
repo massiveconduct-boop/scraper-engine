@@ -12,6 +12,47 @@ round it shipped in.
 
 ---
 
+## Decision: One Browser Budget per Host, Claimed Together With the Politeness Slot
+
+**Date:** 2026-09-22 | **Round:** 65
+
+**What:** `orchestrator/host_capacity.py` keeps one browser budget per host in
+Redis, and a worker claims a seat, the website's politeness slot and the
+website's delay in one atomic Lua call before every browser render.
+`orchestrator/capacity_controller.py` sizes the budget from host CPU PSI and
+MemAvailable. Off by default (`HOST_CAPACITY_ENABLED`).
+
+**Why:** A 97-URL live run put 15 renders on a 4-core host (load avg 58-69):
+every rq work-horse sized `core.budget.BROWSER_SEMAPHORE` as if it owned the
+machine. The run's one failure traced to the same root: a URL took its
+politeness slot, then waited without a time limit for a browser, and a
+same-site sibling ran out its 300s slot wait. A shared counter alone would
+only have moved that wait — hence seat and slot granted together.
+
+**Tradeoffs:** The admission layer depends on Redis, like every other call on
+the fetch path already does; a Redis failure fails the URL as transient
+`DEPENDENCY_UNAVAILABLE` instead of being papered over. Crash recovery is
+bounded by the 90s lease TTL, not instant. Pressure is a brake between two
+marks, not a gauge (CPU PSI saturates once runnable work exceeds the cores),
+so the controller converges by steps and dwell times rather than jumping to
+an ideal. Engine weights stay 1.0 until measured.
+
+**Alternatives (all from the plan's adversarial review, which found 34
+confirmed problems in the first draft):** running the controller inside the
+rq work-horses (rejected — they exit after every job, so its state and
+leadership would reset each job); a degraded local-semaphore mode for when
+Redis is down (rejected — every sibling Redis call on the same path already
+fails the URL, so it would protect one call out of many and add the largest
+chunk of untestable surface); a throughput hill-climb (rejected — at 5-10
+completions per minute with 20-400s per URL, one step's effect is smaller
+than the noise); start-time fair queueing (rejected — the per-job URL cap
+already bounds a job's seats; what actually starved small jobs was rq's one
+job per worker, fixed with `RQ_WORKERS_PER_CONTAINER`); owner-heartbeat keys
+for faster crash reclaim (rejected — they cannot beat their own TTL either);
+cancelling over-long holders (rejected — cancelling inside `XVFB_LOCK` or
+teardown is where rounds 41 and 63 leaked displays and permits; renewal
+stops instead).
+
 ## Decision: Level Memory Skips Levels but Never Blocks Escalation
 
 **Date:** 2026-09-20 | **Round:** 63
