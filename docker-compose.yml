@@ -13,6 +13,10 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
       # extraction-engine integration -- reached over the shared external network
@@ -63,6 +67,10 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
       # extraction-engine integration -- reached over the shared external network
@@ -102,6 +110,10 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
       # extraction-engine integration -- reached over the shared external network
@@ -141,6 +153,10 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
       # extraction-engine integration -- reached over the shared external network
