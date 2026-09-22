@@ -16,6 +16,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import uuid
@@ -24,7 +25,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
-from scraper_engine.config.schema import AppConfig
+from scraper_engine.config.schema import AppConfig, HostCapacityConfig
 from scraper_engine.core.models import (
     CrawlRequest,
     DeadLetterEntryResponse,
@@ -873,6 +874,14 @@ async def cancel_job(
     return {"job_id": job_id, "status": JobStatus.CANCELLED.value}
 
 
+@functools.cache
+def _host_capacity_config() -> HostCapacityConfig:
+    """Loaded once: /v1/health is polled every 10s by the compose healthcheck."""
+    from scraper_engine.config.loader import load_config
+
+    return load_config().host_capacity
+
+
 @router.get("/health")
 async def health() -> dict[str, object]:
     """Composite health check — pg/redis/s3 reachability + daemon liveness + proxy pool size."""
@@ -882,7 +891,9 @@ async def health() -> dict[str, object]:
     if _storage_pg is None or _storage_redis is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    status = await check_health(_storage_pg, _storage_redis, _storage_s3)
+    status = await check_health(
+        _storage_pg, _storage_redis, _storage_s3, _host_capacity_config()
+    )
     payload: dict[str, object] = {
         "status": "ok" if status.healthy else "degraded",
         "pgbouncer_reachable": status.pgbouncer_reachable,
@@ -892,6 +903,8 @@ async def health() -> dict[str, object]:
         "daemons": status.daemons,
         "checks": status.checks,
     }
+    if status.browser_capacity is not None:
+        payload["browser_capacity"] = status.browser_capacity
     if not status.healthy:
         raise HTTPException(status_code=503, detail=payload)
     return payload
@@ -907,15 +920,18 @@ def register_routes(app: FastAPI, cfg: AppConfig) -> None:
             from prometheus_client import REGISTRY
 
             from scraper_engine.api import dependencies
+            from scraper_engine.core.host_identity import resolve_host_id
             from scraper_engine.core.tenant import TenantId
             from scraper_engine.observability.metrics import (
                 count_validated_proxies,
                 proxy_pool_validated_count,
                 refresh_capsolver_spend,
                 refresh_dlq_size,
+                refresh_host_capacity,
                 refresh_proxy_source_health,
                 refresh_redis_backed_counters,
             )
+            from scraper_engine.orchestrator.host_capacity import HostAdmission
 
             pg = dependencies._storage_pg
             redis = dependencies._storage_redis
@@ -944,6 +960,14 @@ def register_routes(app: FastAPI, cfg: AppConfig) -> None:
                     await refresh_proxy_source_health(redis)
                 except Exception:
                     logger.warning("proxy_source_healthy gauge update failed", exc_info=True)
+                host_cfg = _host_capacity_config()
+                if host_cfg.enabled:
+                    try:
+                        await refresh_host_capacity(
+                            redis, HostAdmission(redis.raw, resolve_host_id(), host_cfg)
+                        )
+                    except Exception:
+                        logger.warning("host capacity gauge update failed", exc_info=True)
 
             return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 

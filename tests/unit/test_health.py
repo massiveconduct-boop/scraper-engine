@@ -95,6 +95,7 @@ async def test_check_daemon_liveness_all_heartbeats_present():
         "proxy-harvester": "healthy",
         "dlq-reaper": "healthy",
         "webhook-sweeper": "healthy",
+        "capacity-controller": "healthy",
     }
 
 
@@ -142,6 +143,7 @@ async def test_check_health_all_daemons_healthy_does_not_affect_overall_status()
         "proxy-harvester": "healthy",
         "dlq-reaper": "healthy",
         "webhook-sweeper": "healthy",
+        "capacity-controller": "healthy",
     }
     assert "daemons" not in status.checks
 
@@ -168,3 +170,39 @@ async def test_check_health_stale_daemon_is_informational_only():
     assert status.healthy is True
     assert status.daemons["proxy-harvester"].startswith("stale")
     assert "daemons" in status.checks
+
+
+@pytest.mark.asyncio
+async def test_browser_capacity_block_only_when_host_admission_is_enabled(monkeypatch):
+    """Round 65 — informational, like `daemons`: present only when enabled,
+    and a failed read reports "unknown" without touching `healthy`."""
+    from scraper_engine.config.schema import HostCapacityConfig
+    from scraper_engine.orchestrator.host_capacity import CapacitySnapshot, HostAdmission
+
+    pg = AsyncMock()
+    redis = AsyncMock()
+    redis.get.return_value = "5"
+    redis.raw.get.return_value = "1"
+
+    status = await check_health(pg, redis, AsyncMock(), HostCapacityConfig(enabled=False))
+    assert status.browser_capacity is None
+
+    monkeypatch.setattr(
+        HostAdmission,
+        "snapshot",
+        AsyncMock(return_value=CapacitySnapshot(in_use=2.0, waiters=3, target=4.0)),
+    )
+    status = await check_health(pg, redis, AsyncMock(), HostCapacityConfig(enabled=True))
+    assert status.browser_capacity == {
+        "status": "ok",
+        "in_use_units": 2.0,
+        "target_units": 4.0,
+        "waiters": 3,
+    }
+
+    monkeypatch.setattr(
+        HostAdmission, "snapshot", AsyncMock(side_effect=ConnectionError("redis down"))
+    )
+    status = await check_health(pg, redis, AsyncMock(), HostCapacityConfig(enabled=True))
+    assert status.browser_capacity["status"].startswith("unknown:")
+    assert status.healthy is True

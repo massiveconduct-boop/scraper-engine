@@ -28,6 +28,7 @@ from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.orchestrator.host_capacity import HostAdmission
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
 
@@ -157,6 +158,59 @@ webhook_delivery_failures_total = Gauge(
     registry=REGISTRY,
 )
 
+# Round 65 — host-wide browser admission (orchestrator/host_capacity.py and
+# orchestrator/capacity_controller.py). Written to Redis by the claim scripts
+# and the controller, read here at scrape time: worker processes exit after
+# every job, so in-process metrics there would never be scraped.
+host_capacity_target_units = Gauge(
+    "host_capacity_target_units",
+    "Browser units this host may run at once (capacity controller target)",
+    registry=REGISTRY,
+)
+host_capacity_in_use_units = Gauge(
+    "host_capacity_in_use_units",
+    "Browser units held by live renders on this host",
+    registry=REGISTRY,
+)
+host_capacity_waiters = Gauge(
+    "host_capacity_waiters",
+    "Renders waiting for a browser seat on this host",
+    registry=REGISTRY,
+)
+host_cpu_pressure = Gauge(
+    "host_cpu_pressure",
+    "Host CPU pressure the capacity controller last acted on (PSI some avg10, "
+    "or its load-average stand-in)",
+    registry=REGISTRY,
+)
+host_admission_granted_total = Gauge(
+    "host_admission_granted_total",
+    "Cumulative browser claims granted on this host (Redis-backed counter)",
+    registry=REGISTRY,
+)
+host_admission_timeouts_total = Gauge(
+    "host_admission_timeouts_total",
+    "Cumulative browser claims that ran out of wait budget (Redis-backed counter)",
+    registry=REGISTRY,
+)
+host_capacity_adjustments_total = Gauge(
+    "host_capacity_adjustments_total",
+    "Cumulative capacity-controller target changes (Redis-backed counter)",
+    ["direction"],
+    registry=REGISTRY,
+)
+host_admission_wait_bucket = Gauge(
+    "host_admission_wait_seconds_bucket",
+    "Granted claims by admission wait, cumulative per upper bound (seconds)",
+    ["le"],
+    registry=REGISTRY,
+)
+host_admission_wait_sum = Gauge(
+    "host_admission_wait_seconds_sum",
+    "Total admission wait of granted claims, seconds",
+    registry=REGISTRY,
+)
+
 job_duration_seconds_count = Gauge(
     "job_duration_seconds_count",
     "Cumulative count of completed scrape jobs per status (Redis-backed counter)",
@@ -265,3 +319,33 @@ async def refresh_redis_backed_counters(redis: RedisClient) -> None:
     webhook_outbox_pending.set(float(pending_raw) if pending_raw else 0.0)
     failures_raw = await redis.raw.get("metrics:webhook_delivery_failures_total")
     webhook_delivery_failures_total.set(float(failures_raw) if failures_raw else 0.0)
+
+
+async def refresh_host_capacity(redis: RedisClient, admission: HostAdmission) -> None:
+    """Refresh the host-capacity gauges from this host's admission keys."""
+    from scraper_engine.orchestrator.host_capacity import WAIT_BUCKETS_MS
+
+    snap = await admission.snapshot()
+    host_capacity_target_units.set(snap.target)
+    host_capacity_in_use_units.set(snap.in_use)
+    host_capacity_waiters.set(snap.waiters)
+    stats = await redis.raw.hgetall(admission.stats_key)
+
+    def _num(name: str) -> float:
+        raw = stats.get(name)
+        return float(raw) if raw else 0.0
+
+    host_cpu_pressure.set(_num("cpu_pressure"))
+    host_admission_granted_total.set(_num("granted"))
+    host_admission_timeouts_total.set(_num("timeouts"))
+    for direction in ("up", "down"):
+        host_capacity_adjustments_total.labels(direction=direction).set(
+            _num(f"adjust_{direction}")
+        )
+    cumulative = 0.0
+    for edge in WAIT_BUCKETS_MS:
+        cumulative += _num(f"wait_le_{edge}")
+        host_admission_wait_bucket.labels(le=str(edge / 1000)).set(cumulative)
+    cumulative += _num("wait_le_inf")
+    host_admission_wait_bucket.labels(le="+Inf").set(cumulative)
+    host_admission_wait_sum.set(_num("wait_ms_sum") / 1000)

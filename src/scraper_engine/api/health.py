@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from scraper_engine.core.periodic import heartbeat_key
 
 if TYPE_CHECKING:
+    from scraper_engine.config.schema import HostCapacityConfig
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
     from scraper_engine.storage.s3_client import S3Client
@@ -24,6 +25,9 @@ _DAEMON_JOBS: dict[str, tuple[str, ...]] = {
     "proxy-harvester": ("harvest", "promotion", "health", "pool_health", "retention"),
     "dlq-reaper": ("dlq_reap",),
     "webhook-sweeper": ("webhook_sweep",),
+    # Round 65 — orchestrator/capacity_controller.py; ticks (and heartbeats)
+    # whether or not host_capacity is enabled.
+    "capacity-controller": ("capacity_control",),
 }
 
 
@@ -36,6 +40,9 @@ class HealthStatus:
     s3_reachable: bool = False
     daemons: dict[str, str] = field(default_factory=dict)
     checks: dict[str, str] = field(default_factory=dict)
+    # Round 65 — host-wide browser admission, when enabled. Informational
+    # only, like `daemons`: never affects `healthy`.
+    browser_capacity: dict[str, object] | None = None
 
 
 async def _check_daemon_liveness(redis: RedisClient) -> dict[str, str]:
@@ -66,10 +73,12 @@ class HealthChecker:
         pg: PostgresClient,
         redis: RedisClient,
         s3: S3Client | None = None,
+        host_capacity: HostCapacityConfig | None = None,
     ) -> None:
         self._pg = pg
         self._redis = redis
         self._s3 = s3
+        self._host_capacity = host_capacity
 
     async def check(self) -> HealthStatus:
         """Run all health checks and return composite status."""
@@ -130,14 +139,35 @@ class HealthChecker:
                 f"{k}: {v}" for k, v in unhealthy_daemons.items()
             )
 
+        if self._host_capacity is not None and self._host_capacity.enabled:
+            status.browser_capacity = await _browser_capacity(self._redis, self._host_capacity)
+
         status.healthy = healthy
         return status
+
+
+async def _browser_capacity(redis: RedisClient, cfg: HostCapacityConfig) -> dict[str, object]:
+    """This host's live browser budget: units in use, target, waiters."""
+    from scraper_engine.core.host_identity import resolve_host_id
+    from scraper_engine.orchestrator.host_capacity import HostAdmission
+
+    try:
+        snap = await HostAdmission(redis.raw, resolve_host_id(), cfg).snapshot()
+    except Exception as e:
+        return {"status": f"unknown: {e}"}
+    return {
+        "status": "ok",
+        "in_use_units": snap.in_use,
+        "target_units": snap.target,
+        "waiters": snap.waiters,
+    }
 
 
 async def check_health(
     pg: PostgresClient,
     redis: RedisClient,
     s3: S3Client | None = None,
+    host_capacity: HostCapacityConfig | None = None,
 ) -> HealthStatus:
     """Convenience function for FastAPI/CLI — runs the real composite health check."""
-    return await HealthChecker(pg, redis, s3).check()
+    return await HealthChecker(pg, redis, s3, host_capacity).check()

@@ -825,6 +825,22 @@ async def test_health_route_healthy_returns_ok_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_route_includes_browser_capacity_when_present(monkeypatch):
+    """Round 65 — the block rides along only when host admission reported one."""
+    from scraper_engine.api.health import HealthStatus
+
+    monkeypatch.setattr(deps, "_storage_pg", AsyncMock())
+    monkeypatch.setattr(deps, "_storage_redis", AsyncMock())
+    block = {"status": "ok", "in_use_units": 1.0, "target_units": 4.0, "waiters": 0}
+    monkeypatch.setattr(
+        "scraper_engine.api.health.check_health",
+        AsyncMock(return_value=HealthStatus(healthy=True, browser_capacity=block)),
+    )
+    payload = await health()
+    assert payload["browser_capacity"] == block
+
+
+@pytest.mark.asyncio
 async def test_health_route_unhealthy_returns_503_with_degraded_payload(monkeypatch):
     from scraper_engine.api.health import HealthStatus
 
@@ -1596,3 +1612,34 @@ def test_metrics_endpoint_skips_redis_gauges_without_redis(monkeypatch):
     resp = TestClient(_metrics_app()).get("/metrics")
     assert resp.status_code == 200
     capsolver.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_metrics_endpoint_refreshes_host_capacity_when_enabled(monkeypatch, fails):
+    """Round 65 — host-capacity gauges refresh only with host admission on, and
+    a failed refresh never 500s the scrape."""
+    from scraper_engine.api import routes as routes_module
+    from scraper_engine.config.schema import HostCapacityConfig
+
+    monkeypatch.setattr(deps, "_storage_pg", None)
+    monkeypatch.setattr(deps, "_storage_redis", MagicMock())
+    for name in ("refresh_redis_backed_counters", "refresh_proxy_source_health"):
+        monkeypatch.setattr(
+            f"scraper_engine.observability.metrics.{name}", AsyncMock(return_value=None)
+        )
+    refresh = AsyncMock(side_effect=RuntimeError("redis down") if fails else None)
+    monkeypatch.setattr("scraper_engine.observability.metrics.refresh_host_capacity", refresh)
+    monkeypatch.setattr(
+        routes_module, "_host_capacity_config", lambda: HostCapacityConfig(enabled=True)
+    )
+    resp = TestClient(_metrics_app()).get("/metrics")
+    assert resp.status_code == 200
+    refresh.assert_awaited_once()
+
+
+def test_host_capacity_config_is_loaded_once():
+    from scraper_engine.api import routes as routes_module
+
+    routes_module._host_capacity_config.cache_clear()
+    first = routes_module._host_capacity_config()
+    assert routes_module._host_capacity_config() is first
