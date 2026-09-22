@@ -290,6 +290,18 @@ class Worker:
                 delay = max(overrides.politeness_delay_seconds, cfg.min_request_delay_seconds)
         return concurrency, delay
 
+    def _clamp_timeout(self, request: ScrapeRequest) -> ScrapeRequest:
+        """Cap the caller's per-render timeout at the operator's ceiling
+        (round 65) — server-side, like _resolve_politeness, because a render
+        holds a host browser seat for as long as it runs."""
+        overrides = request.config_overrides
+        cap = self._config.politeness.max_request_timeout_seconds
+        if overrides is None or overrides.timeout_seconds <= cap:
+            return request
+        return request.model_copy(
+            update={"config_overrides": overrides.model_copy(update={"timeout_seconds": cap})}
+        )
+
     @property
     def _l2_tries_botasaurus(self) -> bool:
         """Whether L2 is configured to attempt Botasaurus before Camoufox
@@ -336,6 +348,7 @@ class Worker:
         host capacity stop early enough before it that the URL still gets a
         CAPACITY_TIMEOUT row — rq's own kill writes nothing per URL."""
         errors: list[str] = []
+        request = self._clamp_timeout(request)
         bypass_cache = bool(request.config_overrides and request.config_overrides.bypass_cache)
         # Round 49 — was a strictly sequential `for url in request.urls:`
         # loop; every URL's full L1->L2->L3 escalation ran to completion
@@ -366,6 +379,8 @@ class Worker:
 
         async def _job_cancelled() -> bool:
             return await self._is_cancelled(tenant_id, job_id)
+
+        already_done = await self._succeeded_urls(tenant_id, job_id)
 
         async def _dispatch_one_url(index: int, url: HttpUrl) -> None:
             async with semaphore:
@@ -422,6 +437,8 @@ class Worker:
                 return
             if await self._is_cancelled(tenant_id, job_id):
                 cancelled_state["value"] = True
+                return
+            if url_str in already_done:
                 return
 
             if not bypass_cache:
@@ -1085,6 +1102,26 @@ class Worker:
             job_id,
         )
         return row is not None and row["status"] == JobStatus.CANCELLED.value
+
+    async def _succeeded_urls(self, tenant_id: TenantId, job_id: str) -> set[str]:
+        """URLs this same job already scraped successfully (round 65).
+
+        A job runs again under its own id when proxy/dlq_reaper.py re-drives
+        one of its DLQ'd URLs, and that re-run walks the whole URL list. The
+        reuse cache used to be what kept the finished URLs from being fetched
+        again — but a caller who asked for bypass_cache (the consumer this
+        round's work came from does, on every job) got every one of them
+        re-rendered, on a host the re-drive was meant to spare. Their results
+        are already persisted, so they are skipped outright.
+        """
+        if self._pg is None:
+            return set()
+        rows = await self._pg.fetch(
+            tenant_id,
+            "SELECT DISTINCT url FROM scrape_results WHERE job_id = $1::uuid AND success = true",
+            job_id,
+        )
+        return {row["url"] for row in rows}
 
     async def _check_cache(self, tenant_id: TenantId, url: str) -> FetchResult | None:
         """Reuse a recent successful scrape of this exact URL for this tenant

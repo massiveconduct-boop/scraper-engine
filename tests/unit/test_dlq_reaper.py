@@ -3,7 +3,7 @@
 (round 34)."""
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -23,6 +23,7 @@ def make_entry(
     url="http://example.com/dead",
     job_id="job-1",
     auto_retry_count=0,
+    dead_at=None,
 ):
     now = datetime.now(UTC)
     return DeadLetterEntry(
@@ -35,7 +36,7 @@ def make_entry(
         level_attempted=level_attempted,
         auto_retry_count=auto_retry_count,
         enqueued_at=now,
-        dead_at=now,
+        dead_at=dead_at or now,
     )
 
 
@@ -246,7 +247,9 @@ class TestIsEligible:
         redis = MagicMock()
         redis.raw.eval = AsyncMock(return_value=active)
         entry = make_entry(
-            category=FailureCategory.POLITENESS_TIMEOUT, url="http://busy.example/p"
+            category=FailureCategory.POLITENESS_TIMEOUT,
+            url="http://busy.example/p",
+            dead_at=datetime.now(UTC) - timedelta(hours=1),
         )
         assert (
             await dlq_reaper._is_eligible(entry, redis, AsyncMock(), ProxyTierConfig())
@@ -254,6 +257,64 @@ class TestIsEligible:
         )
         key = redis.raw.eval.await_args.args[2]
         assert key == "politeness:turns:test:busy.example"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "category",
+        [
+            FailureCategory.POLITENESS_TIMEOUT,
+            FailureCategory.CAPACITY_TIMEOUT,
+            FailureCategory.DEPENDENCY_UNAVAILABLE,
+        ],
+    )
+    async def test_contention_entries_wait_out_an_exponential_backoff(self, category):
+        """Round 65 — 60s * 2**auto_retry_count after the last failure."""
+        redis = MagicMock()
+        redis.raw.eval = AsyncMock(return_value=0)
+        fresh = make_entry(category=category, auto_retry_count=1,
+                           dead_at=datetime.now(UTC) - timedelta(seconds=100))
+        assert await dlq_reaper._is_eligible(fresh, redis, AsyncMock(), ProxyTierConfig()) is False
+        assert redis.raw.eval.await_count == 0
+
+    def test_backoff_doubles_per_attempt(self):
+        dead = datetime(2026, 1, 1, tzinfo=UTC)
+        entry = make_entry(auto_retry_count=2, dead_at=dead)
+        assert not dlq_reaper._backoff_elapsed(entry, dead + timedelta(seconds=239))
+        assert dlq_reaper._backoff_elapsed(entry, dead + timedelta(seconds=240))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("in_use", "waiters", "target", "eligible"),
+        [(1.0, 0, 4.0, True), (4.0, 0, 4.0, False), (1.0, 2, 4.0, False)],
+    )
+    async def test_capacity_timeout_needs_spare_host_capacity(
+        self, monkeypatch, in_use, waiters, target, eligible
+    ):
+        from scraper_engine.orchestrator.host_capacity import CapacitySnapshot, HostAdmission
+
+        monkeypatch.setattr(
+            HostAdmission,
+            "snapshot",
+            AsyncMock(return_value=CapacitySnapshot(in_use=in_use, waiters=waiters, target=target)),
+        )
+        entry = make_entry(category=FailureCategory.CAPACITY_TIMEOUT,
+                           dead_at=datetime.now(UTC) - timedelta(hours=1))
+        assert (
+            await dlq_reaper._is_eligible(entry, MagicMock(), AsyncMock(), ProxyTierConfig())
+            is eligible
+        )
+
+    @pytest.mark.asyncio
+    async def test_dependency_unavailable_is_eligible_once_backed_off(self):
+        entry = make_entry(category=FailureCategory.DEPENDENCY_UNAVAILABLE,
+                           dead_at=datetime.now(UTC) - timedelta(hours=1))
+        assert await dlq_reaper._is_eligible(
+            entry, MagicMock(), AsyncMock(), ProxyTierConfig()
+        ) is True
+
+    def test_host_capacity_config_is_loaded_once(self):
+        dlq_reaper._host_capacity_config.cache_clear()
+        assert dlq_reaper._host_capacity_config() is dlq_reaper._host_capacity_config()
 
     def test_politeness_timeout_is_a_reaped_category(self):
         assert FailureCategory.POLITENESS_TIMEOUT in dlq_reaper._TRANSIENT_CATEGORIES

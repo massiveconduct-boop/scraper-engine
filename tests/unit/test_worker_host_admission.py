@@ -268,3 +268,34 @@ class TestClaimWeight:
             TENANT, "http://example.com", level, skip_botasaurus=skip_botasaurus
         )
         assert worker._fetch_with_proxy.await_args.kwargs["weight"] == expected
+
+
+class TestRerunAndClamp:
+    @pytest.mark.asyncio
+    async def test_a_rerun_skips_urls_this_job_already_scraped(self):
+        """Round 65 — a DLQ re-drive re-runs the whole job; finished URLs must
+        not be rendered again, even with bypass_cache."""
+        worker = _worker(FakeAdmission())
+        worker._pg.fetch.return_value = [{"url": "http://example.com/p"}]
+        worker._fetch_url = AsyncMock()
+        request = _request(bypass_cache=True)
+        response = await worker.process_job(TENANT, "job", request)
+        worker._fetch_url.assert_not_awaited()
+        assert response.status == JobStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_no_postgres_means_nothing_to_skip(self):
+        worker = _worker(FakeAdmission())
+        worker._pg = None
+        assert await worker._succeeded_urls(TENANT, "job") == set()
+
+    @pytest.mark.parametrize(("asked", "used"), [(900, 300), (120, 120)])
+    def test_caller_timeout_is_clamped_to_the_operator_ceiling(self, asked, used):
+        worker = _worker(FakeAdmission())
+        clamped = worker._clamp_timeout(_request(timeout_seconds=asked))
+        assert clamped.config_overrides.timeout_seconds == used
+
+    def test_a_request_without_overrides_is_left_alone(self):
+        worker = _worker(FakeAdmission())
+        request = ScrapeRequest(urls=["http://example.com/p"])
+        assert worker._clamp_timeout(request) is request

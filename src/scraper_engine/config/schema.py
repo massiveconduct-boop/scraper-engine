@@ -273,6 +273,10 @@ class PolitenessConfig(BaseModel):
     # fast as possible" stays something the operator chose.
     max_request_concurrency: int = 10
     min_request_delay_seconds: float = 0.5
+    # Round 65 — ceiling for ConfigOverrides.timeout_seconds (the per-render
+    # navigation timeout). A render holds a host browser seat for as long as
+    # it runs, so an unbounded caller timeout was an unbounded seat hold.
+    max_request_timeout_seconds: int = Field(default=300, ge=1)
     # Round 49 — orchestrator/worker.py::Worker.process_job's per-job URL
     # dispatch semaphore size. Was strictly sequential before this (root
     # cause of slow large-batch job runs, round 45). Deliberately below

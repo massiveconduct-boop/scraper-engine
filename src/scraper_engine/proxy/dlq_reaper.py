@@ -27,19 +27,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import signal
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 from rq import Queue
 
 from scraper_engine.config.loader import load_config
-from scraper_engine.config.schema import AppConfig, DlqReaperConfig, ProxyTierConfig
+from scraper_engine.config.schema import (
+    AppConfig,
+    DlqReaperConfig,
+    HostCapacityConfig,
+    ProxyTierConfig,
+)
+from scraper_engine.core.host_identity import resolve_host_id
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.periodic import run_periodic
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.observability.bootstrap import bootstrap_observability
 from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker, CircuitState
+from scraper_engine.orchestrator.host_capacity import HostAdmission
 from scraper_engine.orchestrator.job_queue import build_queue
 from scraper_engine.orchestrator.politeness import PolitenessController
 from scraper_engine.proxy.pool_health import current_state as pool_current_state
@@ -84,7 +93,34 @@ _TRANSIENT_CATEGORIES = [
     # ever retried. It is contention for this tenant's slots on one domain,
     # so it is eligible once that domain has no live slot holder left.
     FailureCategory.POLITENESS_TIMEOUT,
+    # Round 65 — host admission (orchestrator/host_capacity.py): our own
+    # browser capacity ran out, or our own Redis failed. See _is_eligible.
+    FailureCategory.CAPACITY_TIMEOUT,
+    FailureCategory.DEPENDENCY_UNAVAILABLE,
 ]
+
+# Round 65 — contention categories wait base * 2**auto_retry_count after
+# their last failure before a retry: re-driving the moment a slot or seat
+# frees would re-enter the same contention at once, and a re-drive re-runs a
+# whole job on a worker.
+_CONTENTION_CATEGORIES = frozenset(
+    {
+        FailureCategory.POLITENESS_TIMEOUT,
+        FailureCategory.CAPACITY_TIMEOUT,
+        FailureCategory.DEPENDENCY_UNAVAILABLE,
+    }
+)
+_CONTENTION_BACKOFF_BASE_SECONDS = 60.0
+
+
+@functools.cache
+def _host_capacity_config() -> HostCapacityConfig:
+    return load_config().host_capacity
+
+
+def _backoff_elapsed(entry: DeadLetterEntry, now: datetime | None = None) -> bool:
+    wait = _CONTENTION_BACKOFF_BASE_SECONDS * (2**entry.auto_retry_count)
+    return (now or datetime.now(UTC)) >= entry.dead_at + timedelta(seconds=wait)
 
 
 def _domain(url: str) -> str:
@@ -154,6 +190,19 @@ async def _is_eligible(
     if entry.failure_category == FailureCategory.CIRCUIT_OPEN:
         circuit_state = await circuit_breaker.state(_domain(entry.url))
         return circuit_state == CircuitState.CLOSED
+    if entry.failure_category in _CONTENTION_CATEGORIES and not _backoff_elapsed(entry):
+        return False
+    if entry.failure_category == FailureCategory.CAPACITY_TIMEOUT:
+        # Only once this host has spare browser capacity: nobody waiting and
+        # units free. Re-driving into a saturated host is exactly the
+        # overload the URL timed out on.
+        snap = await HostAdmission(
+            redis.raw, resolve_host_id(), _host_capacity_config()
+        ).snapshot()
+        return snap.waiters == 0 and snap.in_use < snap.target
+    if entry.failure_category == FailureCategory.DEPENDENCY_UNAVAILABLE:
+        # The reaper reaching this point means Redis answers again.
+        return True
     if entry.failure_category == FailureCategory.POLITENESS_TIMEOUT:
         politeness = PolitenessController(redis.raw)
         active = await politeness.active_slots(_domain(entry.url), TenantId(entry.tenant_id))
