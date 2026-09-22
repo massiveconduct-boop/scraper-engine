@@ -363,7 +363,12 @@ async def _run_scrape(
     # same-domain URLs in a crawl job instead of relaunching per URL. See
     # browser/botasaurus_pool.py for why this doesn't use botasaurus's own
     # reuse_driver=True.
-    botasaurus_pool = BotasaurusPool(tenant_id=tenant_id, config=cfg.botasaurus)
+    # Round 66 — and, like it, closes on release under host admission.
+    botasaurus_pool = BotasaurusPool(
+        tenant_id=tenant_id,
+        config=cfg.botasaurus,
+        park_drivers=not cfg.host_capacity.enabled,
+    )
 
     admission: HostAdmission | None = None
     if cfg.host_capacity.enabled:

@@ -80,9 +80,17 @@ class BotasaurusPool:
         self,
         tenant_id: TenantId,
         config: BotasaurusConfig,
+        park_drivers: bool = True,
     ) -> None:
         self._tenant_id = tenant_id
         self._config = config
+        # Round 66 — False under host admission (orchestrator/host_capacity.py):
+        # a parked driver holds no host seat, so it is load the host budget
+        # cannot see. Live, free pool, 97 URLs with admission on: 8 seats in
+        # use, 20 live browsers. With a fresh proxy per attempt a parked
+        # driver's proxy almost never matches again, so it was not saving a
+        # relaunch either. Same fix round 65 made to BrowserPool (park_spares).
+        self._park_drivers = park_drivers
         self._max_drivers = max(1, config.max_pooled_drivers)
         self._entries: list[_PooledDriver] = []
         # Guards _entries and every entry's `busy` flag; notified whenever an
@@ -125,7 +133,9 @@ class BotasaurusPool:
                 html = await loop.run_in_executor(
                     None, self._navigate, entry.driver, url, scroll_passes, scroll_wait_ms
                 )
-                parked_idle = await loop.run_in_executor(None, self._park, entry.driver)
+                parked_idle = self._park_drivers and await loop.run_in_executor(
+                    None, self._park, entry.driver
+                )
             finally:
                 budget.BROWSER_SEMAPHORE.release()
         except BaseException:

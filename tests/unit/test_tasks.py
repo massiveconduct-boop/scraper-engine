@@ -822,6 +822,10 @@ class TestHostAdmissionWiring:
 
         assert pool_cls.call_args.kwargs["prewarm_count"] == 0
         assert pool_cls.call_args.kwargs["park_spares"] is False
+        # Round 66 — Botasaurus drivers too: a parked one holds no host seat.
+        from scraper_engine.browser import botasaurus_pool
+
+        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["park_drivers"] is False
         assert isinstance(worker_cls.call_args.kwargs["admission"], HostAdmission)
         assert worker.process_job.await_args.kwargs["deadline"] == 1234.5
 
@@ -843,6 +847,9 @@ class TestHostAdmissionWiring:
 
         assert pool_cls.call_args.kwargs["prewarm_count"] == prewarm
         assert pool_cls.call_args.kwargs["park_spares"] is True
+        from scraper_engine.browser import botasaurus_pool
+
+        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["park_drivers"] is True
         assert worker_cls.call_args.kwargs["admission"] is None
 
 

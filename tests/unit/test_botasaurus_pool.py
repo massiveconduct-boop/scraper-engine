@@ -634,6 +634,21 @@ class TestMultiDriverPool:
         assert len(pool._entries) == 1 and not pool._entries[0].busy
 
     @pytest.mark.asyncio
+    async def test_without_parking_every_driver_is_closed_after_its_fetch(self, _budget):
+        """Round 66 — under host admission a parked driver runs outside the
+        host budget (live: 8 seats, 20 browsers), so none is kept."""
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), park_drivers=False)
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            html = await pool.fetch(
+                "https://a.example/", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert html == "<html>fresh</html>"
+        driver.get.assert_not_called()  # not parked on about:blank first
+        driver.close.assert_called_once()
+        assert pool._entries == []
+
+    @pytest.mark.asyncio
     async def test_a_driver_that_cannot_park_is_closed_but_the_page_is_kept(self, _budget):
         budget = _budget
         pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig())
