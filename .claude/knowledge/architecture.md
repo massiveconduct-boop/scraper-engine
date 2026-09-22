@@ -563,6 +563,12 @@ every detail: `.claude/knowledge/technical-debt.md`'s round-42 entry.
 **Design:** Hot-browser pool with real reuse. `pool.start(N)` launches N Camoufox instances and stores live contexts in an asyncio.Queue. `pool.lease(proxy, domain)` is the async context manager — returns a live context, guarantees release (structural cleanup per invariant §1.1.6).
 
 **Key methods:**
+- **Round 65:** with host admission on (`host_capacity.enabled`),
+  `orchestrator/tasks.py` builds the pool with `prewarm_count=0` and
+  `park_spares=False` — every healthy instance is closed on release instead
+  of parked, because a parked spare runs outside any host seat and, with a
+  rotated gateway session per attempt, is never reused. The parking rules
+  below apply only with admission off.
 - `start()` — launches prewarm_count browsers, stores (context, wrapper, idle_since)
 - `acquire(domain)` — classifies drained items as selected/keep/teardown per idle timeout + domain matching
 - `release(ctx, healthy)` — healthy returns to pool, unhealthy tears down

@@ -231,6 +231,34 @@ convention only needed two call sites fixed.
 
 ---
 
+## Every Jumia URL Suddenly Fails as `browser_crash` (Round 65)
+
+**Symptom:** a run that was working starts failing every URL, all
+`failure_category: browser_crash`, error
+`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`; the DLQ reaper keeps
+re-driving them.
+
+**Cause:** the paid gateway (DataImpulse) refuses our credentials — seen
+live as `407 TRAFFIC_EXHAUSTED` when the plan ran out of traffic. Level
+memory sends Jumia straight to the gateway (`levelhint:poolblock:*`) and the
+free pool is refused there, so nothing gets through. It is labelled
+`browser_crash` because that is how Camoufox reports a proxy auth failure
+(open item: give it its own category).
+
+**Check:** one direct request through the gateway from inside a worker:
+`docker compose exec -T worker-l1 python -c "…build_gateway_proxy(…)…
+httpx.get('https://api.ipify.org', proxy=…)"` — a 407 with
+`TRAFFIC_EXHAUSTED` is the account, not the code. Fix: top up the plan.
+
+## Host Admission On but Load Still High (Round 65)
+
+**Check live browsers against seats:** `/v1/health` → `browser_capacity.
+in_use_units` vs. `ps -eo args | grep camoufox-bin | grep -v contentproc`
+in each worker. Browsers far above seats means something launches or keeps
+browsers outside a claim. The one found live was parked BrowserPool spares
+(fixed: `park_spares=False` under admission). A low `target_units` with high
+load is the controller reacting to that outside load, not the cause.
+
 ## The API Is Not On Port 8000 (Round 62)
 
 **Symptom:** `curl http://localhost:8000/v1/health` returns

@@ -239,6 +239,12 @@ re-paying the attempts that already failed, so their timings show only
 `level_3_ms`. Pin the ladder explicitly with `config_overrides.min_level` /
 `max_level` if you want to override that.
 
+With host-wide browser admission enabled (operator setting, off by
+default), browser levels wait for a seat, the site's politeness slot and
+its delay together: that wait is `admission_wait_ms`, and `level_N_ms` is
+then render time only. `politeness_wait_ms` / `slot_wait_ms` appear only
+for levels that did not go through admission (always L1).
+
 **`escalations` — why each earlier attempt was not the answer.** One
 entry per level (or per same-level attempt) the engine rejected before the
 result you got, in order; `null` when the first attempt succeeded.
@@ -312,14 +318,24 @@ Raw dead-letter detail for one job — the same failed URLs already appear in
 ]
 ```
 
-**Auto-retry:** `proxy_exhausted` and `circuit_open` entries are
-automatically re-enqueued once the condition that caused them clears (the
-proxy pool tier recovers, or the circuit breaker for that domain closes)
-— up to a configured cap, tracked in `auto_retry_count`. A retried job
-keeps its original `job_id`; poll `GET /v1/jobs/{job_id}` to see it move
-through `PENDING`/`PROCESSING` again rather than watching this endpoint.
-Every other `failure_category` (`ssrf_blocked`, `quota_exceeded`,
-`host_unreachable`) is permanent and never auto-retried.
+**Auto-retry:** these entries are automatically re-enqueued once the
+condition that caused them clears, up to a configured cap tracked in
+`auto_retry_count`:
+
+| `failure_category` | Retried when |
+|---|---|
+| `proxy_exhausted`, `browser_crash`, `network_timeout` | the proxy pool tier for that level is healthy again |
+| `circuit_open` | the domain's circuit breaker has closed |
+| `politeness_timeout` | nothing holds a politeness slot on that domain any more |
+| `capacity_timeout` | the host has spare browser capacity (nobody waiting, seats free) |
+| `dependency_unavailable` | the engine's own Redis answers again |
+
+The last three also wait 60s × 2^`auto_retry_count` after their most
+recent failure. A retried job keeps its original `job_id`, and only its
+not-yet-successful URLs are fetched again; poll `GET /v1/jobs/{job_id}` to
+see it move through `PENDING`/`PROCESSING` again. Every other
+`failure_category` (`ssrf_blocked`, `quota_exceeded`, `host_unreachable`,
+`detection_block`, `parse_error`, …) is never auto-retried.
 
 ---
 
@@ -409,9 +425,17 @@ Composite health check. No authentication required.
   "proxy_pool_size": 42,
   "pgbouncer_reachable": true,
   "redis_reachable": true,
-  "s3_reachable": true
+  "s3_reachable": true,
+  "daemons": {"proxy-harvester": "healthy", "dlq-reaper": "healthy",
+              "webhook-sweeper": "healthy", "capacity-controller": "healthy"},
+  "checks": {}
 }
 ```
+
+`daemons` is informational (a stale daemon never turns the status to
+`degraded`). With host-wide browser admission enabled, a
+`browser_capacity` block is added — `in_use_units`, `target_units`,
+`waiters`, `status` — also informational.
 
 ---
 
