@@ -8,9 +8,13 @@ exception caught here must NOT also map to HOST_UNREACHABLE. Everything else
 falls back to the caller's default (NETWORK_TIMEOUT for L1, BROWSER_CRASH
 for the browser levels) — both already retryable and already proxy-
 attributable (orchestrator/worker.py's round-37 same-level fresh-proxy retry).
+The one exception is a proxy refusing our credentials (PROXY_AUTH_FAILED,
+round 66), which no retry fixes when that proxy is the paid gateway.
 """
 
 from __future__ import annotations
+
+import httpx
 
 from scraper_engine.core.exceptions import SSRFBlockedError
 from scraper_engine.core.models import FailureCategory
@@ -42,12 +46,25 @@ def classify_fetch_exception(exc: BaseException, default: FailureCategory) -> Fa
     a real block (resolved to a denied network) and an unresolvable host
     (dead domain, no DNS record at all, checked unproxied) — see
     exceptions.py::SSRFBlockedError. Only the first is actually SSRF_BLOCKED.
+
+    Round 66 — PROXY_AUTH_FAILED for a proxy's 407, in the two shapes seen
+    live against the exhausted DataImpulse gateway: Camoufox's
+    `Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED` and httpx's
+    `ProxyError('407 TRAFFIC_EXHAUSTED')`. Both used to fall through to `default`.
     """
     if isinstance(exc, SSRFBlockedError):
         if exc.is_unresolvable:
             return FailureCategory.HOST_UNREACHABLE
         return FailureCategory.SSRF_BLOCKED
+    if _is_proxy_auth_failure(exc):
+        return FailureCategory.PROXY_AUTH_FAILED
     return default
+
+
+def _is_proxy_auth_failure(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.ProxyError):
+        return str(exc).startswith("407")
+    return "NS_ERROR_PROXY_AUTHENTICATION_FAILED" in str(exc)
 
 
 # Statuses that mean "the site actively rejected/blocked this specific

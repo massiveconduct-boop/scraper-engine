@@ -2726,3 +2726,121 @@ class TestPolitenessTimeoutStreaming:
         streamed = on_result.await_args.args[0]
         assert streamed.failure_category == FailureCategory.POLITENESS_TIMEOUT
         assert streamed.timings is not None
+
+
+class TestProxyAuthFailed:
+    """Round 66 — a proxy refusing our credentials (407). Live, with the
+    DataImpulse plan out of traffic, Camoufox reported it as
+    `NS_ERROR_PROXY_AUTHENTICATION_FAILED` and it was stored as
+    BROWSER_CRASH: retried on a new gateway session, escalated through every
+    level on the same refused account, counted against the domain's circuit
+    and re-driven by the DLQ reaper."""
+
+    @staticmethod
+    def _refused(source, level=2):
+        return FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=level,
+            duration_ms=5,
+            failure_category=FailureCategory.PROXY_AUTH_FAILED,
+            error_message="Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED",
+            proxy_source=source,
+        )
+
+    @staticmethod
+    def _wire_fetcher(monkeypatch, *results):
+        fetcher = MagicMock()
+        fetcher.fetch = AsyncMock(side_effect=list(results))
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.factory.build_level2_fetcher", MagicMock(return_value=fetcher)
+        )
+        return fetcher
+
+    @staticmethod
+    def _wire_pm(monkeypatch, tenant, proxy=None):
+        pm_instance = MagicMock()
+        pm_instance.get_proxy = AsyncMock(
+            return_value=ProxyLease(proxy=proxy, tenant_id=tenant) if proxy else None
+        )
+        pm_instance.mark_success = AsyncMock()
+        pm_instance.mark_failure = AsyncMock()
+        monkeypatch.setattr(
+            "scraper_engine.proxy.manager.ProxyManager", MagicMock(return_value=pm_instance)
+        )
+        return pm_instance
+
+    @pytest.mark.asyncio
+    async def test_gateway_refusal_is_not_retried_on_a_new_session(
+        self, tenant, worker, monkeypatch
+    ):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(
+            enabled=True, strategy="paid_only", rotate_on_block_retries=2
+        )
+        self._wire_pm(monkeypatch, tenant)
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=TestGatewayFallbackOnFailure._gateway_proxy()),
+        )
+        ok = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None), ok)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        assert result.proxy_source == "paid_gateway"
+
+    @pytest.mark.asyncio
+    async def test_free_proxy_refusal_retries_on_a_fresh_lease(self, tenant, worker, monkeypatch):
+        pool_proxy = Proxy(id=7, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP)
+        pm = self._wire_pm(monkeypatch, tenant, pool_proxy)
+        ok = FetchResult(url="http://example.com", success=True, level_used=2, duration_ms=5)
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None), ok)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 2
+        assert result.success is True
+        pm.mark_failure.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_refusal_is_terminal_and_spares_the_circuit(self, tenant, worker):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="paid_only")
+        worker._fetch_url = AsyncMock(return_value=self._refused("paid_gateway", level=1))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-gateway-refused", request)
+
+        assert response.results is not None
+        assert response.results[0].failure_category == FailureCategory.PROXY_AUTH_FAILED
+        # No later level: it would go out through the same refused account.
+        assert worker._fetch_url.await_count == 1
+        worker._dlq.enqueue.assert_awaited_once()
+        assert worker._dlq.enqueue.await_args.args[3] == FailureCategory.PROXY_AUTH_FAILED
+        worker._circuit_breaker.record_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_free_proxy_refusal_escalates_and_spares_the_circuit(self, tenant, worker):
+        ok = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            duration_ms=5,
+            html="<html><body>" + "real content " * 50 + "</body></html>",
+            proxy_source="pool",
+        )
+        worker._fetch_url = AsyncMock(side_effect=[self._refused("pool", level=1), ok])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-pool-refused", request)
+
+        assert response.results is not None
+        assert response.results[0].success is True
+        assert worker._fetch_url.await_count == 2
+        worker._dlq.enqueue.assert_not_awaited()
+        worker._circuit_breaker.record_failure.assert_not_awaited()

@@ -27,6 +27,7 @@ class TestRetryMatrix:
             FailureCategory.CIRCUIT_OPEN,
             FailureCategory.CAPTCHA_TRIGGERED,
             FailureCategory.DETECTION_BLOCK,
+            FailureCategory.PROXY_AUTH_FAILED,
         }
         for cat in non_retryable:
             assert RETRY_MATRIX[cat].retryable is False, f"{cat} should not be retryable"

@@ -329,6 +329,75 @@ class TestIsEligible:
         assert await dlq_reaper._is_eligible(entry, redis, cb, tier_config) is False
 
 
+class TestProxyAuthFailed:
+    """Round 66 — a proxy refused our credentials. With the gateway in play
+    that is the account (plan out of traffic): re-drive only once a probe
+    through the gateway succeeds, and probe once for many entries."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_probe(self, monkeypatch):
+        monkeypatch.setattr(dlq_reaper, "_gateway_probe", None)
+
+    def _gateway(self, monkeypatch, *, enabled=True, strategy="free_first", ok=True):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        cfg = DataImpulseConfig(enabled=enabled, strategy=strategy, country="ng", asn=29465)
+        monkeypatch.setattr(dlq_reaper, "_dataimpulse_config", lambda: cfg)
+        probe = AsyncMock(return_value=ok)
+        monkeypatch.setattr(dlq_reaper, "gateway_accepts_credentials", probe)
+        return probe
+
+    def test_is_a_reaped_category(self):
+        assert FailureCategory.PROXY_AUTH_FAILED in dlq_reaper._TRANSIENT_CATEGORIES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ok", [True, False])
+    async def test_gateway_entry_follows_the_probe(self, monkeypatch, ok):
+        probe = self._gateway(monkeypatch, ok=ok)
+        entry = make_entry(category=FailureCategory.PROXY_AUTH_FAILED)
+        assert (
+            await dlq_reaper._is_eligible(entry, AsyncMock(), AsyncMock(), ProxyTierConfig())
+            is ok
+        )
+        probe.assert_awaited_once_with(country="ng", asn=29465)
+
+    @pytest.mark.asyncio
+    async def test_one_probe_answers_for_many_entries_until_it_expires(self, monkeypatch):
+        probe = self._gateway(monkeypatch, ok=False)
+        clock = [1000.0]
+        monkeypatch.setattr(dlq_reaper.time, "monotonic", lambda: clock[0])
+        entry = make_entry(category=FailureCategory.PROXY_AUTH_FAILED)
+        for _ in range(5):
+            await dlq_reaper._is_eligible(entry, AsyncMock(), AsyncMock(), ProxyTierConfig())
+        assert probe.await_count == 1
+        clock[0] += dlq_reaper._GATEWAY_PROBE_TTL_SECONDS
+        await dlq_reaper._is_eligible(entry, AsyncMock(), AsyncMock(), ProxyTierConfig())
+        assert probe.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("enabled", "strategy"), [(False, "free_first"), (True, "free_only")]
+    )
+    async def test_without_the_gateway_it_is_a_free_proxy_and_checks_tier_health(
+        self, monkeypatch, enabled, strategy
+    ):
+        probe = self._gateway(monkeypatch, enabled=enabled, strategy=strategy)
+        monkeypatch.setattr(
+            "scraper_engine.proxy.dlq_reaper.pool_current_state",
+            AsyncMock(return_value=PoolHealthState.HEALTHY),
+        )
+        entry = make_entry(category=FailureCategory.PROXY_AUTH_FAILED)
+        assert (
+            await dlq_reaper._is_eligible(entry, AsyncMock(), AsyncMock(), ProxyTierConfig())
+            is True
+        )
+        probe.assert_not_awaited()
+
+    def test_dataimpulse_config_is_loaded_once(self):
+        dlq_reaper._dataimpulse_config.cache_clear()
+        assert dlq_reaper._dataimpulse_config() is dlq_reaper._dataimpulse_config()
+
+
 class TestRetryEntry:
     @pytest.mark.asyncio
     async def test_bumps_counter_resets_status_and_reenqueues(self, tenant):

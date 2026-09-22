@@ -30,6 +30,7 @@ import contextlib
 import functools
 import logging
 import signal
+import time
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
@@ -38,6 +39,7 @@ from rq import Queue
 from scraper_engine.config.loader import load_config
 from scraper_engine.config.schema import (
     AppConfig,
+    DataImpulseConfig,
     DlqReaperConfig,
     HostCapacityConfig,
     ProxyTierConfig,
@@ -51,6 +53,7 @@ from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker, CircuitS
 from scraper_engine.orchestrator.host_capacity import HostAdmission
 from scraper_engine.orchestrator.job_queue import build_queue
 from scraper_engine.orchestrator.politeness import PolitenessController
+from scraper_engine.proxy.paid_gateway import gateway_accepts_credentials
 from scraper_engine.proxy.pool_health import current_state as pool_current_state
 from scraper_engine.storage.dlq import DeadLetterEntry, DeadLetterQueue
 from scraper_engine.storage.postgres_client import PostgresClient
@@ -97,6 +100,9 @@ _TRANSIENT_CATEGORIES = [
     # browser capacity ran out, or our own Redis failed. See _is_eligible.
     FailureCategory.CAPACITY_TIMEOUT,
     FailureCategory.DEPENDENCY_UNAVAILABLE,
+    # Round 66 — a proxy refused our credentials; with the gateway in play,
+    # eligible only once a probe through it succeeds again. See _is_eligible.
+    FailureCategory.PROXY_AUTH_FAILED,
 ]
 
 # Round 65 — contention categories wait base * 2**auto_retry_count after
@@ -116,6 +122,29 @@ _CONTENTION_BACKOFF_BASE_SECONDS = 60.0
 @functools.cache
 def _host_capacity_config() -> HostCapacityConfig:
     return load_config().host_capacity
+
+
+@functools.cache
+def _dataimpulse_config() -> DataImpulseConfig:
+    return load_config().dataimpulse
+
+
+# Round 66 — one gateway probe answers for every PROXY_AUTH_FAILED entry in
+# a cycle (and the next few): the answer is about the account, not the URL,
+# and each probe spends plan traffic.
+_GATEWAY_PROBE_TTL_SECONDS = 120.0
+_gateway_probe: tuple[float, bool] | None = None
+
+
+async def _gateway_ok() -> bool:
+    global _gateway_probe
+    now = time.monotonic()
+    if _gateway_probe is not None and now - _gateway_probe[0] < _GATEWAY_PROBE_TTL_SECONDS:
+        return _gateway_probe[1]
+    cfg = _dataimpulse_config()
+    ok = await gateway_accepts_credentials(country=cfg.country or None, asn=cfg.asn)
+    _gateway_probe = (now, ok)
+    return ok
 
 
 def _backoff_elapsed(entry: DeadLetterEntry, now: datetime | None = None) -> bool:
@@ -169,6 +198,17 @@ async def _is_eligible(
     the new tier-1 fallback."""
     from scraper_engine.proxy.pool_health import PoolHealthState
 
+    di_cfg = _dataimpulse_config()
+    if (
+        entry.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        and di_cfg.enabled
+        and di_cfg.strategy != "free_only"
+    ):
+        # Round 66 — the gateway refusing our credentials is the account
+        # (plan out of traffic). Re-driving before it accepts them again only
+        # repeats the refusal on every URL. Under free_only the entry can only
+        # be a free proxy's refusal, which the tier check below covers.
+        return await _gateway_ok()
     if entry.failure_category in (
         FailureCategory.PROXY_EXHAUSTED,
         # Round 42 — same tier-health check as PROXY_EXHAUSTED. These
@@ -179,6 +219,7 @@ async def _is_eligible(
         # tier is exactly the condition that makes a retry plausible.
         FailureCategory.BROWSER_CRASH,
         FailureCategory.NETWORK_TIMEOUT,
+        FailureCategory.PROXY_AUTH_FAILED,
     ):
         check_tier = entry.level_attempted
         if entry.level_attempted == 3 and tier_config.allow_tier2_fallback_for_tier3:

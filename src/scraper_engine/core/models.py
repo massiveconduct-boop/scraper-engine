@@ -127,6 +127,14 @@ class FailureCategory(str, Enum):
     # or timed out. Also ours, also transient, also circuit-exempt: a Redis
     # blip must not open circuits for healthy domains.
     DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    # Round 66 — the proxy refused our credentials (HTTP 407). On the paid
+    # gateway that is the ACCOUNT (live: `407 TRAFFIC_EXHAUSTED` once the
+    # plan ran out), so no retry, rotation or re-drive can help until
+    # someone tops it up; Camoufox reports it as
+    # `NS_ERROR_PROXY_AUTHENTICATION_FAILED`, which used to fall through as
+    # BROWSER_CRASH and be retried and re-driven. Never the target's fault:
+    # exempt from the circuit breaker and level memory.
+    PROXY_AUTH_FAILED = "proxy_auth_failed"
 
 
 class FetchResult(BaseModel):

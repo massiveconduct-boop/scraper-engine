@@ -909,20 +909,32 @@ class Worker:
                             await on_result(result)
                         break
                     else:
-                        await self._circuit_breaker.record_failure(domain)
+                        # Round 66 — a proxy refusing our credentials says
+                        # nothing about the domain. From the gateway it is
+                        # also terminal for this URL: every later level and
+                        # retry would go out through the same refused
+                        # account. The DLQ reaper re-drives it once a probe
+                        # through the gateway succeeds again.
+                        category = result.failure_category
+                        auth_failed = category == FailureCategory.PROXY_AUTH_FAILED
+                        gateway_refused = auth_failed and result.proxy_source == "paid_gateway"
+                        if not auth_failed:
+                            await self._circuit_breaker.record_failure(domain)
                         _reject(
                             level,
                             result,
-                            f"failure:{result.failure_category.value}"
-                            if result.failure_category is not None
+                            f"failure:{category.value}"
+                            if category is not None
                             else "failure:unknown",
                         )
-                        if result.failure_category in DLQ_ELIGIBLE_CATEGORIES:
+                        if category is not None and (
+                            category in DLQ_ELIGIBLE_CATEGORIES or gateway_refused
+                        ):
                             await self._dlq.enqueue(
                                 tenant_id,
                                 job_id,
                                 url_str,
-                                result.failure_category,
+                                category,
                                 result.error_message or "",
                                 level,
                             )
@@ -1389,7 +1401,14 @@ class Worker:
                         return result
                     if lease.proxy.source == "pool":
                         await pm.mark_failure(tenant_id, lease.proxy.ip, lease.proxy.port, domain)
-                    retryable = result.failure_category in _PROXY_RETRYABLE_CATEGORIES
+                    # Round 66 — a free proxy refusing our credentials is that
+                    # proxy's fault, so a fresh lease can help. The gateway
+                    # refusing them is the account's: every new session gets
+                    # the same 407, so it returns at once (see process_job).
+                    retryable = result.failure_category in _PROXY_RETRYABLE_CATEGORIES or (
+                        result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+                        and lease.proxy.source == "pool"
+                    )
                     if retryable and pool_retries_left > 0:
                         pool_retries_left -= 1
                         continue  # loop again with a freshly leased proxy

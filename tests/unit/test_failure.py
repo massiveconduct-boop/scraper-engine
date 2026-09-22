@@ -5,6 +5,9 @@ rejection (SSRFBlockedError.is_unresolvable) — every other exception,
 including a raw DNS-failure error from the real fetch attempt, falls back to
 the caller's default. See classify_fetch_exception's docstring for why."""
 
+import httpx
+import pytest
+
 from scraper_engine.core.exceptions import SSRFBlockedError
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.fetcher._failure import (
@@ -14,6 +17,30 @@ from scraper_engine.fetcher._failure import (
 
 
 class TestClassifyFetchException:
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            # Both verbatim from the exhausted DataImpulse gateway, round 66.
+            Exception(
+                "Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED\nCall log:\n"
+                '  - navigating to "https://www.jumia.com.ng/"'
+            ),
+            httpx.ProxyError("407 TRAFFIC_EXHAUSTED"),
+        ],
+    )
+    def test_proxy_refusing_credentials_maps_to_proxy_auth_failed(self, exc):
+        assert (
+            classify_fetch_exception(exc, FailureCategory.BROWSER_CRASH)
+            == FailureCategory.PROXY_AUTH_FAILED
+        )
+
+    def test_other_proxy_errors_fall_back_to_default(self):
+        exc = httpx.ProxyError("502 Bad Gateway")
+        assert (
+            classify_fetch_exception(exc, FailureCategory.NETWORK_TIMEOUT)
+            == FailureCategory.NETWORK_TIMEOUT
+        )
+
     def test_ssrf_blocked_error_maps_to_ssrf_blocked(self):
         exc = SSRFBlockedError(url="http://10.0.0.1/", host="10.0.0.1", network="10.0.0.0/8")
         assert (

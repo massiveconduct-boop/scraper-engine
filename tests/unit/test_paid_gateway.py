@@ -3,10 +3,15 @@
 string building, no network I/O, so these are plain unit tests with
 monkeypatched os.environ."""
 
+import httpx
+import pytest
+
 from scraper_engine.core.models import ProxyProtocol
+from scraper_engine.proxy import paid_gateway
 from scraper_engine.proxy.paid_gateway import (
     build_gateway_proxy,
     build_gateway_username,
+    gateway_accepts_credentials,
     new_session_id,
 )
 
@@ -211,3 +216,49 @@ class TestAsnRequiresCountry:
         cfg = DataImpulseConfig()
         assert cfg.asn is None
         assert cfg.country == ""
+
+
+class TestGatewayAcceptsCredentials:
+    """Round 66 — the probe proxy/dlq_reaper.py runs before re-driving a URL
+    the gateway refused. True only on a real 200 through the gateway."""
+
+    @staticmethod
+    def _client(monkeypatch, handler):
+        seen = {}
+        real = httpx.AsyncClient
+
+        def _factory(*, proxy, timeout):
+            seen["proxy"] = proxy
+            return real(transport=httpx.MockTransport(handler), timeout=timeout)
+
+        monkeypatch.setattr(paid_gateway.httpx, "AsyncClient", _factory)
+        return seen
+
+    @pytest.fixture
+    def env(self, monkeypatch):
+        for key, value in _ALL_VARS.items():
+            monkeypatch.setenv(key, value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "expected"), [(200, True), (407, False), (503, False)])
+    async def test_only_a_200_counts(self, env, monkeypatch, status, expected):
+        seen = self._client(monkeypatch, lambda request: httpx.Response(status))
+        assert await gateway_accepts_credentials(country="ng", asn=29465) is expected
+        # The credentials must travel with the probe: without them every
+        # gateway answers 407 and the probe could never pass.
+        assert seen["proxy"].startswith("http://user123__cr.ng;asn.29465;sessid.")
+        assert seen["proxy"].endswith(":pass456@gw.dataimpulse.com:823")
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_is_not_acceptance(self, env, monkeypatch):
+        def _boom(request):
+            raise httpx.ConnectTimeout("timed out")
+
+        self._client(monkeypatch, _boom)
+        assert await gateway_accepts_credentials() is False
+
+    @pytest.mark.asyncio
+    async def test_missing_configuration_is_not_acceptance(self, monkeypatch):
+        for key in _ALL_VARS:
+            monkeypatch.delenv(key, raising=False)
+        assert await gateway_accepts_credentials() is False

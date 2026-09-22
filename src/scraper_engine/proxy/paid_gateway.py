@@ -73,6 +73,8 @@ from __future__ import annotations
 import os
 import secrets
 
+import httpx
+
 from scraper_engine.core.models import AnonymityLevel, AsnClass, Proxy, ProxyProtocol
 
 
@@ -167,3 +169,27 @@ def build_gateway_proxy(
         password=password,
         source="paid_gateway",
     )
+
+
+# Round 66 — what proxy/dlq_reaper.py asks before re-driving a URL the
+# gateway refused (FailureCategory.PROXY_AUTH_FAILED). A judge that answers
+# with the caller's IP and nothing else: a few hundred bytes of plan traffic.
+_PROBE_URL = "https://api.ipify.org"
+
+
+async def gateway_accepts_credentials(
+    *, country: str | None = None, asn: int | None = None, timeout: float = 10.0
+) -> bool:
+    """One real request through the gateway on a fresh session; True only on
+    a 200. A 407 (plan out of traffic, bad credentials), any other status, a
+    timeout or a missing configuration are all False — the caller is deciding
+    whether a re-drive can succeed, and none of those say it can."""
+    proxy = build_gateway_proxy(country=country, session_id=new_session_id(), asn=asn)
+    if proxy is None:
+        return False
+    try:
+        async with httpx.AsyncClient(proxy=proxy.auth_url(), timeout=timeout) as client:
+            response = await client.get(_PROBE_URL)
+    except httpx.HTTPError:
+        return False
+    return response.status_code == 200
