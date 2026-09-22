@@ -71,7 +71,27 @@ account is topped up.
   state. Use `auth_url()`.
 - Gate: 1404 tests, 0 missed lines, 0 missed branches, ruff + mypy clean.
 - **OPEN — after a top-up,** confirm the reaper re-drives these entries on
-  its own (probe → True → `retried>0`).
+  its own (probe → True → `retried>0`). My own live-test entry was deleted
+  so a top-up cannot re-drive it onto the paid gateway.
+- **New per-URL timing `display_lock_wait_ms`** (round-65 plan's
+  `local_wait_ms`, display half). `core/budget.py::xvfb_lock()` is now the
+  only way to take `XVFB_LOCK` (5 sites switched) and charges the wait to a
+  per-task meter the worker starts per URL. Live, free pool, 5 concurrent
+  example.com renders at L3 in one job: waits 0 / 1325 / 2134 / 3574 /
+  5464 ms — the fifth URL spent 5.5s of its 17.7s render queued for the
+  display. CapSolver time was not added: it is solving, not queueing.
+- **Measured engine cost (no proxy, example.com, median of 3, worker-l2):**
+  Camoufox launch 1.39s, render 1.30s, close 0.99s, peak RSS 916 MiB, CPU
+  4.46s; Botasaurus launch 0.58s, render 0.53s, close 0.16s, peak RSS
+  1167 MiB, CPU 2.53s. So close-on-release costs ~2.4s of serialized
+  launch+close per Camoufox render. Botasaurus/Camoufox: RSS 1.27, CPU 0.57
+  — opposite directions on a trivial page, so the 1.0/1.0 weights were left
+  alone. Closes round 65's two "measure after the top-up" items; neither
+  needed the gateway.
+- **No paid traffic without the user's explicit permission** (user,
+  2026-09-22). The plan ran out during round 65's repeated 97-URL Jumia
+  benchmark runs. Any future A/B must be approved per run with a cost
+  estimate, or designed on free targets.
 
 ## Technical Debt / Open Threads (as of round 65)
 
@@ -137,12 +157,9 @@ Host, Claimed Together With the Politeness Slot".
   Deployed state was rolled back to off until then.
 - **CLOSED in round 66 — gateway traffic exhaustion was labelled
   BROWSER_CRASH.** Now `proxy_auth_failed`; see the round-66 entry.
-- **OPEN — close-on-release pays a launch + teardown per render,** serialized
-  per process under `XVFB_LOCK`; seats wait on it (seen: 8 seats vs 3 live
-  browsers on short example.com renders). Measure on Jumia after the top-up.
-- **OPEN — engine weights are 1.0/1.0 (unmeasured); `local_wait_ms` (time
-  inside a held seat spent on XVFB_LOCK / CapSolver) was planned and not
-  built.**
+- **MEASURED in round 66 — close-on-release** (~2.4s serialized launch +
+  close per Camoufox render) **and engine weights** (left at 1.0/1.0);
+  `display_lock_wait_ms` built. See the round-66 entry.
 
 ## Technical Debt / Open Threads (as of round 64)
 
