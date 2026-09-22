@@ -2844,3 +2844,48 @@ class TestProxyAuthFailed:
         assert worker._fetch_url.await_count == 2
         worker._dlq.enqueue.assert_not_awaited()
         worker._circuit_breaker.record_failure.assert_not_awaited()
+
+
+class TestDisplayLockWait:
+    """Round 66 — a URL's time queued for XVFB_LOCK is reported in timings."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_lock(self, monkeypatch):
+        # The module-level lock binds to the first event loop that contends
+        # for it; every test runs in its own loop.
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "XVFB_LOCK", asyncio.Lock())
+
+    @pytest.mark.asyncio
+    async def test_queueing_for_the_display_is_reported(self, tenant, worker):
+        from scraper_engine.core import budget
+
+        ok = FetchResult(url="http://example.com", success=True, level_used=1, duration_ms=10)
+
+        async def fetch_behind_a_held_lock(*args, **kwargs):
+            await budget.XVFB_LOCK.acquire()
+            asyncio.get_running_loop().call_later(0.05, budget.XVFB_LOCK.release)
+            async with budget.xvfb_lock():
+                pass
+            return ok
+
+        worker._fetch_url = AsyncMock(side_effect=fetch_behind_a_held_lock)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-display-wait", request)
+
+        assert response.results[0].timings["display_lock_wait_ms"] >= 40
+
+    @pytest.mark.asyncio
+    async def test_no_wait_leaves_no_key(self, tenant, worker):
+        worker._fetch_url = AsyncMock(
+            return_value=FetchResult(
+                url="http://example.com", success=True, level_used=1, duration_ms=10
+            )
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-no-display-wait", request)
+
+        assert "display_lock_wait_ms" not in response.results[0].timings

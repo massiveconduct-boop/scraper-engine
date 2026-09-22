@@ -215,7 +215,7 @@ class CamoufoxWrapper:
             # same virtual display number (core/budget.py::XVFB_LOCK
             # docstring). Held only across __aenter__, not the fetch that
             # follows — reacquired fresh on each retry below.
-            async with asyncio.timeout(_BROWSER_LAUNCH_TIMEOUT_SECONDS), budget.XVFB_LOCK:
+            async with asyncio.timeout(_BROWSER_LAUNCH_TIMEOUT_SECONDS), budget.xvfb_lock():
                 try:
                     return await self._browser.__aenter__()
                 except InvalidIP:
@@ -287,7 +287,7 @@ class CamoufoxWrapper:
         """Tear the browser down under XVFB_LOCK, but never indefinitely.
 
         Round 63 — this whole section used to be an unbounded
-        `async with budget.XVFB_LOCK: await self._browser.__aexit__(*exc)`,
+        `async with budget.xvfb_lock(): await self._browser.__aexit__(*exc)`,
         and `budget.BROWSER_SEMAPHORE.release()` sits AFTER it. Both the lock
         and the teardown can hang on a wedged browser (a dead CDP pipe, an
         Xvfb that will not die), and XVFB_LOCK is process-wide — so one stuck
@@ -306,7 +306,7 @@ class CamoufoxWrapper:
         """
         try:
             async with asyncio.timeout(_BROWSER_TEARDOWN_TIMEOUT_SECONDS):
-                async with budget.XVFB_LOCK:
+                async with budget.xvfb_lock():
                     await self._browser.__aexit__(*exc)
         except TimeoutError:
             # No cleanup call here on purpose: _xvfb_cleanup.cleanup_stale_display

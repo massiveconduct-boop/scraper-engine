@@ -143,7 +143,7 @@ class BotasaurusWrapper:
         # core/budget.py::acquire_browser_permit).
         await budget.acquire_browser_permit()
         try:
-            async with budget.XVFB_LOCK:
+            async with budget.xvfb_lock():
                 loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(
                     None,

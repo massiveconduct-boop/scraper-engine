@@ -118,7 +118,7 @@ class BotasaurusPool:
             await budget.acquire_browser_permit()
             try:
                 if entry.driver is None:
-                    async with budget.XVFB_LOCK:
+                    async with budget.xvfb_lock():
                         entry.driver = await loop.run_in_executor(
                             None, self._launch_driver, entry, proxy, session_id
                         )
@@ -181,7 +181,7 @@ class BotasaurusPool:
             return
         driver, entry.driver = entry.driver, None
         loop = asyncio.get_running_loop()
-        async with budget.XVFB_LOCK:
+        async with budget.xvfb_lock():
             await loop.run_in_executor(None, self._close_driver, driver)
 
     def _launch_driver(

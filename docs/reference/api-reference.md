@@ -245,6 +245,11 @@ its delay together: that wait is `admission_wait_ms`, and `level_N_ms` is
 then render time only. `politeness_wait_ms` / `slot_wait_ms` appear only
 for levels that did not go through admission (always L1).
 
+`display_lock_wait_ms` is how long this URL's browsers queued behind other
+browsers opening or closing in the same worker process (each one's virtual
+display is started and torn down one at a time). It is part of the render
+time above, and absent when there was no wait.
+
 **`escalations` — why each earlier attempt was not the answer.** One
 entry per level (or per same-level attempt) the engine rejected before the
 result you got, in order; `null` when the first attempt succeeded.
@@ -326,6 +331,7 @@ condition that caused them clears, up to a configured cap tracked in
 |---|---|
 | `proxy_exhausted`, `browser_crash`, `network_timeout` | the proxy pool tier for that level is healthy again |
 | `circuit_open` | the domain's circuit breaker has closed |
+| `proxy_auth_failed` | a test request through the paid gateway succeeds again (the gateway refused the engine's credentials, e.g. plan out of traffic); without the gateway, as `browser_crash` |
 | `politeness_timeout` | nothing holds a politeness slot on that domain any more |
 | `capacity_timeout` | the host has spare browser capacity (nobody waiting, seats free) |
 | `dependency_unavailable` | the engine's own Redis answers again |

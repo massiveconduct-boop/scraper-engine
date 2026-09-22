@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from scraper_engine.core.budget import start_display_wait_meter
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 from scraper_engine.fetcher._failure import classify_http_status
 from scraper_engine.observability.metrics import fetch_duration_seconds
@@ -399,12 +400,18 @@ class Worker:
             # whose fetch took 28s.
             timings: dict[str, int] = {}
             url_start = time.monotonic()
+            # Round 66 — this task's XVFB_LOCK queueing (core/budget.py).
+            display_wait = start_display_wait_meter()
 
             escalations: list[dict[str, Any]] = []
 
             def _finish(result: FetchResult) -> FetchResult:
                 """Stamp the accumulated timings onto a terminal result."""
                 timings["total_ms"] = int((time.monotonic() - url_start) * 1000)
+                # Like a level that never ran, no wait means no key.
+                display_wait_ms = int(display_wait[0] * 1000)
+                if display_wait_ms:
+                    timings["display_lock_wait_ms"] = display_wait_ms
                 result.timings = dict(timings)
                 result.escalations = list(escalations) or None
                 return result

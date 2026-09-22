@@ -7,9 +7,11 @@ Closes F-14/F-13/F-12: all resource acquisitions bounded by explicit ceilings.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -53,6 +55,38 @@ CAPSOLVER_CONCURRENCY = asyncio.Semaphore(10)
 # bundles launch+navigate+close with no seam to split, so it holds this for
 # its whole call instead — an accepted throughput trade for correctness.
 XVFB_LOCK = asyncio.Lock()
+
+# Round 66 — how long the current URL spent WAITING for XVFB_LOCK. Every
+# launch and close is serialized behind it per process, so under concurrency a
+# render can hold a browser seat (and a politeness slot) while doing nothing
+# but queueing for the display. Round 65 saw 8 seats in use with 3 live
+# browsers on short renders and had no number to explain it; this is that
+# number. Per task: orchestrator/worker.py starts one meter per URL (each URL
+# runs in its own asyncio task, which copies the context), so concurrent URLs
+# never add to each other's total.
+_display_wait: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar(
+    "display_wait", default=None
+)
+
+
+def start_display_wait_meter() -> list[float]:
+    """Start metering XVFB_LOCK waits for the current task. Returns the
+    accumulator (seconds, in element 0) that xvfb_lock() adds to."""
+    meter = [0.0]
+    _display_wait.set(meter)
+    return meter
+
+
+@contextlib.asynccontextmanager
+async def xvfb_lock() -> AsyncIterator[None]:
+    """Hold XVFB_LOCK, charging the time spent waiting for it to the current
+    task's meter, if one is running. The only way code should take the lock."""
+    start = time.monotonic()
+    async with XVFB_LOCK:
+        meter = _display_wait.get()
+        if meter is not None:
+            meter[0] += time.monotonic() - start
+        yield
 
 # Round 64 — one way to take a BROWSER_SEMAPHORE permit, for every engine.
 #

@@ -214,3 +214,64 @@ class _Reclaimer:
         if self.frees:
             budget.BROWSER_SEMAPHORE.release()
         return self.frees
+
+
+class TestDisplayWaitMeter:
+    """Round 66 — time spent queueing for XVFB_LOCK, per task."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_lock(self, monkeypatch):
+        # The module-level lock binds to the first event loop that contends
+        # for it; every test runs in its own loop.
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "XVFB_LOCK", asyncio.Lock())
+
+    @pytest.mark.asyncio
+    async def test_waiting_behind_a_holder_is_charged_to_the_waiter(self):
+        from scraper_engine.core import budget
+
+        release = asyncio.Event()
+        holding = asyncio.Event()
+
+        async def holder():
+            async with budget.xvfb_lock():
+                holding.set()
+                await release.wait()
+
+        async def waiter():
+            meter = budget.start_display_wait_meter()
+            await holding.wait()
+            asyncio.get_running_loop().call_later(0.05, release.set)
+            async with budget.xvfb_lock():
+                pass
+            return meter[0]
+
+        holder_task = asyncio.create_task(holder())
+        waited = await asyncio.create_task(waiter())
+        await holder_task
+        assert waited >= 0.04
+
+    @pytest.mark.asyncio
+    async def test_meters_are_per_task(self):
+        from scraper_engine.core import budget
+
+        async def uncontended():
+            meter = budget.start_display_wait_meter()
+            async with budget.xvfb_lock():
+                await asyncio.sleep(0.02)
+            return meter
+
+        first, second = await asyncio.gather(uncontended(), uncontended())
+        # One of the two queued behind the other; neither sees the other's wait.
+        assert sorted([first[0] > 0.01, second[0] > 0.01]) == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_no_meter_no_accounting(self):
+        from scraper_engine.core import budget
+
+        async def unmetered():
+            async with budget.xvfb_lock():
+                return budget._display_wait.get()
+
+        assert await asyncio.create_task(unmetered()) is None
