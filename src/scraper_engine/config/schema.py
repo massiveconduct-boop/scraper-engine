@@ -431,7 +431,9 @@ class HostCapacityConfig(BaseModel):
     renders on a 4-core host (load avg 58-69, measured live) and slowed every
     one of them. Units, not browsers: a render costs `*_weight` units, and the
     controller moves the host total between `min_units` and `max_units`.
-    `None` for max/default means "derive from the host's CPU count".
+    `None` for default means "the host's CPU count"; `None` for max means
+    "as many browsers as the host's total memory holds" (round 66, see
+    `browser_memory_mb`).
     """
 
     enabled: bool = False
@@ -461,9 +463,22 @@ class HostCapacityConfig(BaseModel):
     # Controller (orchestrator/capacity_controller.py).
     controller_interval_seconds: int = Field(default=5, ge=1)
     cpu_pressure_low: float = Field(default=40.0, ge=0, le=100)
-    cpu_pressure_high: float = Field(default=80.0, ge=0, le=100)
+    # Round 66 — 80 -> 90. Live (4 cores, free-pool Wikipedia renders): 20
+    # browsers ran at CPU PSI median 66 / p90 87 with no failures caused by
+    # load, and cutting at 80 held the host at 2-4 browsers while it idled.
+    # The harmful overload seen (Jumia, round 65) sat at a median of 93.
+    cpu_pressure_high: float = Field(default=90.0, ge=0, le=100)
+    # Round 66 — between the two marks the target keeps climbing by this
+    # fraction of itself (at least one unit) per raise, instead of freezing.
+    raise_step_fraction: float = Field(default=0.25, gt=0)
     mem_available_floor_mb: int = Field(default=1536, ge=0)
-    raise_dwell_seconds: int = Field(default=30, ge=0)
+    # Round 66 — memory one browser needs, for the memory-derived ceiling and
+    # for how far one raise may go. Measured peaks on a trivial page: Camoufox
+    # 916 MiB, Botasaurus 1167 MiB; real pages need more.
+    browser_memory_mb: int = Field(default=1200, gt=0)
+    # Round 66 — 30 -> 10: one CPU PSI avg10 window, i.e. long enough for the
+    # browsers the last raise admitted to show up in the reading.
+    raise_dwell_seconds: int = Field(default=10, ge=0)
     cut_dwell_seconds: int = Field(default=15, ge=0)
     cut_factor: float = Field(default=0.7, gt=0, lt=1)
     target_ttl_seconds: int = Field(default=120, ge=10)

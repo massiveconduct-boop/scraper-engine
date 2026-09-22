@@ -58,14 +58,26 @@ class TestReaders:
         (tmp_path / "none").write_text("MemTotal: 100 kB\n")
         assert cc.read_mem_available_mb(tmp_path / "none") is None
 
+    def test_mem_total(self, tmp_path):
+        info = tmp_path / "meminfo"
+        info.write_text("MemTotal: 24576000 kB\nMemAvailable: 100 kB\n")
+        assert cc.read_mem_total_mb(info) == 24000
+        assert cc.read_mem_total_mb(tmp_path / "absent") is None
+        (tmp_path / "none").write_text("MemAvailable: 100 kB\n")
+        assert cc.read_mem_total_mb(tmp_path / "none") is None
+        assert cc.read_mem_total_mb() > 0
+
 
 class TestDecide:
-    def _d(self, current=4.0, cpu=50.0, mem=4000, waiters=1, since=1000.0, max_units=8.0):
+    def _d(
+        self, current=4.0, cpu=50.0, mem=40000, waiters=1, in_use=4.0, since=1000.0, max_units=8.0
+    ):
         return decide(
             current,
             cpu_pressure=cpu,
             mem_available_mb=mem,
             waiters=waiters,
+            in_use=in_use,
             since_change=since,
             cfg=CFG,
             max_units=max_units,
@@ -77,19 +89,52 @@ class TestDecide:
         assert self._d(cpu=10.0, since=5.0) == 4.0  # inside raise dwell
         assert self._d(cpu=10.0, current=8.0) == 8.0  # at max
 
-    def test_cut_on_cpu_or_memory_strain(self):
-        assert self._d(cpu=90.0) == 2.8
-        assert self._d(mem=100) == 2.8
-        assert self._d(cpu=90.0, since=5.0) == 4.0  # inside cut dwell
-        assert self._d(cpu=90.0, current=1.2) == 1.0  # floor
+    def test_a_calm_host_admits_the_whole_queue_in_one_step(self):
+        """Round 66 — not one unit per dwell: short jobs finished before the
+        target caught up, so on light pages the limiter only added waiting."""
+        assert self._d(cpu=10.0, waiters=3, max_units=20.0) == 7.0
+        assert self._d(cpu=10.0, waiters=30) == 8.0  # still capped
 
-    def test_hold_in_between_or_without_signal(self):
-        assert self._d(cpu=60.0) == 4.0
+    def test_a_raise_never_outgrows_free_memory(self):
+        # 1536 MB floor + 2 x 1200 MB spare -> room for 2 more browsers only.
+        assert self._d(cpu=10.0, waiters=5, mem=1536 + 2400, max_units=20.0) == 6.0
+        # No spare memory: hold, never cut while calm.
+        assert self._d(cpu=10.0, waiters=5, mem=1600, max_units=20.0) == 4.0
+        # No memory reading: only the queue and the ceiling bound the raise.
+        assert self._d(cpu=10.0, waiters=5, mem=None, max_units=20.0) == 9.0
+
+    def test_waiters_already_covered_by_the_target_raise_nothing(self):
+        """Seats are free but the waiter is queued for something else (its
+        site's politeness slot): a bigger target would not help it."""
+        assert self._d(cpu=10.0, waiters=1, in_use=2.0) == 4.0
+
+    def test_memory_ceiling(self):
+        assert cc.memory_ceiling(CFG, 4, 24000) == 8.0  # explicit max wins
+        auto = HostCapacityConfig(enabled=True)
+        assert cc.memory_ceiling(auto, 4, 24000) == 20.0  # 24000 // 1200
+        assert cc.memory_ceiling(auto, 4, None) == 8.0  # no reading: 2 x CPUs
+        assert cc.memory_ceiling(auto, 4, 500) == 1.0  # never below min_units
+
+    def test_cut_on_cpu_or_memory_strain(self):
+        assert self._d(cpu=95.0) == 2.8
+        assert self._d(mem=100) == 2.8
+        assert self._d(cpu=95.0, since=5.0) == 4.0  # inside cut dwell
+        assert self._d(cpu=95.0, current=1.2) == 1.0  # floor
+        assert self._d(cpu=85.0, waiters=0) == 4.0  # 85 is busy, not strained
+
+    def test_between_the_marks_it_keeps_climbing_a_step_at_a_time(self):
+        """Round 66 — it used to hold here, so after any cut it never came back
+        (live: 2-4 browsers on an idle host, pages queued for minutes)."""
+        assert self._d(cpu=60.0) == 5.0  # one unit minimum
+        assert self._d(cpu=60.0, current=8.0, in_use=8.0, waiters=10, max_units=20.0) == 10.0
+        assert self._d(cpu=60.0, waiters=0) == 4.0  # nobody waiting: hold
+
+    def test_hold_without_signal(self):
         assert self._d(cpu=None, mem=None) == 4.0
 
     def test_out_of_bounds_current_is_clamped(self):
-        assert self._d(current=20.0) == 8.0
-        assert self._d(current=0.1) == 1.0
+        assert self._d(current=20.0, waiters=0) == 8.0
+        assert self._d(current=0.1, waiters=0) == 1.0
 
 
 @pytest.fixture
@@ -145,17 +190,19 @@ class TestTick:
     async def test_raises_with_waiters_then_respects_the_dwell(self, redis):
         host = f"cctest-{uuid.uuid4().hex[:6]}"
         now = [1_000_000.0]
-        ctl = _controller(redis, host, clock=lambda: now[0])
-        await redis.raw.zadd(f"hc:{host}:waiter_exp", {"w": 10**13})
+        ctl = _controller(redis, host, clock=lambda: now[0], mem=40000)
+        await redis.raw.zadd(f"hc:{host}:waiter_exp", {f"w{i}": 10**13 for i in range(6)})
         await ctl.tick()
-        assert await redis.raw.get(f"hc:{host}:target") == "5.0"
+        # Nothing in use, 6 waiting: straight to 6 (was one unit per dwell).
+        assert await redis.raw.get(f"hc:{host}:target") == "6.0"
         assert await redis.raw.hget(f"hc:{host}:stats", "adjust_up") == "1"
+        await redis.raw.zadd(f"hc:{host}:waiter_exp", {"w6": 10**13, "w7": 10**13})
         now[0] += 5
         await ctl.tick()
-        assert await redis.raw.get(f"hc:{host}:target") == "5.0"
+        assert await redis.raw.get(f"hc:{host}:target") == "6.0"  # inside the dwell
         now[0] += 60
         await ctl.tick()
-        assert await redis.raw.get(f"hc:{host}:target") == "6.0"
+        assert await redis.raw.get(f"hc:{host}:target") == "8.0"
 
     @pytest.mark.asyncio
     async def test_cuts_under_strain_using_the_load_fallback(self, redis):

@@ -7,9 +7,13 @@ every `controller_interval_seconds` it reads the host's CPU pressure (Linux
 PSI, `/proc/pressure/cpu` "some avg10" — containers see the HOST's value, not
 their own, verified live) and available memory, then
 
-  - raises the target by one unit when CPU pressure is under
-    `cpu_pressure_low`, someone is waiting for a seat, and the last change is
-    at least `raise_dwell_seconds` old;
+  - when someone is waiting for a seat and the last change is at least
+    `raise_dwell_seconds` old, raises the target — under `cpu_pressure_low`
+    straight to everyone waiting, between the two marks by
+    `raise_step_fraction` of itself; never past what free memory can hold
+    (round 66: it used to add one unit per 30s and only under the low mark,
+    so after any cut it froze in between — live, 2-4 browsers on an idle
+    host);
   - cuts it by `cut_factor` when CPU pressure is over `cpu_pressure_high` or
     MemAvailable is under `mem_available_floor_mb`, at most once per
     `cut_dwell_seconds`;
@@ -113,12 +117,37 @@ def read_mem_available_mb(path: Path = _MEMINFO_PATH) -> int | None:
     return None
 
 
+def read_mem_total_mb(path: Path = _MEMINFO_PATH) -> int | None:
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("MemTotal:"):
+            return int(line.split()[1]) // 1024
+    return None
+
+
+def memory_ceiling(cfg: HostCapacityConfig, cpu_count: int, mem_total_mb: int | None) -> float:
+    """The most units this host may ever run. An explicit `max_units` wins;
+    otherwise as many browsers as total memory holds (round 66 — it was
+    2 x CPUs, which on light pages was the limit that bound, not pressure:
+    live, 8 seats on a host that ran 18 browsers at CPU PSI 27 unlimited).
+    Without a memory reading, the old 2 x CPUs."""
+    if cfg.max_units is not None:
+        return cfg.max_units
+    if mem_total_mb is None:
+        return float(2 * cpu_count)
+    return float(max(cfg.min_units, mem_total_mb // cfg.browser_memory_mb))
+
+
 def decide(
     current: float,
     *,
     cpu_pressure: float | None,
     mem_available_mb: int | None,
     waiters: int,
+    in_use: float,
     since_change: float,
     cfg: HostCapacityConfig,
     max_units: float,
@@ -132,10 +161,21 @@ def decide(
         if since_change >= cfg.cut_dwell_seconds:
             return max(cfg.min_units, round(current * cfg.cut_factor, 2))
         return current
-    calm = cpu_pressure is not None and cpu_pressure < cfg.cpu_pressure_low
-    if calm and waiters > 0 and since_change >= cfg.raise_dwell_seconds:
-        return min(max_units, current + 1)
-    return current
+    if cpu_pressure is None or waiters == 0 or since_change < cfg.raise_dwell_seconds:
+        return current
+    # Round 66 — work is waiting and nothing is strained: let it in. Calm, the
+    # whole queue at once (one unit per dwell made short jobs finish before
+    # the target caught up: +60-100% wall time on light pages). Between the
+    # marks, a step at a time — the old rule held there, and after a cut the
+    # target never came back up.
+    wanted = in_use + waiters
+    if cpu_pressure >= cfg.cpu_pressure_low:
+        wanted = min(wanted, current + max(1.0, current * cfg.raise_step_fraction))
+    if mem_available_mb is not None:
+        spare = max(0, mem_available_mb - cfg.mem_available_floor_mb)
+        # Whole browsers only: a browser needs all of its memory.
+        wanted = min(wanted, in_use + spare // cfg.browser_memory_mb)
+    return max(current, min(max_units, round(wanted, 2)))
 
 
 class CapacityController:
@@ -159,7 +199,7 @@ class CapacityController:
         self._read_mem = mem_reader
         self._read_load = load_reader
         self._admission = HostAdmission(redis.raw, host_id, cfg, cpu_count=self._cpus)
-        self.max_units = cfg.max_units or float(2 * self._cpus)
+        self.max_units = memory_ceiling(cfg, self._cpus, read_mem_total_mb())
         self._token = uuid.uuid4().hex
         self.leader_key = f"hc:{host_id}:leader"
         self.changed_key = f"hc:{host_id}:target_changed_at"
@@ -187,6 +227,7 @@ class CapacityController:
             cpu_pressure=cpu,
             mem_available_mb=mem,
             waiters=snap.waiters,
+            in_use=snap.in_use,
             since_change=since_change,
             cfg=self._cfg,
             max_units=self.max_units,
