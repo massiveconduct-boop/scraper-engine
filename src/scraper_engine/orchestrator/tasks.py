@@ -349,6 +349,7 @@ async def _run_scrape(
     browser_pool = BrowserPool(
         tenant_id=tenant_id,
         prewarm_count=2 if prewarm else 0,
+        park_spares=not cfg.host_capacity.enabled,
         session_mgr=session_mgr,
         geoip=cfg.camoufox.geoip,
         humanize=cfg.camoufox.humanize,

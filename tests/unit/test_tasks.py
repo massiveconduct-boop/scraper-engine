@@ -821,6 +821,7 @@ class TestHostAdmissionWiring:
         await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
 
         assert pool_cls.call_args.kwargs["prewarm_count"] == 0
+        assert pool_cls.call_args.kwargs["park_spares"] is False
         assert isinstance(worker_cls.call_args.kwargs["admission"], HostAdmission)
         assert worker.process_job.await_args.kwargs["deadline"] == 1234.5
 
@@ -841,6 +842,7 @@ class TestHostAdmissionWiring:
         await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
 
         assert pool_cls.call_args.kwargs["prewarm_count"] == prewarm
+        assert pool_cls.call_args.kwargs["park_spares"] is True
         assert worker_cls.call_args.kwargs["admission"] is None
 
 

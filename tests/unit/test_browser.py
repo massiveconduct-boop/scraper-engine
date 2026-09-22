@@ -985,6 +985,18 @@ class TestParkedSparesNeverStarveALaunch:
         await pool.shutdown()
         assert budget._reclaimers == []
 
+    async def test_release_closes_instead_of_parking_when_parking_is_off(
+        self, tenant, one_permit
+    ):
+        """Round 65 — under host admission a parked spare would run outside
+        any host seat, and a rotated gateway identity means none is reused."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, park_spares=False)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+        assert pool._active_wrappers == []
+
     async def test_release_parks_when_nobody_is_waiting(self, tenant, one_permit):
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         ctx = await pool.acquire(proxy=self._proxy(1))

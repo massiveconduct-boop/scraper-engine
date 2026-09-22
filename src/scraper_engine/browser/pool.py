@@ -61,8 +61,16 @@ class BrowserPool:
         max_total_instances: int | None = None,
         fingerprint_preset: bool = True,
         os: str = "linux",
+        park_spares: bool = True,
     ) -> None:
         self._tenant_id = tenant_id
+        # Round 65 — False closes every healthy instance on release instead of
+        # parking it. Under host admission (orchestrator/host_capacity.py) a
+        # parked spare runs outside any host seat — and it was never idle:
+        # live, one work-horse held 5 parked Camoufox instances for 10+ minutes,
+        # each still running its last page, none ever reused (a rotated gateway
+        # session id makes every render's proxy new, so no spare matches).
+        self._park_spares = park_spares
         self._prewarm_count = prewarm_count
         self._max_idle_seconds = max_idle_seconds
         self._session_mgr = session_mgr
@@ -340,10 +348,12 @@ class BrowserPool:
 
         for w in self._active_wrappers:
             if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
-                if budget.permit_waiters() and budget.BROWSER_SEMAPHORE.locked():
+                waiting = budget.permit_waiters() and budget.BROWSER_SEMAPHORE.locked()
+                if waiting or not self._park_spares:
                     # Someone (any engine) is blocked on a permit this
                     # instance holds. Parking it would keep that permit idle
                     # while they wait forever (round 63); close it instead.
+                    # Round 65 — or parking is off (host admission).
                     self._active_wrappers.remove(w)
                     await w.__aexit__()
                     return
