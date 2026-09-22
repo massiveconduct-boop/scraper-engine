@@ -18,6 +18,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 from scraper_engine.fetcher._failure import classify_http_status
 from scraper_engine.observability.metrics import fetch_duration_seconds
@@ -1034,20 +1037,32 @@ class Worker:
                     job_id,
                     url_str,
                 )
-                await self._circuit_breaker.record_failure(domain)
+                # Round 65 — our own Redis failing anywhere on this path
+                # (circuit breaker, level memory, proxy manager, politeness —
+                # not only host admission) is ours, not the target's: live, a
+                # 20s Redis pause mislabelled 4 URLs PARSE_ERROR and counted
+                # them against the domain's circuit.
+                redis_down = isinstance(exc, RedisConnectionError | RedisTimeoutError)
+                category = (
+                    FailureCategory.DEPENDENCY_UNAVAILABLE
+                    if redis_down
+                    else FailureCategory.PARSE_ERROR
+                )
+                if not redis_down:
+                    await self._circuit_breaker.record_failure(domain)
                 crash_result = FetchResult(
                     url=url_str,
                     success=False,
                     level_used=url_levels[-1],
                     duration_ms=0,
-                    failure_category=FailureCategory.PARSE_ERROR,
+                    failure_category=category,
                     error_message=f"Unexpected error processing URL: {exc}",
                 )
                 await self._dlq.enqueue(
                     tenant_id,
                     job_id,
                     url_str,
-                    FailureCategory.PARSE_ERROR,
+                    category,
                     crash_result.error_message or "",
                     url_levels[-1],
                 )

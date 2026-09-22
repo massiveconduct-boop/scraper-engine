@@ -299,3 +299,28 @@ class TestRerunAndClamp:
         worker = _worker(FakeAdmission())
         request = ScrapeRequest(urls=["http://example.com/p"])
         assert worker._clamp_timeout(request) is request
+
+
+class TestRedisOutageElsewhere:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_cls", ["ConnectionError", "TimeoutError"])
+    async def test_a_redis_failure_anywhere_is_dependency_unavailable(self, error_cls):
+        """Round 65 — live: a 20s Redis pause surfaced from the circuit
+        breaker / level memory path as PARSE_ERROR and blamed the domain."""
+        import redis.exceptions
+
+        worker = _worker(None)
+        worker._fetch_url = AsyncMock(
+            side_effect=getattr(redis.exceptions, error_cls)("Timeout reading from redis:6379")
+        )
+        response = await worker.process_job(TENANT, "job", _request())
+        assert response.results[0].failure_category == FailureCategory.DEPENDENCY_UNAVAILABLE
+        worker._circuit_breaker.record_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_unexpected_errors_stay_parse_errors(self):
+        worker = _worker(None)
+        worker._fetch_url = AsyncMock(side_effect=RecursionError("deep page"))
+        response = await worker.process_job(TENANT, "job", _request())
+        assert response.results[0].failure_category == FailureCategory.PARSE_ERROR
+        worker._circuit_breaker.record_failure.assert_awaited_once()
