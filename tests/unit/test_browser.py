@@ -43,7 +43,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         # First acquire — should get the fake context
         ctx1 = await pool.acquire()
@@ -76,7 +76,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
@@ -174,7 +174,7 @@ class TestBrowserPool:
         fake_wrapper._last_domain = None
         fake_wrapper.proxy = None
         fake_wrapper.__aexit__ = AsyncMock()
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         with patch.object(pool, "_active_wrappers", [fake_wrapper]):
             ctx = await pool.acquire(domain="example.com")
@@ -194,7 +194,7 @@ class TestBrowserPool:
         fake_wrapper._last_domain = "other.example"
         fake_wrapper.proxy = None
         fake_wrapper.__aexit__ = AsyncMock()
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         with (
             patch.object(pool, "_active_wrappers", [fake_wrapper]),
@@ -445,7 +445,7 @@ class TestSessionIsolation:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
@@ -609,9 +609,7 @@ class TestCamoufoxWrapperGeoipFallback:
             assert call.kwargs["geoip"] is True
 
     @pytest.mark.asyncio
-    async def test_launch_falls_back_even_when_fingerprint_preset_starts_disabled(
-        self, tenant
-    ):
+    async def test_launch_falls_back_even_when_fingerprint_preset_starts_disabled(self, tenant):
         """Round 51 — a caller-supplied fingerprint_preset=False is exactly
         as exposed to the webgl_data.db gap as True (camoufox's `is not
         None` check treats them identically), so the retry guard must not
@@ -920,9 +918,7 @@ class TestParkedSparesNeverStarveALaunch:
     def _proxy(port):
         return Proxy(id=port, ip="10.0.0.1", port=port, protocol=ProxyProtocol.HTTP)
 
-    async def test_a_spare_parked_while_a_launch_waits_is_handed_over(
-        self, tenant, one_permit
-    ):
+    async def test_a_spare_parked_while_a_launch_waits_is_handed_over(self, tenant, one_permit):
         """The live deadlock: the waiter arrived while every instance was
         leased, then a sibling finished and returned its instance healthy."""
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
@@ -985,9 +981,7 @@ class TestParkedSparesNeverStarveALaunch:
         await pool.shutdown()
         assert budget._reclaimers == []
 
-    async def test_release_closes_instead_of_parking_when_parking_is_off(
-        self, tenant, one_permit
-    ):
+    async def test_release_closes_instead_of_parking_when_parking_is_off(self, tenant, one_permit):
         """Round 65 — under host admission a parked spare would run outside
         any host seat, and a rotated gateway identity means none is reused."""
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0, park_spares=False)
@@ -1013,7 +1007,7 @@ class TestParkedSparesNeverStarveALaunch:
         spare = _FakeWrapper()
         await spare.__aenter__()
         pool._active_wrappers = [spare]
-        await pool._pool.put((spare._isolated_ctx, spare, time.monotonic()))
+        await pool._pool.put((spare._isolated_ctx, spare, time.monotonic(), None))
 
         await budget.acquire_browser_permit()
 
@@ -1044,7 +1038,7 @@ class TestParkedSparesNeverStarveALaunch:
         for w in (old, new):
             await w.__aenter__()
             pool._active_wrappers.append(w)
-            await pool._pool.put((w._isolated_ctx, w, time.monotonic()))
+            await pool._pool.put((w._isolated_ctx, w, time.monotonic(), None))
 
         await asyncio.wait_for(budget.acquire_browser_permit(), timeout=1)
 
@@ -1062,7 +1056,7 @@ class TestParkedSparesNeverStarveALaunch:
         spare._isolated_ctx = None
         spare.__aexit__ = AsyncMock(side_effect=RuntimeError("browser already gone"))
         pool._active_wrappers = [spare]
-        await pool._pool.put(("ctx-1", spare, time.monotonic()))
+        await pool._pool.put(("ctx-1", spare, time.monotonic(), None))
 
         from scraper_engine.core import budget
 
@@ -1075,9 +1069,7 @@ class TestParkedSparesNeverStarveALaunch:
         assert pool._active_wrappers == []
         assert pool._pool.qsize() == 0
 
-    async def test_a_cancelled_launch_is_not_counted_as_a_live_browser(
-        self, tenant, one_permit
-    ):
+    async def test_a_cancelled_launch_is_not_counted_as_a_live_browser(self, tenant, one_permit):
         pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
         await pool.acquire(proxy=self._proxy(1))
         waiter = asyncio.create_task(pool.acquire(proxy=self._proxy(2)))
@@ -1217,3 +1209,164 @@ class TestBoundedBrowserTeardown:
         assert wrapper._browser is None
         assert budget.BROWSER_SEMAPHORE._value == before + 1
         assert not budget.XVFB_LOCK.locked()
+
+
+class _FakeKeeper:
+    """Stands in for orchestrator/host_capacity.py::SeatKeeper — hands out one
+    seat id per render and records what comes back."""
+
+    def __init__(self, seats=("seat-1", "seat-2", "seat-3")):
+        self._seats = list(seats)
+        self.released: list[str] = []
+        self.reclaimers: list[object] = []
+
+    def register_reclaimer(self, reclaim):
+        self.reclaimers.append(reclaim)
+
+    def retain(self):
+        return self._seats.pop(0) if self._seats else None
+
+    async def discard(self, seat):
+        self.released.append(seat)
+
+
+@pytest.mark.asyncio
+class TestParkedBrowsersKeepTheirHostSeat:
+    """Round 67 — under host admission a parked browser keeps the seat of the
+    render that launched it, so the host budget still counts it. Rounds 65-66
+    closed every browser on release instead, which cost a cold browser per
+    render (light pages, measured: a render's median 24.1s -> 28.4s)."""
+
+    @pytest.fixture
+    def permits(self, monkeypatch):
+        from scraper_engine.browser import pool as pool_mod
+        from scraper_engine.core import budget as budget_mod
+
+        monkeypatch.setattr(budget_mod, "BROWSER_SEMAPHORE", asyncio.Semaphore(4))
+        monkeypatch.setattr(budget_mod, "_reclaimers", [])
+        monkeypatch.setattr(pool_mod, "CamoufoxWrapper", _FakeWrapper)
+        _FakeWrapper.instances = []
+
+    @staticmethod
+    def _proxy(port):
+        return Proxy(id=port, ip="10.0.0.1", port=port, protocol=ProxyProtocol.HTTP)
+
+    async def test_the_pool_offers_the_keeper_a_browser_to_reclaim(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        assert keeper.reclaimers == [pool._close_parked]
+
+    async def test_a_parked_browser_carries_its_seat(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1), domain="a.example")
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 1
+        assert pool._pool.get_nowait()[3] == "seat-1"
+        assert keeper.released == []
+
+    async def test_a_paid_gateway_browser_is_closed_not_parked(self, tenant, permits):
+        """Every gateway attempt gets a fresh sessid, so nothing can ask for
+        this browser again: parking it would only hold a seat and RAM."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        gateway = Proxy(
+            id=-1,
+            ip="gw.example",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="u__sessid.1",
+            password="p",
+            source="paid_gateway",
+        )
+        ctx = await pool.acquire(proxy=gateway)
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+        # No seat was retained for it.
+        assert keeper._seats == ["seat-1", "seat-2", "seat-3"]
+
+    async def test_a_browser_with_no_seat_to_keep_is_closed(self, tenant, permits):
+        """One seat is one browser: a render whose seat already keeps another
+        instance alive cannot park a second one."""
+        keeper = _FakeKeeper(seats=())
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+
+    async def test_reusing_a_parked_browser_hands_its_seat_back(self, tenant, permits):
+        """The render that reuses it holds a seat of its own — keeping both
+        would count one browser twice."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        proxy = self._proxy(1)
+        ctx = await pool.acquire(proxy=proxy, domain="a.example")
+        await pool.release(ctx, healthy=True)
+
+        again = await pool.acquire(proxy=proxy, domain="a.example")
+
+        assert again is ctx
+        assert keeper.released == ["seat-1"]
+
+    async def test_a_browser_torn_down_on_its_idle_timeout_gives_its_seat_back(
+        self, tenant, permits
+    ):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(
+            tenant_id=tenant, prewarm_count=0, max_idle_seconds=0, seat_keeper=keeper
+        )
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        await asyncio.sleep(0.01)
+
+        await pool.acquire(proxy=self._proxy(2))
+
+        assert keeper.released == ["seat-1"]
+
+    async def test_a_reclaimed_browser_gives_its_seat_back(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        assert await pool._close_parked() is True
+        assert keeper.released == ["seat-1"]
+        # Nothing parked any more.
+        assert await pool._close_parked() is False
+
+    async def test_the_keeper_can_reclaim_the_browser_holding_a_given_seat(self, tenant, permits):
+        """A lapsed seat must close the browser that held it, not whichever
+        parked browser happens to be oldest — the others stay parked."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        first = await pool.acquire(proxy=self._proxy(1))
+        second = await pool.acquire(proxy=self._proxy(2))
+        await pool.release(first, healthy=True)
+        await pool.release(second, healthy=True)
+
+        assert await pool._close_parked("seat-missing") is False
+        assert pool._pool.qsize() == 2
+        assert await pool._close_parked("seat-2") is True
+
+        assert keeper.released == ["seat-2"]
+        assert [w.closed for w in _FakeWrapper.instances] == [False, True]
+        assert pool._pool.qsize() == 1
+        assert pool._pool.get_nowait()[3] == "seat-1"
+
+    async def test_job_end_gives_every_seat_back(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        await pool.shutdown()
+
+        assert keeper.released == ["seat-1"]

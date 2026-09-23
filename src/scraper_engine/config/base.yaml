@@ -185,6 +185,8 @@ politeness:
 # live-verified; see config/schema.py::HostCapacityConfig for every knob.
 host_capacity:
   enabled: ${HOST_CAPACITY_ENABLED:false}
+  # Round 67 — false restores round 66's close-on-release under admission.
+  reuse_browsers: ${HOST_CAPACITY_REUSE_BROWSERS:true}
   min_units: 1.0
   tenant_share: 0.6
   lease_ttl_seconds: 90

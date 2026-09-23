@@ -122,7 +122,10 @@ class TestBotasaurusPool:
                 "https://a.example/2", proxy=_gateway("2"), domain="a.example", session_id="s1"
             )
         assert driver_cls.call_count == 2
-        driver.close.assert_called_once()
+        # Round 67 — and neither is parked: a gateway session is single-use
+        # (Proxy.reusable), so each driver closes after its own fetch.
+        assert driver.close.call_count == 2
+        assert pool._entries == []
 
     @pytest.mark.asyncio
     async def test_network_capture_redirects_to_current_calls_sink_on_reuse(self):
@@ -707,3 +710,148 @@ class TestMultiDriverPool:
         a.close.assert_called_once()
         b.close.assert_called_once()
         assert pool._entries == []
+
+
+class _FakeKeeper:
+    """Stands in for orchestrator/host_capacity.py::SeatKeeper (round 67)."""
+
+    def __init__(self, seats=("seat-1", "seat-2")):
+        self._seats = list(seats)
+        self.released: list[str] = []
+        self.reclaimers: list[object] = []
+
+    def register_reclaimer(self, reclaim):
+        self.reclaimers.append(reclaim)
+
+    def retain(self):
+        return self._seats.pop(0) if self._seats else None
+
+    async def discard(self, seat):
+        self.released.append(seat)
+
+
+class TestParkedDriversKeepTheirHostSeat:
+    """Round 67 — a parked driver keeps the seat of the fetch that launched
+    it, instead of round 66's close-on-release under host admission."""
+
+    @pytest.mark.asyncio
+    async def test_the_pool_offers_the_keeper_a_driver_to_reclaim(self):
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        assert keeper.reclaimers == [pool._close_parked]
+
+    @pytest.mark.asyncio
+    async def test_a_parked_driver_carries_its_seat(self):
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        with patch("botasaurus.browser.Driver", return_value=_fake_driver()):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert [e.seat for e in pool._entries] == ["seat-1"]
+        assert keeper.released == []
+
+    @pytest.mark.asyncio
+    async def test_a_driver_with_no_seat_to_keep_is_closed(self):
+        keeper = _FakeKeeper(seats=())
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        assert pool._entries == []
+        driver.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reusing_a_parked_driver_hands_its_seat_back(self):
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver) as driver_cls:
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://a.example/2", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+        # One launch, two fetches: the second reused the parked driver and
+        # gave its seat back, then parked it again on its own seat.
+        driver_cls.assert_called_once()
+        assert keeper.released == ["seat-1"]
+        assert [e.seat for e in pool._entries] == ["seat-2"]
+
+    @pytest.mark.asyncio
+    async def test_a_paid_gateway_driver_is_closed_not_parked(self):
+        """A gateway session is single-use (fresh sessid per attempt)."""
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        gateway = Proxy(
+            id=-1,
+            ip="gw.example",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="u__sessid.1",
+            password="p",
+            source="paid_gateway",
+        )
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=gateway, domain="a.example", session_id="s1"
+            )
+
+        driver.close.assert_called_once()
+        assert pool._entries == []
+        assert keeper._seats == ["seat-1", "seat-2"]
+
+    @pytest.mark.asyncio
+    async def test_the_keeper_can_reclaim_an_idle_driver(self):
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        driver = _fake_driver()
+        with patch("botasaurus.browser.Driver", return_value=driver):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+
+        assert await pool._close_parked() is True
+        assert keeper.released == ["seat-1"]
+        assert pool._entries == []
+        driver.close.assert_called_once()
+        # Nothing parked any more: real contention, not something to reclaim.
+        assert await pool._close_parked() is False
+
+    @pytest.mark.asyncio
+    async def test_the_keeper_can_reclaim_the_driver_holding_a_given_seat(self):
+        """A lapsed seat must close the driver that held it, not whichever
+        parked driver happens to be oldest."""
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        a, b = _fake_driver(), _fake_driver()
+        with patch("botasaurus.browser.Driver", side_effect=[a, b]):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+            await pool.fetch(
+                "https://b.example/1", proxy=_proxy(), domain="b.example", session_id="s1"
+            )
+
+        assert await pool._close_parked("seat-missing") is False
+        assert await pool._close_parked("seat-2") is True
+        b.close.assert_called_once()
+        a.close.assert_not_called()
+        assert [e.seat for e in pool._entries] == ["seat-1"]
+
+    @pytest.mark.asyncio
+    async def test_job_end_gives_every_seat_back(self):
+        keeper = _FakeKeeper()
+        pool = BotasaurusPool(tenant_id=TENANT, config=BotasaurusConfig(), seat_keeper=keeper)
+        with patch("botasaurus.browser.Driver", return_value=_fake_driver()):
+            await pool.fetch(
+                "https://a.example/1", proxy=_proxy(), domain="a.example", session_id="s1"
+            )
+
+        await pool.shutdown()
+
+        assert keeper.released == ["seat-1"]

@@ -54,6 +54,14 @@ class TestProxy:
         with pytest.raises(ValidationError):
             Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP, reliability_score=-10)
 
+    def test_only_a_paid_gateway_session_is_single_use(self):
+        """Round 67 — a browser launched on a gateway session is never asked
+        for again (fresh sessid per attempt), so pools must not park it."""
+        pool = Proxy(id=1, ip="1.2.3.4", port=80, protocol=ProxyProtocol.HTTP)
+        gateway = pool.model_copy(update={"source": "paid_gateway"})
+        assert pool.reusable() is True
+        assert gateway.reusable() is False
+
 
 class TestScrapeRequest:
     def test_valid_request(self) -> None:

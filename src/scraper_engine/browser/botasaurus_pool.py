@@ -50,12 +50,17 @@ if TYPE_CHECKING:
     from scraper_engine.config.schema import BotasaurusConfig
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.orchestrator.host_capacity import SeatKeeper
 
 
 class _PooledDriver:
-    __slots__ = ("driver", "proxy_key", "domain", "busy", "last_used", "events_sink")
+    __slots__ = ("driver", "proxy_key", "domain", "busy", "last_used", "events_sink", "seat")
 
     def __init__(self, proxy_key: str, domain: str) -> None:
+        # Round 67 — the host seat this driver holds while parked, or None
+        # (admission off, or the driver is checked out and its render's own
+        # claim is what covers it).
+        self.seat: str | None = None
         # None until launched: an entry is reserved (busy) before its driver
         # exists, so the pool's size cap counts launches in flight too.
         self.driver: Any = None
@@ -81,9 +86,17 @@ class BotasaurusPool:
         tenant_id: TenantId,
         config: BotasaurusConfig,
         park_drivers: bool = True,
+        seat_keeper: SeatKeeper | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._config = config
+        # Round 67 — a parked driver keeps the seat of the render that
+        # launched it, so the host budget still counts it (see
+        # orchestrator/host_capacity.py::SeatKeeper). Without a keeper
+        # (admission off) every seat here is None.
+        self._seat_keeper = seat_keeper
+        if seat_keeper is not None:
+            seat_keeper.register_reclaimer(self._close_parked)
         # Round 66 — False under host admission (orchestrator/host_capacity.py):
         # a parked driver holds no host seat, so it is load the host budget
         # cannot see. Live, free pool, 97 URLs with admission on: 8 seats in
@@ -133,9 +146,19 @@ class BotasaurusPool:
                 html = await loop.run_in_executor(
                     None, self._navigate, entry.driver, url, scroll_passes, scroll_wait_ms
                 )
-                parked_idle = self._park_drivers and await loop.run_in_executor(
-                    None, self._park, entry.driver
+                # Round 67 — a paid-gateway session is single-use, so its
+                # driver is closed, not parked (Proxy.reusable).
+                parked_idle = (
+                    self._park_drivers
+                    and proxy.reusable()
+                    and await loop.run_in_executor(None, self._park, entry.driver)
                 )
+                if parked_idle and self._seat_keeper is not None:
+                    # Round 67 — park it only if it can keep this render's
+                    # seat: a driver the host budget cannot see is what round
+                    # 66 closed on release.
+                    entry.seat = self._seat_keeper.retain()
+                    parked_idle = entry.seat is not None
             finally:
                 budget.BROWSER_SEMAPHORE.release()
         except BaseException:
@@ -151,12 +174,16 @@ class BotasaurusPool:
         """Reserve an entry: an idle match, else a new slot under the cap,
         else the oldest idle entry's slot (closing it), else wait."""
         evicted: _PooledDriver | None = None
+        reused: _PooledDriver | None = None
         async with self._cond:
             while True:
                 for e in self._entries:
                     if not e.busy and e.proxy_key == proxy_key and e.domain == domain:
                         e.busy = True
-                        return e
+                        reused = e
+                        break
+                if reused is not None:
+                    break
                 entry = _PooledDriver(proxy_key, domain)
                 if len(self._entries) < self._max_drivers:
                     self._entries.append(entry)
@@ -168,6 +195,13 @@ class BotasaurusPool:
                     self._entries.append(entry)
                     break
                 await self._cond.wait()
+        if reused is not None:
+            # This fetch launches nothing — its own claim covers the driver it
+            # just took over, so the seat that kept it parked goes back to the
+            # host (round 67).
+            seat, reused.seat = reused.seat, None
+            await self._release_seat(seat)
+            return reused
         await self._close_entry(evicted)
         return entry
 
@@ -184,9 +218,35 @@ class BotasaurusPool:
                 self._entries.remove(entry)
             self._cond.notify_all()
 
-    async def _close_entry(self, entry: _PooledDriver) -> None:
+    async def _close_parked(self, seat: str | None = None) -> bool:
+        """Close the parked driver holding `seat`, or the longest-idle one for
+        None, freeing the host seat it holds. False when there is no such
+        driver — for None, every entry is mid-fetch, which is real contention.
+        Registered with the SeatKeeper (round 67)."""
+        async with self._cond:
+            idle = [e for e in self._entries if not e.busy]
+            if seat is not None:
+                idle = [e for e in idle if e.seat == seat]
+            if not idle:
+                return False
+            entry = min(idle, key=lambda e: e.last_used)
+            self._entries.remove(entry)
+            self._cond.notify_all()
+        await self._close_entry(entry)
+        return True
+
+    async def _release_seat(self, seat: str | None) -> None:
+        """Hand a parked driver's host seat back. No-op with admission off."""
+        if seat is not None and self._seat_keeper is not None:
+            await self._seat_keeper.discard(seat)
+
+    async def _close_entry(self, entry: _PooledDriver | None) -> None:
         """Close a driver under XVFB_LOCK (round 41: a teardown must never
         overlap a launch's display spinup). No-op for an unlaunched entry."""
+        if entry is None:
+            return
+        seat, entry.seat = entry.seat, None
+        await self._release_seat(seat)
         if entry.driver is None:
             return
         driver, entry.driver = entry.driver, None
@@ -194,9 +254,7 @@ class BotasaurusPool:
         async with budget.xvfb_lock():
             await loop.run_in_executor(None, self._close_driver, driver)
 
-    def _launch_driver(
-        self, entry: _PooledDriver, proxy: Proxy, session_id: str | None
-    ) -> Any:
+    def _launch_driver(self, entry: _PooledDriver, proxy: Proxy, session_id: str | None) -> Any:
         """Synchronous — constructs and prepares a fresh Driver, run in the
         executor under XVFB_LOCK (Selenium-style driver management has no
         native asyncio API to await on). Navigation is `_navigate`'s job, run

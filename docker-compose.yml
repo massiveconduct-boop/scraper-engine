@@ -16,6 +16,7 @@ services:
       # Round 65 — host-wide browser admission (off by default). Passed
       # through explicitly: env_file only carries what .env itself sets.
       HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
       RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
@@ -70,6 +71,7 @@ services:
       # Round 65 — host-wide browser admission (off by default). Passed
       # through explicitly: env_file only carries what .env itself sets.
       HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
       RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
@@ -113,6 +115,7 @@ services:
       # Round 65 — host-wide browser admission (off by default). Passed
       # through explicitly: env_file only carries what .env itself sets.
       HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
       RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
@@ -156,6 +159,7 @@ services:
       # Round 65 — host-wide browser admission (off by default). Passed
       # through explicitly: env_file only carries what .env itself sets.
       HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
       RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000

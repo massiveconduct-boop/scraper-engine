@@ -128,17 +128,27 @@ def read_mem_total_mb(path: Path = _MEMINFO_PATH) -> int | None:
     return None
 
 
-def memory_ceiling(cfg: HostCapacityConfig, cpu_count: int, mem_total_mb: int | None) -> float:
+def memory_ceiling(
+    cfg: HostCapacityConfig,
+    cpu_count: int,
+    mem_total_mb: int | None,
+    browser_mb: float | None = None,
+) -> float:
     """The most units this host may ever run. An explicit `max_units` wins;
     otherwise as many browsers as total memory holds (round 66 — it was
     2 x CPUs, which on light pages was the limit that bound, not pressure:
     live, 8 seats on a host that ran 18 browsers at CPU PSI 27 unlimited).
-    Without a memory reading, the old 2 x CPUs."""
+    Without a memory reading, the old 2 x CPUs.
+
+    Round 67 — `browser_mb` is what this host's browsers were measured to
+    weigh (core/browser_rss.py); without a measurement, the configured
+    `browser_memory_mb` as before."""
     if cfg.max_units is not None:
         return cfg.max_units
     if mem_total_mb is None:
         return float(2 * cpu_count)
-    return float(max(cfg.min_units, mem_total_mb // cfg.browser_memory_mb))
+    per_browser = cfg.browser_memory_mb if browser_mb is None else browser_mb
+    return float(max(cfg.min_units, int(mem_total_mb // per_browser)))
 
 
 def decide(
@@ -151,6 +161,7 @@ def decide(
     since_change: float,
     cfg: HostCapacityConfig,
     max_units: float,
+    browser_mb: float | None = None,
 ) -> float:
     """The next target. Pure: every input is passed in."""
     current = min(max(current, cfg.min_units), max_units)
@@ -173,8 +184,12 @@ def decide(
         wanted = min(wanted, current + max(1.0, current * cfg.raise_step_fraction))
     if mem_available_mb is not None:
         spare = max(0, mem_available_mb - cfg.mem_available_floor_mb)
-        # Whole browsers only: a browser needs all of its memory.
-        wanted = min(wanted, in_use + spare // cfg.browser_memory_mb)
+        # Whole browsers only: a browser needs all of its memory. Round 67 —
+        # charged at what this host's browsers were measured to weigh, not at
+        # the constant, which on light pages held the target near 9 browsers
+        # where an unlimited run drove 14-21 with the host unstrained.
+        per_browser = cfg.browser_memory_mb if browser_mb is None else browser_mb
+        wanted = min(wanted, in_use + int(spare // per_browser))
     return max(current, min(max_units, round(wanted, 2)))
 
 
@@ -199,7 +214,8 @@ class CapacityController:
         self._read_mem = mem_reader
         self._read_load = load_reader
         self._admission = HostAdmission(redis.raw, host_id, cfg, cpu_count=self._cpus)
-        self.max_units = memory_ceiling(cfg, self._cpus, read_mem_total_mb())
+        self._mem_total_mb = read_mem_total_mb()
+        self.max_units = memory_ceiling(cfg, self._cpus, self._mem_total_mb)
         self._token = uuid.uuid4().hex
         self.leader_key = f"hc:{host_id}:leader"
         self.changed_key = f"hc:{host_id}:target_changed_at"
@@ -222,6 +238,13 @@ class CapacityController:
         now = self._clock()
         changed_raw = await raw.get(self.changed_key)
         since_change = now - float(changed_raw) if changed_raw else float("inf")
+        # Round 67 — what the workers on this host report their live browsers
+        # weigh, falling back to cfg.browser_memory_mb until two are reported.
+        browser_mb = await self._admission.browser_memory_mb(
+            max(3 * self._cfg.controller_interval_seconds, 30)
+        )
+        max_units = memory_ceiling(self._cfg, self._cpus, self._mem_total_mb, browser_mb)
+        self.max_units = max_units
         target = decide(
             snap.target,
             cpu_pressure=cpu,
@@ -230,7 +253,8 @@ class CapacityController:
             in_use=snap.in_use,
             since_change=since_change,
             cfg=self._cfg,
-            max_units=self.max_units,
+            max_units=max_units,
+            browser_mb=browser_mb,
         )
         keep_ms = self._cfg.target_ttl_seconds * 1000
         if target != snap.target:
@@ -239,12 +263,13 @@ class CapacityController:
             await raw.hincrby(self._admission.stats_key, f"adjust_{direction}", 1)
             logger.info(
                 "host_capacity_target %s %.2f -> %.2f cpu_pressure=%s mem_available_mb=%s "
-                "waiters=%d in_use=%.2f",
+                "browser_mb=%.0f waiters=%d in_use=%.2f",
                 direction,
                 snap.target,
                 target,
                 cpu,
                 mem,
+                browser_mb,
                 snap.waiters,
                 snap.in_use,
             )
@@ -255,11 +280,12 @@ class CapacityController:
             mapping={
                 "cpu_pressure": "" if cpu is None else str(cpu),
                 "mem_available_mb": "" if mem is None else str(mem),
+                "browser_mb": str(browser_mb),
             },
         )
         return (
             f"target={target:.2f} in_use={snap.in_use:.2f} waiters={snap.waiters} "
-            f"cpu_pressure={cpu} mem_available_mb={mem}"
+            f"cpu_pressure={cpu} mem_available_mb={mem} browser_mb={browser_mb:.0f}"
         )
 
 

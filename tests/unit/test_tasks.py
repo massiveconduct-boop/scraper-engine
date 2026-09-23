@@ -820,14 +820,45 @@ class TestHostAdmissionWiring:
 
         await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
 
+        from scraper_engine.orchestrator.host_capacity import SeatKeeper
+
         assert pool_cls.call_args.kwargs["prewarm_count"] == 0
-        assert pool_cls.call_args.kwargs["park_spares"] is False
-        # Round 66 — Botasaurus drivers too: a parked one holds no host seat.
+        # Round 67 — both pools park again, because a parked browser now keeps
+        # the seat of the render that launched it (the keeper holds it).
+        assert pool_cls.call_args.kwargs["park_spares"] is True
+        assert isinstance(pool_cls.call_args.kwargs["seat_keeper"], SeatKeeper)
         from scraper_engine.browser import botasaurus_pool
 
-        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["park_drivers"] is False
+        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["park_drivers"] is True
+        assert isinstance(
+            botasaurus_pool.BotasaurusPool.call_args.kwargs["seat_keeper"], SeatKeeper
+        )
         assert isinstance(worker_cls.call_args.kwargs["admission"], HostAdmission)
         assert worker.process_job.await_args.kwargs["deadline"] == 1234.5
+
+    @pytest.mark.asyncio
+    async def test_reuse_off_closes_browsers_on_release_as_round_66_did(
+        self, fake_clients, monkeypatch
+    ):
+        """`reuse_browsers=False` is the arm the live A/B compares against:
+        no pool keeps a browser, but the keeper still runs, because it is also
+        what reports browser memory to the controller."""
+        from scraper_engine.config.schema import HostCapacityConfig
+
+        pg, redis, s3, cfg = fake_clients
+        cfg.host_capacity = HostCapacityConfig(enabled=True, reuse_browsers=False)
+        monkeypatch.setattr(tasks_module, "_job_deadline", lambda: None)
+        pool_cls, _worker_cls, _worker = _patch_run_scrape_collaborators(monkeypatch)
+        request = ScrapeRequest(urls=["http://example.com"])
+
+        await tasks_module._run_scrape(TenantId("system"), "j", request, redis, pg, s3, cfg)
+
+        from scraper_engine.browser import botasaurus_pool
+
+        assert pool_cls.call_args.kwargs["park_spares"] is False
+        assert pool_cls.call_args.kwargs["seat_keeper"] is None
+        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["park_drivers"] is False
+        assert botasaurus_pool.BotasaurusPool.call_args.kwargs["seat_keeper"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("max_level", "prewarm"), [(None, 2), (3, 2), (1, 0)])

@@ -63,6 +63,7 @@ from scraper_engine.orchestrator.politeness import delay_key, slot_key
 
 if TYPE_CHECKING:
     from scraper_engine.config.schema import HostCapacityConfig
+    from scraper_engine.core.browser_rss import BrowserMemorySample
     from scraper_engine.core.tenant import TenantId
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,15 @@ redis.call('ZREM', KEYS[4], ARGV[1])
 return 1
 """
 
+# KEYS: slot_key   ARGV: lease_id
+# Round 67 — the render is over but its browser was parked for reuse, so the
+# seat stays with the browser (SeatKeeper) and only the website's politeness
+# slot comes back now.
+RELEASE_SLOT_LUA = """
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1
+"""
+
 # KEYS: waiters, waiter_exp, waiter_info   ARGV: waiter_id
 LEAVE_LUA = """
 redis.call('ZREM', KEYS[1], ARGV[1])
@@ -284,6 +294,22 @@ return {tostring(in_use), tostring(waiting), tostring(target)}
 # could free), so it is refused outright instead.
 _CLAIM_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "host_capacity_claim_held", default=False
+)
+
+
+@dataclass
+class _ActiveClaim:
+    """The claim the current task is inside, so a browser pool deep in the
+    fetch path can keep its seat when it parks a browser (round 67) without
+    every fetcher signature growing a lease argument."""
+
+    lease_id: str
+    turn_key: str
+    retained: bool = False
+
+
+_ACTIVE_CLAIM: contextvars.ContextVar[_ActiveClaim | None] = contextvars.ContextVar(
+    "host_capacity_active_claim", default=None
 )
 
 
@@ -362,6 +388,9 @@ class HostAdmission:
         self.waiter_info_key = f"{prefix}:waiter_info"
         self.target_key = f"{prefix}:target"
         self.stats_key = f"{prefix}:stats"
+        # Round 67 — what this host's live browsers actually weigh, one field
+        # per worker process (core/browser_rss.py).
+        self.browser_rss_key = f"{prefix}:browser_rss"
 
     async def _eval(self, script: str, keys: list[str], args: list[Any]) -> Any:
         try:
@@ -404,20 +433,30 @@ class HostAdmission:
             is_cancelled=is_cancelled,
         )
         token = _CLAIM_HELD.set(True)
+        active = _ActiveClaim(lease_id=grant.lease_id, turn_key=turn_key)
+        active_token = _ACTIVE_CLAIM.set(active)
         renewer = asyncio.create_task(self._renew_loop(grant.lease_id, turn_key))
         try:
             yield grant
         finally:
             _CLAIM_HELD.reset(token)
+            _ACTIVE_CLAIM.reset(active_token)
             renewer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await renewer
-            try:
-                await self._eval(
+            # Round 67 — a pool parked the browser this render launched and
+            # took the seat over (SeatKeeper renews it from here on), so only
+            # the website's slot comes back now.
+            script, keys = (
+                (RELEASE_SLOT_LUA, [turn_key])
+                if active.retained
+                else (
                     RELEASE_LUA,
                     [self.seats_key, self.seat_weight_key, self.seat_tenant_key, turn_key],
-                    [grant.lease_id],
                 )
+            )
+            try:
+                await self._eval(script, keys, [grant.lease_id])
             except AdmissionUnavailableError:
                 logger.warning(
                     "host_claim_release_failed lease=%s — it lapses within %ds",
@@ -535,17 +574,80 @@ class HostAdmission:
                 )
                 return
             try:
-                alive = await self._eval(
-                    RENEW_LUA,
-                    [self.seats_key, turn_key],
-                    [lease_id, cfg.lease_ttl_seconds * 1000, _HOST_KEY_TTL_MS],
-                )
+                alive = await self.renew_lease(lease_id, turn_key)
             except AdmissionUnavailableError:
                 logger.warning("host_claim_renew_failed lease=%s", lease_id)
                 continue
-            if not int(alive):
+            if not alive:
                 logger.warning("host_claim_lease_lost lease=%s", lease_id)
                 return
+
+    async def renew_lease(self, lease_id: str, turn_key: str) -> bool:
+        """Push a held lease's expiry out by one lease TTL. False once the
+        lease is gone (it lapsed, or another script purged it)."""
+        alive = await self._eval(
+            RENEW_LUA,
+            [self.seats_key, turn_key],
+            [lease_id, self._cfg.lease_ttl_seconds * 1000, _HOST_KEY_TTL_MS],
+        )
+        return bool(int(alive))
+
+    async def release_seat(self, lease_id: str, turn_key: str) -> None:
+        """Give a seat back to the host. Used by SeatKeeper for a seat that
+        outlived its render on a parked browser (round 67)."""
+        await self._eval(
+            RELEASE_LUA,
+            [self.seats_key, self.seat_weight_key, self.seat_tenant_key, turn_key],
+            [lease_id],
+        )
+
+    async def report_browser_memory(self, reporter_id: str, sample: BrowserMemorySample) -> None:
+        """Publish what this process's live browsers weigh (round 67). Best
+        effort: a host that reports nothing falls back to the configured
+        `browser_memory_mb`, which is what round 66 always used."""
+        payload = json.dumps(
+            {"count": sample.count, "mean_mb": sample.mean_mb, "at": time.time()}
+        )
+        with contextlib.suppress(Exception):
+            await self._redis.hset(self.browser_rss_key, reporter_id, payload)
+            await self._redis.pexpire(self.browser_rss_key, _HOST_KEY_TTL_MS)
+
+    async def browser_memory_mb(self, fresh_seconds: float) -> float:
+        """What one browser costs on this host: the mean every worker reported,
+        clamped to `[min_browser_memory_mb, browser_memory_mb]`. Falls back to
+        `browser_memory_mb` until at least two live browsers are reported, so a
+        single starting browser never sizes the host.
+
+        Reports older than `fresh_seconds` are dropped — a worker process exits
+        after each job and its browsers go with it.
+        """
+        cfg = self._cfg
+        now = time.time()
+        total = 0.0
+        browsers = 0
+        stale: list[str] = []
+        reports = await self._redis.hgetall(self.browser_rss_key)
+        for field, value in reports.items():
+            name = field.decode() if isinstance(field, bytes) else str(field)
+            try:
+                payload = json.loads(value)
+                age = now - float(payload["at"])
+                count = int(payload["count"])
+                mean_mb = float(payload["mean_mb"])
+            except Exception:
+                stale.append(name)
+                continue
+            if age > fresh_seconds:
+                stale.append(name)
+                continue
+            browsers += count
+            total += mean_mb * count
+        if stale:
+            await self._redis.hdel(self.browser_rss_key, *stale)
+        if browsers < 2:
+            return float(cfg.browser_memory_mb)
+        measured = total / browsers
+        return float(min(max(measured, cfg.min_browser_memory_mb), cfg.browser_memory_mb))
 
     async def snapshot(self) -> CapacitySnapshot:
         """Live units in use, live waiters, and the current target."""
@@ -557,3 +659,183 @@ class HostAdmission:
         return CapacitySnapshot(
             in_use=float(reply[0]), waiters=int(reply[1]), target=float(reply[2])
         )
+
+
+@dataclass
+class _RetainedSeat:
+    turn_key: str
+    idle_since: float
+    last_renew: float
+
+
+class SeatKeeper:
+    """Holds the seats of browsers that are parked for reuse (round 67).
+
+    Rounds 65-66 closed every browser on release, because a parked one ran
+    outside any host seat — load the budget could not see. The cost was a cold
+    browser per render: measured on light pages, a render's median went from
+    24.1s to 28.4s with admission on.
+
+    So the seat follows the BROWSER instead of the render: when a pool parks an
+    instance it keeps the seat of the render that launched it, and this keeper
+    renews it. `in_use` then counts live browsers, which is what a
+    memory-derived target (capacity_controller.py) needs it to mean.
+
+    A retained seat comes back when:
+      - the pool closes that instance (discard, LRU eviction, idle timeout,
+        job-end shutdown) — the pool calls `discard()`;
+      - anyone is waiting in the host's line and the seat has been idle at
+        least `idle_grace_seconds` — the loop below asks a pool to close one
+        parked instance. A local render waiting for capacity is a waiter like
+        any other, so a process cannot sit on its own parked browsers;
+      - it has been idle `idle_seat_seconds` with nobody waiting at all.
+    """
+
+    def __init__(
+        self,
+        admission: HostAdmission,
+        config: HostCapacityConfig,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._admission = admission
+        self._cfg = config
+        self._clock = clock
+        self._sleep = sleep
+        self._seats: dict[str, _RetainedSeat] = {}
+        self._reclaimers: list[Callable[[str | None], Awaitable[bool]]] = []
+        # Round 67 — this process's identity in the host's browser-memory
+        # report, and when it last published (core/browser_rss.py).
+        self._reporter_id = uuid.uuid4().hex
+        self._last_report = 0.0
+
+    def register_reclaimer(self, reclaim: Callable[[str | None], Awaitable[bool]]) -> None:
+        """Register a pool's "close a parked instance" method. Given a lease id
+        it closes the instance holding that seat, if the pool has it; given
+        None, its longest-idle instance. It returns True when it closed one —
+        that instance's own close path is what gives the seat back, through
+        `discard()`."""
+        self._reclaimers.append(reclaim)
+
+    def retain(self) -> str | None:
+        """Keep the current render's seat with the browser being parked.
+
+        Returns the lease id now bound to that browser, or None when there is
+        no claim to keep (admission off) or this render's seat was already
+        taken over by another parked instance — one seat is one browser, so
+        the caller closes its instance instead, exactly as in round 66.
+        """
+        active = _ACTIVE_CLAIM.get()
+        if active is None or active.retained:
+            return None
+        active.retained = True
+        now = self._clock()
+        self._seats[active.lease_id] = _RetainedSeat(
+            turn_key=active.turn_key, idle_since=now, last_renew=now
+        )
+        return active.lease_id
+
+    async def discard(self, lease_id: str | None) -> None:
+        """Give back the seat of an instance that has just been closed."""
+        if lease_id is None:
+            return
+        seat = self._seats.pop(lease_id, None)
+        if seat is None:
+            return
+        try:
+            await self._admission.release_seat(lease_id, seat.turn_key)
+        except AdmissionUnavailableError:
+            logger.warning(
+                "host_seat_release_failed lease=%s — it lapses within %ds",
+                lease_id,
+                self._cfg.lease_ttl_seconds,
+            )
+
+    async def _reclaim(self, lease_id: str | None = None) -> bool:
+        """Ask the pools to close the parked instance holding `lease_id`, or
+        any one parked instance for None. That pool's close path calls
+        discard(), which is what actually frees the seat."""
+        for reclaim in self._reclaimers:
+            if await reclaim(lease_id):
+                return True
+        return False
+
+    def _idle_seats(self, now: float, min_idle: float) -> int:
+        return sum(1 for s in self._seats.values() if now - s.idle_since >= min_idle)
+
+    async def _report_memory(self, now: float) -> None:
+        """Publish what this process's browsers weigh, at most once per
+        controller interval — the reading is what sizes the host's budget."""
+        from scraper_engine.core.browser_rss import sample_browser_rss
+
+        if now - self._last_report < self._cfg.controller_interval_seconds:
+            return
+        self._last_report = now
+        sample = sample_browser_rss()
+        if sample is not None:
+            await self._admission.report_browser_memory(self._reporter_id, sample)
+
+    async def tick(self) -> None:
+        """One pass: report memory, renew what is held, hand back what should
+        not be. Runs whether or not anything is parked — a process with every
+        browser mid-fetch still has memory worth reporting."""
+        now = self._clock()
+        await self._report_memory(now)
+        if not self._seats:
+            return
+        cfg = self._cfg
+        for lease_id, seat in list(self._seats.items()):
+            if now - seat.last_renew < cfg.renew_interval_seconds:
+                continue
+            seat.last_renew = now
+            try:
+                alive = await self._admission.renew_lease(lease_id, seat.turn_key)
+            except AdmissionUnavailableError:
+                logger.warning("host_seat_renew_failed lease=%s", lease_id)
+                continue
+            if not alive:
+                # The seat lapsed (Redis outage past the TTL, or a purge): the
+                # host has already given those units away, so stop counting on
+                # them and close the browser they were holding — that one,
+                # not whichever is oldest, or a seatless browser stays parked
+                # while a seated one is closed.
+                logger.warning("host_seat_lease_lost lease=%s", lease_id)
+                self._seats.pop(lease_id, None)
+                await self._reclaim(lease_id)
+        overheld = [
+            lease_id
+            for lease_id, seat in self._seats.items()
+            if now - seat.idle_since >= cfg.idle_seat_seconds
+        ]
+        for lease_id in overheld:
+            await self._reclaim(lease_id)
+        if self._seats and not overheld:
+            await self._yield_to_waiters(now)
+
+    async def _yield_to_waiters(self, now: float) -> None:
+        """Close parked browsers while other work is queued for the host."""
+        idle = self._idle_seats(now, self._cfg.idle_grace_seconds)
+        if not idle:
+            return
+        try:
+            snapshot = await self._admission.snapshot()
+        except AdmissionUnavailableError:
+            return
+        for _ in range(min(idle, snapshot.waiters)):
+            if not await self._reclaim():
+                return
+
+    async def run(self, stop: asyncio.Event) -> None:
+        """Poll until `stop` — one pass per `poll_min_seconds`."""
+        while not stop.is_set():
+            await self._sleep(self._cfg.poll_min_seconds)
+            with contextlib.suppress(AdmissionError):
+                await self.tick()
+
+    async def shutdown(self) -> None:
+        """Release every seat still held. The pools close their instances in
+        the same job-end bracket; this is what covers a seat whose instance
+        was closed by a path that could not reach discard()."""
+        for lease_id in list(self._seats):
+            await self.discard(lease_id)

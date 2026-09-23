@@ -444,6 +444,18 @@ class HostCapacityConfig(BaseModel):
     default_units: float | None = Field(default=None, gt=0)
     camoufox_weight: float = Field(default=1.0, gt=0)
     botasaurus_weight: float = Field(default=1.0, gt=0)
+    # Round 67 — a browser parked for reuse keeps the seat of the render that
+    # launched it (orchestrator/host_capacity.py::SeatKeeper), instead of both
+    # pools closing every browser on release. False restores round 66's
+    # close-on-release, which is what the live A/B compares against.
+    reuse_browsers: bool = True
+    # A retained seat is only reclaimed once it has been idle this long, so a
+    # browser parked a moment ago survives long enough for the next URL of the
+    # same job to reuse it.
+    idle_grace_seconds: float = Field(default=2.0, ge=0)
+    # An idle browser holds its seat at most this long even with nobody
+    # waiting — past it the seat (and its RAM) go back to the host.
+    idle_seat_seconds: float = Field(default=45.0, gt=0)
     # While another tenant is waiting, one tenant holds at most
     # ceil(target * tenant_share) units.
     tenant_share: float = Field(default=0.6, gt=0, le=1)
@@ -475,7 +487,16 @@ class HostCapacityConfig(BaseModel):
     # Round 66 — memory one browser needs, for the memory-derived ceiling and
     # for how far one raise may go. Measured peaks on a trivial page: Camoufox
     # 916 MiB, Botasaurus 1167 MiB; real pages need more.
+    # Round 67 — this is now the FALLBACK and the upper clamp: workers publish
+    # what their live browsers actually use (core/browser_rss.py) and the
+    # controller sizes on that, never charging more than this constant.
     browser_memory_mb: int = Field(default=1200, gt=0)
+    # Floor for that measurement: a sample below this is treated as a bad
+    # reading (a browser still starting up). With `browser_memory_mb` as the
+    # ceiling, a measurement can only loosen round 66's constant, never
+    # tighten it — summed RSS over-counts pages shared between a browser's
+    # processes, and real MemAvailable still gates every raise.
+    min_browser_memory_mb: int = Field(default=400, gt=0)
     # Round 66 — 30 -> 10: one CPU PSI avg10 window, i.e. long enough for the
     # browsers the last raise admitted to show up in the reading.
     raise_dwell_seconds: int = Field(default=10, ge=0)

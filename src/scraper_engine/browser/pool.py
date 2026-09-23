@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from scraper_engine.browser.session_state import SessionStateManager
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.orchestrator.host_capacity import SeatKeeper
 
 
 class BrowserPool:
@@ -62,8 +63,16 @@ class BrowserPool:
         fingerprint_preset: bool = True,
         os: str = "linux",
         park_spares: bool = True,
+        seat_keeper: SeatKeeper | None = None,
     ) -> None:
         self._tenant_id = tenant_id
+        # Round 67 — under host admission a parked instance keeps the seat of
+        # the render that launched it (orchestrator/host_capacity.py), so it is
+        # load the host budget still sees. Without a keeper (admission off)
+        # every seat below is None and the pool behaves as it always did.
+        self._seat_keeper = seat_keeper
+        if seat_keeper is not None:
+            seat_keeper.register_reclaimer(self._close_parked)
         # Round 65 — False closes every healthy instance on release instead of
         # parking it. Under host admission (orchestrator/host_capacity.py) a
         # parked spare runs outside any host seat — and it was never idle:
@@ -152,7 +161,9 @@ class BrowserPool:
                 )
                 continue
             self._active_wrappers.append(wrapper)
-            await self._pool.put((ctx, wrapper, time.monotonic()))
+            # Prewarm is off under host admission (orchestrator/tasks.py), so a
+            # prewarmed instance never holds a seat: None.
+            await self._pool.put((ctx, wrapper, time.monotonic(), None))
         self._started = True
 
     async def acquire(self, proxy: Proxy | None = None, domain: str | None = None) -> Any:
@@ -167,7 +178,7 @@ class BrowserPool:
 
         selected = None
         keep = []
-        for ctx, wrapper, idle_since in drained:
+        for ctx, wrapper, idle_since, seat in drained:
             if now - idle_since > self._max_idle_seconds:
                 # Genuinely stale — this is the one case that actually tears
                 # down the browser. idle timeout, not a mismatch, is what
@@ -177,6 +188,7 @@ class BrowserPool:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
+                await self._release_seat(seat)
                 continue
 
             # A wrapper leased with proxy A must never be handed back out for a
@@ -206,12 +218,16 @@ class BrowserPool:
                 # and build a fresh one (below) for this one instead. Total
                 # concurrently-alive instances still can't exceed
                 # core.budget.BROWSER_SEMAPHORE either way.
-                keep.append((ctx, wrapper, idle_since))
+                keep.append((ctx, wrapper, idle_since, seat))
                 continue
             if selected is None:
+                # This render launches nothing: the seat that came with the
+                # parked instance is the one it runs on, and this render's own
+                # claim covers it, so hand it back (round 67).
                 selected = (ctx, wrapper)
+                await self._release_seat(seat)
             else:
-                keep.append((ctx, wrapper, idle_since))
+                keep.append((ctx, wrapper, idle_since, seat))
 
         for item in keep:
             await self._pool.put(item)
@@ -287,9 +303,37 @@ class BrowserPool:
         absorb by making the caller wait.
         """
         try:
-            ctx, wrapper, _idle_since = self._pool.get_nowait()
+            item = self._pool.get_nowait()
         except asyncio.QueueEmpty:
             return False
+        await self._close_spare(item)
+        return True
+
+    async def _close_parked(self, seat: str | None = None) -> bool:
+        """Close the parked instance holding host seat `seat`, or the oldest
+        spare for None. False when this pool has no such instance. Registered
+        with the SeatKeeper (round 67)."""
+        if seat is None:
+            return await self._evict_oldest_spare()
+        found = None
+        keep = []
+        while not self._pool.empty():
+            item = self._pool.get_nowait()
+            if found is None and item[3] == seat:
+                found = item
+            else:
+                keep.append(item)
+        for item in keep:
+            await self._pool.put(item)
+        if found is None:
+            return False
+        await self._close_spare(found)
+        return True
+
+    async def _close_spare(self, item: tuple[Any, Any, float, str | None]) -> None:
+        """Tear down one instance already taken off the parked queue and hand
+        back the host seat it held."""
+        ctx, wrapper, _idle_since, seat = item
         for w in list(self._active_wrappers):
             if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                 self._active_wrappers.remove(w)
@@ -297,7 +341,13 @@ class BrowserPool:
                 with contextlib.suppress(Exception):
                     await w.__aexit__()
                 break
-        return True
+        await self._release_seat(seat)
+
+    async def _release_seat(self, seat: str | None) -> None:
+        """Hand back the host seat a parked instance was holding (round 67).
+        No-op with admission off, where nothing ever holds one."""
+        if seat is not None and self._seat_keeper is not None:
+            await self._seat_keeper.discard(seat)
 
     @asynccontextmanager
     async def lease(
@@ -349,15 +399,26 @@ class BrowserPool:
         for w in self._active_wrappers:
             if w._context is ctx or w._isolated_ctx is ctx or w._context == ctx:
                 waiting = budget.permit_waiters() and budget.BROWSER_SEMAPHORE.locked()
-                if waiting or not self._park_spares:
+                seat: str | None = None
+                proxy = getattr(w, "proxy", None)
+                single_use = proxy is not None and not proxy.reusable()
+                close = bool(waiting) or not self._park_spares or single_use
+                if not close and self._seat_keeper is not None:
+                    seat = self._seat_keeper.retain()
+                    close = seat is None
+                if close:
                     # Someone (any engine) is blocked on a permit this
                     # instance holds. Parking it would keep that permit idle
                     # while they wait forever (round 63); close it instead.
-                    # Round 65 — or parking is off (host admission).
+                    # Round 65 — or parking is off (park_spares).
+                    # Round 67 — or this render's seat is already keeping
+                    # another parked instance alive: one seat, one browser.
+                    # Or it ran on a paid-gateway session, which no later
+                    # request can ask for again (Proxy.reusable).
                     self._active_wrappers.remove(w)
                     await w.__aexit__()
                     return
-                await self._pool.put((ctx, w, time.monotonic()))
+                await self._pool.put((ctx, w, time.monotonic(), seat))
                 return
         with contextlib.suppress(Exception):
             await ctx.__aexit__(None, None, None)
@@ -367,12 +428,13 @@ class BrowserPool:
         budget.unregister_permit_reclaimer(self._evict_oldest_spare)
         while not self._pool.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
-                ctx, wrapper, _ = self._pool.get_nowait()
+                ctx, wrapper, _, seat = self._pool.get_nowait()
                 for w in self._active_wrappers:
                     if w is wrapper or w._context is ctx or w._isolated_ctx is ctx:
                         self._active_wrappers.remove(w)
                         await w.__aexit__()
                         break
+                await self._release_seat(seat)
         for w in list(self._active_wrappers):
             await w.__aexit__()
         self._active_wrappers.clear()

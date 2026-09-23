@@ -21,6 +21,7 @@ does (it only returns an in-memory ``JobStatusResponse``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -311,7 +312,7 @@ async def _run_scrape(
     from scraper_engine.browser.session_state import SessionStateManager
     from scraper_engine.core.host_identity import resolve_host_id
     from scraper_engine.orchestrator.circuit_breaker import CircuitBreaker
-    from scraper_engine.orchestrator.host_capacity import HostAdmission
+    from scraper_engine.orchestrator.host_capacity import HostAdmission, SeatKeeper
     from scraper_engine.orchestrator.politeness import PolitenessController
     from scraper_engine.orchestrator.worker import Worker
     from scraper_engine.storage.dlq import DeadLetterQueue
@@ -346,10 +347,27 @@ async def _run_scrape(
     # never reach a browser level at all.
     max_level = request.config_overrides.max_level if request.config_overrides else None
     prewarm = not cfg.host_capacity.enabled and (max_level is None or max_level >= 2)
+
+    # Round 67 — under admission a pool may park a browser again, as long as
+    # that browser keeps the seat of the render that launched it. The keeper is
+    # what holds (and gives back) those seats; without one, both pools close on
+    # release exactly as in round 66.
+    admission: HostAdmission | None = None
+    seat_keeper: SeatKeeper | None = None
+    if cfg.host_capacity.enabled:
+        admission = HostAdmission(redis.raw, resolve_host_id(), cfg.host_capacity)
+        # The keeper also reports what this process's browsers weigh, which
+        # sizes the host budget (core/browser_rss.py), so it runs under
+        # admission either way; the pools only get it when reuse is on.
+        seat_keeper = SeatKeeper(admission, cfg.host_capacity)
+    reuse = not cfg.host_capacity.enabled or cfg.host_capacity.reuse_browsers
+    pool_keeper = seat_keeper if reuse else None
+
     browser_pool = BrowserPool(
         tenant_id=tenant_id,
         prewarm_count=2 if prewarm else 0,
-        park_spares=not cfg.host_capacity.enabled,
+        park_spares=reuse,
+        seat_keeper=pool_keeper,
         session_mgr=session_mgr,
         geoip=cfg.camoufox.geoip,
         humanize=cfg.camoufox.humanize,
@@ -367,12 +385,9 @@ async def _run_scrape(
     botasaurus_pool = BotasaurusPool(
         tenant_id=tenant_id,
         config=cfg.botasaurus,
-        park_drivers=not cfg.host_capacity.enabled,
+        park_drivers=reuse,
+        seat_keeper=pool_keeper,
     )
-
-    admission: HostAdmission | None = None
-    if cfg.host_capacity.enabled:
-        admission = HostAdmission(redis.raw, resolve_host_id(), cfg.host_capacity)
 
     async def _on_result(result: FetchResult) -> None:
         """Persist each result the moment it lands (round 29) instead of
@@ -387,6 +402,10 @@ async def _run_scrape(
     # this finally. start() itself no longer raises on a per-instance
     # launch failure (browser/pool.py round 51), but keeping this ordering
     # correct for the config-check case that legitimately still can.
+    keeper_stop = asyncio.Event()
+    keeper_task: asyncio.Task[None] | None = None
+    if seat_keeper is not None:
+        keeper_task = asyncio.create_task(seat_keeper.run(keeper_stop))
     try:
         await browser_pool.start()
         worker = Worker(
@@ -406,6 +425,15 @@ async def _run_scrape(
     finally:
         await browser_pool.shutdown()
         await botasaurus_pool.shutdown()
+        # The pools' shutdowns close every parked instance, which is what
+        # returns its seat; the keeper's own shutdown covers a seat whose
+        # instance was closed by a path that could not reach it (round 67).
+        if seat_keeper is not None and keeper_task is not None:
+            keeper_stop.set()
+            keeper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keeper_task
+            await seat_keeper.shutdown()
 
 
 async def _run_crawl_job(

@@ -62,10 +62,23 @@ class Proxy(BaseModel):
         structured dict (Botasaurus). Identical to url() when unauthenticated."""
         if self.username is None or self.password is None:
             return self.url()
-        return f"{self.protocol.value.lower()}://{self.username}:{self.password}@{self.ip}:{self.port}"
+        return (
+            f"{self.protocol.value.lower()}://{self.username}:{self.password}@{self.ip}:{self.port}"
+        )
 
     def key(self) -> str:
         return f"{self.ip}:{self.port}"
+
+    def reusable(self) -> bool:
+        """Whether a browser launched on this proxy can serve a later request.
+
+        Round 67. False for a paid-gateway session: the worker gives every
+        gateway attempt a fresh `sessid` (orchestrator/worker.py ->
+        paid_gateway.new_session_id), so its identity_key() is never asked for
+        again, and a browser parked on it could only sit idle holding RAM, a
+        browser permit and (under host admission) a host seat.
+        """
+        return self.source != "paid_gateway"
 
     def identity_key(self) -> str:
         """The exit identity this proxy represents, not just its endpoint.

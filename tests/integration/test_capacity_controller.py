@@ -275,3 +275,57 @@ class TestRun:
         monkeypatch.setattr(cc, "run", fake_run)
         cc.main()
         assert seen == {"ran": True}
+
+
+class TestMeasuredBrowserMemory:
+    """Round 67 — the host is sized by what its browsers were measured to
+    weigh (core/browser_rss.py), not by the 1200 MB constant. On this
+    project's own host the constant is what bound: 10.5 GB MemAvailable held
+    the target near 9 browsers while an unlimited run drove 14-21 of them at
+    CPU PSI 15-19."""
+
+    def test_a_raise_is_charged_at_what_a_browser_actually_weighs(self):
+        # 1536 MB floor + 2400 MB spare: 2 browsers at the constant, 4 at the
+        # 600 MB these browsers were measured to use.
+        assert (
+            decide(
+                4.0,
+                cpu_pressure=10.0,
+                mem_available_mb=1536 + 2400,
+                waiters=5,
+                in_use=4.0,
+                since_change=1000.0,
+                cfg=CFG,
+                max_units=20.0,
+                browser_mb=600.0,
+            )
+            == 8.0
+        )
+
+    def test_the_ceiling_moves_with_the_measurement(self):
+        auto = HostCapacityConfig(enabled=True)
+        assert cc.memory_ceiling(auto, 4, 24000, 600.0) == 40.0
+        assert cc.memory_ceiling(auto, 4, 24000, None) == 20.0
+
+    @pytest.mark.asyncio
+    async def test_tick_sizes_the_host_from_what_the_workers_reported(self, redis):
+        from scraper_engine.core.browser_rss import BrowserMemorySample
+
+        host = f"cctest-{uuid.uuid4().hex[:6]}"
+        cfg = HostCapacityConfig(enabled=True, min_browser_memory_mb=100, default_units=1.0)
+        ctl = _controller(redis, host, cfg=cfg, mem=1536 + 2400)
+        await redis.raw.zadd(f"hc:{host}:waiter_exp", {f"w{i}": 10**13 for i in range(6)})
+
+        # No reports yet: the configured constant, two browsers' worth of spare.
+        assert (await ctl.tick()).endswith("browser_mb=1200")
+        assert await redis.raw.get(f"hc:{host}:target") == "2.0"
+
+        await ctl._admission.report_browser_memory(
+            "w1", BrowserMemorySample(count=4, mean_mb=600.0)
+        )
+        await redis.raw.delete(f"hc:{host}:target_changed_at")
+
+        assert (await ctl.tick()).endswith("browser_mb=600")
+        # Same free memory, half the weight per browser: twice the room.
+        assert await redis.raw.get(f"hc:{host}:target") == "4.0"
+        assert await redis.raw.hget(f"hc:{host}:stats", "browser_mb") == "600.0"
