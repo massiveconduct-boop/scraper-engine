@@ -2,7 +2,7 @@
 G-06 closure: real OS subprocess politeness race test.
 
 Spawns actual subprocess workers (not asyncio tasks) targeting the same domain,
-asserting Redis SCARD never exceeds max_concurrent at any sampled instant.
+asserting Redis ZCARD never exceeds max_concurrent at any sampled instant.
 
 Round 9 instrumentation: each subprocess logs wall-clock timestamps for every
 ACQUIRE and RELEASE so the test can prove real overlap occurred, not just that
@@ -42,7 +42,7 @@ async def test_os_subprocess_politeness_holds_across_real_processes(redis):
     """
     domain = "os-racetest.internal"
     tenant = TenantId("g06_os_test")
-    slot_key = f"politeness:slots:{tenant}:{domain}"
+    slot_key = f"politeness:turns:{tenant}:{domain}"
     await redis.delete(slot_key)
 
     # Worker script: logs timestamps to stdout for the parent to parse.
@@ -55,7 +55,7 @@ async def worker():
     r = Redis(host="localhost", port=6379, decode_responses=True)
     wid = f"subproc-{os.getpid()}-{random.randint(0,9999)}"
     from scraper_engine.orchestrator.politeness import ACQUIRE_SLOT_LUA, RELEASE_SLOT_LUA
-    key = "politeness:slots:g06_os_test:os-racetest.internal"
+    key = "politeness:turns:g06_os_test:os-racetest.internal"
     for _ in range(10):
         ok = await r.eval(ACQUIRE_SLOT_LUA, 1, key, wid, 2, 300)
         if ok != 1:
@@ -89,7 +89,7 @@ asyncio.run(worker())
 
         max_observed = 0
         for _ in range(80):
-            count = await redis.scard(slot_key)
+            count = await redis.zcard(slot_key)
             max_observed = max(max_observed, count)
             await asyncio.sleep(0.2)
 

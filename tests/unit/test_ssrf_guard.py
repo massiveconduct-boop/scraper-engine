@@ -2,6 +2,7 @@
 """SSRFGuard tests — spec §3.1."""
 
 import ipaddress
+import socket
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -105,8 +106,60 @@ class TestSSRFGuard:
             assert exc_info.value.network == "<unresolvable>"
 
     @pytest.mark.asyncio
+    async def test_resolve_hosts_raises_ssrf_blocked_on_gaierror(self):
+        """A hostname that doesn't resolve at all (NXDOMAIN, dead domain in a
+        batch submission, etc.) must surface as SSRFBlockedError, not an
+        unhandled socket.gaierror — the crash this regression-tests: one
+        dead domain in a batch used to blow up the whole /v1/scrape request
+        with a 500 instead of failing just that one URL."""
+        guard = SSRFGuard()
+        with patch("socket.getaddrinfo") as mock_getaddrinfo:
+            mock_getaddrinfo.side_effect = socket.gaierror(
+                socket.EAI_NONAME, "Name or service not known"
+            )
+            with pytest.raises(SSRFBlockedError) as exc_info:
+                await guard._resolve_hosts("https://this-domain-does-not-exist.invalid/")
+            assert exc_info.value.network == "<unresolvable>"
+
+    @pytest.mark.asyncio
+    async def test_validate_raises_ssrf_blocked_on_gaierror(self):
+        """Same as above but through the public validate() entry point, the
+        one every caller (routes.py, every fetcher level) actually calls."""
+        guard = SSRFGuard()
+        with patch("socket.getaddrinfo") as mock_getaddrinfo:
+            mock_getaddrinfo.side_effect = socket.gaierror(
+                socket.EAI_NONAME, "Name or service not known"
+            )
+            with pytest.raises(SSRFBlockedError):
+                await guard.validate("https://this-domain-does-not-exist.invalid/")
+
+    @pytest.mark.asyncio
     async def test_resolve_hosts_no_hostname(self):
         """Test _resolve_hosts raises ValueError for malformed URL."""
         guard = SSRFGuard()
         with pytest.raises(ValueError):
             await guard._resolve_hosts("not-a-valid-url://")
+
+
+class TestValidateSync:
+    """Round 64 — the blocking twin the Scrapy crawl subprocess uses. Same
+    resolution and deny list as validate(), so the two cannot drift."""
+
+    def test_blocks_a_denied_address(self):
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.1.2.3", 0))]),
+            pytest.raises(SSRFBlockedError),
+        ):
+            SSRFGuard().validate_sync("http://internal.example/")
+
+    def test_allows_a_public_address(self):
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            SSRFGuard().validate_sync("http://example.com/")
+
+    def test_any_denied_record_blocks(self):
+        records = [(2, 1, 6, "", ("93.184.216.34", 0)), (2, 1, 6, "", ("127.0.0.1", 0))]
+        with (
+            patch("socket.getaddrinfo", return_value=records),
+            pytest.raises(SSRFBlockedError),
+        ):
+            SSRFGuard().validate_sync("http://rebind.example/")

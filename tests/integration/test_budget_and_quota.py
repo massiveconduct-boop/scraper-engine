@@ -68,7 +68,24 @@ class TestQuotaManager:
         redis = AsyncMock()
         redis.eval.return_value = 5  # new count
         qm = QuotaManager(redis=redis, daily_limit=100)
-        await qm.check_and_increment(tenant)
+
+        # Round 64 — this test used to call the method and assert nothing
+        # (round-62 audit T4), so it could not catch a wrong key, limit,
+        # increment or TTL — only an exception.
+        assert await qm.check_and_increment(tenant) is None
+
+        redis.eval.assert_awaited_once()
+        _script, numkeys, key, limit, count, ttl = redis.eval.await_args.args
+        assert (numkeys, key, limit, count, ttl) == (1, qm._quota_key(tenant), 100, 1, 172800)
+        assert key.endswith(f":{tenant}")
+
+    @pytest.mark.asyncio
+    async def test_check_and_increment_forwards_a_batch_count(self, tenant):
+        redis = AsyncMock()
+        redis.eval.return_value = 30
+        qm = QuotaManager(redis=redis, daily_limit=100)
+        await qm.check_and_increment(tenant, count=25)
+        assert redis.eval.await_args.args[4] == 25
 
     @pytest.mark.asyncio
     async def test_check_and_increment_exceeds_limit(self, tenant):

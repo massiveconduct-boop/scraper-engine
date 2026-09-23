@@ -1,9 +1,20 @@
 # Troubleshooting & Known Bugs
 
 **Purpose:** Diagnostic patterns, known failure modes, and their fixes.
-**Scope:** Bugs encountered during 7 rounds of audit. Recurring failure patterns.
-**When to read:** Debugging failures; encountering familiar error patterns.
-**Related:** `.claude/knowledge/decisions.md`, `.archive/{evidence,directive,closure}/round-6-*.md` (local-only, not tracked in git)
+**Scope:** Bugs encountered across this project's full history (rounds 1-29
+and counting). Recurring failure patterns, not one-off fixes already fully
+covered by `technical-debt.md`.
+**When to read:** Debugging failures; encountering familiar error patterns;
+before assuming a live-test or CI failure means the code under test is
+broken.
+**Keywords:** bugs, gotchas, diagnostics, known failures, CI failures,
+browser/pool failures, proxy/harvest failures, CAPTCHA gotchas, SSRF
+diagnostic patterns, import rebinding, type stub drift.
+**Dependencies:** none — self-contained diagnostic reference.
+**Related:** `.claude/knowledge/decisions.md` (WHY a fix was chosen),
+`.claude/knowledge/technical-debt.md` (full round-by-round history a bug
+belongs to), `.archive/{evidence,directive,closure}/round-6-*.md`
+(local-only, not tracked in git)
 
 ---
 
@@ -25,6 +36,53 @@
 **Symptom:** Ruff E501 on f-strings containing Python subprocess scripts.
 **Fix:** Add `# ruff: noqa: E501` at file top with comment explaining why.
 **Notable locations:** `proxy/harvester.py` (broker subprocess script strings).
+
+### Round 40: `except Exception:` Doesn't Catch a Third-Party Library's `sys.exit()`
+**Symptom:** A code path documented as "falls back gracefully on failure"
+instead crashes the entire job/process, even though it's wrapped in a
+`try/except Exception:`.
+**Root cause:** Some third-party libraries call `sys.exit(N)` on an
+environment-check failure instead of raising a normal exception (e.g.
+Botasaurus's `botasaurus_proxy_authentication` → `javascript_fixes.
+check_node()`, which `sys.exit(1)`s if Node.js isn't on `PATH`, reached
+only when a proxy string carries embedded `user:pass@` credentials).
+`sys.exit()` raises `SystemExit`, a `BaseException` subclass — NOT an
+`Exception` subclass — so a bog-standard `except Exception:` guard doesn't
+catch it, and it propagates all the way up, bypassing any
+"catch-and-fall-back" contract in between.
+**Fix:** Catch it explicitly where the fallback contract needs to hold:
+`except (Exception, SystemExit):`. Deliberately NOT a bare `except:` —
+that would also swallow `asyncio.CancelledError` (breaks cooperative job
+cancellation) and `KeyboardInterrupt`.
+**Occurrence:** `fetcher/level_2.py::_fetch_via_botasaurus` — see
+`technical-debt.md`'s round-40 entry for the live incident (one job left
+permanently stuck at `PROCESSING` before this fix).
+**General lesson:** when a documented "always falls back on failure"
+contract seems to not be holding, check whether the failure is actually a
+`SystemExit`/other non-`Exception` `BaseException` before assuming the
+fallback logic itself is broken.
+
+### Round 40: Botasaurus Authenticated Proxies Need `nodejs` AND `npm`, Not Just One
+**Symptom:** A Botasaurus fetch using a `user:pass@host:port` proxy string
+fails. Two distinct symptoms depending on which binary is missing: (1) no
+`node` on `PATH` → `SystemExit` from `javascript_fixes.check_node()` (see
+the entry above); (2) `node` present but no `npm` → silent `sh: npm: not
+found` in stdout while installing the `proxy-chain` npm package
+(`botasaurus_driver`'s `create_local_proxy()` shells out to `npm install`
+the first time it's needed — lazy, not vendored into the image).
+**Root cause:** Chrome's `--proxy-server` flag has no native username/
+password support, so `botasaurus_driver` spins up a local anonymizing
+proxy relay via a Node-based helper to strip and inject the credentials.
+This whole code path is unreachable — and therefore its missing
+dependencies invisible — for any unauthenticated proxy, which is every
+free-pool proxy this system used before round 40.
+**Fix:** `Dockerfile`'s `system-base` stage installs both `nodejs` and
+`npm` (found one at a time, live, via two separate rebuild-redeploy-retest
+cycles — don't assume fixing one is sufficient, verify the actual next
+symptom).
+**Detection:** `docker compose exec <service> node --version` and `npm
+--version` inside the running container; grep worker logs for `npm: not
+found` or `Installing 'proxy-chain'`.
 
 ### Round 27: Bare Dotted Import Rebinding on Package Rename/Move
 **Symptom:** After renaming/moving a package, a bulk import-rewrite looks
@@ -134,7 +192,114 @@ resolves relative to the ini file's own directory instead of cwd:
 location-independence mechanism over hand-rolled `Path(__file__)` tricks
 when one exists.
 
+### Round 29: FastAPI `Header()` marker leaks through when a route function is called directly, not via DI
+**Symptom:** Adding a new *optional* `Header(...)`-typed parameter to a
+FastAPI route function breaks existing unit tests that call the route as
+a plain Python coroutine (`await scrape(request, x_api_key="sk-admin")`)
+without touching the new parameter — even though the parameter has a
+`None` default and the test never passes it. The failure is often a
+confusing downstream `KeyError` on a mock's return value, not an obvious
+"missing argument" error.
+**Root cause:** `Header(None, alias=...)` as a function default is a
+`fastapi.params.Header` marker object (a `FieldInfo` subclass) — FastAPI's
+dependency-injection layer resolves it to the real header value (or `None`
+if absent) only when the route runs through an actual `Request`. Call the
+function directly as ordinary Python, bypassing that DI layer entirely (a
+pattern this codebase's route tests already rely on for every route,
+`x_api_key="sk-admin"` always passed explicitly), and an omitted parameter
+gets the marker object itself as its "default" — which is truthy, not
+`None`. Existing required headers (`x_api_key: str = Header(...)`) never
+hit this because every test already passes them explicitly; the bug only
+surfaces the first time an *optional* Header-typed parameter is added and
+some existing test doesn't pass it.
+**Real occurrence (round 29):** adding `idempotency_key: str | None =
+Header(None, alias="Idempotency-Key")` to `scrape()`/`crawl()` broke two
+existing tests whose mocked `pg.fetchrow` returned a quota-limit-shaped
+dict for every call — the truthy marker object made the new idempotency
+dedup lookup run unexpectedly, and it misread that same mock as a "found a
+duplicate job" row, `KeyError`'ing on the missing `job_id`/`status` keys.
+**Fix:** Pass the new optional parameter explicitly (e.g.
+`idempotency_key=None`) at every direct-call test site that doesn't
+specifically exercise it — matching the existing explicit-kwarg convention
+this test suite already uses for required headers, rather than adding
+runtime `isinstance` workarounds in production code for what is purely a
+test-calling-convention gap. If a route gains many optional Header params
+over time, consider whether route-level tests should switch to FastAPI's
+`TestClient`/`AsyncClient` (real request path, no marker-leak risk) instead
+of direct coroutine calls — not done in round 29 since the existing
+convention only needed two call sites fixed.
+
 ---
+
+## Every Jumia URL Suddenly Fails as `proxy_auth_failed` (Round 65, relabelled Round 66)
+
+**Symptom:** a run that was working starts failing every URL, all
+`failure_category: proxy_auth_failed`, `proxy_source: paid_gateway`, error
+`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`, each after one ~5s
+attempt. Before round 66 the same thing was labelled `browser_crash`,
+retried, escalated through every level and re-driven by the DLQ reaper.
+
+**Cause:** the paid gateway (DataImpulse) refuses our credentials — seen
+live as `407 TRAFFIC_EXHAUSTED` when the plan ran out of traffic. Level
+memory sends Jumia straight to the gateway (`levelhint:poolblock:*`) and the
+free pool is refused there, so nothing gets through. Since round 66 the
+refusal is terminal for the URL, and the DLQ reaper holds these entries
+until its gateway probe (`paid_gateway.gateway_accepts_credentials`, cached
+120s) gets a 200 — after a top-up they re-drive on their own.
+
+**Check:** one direct request through the gateway from inside a worker:
+`docker compose exec -T worker-l1 python -c "…build_gateway_proxy(…)…
+httpx.get('https://api.ipify.org', proxy=p.auth_url())"` — use `auth_url()`,
+not `url()`: without credentials every answer is `407 NO_USER`, which proves
+nothing. A 407 with `TRAFFIC_EXHAUSTED` is the account, not the code. Fix:
+top up the plan.
+
+## Host Admission On but Load Still High (Round 65)
+
+**Check live browsers against seats:** `/v1/health` → `browser_capacity.
+in_use_units` vs. `ps -eo args | grep camoufox-bin | grep -v contentproc`
+in each worker. Browsers far above seats means something launches or keeps
+browsers outside a claim. The one found live was parked BrowserPool spares
+(fixed: `park_spares=False` under admission). A low `target_units` with high
+load is the controller reacting to that outside load, not the cause.
+
+Round 66 found the second cause of "limited but still slow": the controller
+itself. It raised one unit per 30s and only below `cpu_pressure_low`, so
+after any cut it froze between the marks — live, 2-4 browsers on a host
+idling at load 3, pages queued for minutes. Fixed (see decisions.md → "A
+Limiter That Only Limits When the Host Is Actually Strained"); the same
+symptom now means a real strain reading, so check what else runs on the
+host. `docker compose logs api | grep host_capacity_target` prints every
+change with the pressure, waiters and in-use numbers behind it.
+
+## The API Is Not On Port 8000 (Round 62)
+
+**Symptom:** `curl http://localhost:8000/v1/health` returns
+`{"detail":"Not Found"}` (or an unrelated app's response) while
+`docker compose ps` insists the api container is `healthy`.
+
+**Not a bug.** The container listens on 8000 *internally* — which is why
+the container healthcheck (`curl -f http://localhost:8000/v1/health`) is
+green and why `docker compose exec -T api curl ... :8000/v1/health` returns
+the real `{"status":"ok",...}` payload. The host-side published port is
+`API_PORT` from `.env`, and on this host it is **8010**, because another
+project of the operator's (`deepanalyze_agent-app-1`) already publishes
+8000. `deploy-platform-core-1` likewise sits on 8001.
+
+**Do not "free" port 8000** — those are unrelated running services, not
+leftovers from this stack.
+
+**Resolve it, don't guess it:**
+
+```bash
+docker compose port api 8000        # authoritative host mapping for this stack
+sudo ss -ltnp | grep :8000          # what actually holds 8000
+docker ps --format '{{.Names}}\t{{.Ports}}' | grep 8000
+```
+
+Related: `.wolf/cerebrum.md`'s 2026-08-07 Do-Not-Repeat entry already warned
+that 8000 can be held by something else; round 62 pins down the current
+owner and the one-command way to check.
 
 ## Infrastructure Failures
 
@@ -178,14 +343,34 @@ when one exists.
 **Causes (check in order):**
 1. **Column name mismatch:** INSERT uses `anonymity` but schema has `anonymity_level`. Check with `SELECT column_name FROM information_schema.columns WHERE table_name='proxy_pool'`.
 2. **ON CONFLICT mismatch:** INSERT uses `ON CONFLICT (ip, port)` but constraint is `UNIQUE (ip, port, protocol)`. Check with `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='proxy_pool'::regclass`.
-3. **Judge not running:** Check `curl http://127.0.0.1:8089/`. Start with `python judge_server.py &`.
+3. **All validation targets unreachable:** validation goes through the proxy to one of `proxy/harvester.py::JUDGE_URLS` (public IP-echo endpoints — `httpbingo.org`, `api.ipify.org`, `postman-echo.com`). Check each is reachable directly from the `proxy-harvester` process (round 35 — runs inside the `api` container via supervisord, not its own container): `docker exec scraper_engine-api-1 curl -s -o /dev/null -w '%{http_code}\n' http://httpbingo.org/ip` (repeat per URL). All three down at once is unlikely but not impossible — if so, add another independent public IP-echo service to `JUDGE_URLS` rather than waiting.
 4. **All proxies failed validation:** Normal for free proxies. Check pool query for score distribution.
 
-### All Pool Proxies Score 25
-**Symptom:** Pool query shows `avg=25`, no score-60 rows.
-**Meaning:** No proxy passed HTTP validation. All are TCP-only (below L1 threshold 40 — cannot be selected).
-**Why:** Free proxy HTTP forwarding rate is ~0.02%. Expected behavior. Broker path produces validated proxies (score 60).
-**Fix:** Ensure `harvest_once()` calls both paths. Wait for `promote_tcp_only()` re-validation.
+### All Pool Proxies Score 25 (100% of them, none ever promoted)
+**Symptom:** Pool query shows `avg=25` (or similar low number), zero score-60+ rows,
+ever — not just most proxies, literally all of them, indefinitely.
+**Root cause (round 32, two layers):** first found the self-hosted judge
+server was never running in any real deployment, so every single
+`_http_validate()` call failed via connection-refused. Fixing that
+uncovered a deeper, architectural issue: a loopback judge (`127.0.0.1`)
+can never validate a real third-party proxy at all, running or not —
+when a request routes through a forward proxy, the *proxy* resolves
+"127.0.0.1" as its own machine, never the machine that made the request.
+Confirmed live via real proxies returning their own internal service
+responses instead of reaching our judge. Fixed by validating against
+public IP-echo endpoints instead (`JUDGE_URLS`, item 3 above) — genuinely
+reachable from anywhere. If you still see 100%-score-25 after confirming
+those are reachable, it's proxy quality, not validation infrastructure.
+**Separately, still true even with the judge running:** free proxy HTTP
+forwarding success rate is genuinely low (~0.02% per round 6's own
+measurement) — so *some* proxies capping at 25 (TCP-reachable but failed
+real HTTP validation) is expected. The distinguishing signal is whether
+*any* proxies ever reach 60+ — zero, ever, points at the judge; a nonzero
+but small fraction is the expected free-proxy base rate.
+**Fix:** confirm the judge is reachable (item 3) first. Only after that,
+if scores are still low, this is expected free-proxy-source behavior — wait
+for `promote_tcp_only()`/`ProxyPromotionJob` re-validation, or use a paid
+proxy source for a higher base rate.
 
 ---
 
@@ -230,6 +415,12 @@ when one exists.
 **Root cause:** `PostgresClient.acquire()` wraps `SET search_path` + yield in `BEGIN...COMMIT`. If the first query after `SET search_path` fails (e.g., `UndefinedTableError` because `public` schema was excluded from the path), the transaction is aborted. All subsequent queries in the same `acquire()` block fail with `InFailedSQLTransactionError`.
 **Fix:** Always include `public` in search_path: `SET search_path = {tenant_str}, public`. The `proxy_pool` table lives in `public` schema, not per-tenant schemas.
 **Occurrence:** Round 11 — `test_promotion.py` fixture tried `DELETE FROM proxy_pool` with search_path set to only `system` (no `public`). First query failed → transaction aborted → cleanup SET search_path also failed → cascade error on next acquire.
+
+### acquire()'s finally-block COMMIT masked the real exception and poisoned the connection pool (general case)
+**Symptom:** Any failing query inside `PostgresClient.acquire()` surfaces `asyncpg.exceptions.InFailedSQLTransactionError` instead of its own real exception (e.g. `UndefinedTableError`) — masking the actual root cause regardless of *why* the query failed (not specific to the missing-`public` case above). Separately, `proxy-harvester`'s logs showed recurring `asyncio`-logger ERROR lines: `"Resetting connection with an active transaction <asyncpg.connection.Connection object at 0x...>"`.
+**Root cause:** `acquire()`'s `finally` block used to run `SET search_path = public` then `COMMIT` unconditionally, regardless of whether the `yield`ed query succeeded or raised. A failed query aborts the transaction server-side; the `finally` block's own `SET search_path` then hit the aborted transaction and raised `InFailedSQLTransactionError` itself — Python's exception-chaining means *that* new exception is what propagates to the caller, not the original one — and since that new exception happened before `COMMIT` ran, the connection returned to the pool still mid-transaction. asyncpg's own `Pool.release()`→`Connection._reset()` safety net (not this codebase) detects an unmanaged open transaction on release and force-`ROLLBACK`s it, logging the "Resetting connection with an active transaction" line — that's where the proxy-harvester noise came from, and it could fire from *any* failed query anywhere in the app that goes through `PostgresClient`, not just a proxy-harvester-specific leak.
+**Fix:** `acquire()` now distinguishes the two paths explicitly — `except BaseException: ROLLBACK; raise` (no `SET search_path` attempt, since `ROLLBACK` is always accepted regardless of transaction state and the connection is about to be reset by the pool anyway) vs. `else: SET search_path = public; COMMIT` on the clean path. See `storage/postgres_client.py::acquire` and `tests/integration/test_postgres_client.py::test_acquire_failing_query_does_not_mask_error_or_poison_pool` (asserts both that the *original* exception type surfaces, and that a subsequent unrelated `acquire()` on the same pool succeeds immediately — no poisoning).
+**Occurrence:** Found during a production-readiness review — the report separately flagged "transaction poisoning masks the real error" and "recurring error-log noise from proxy-harvester" as two uncertain, possibly-unrelated findings; both turned out to be the same root cause.
 
 ### UndefinedTableError: relation "proxy_pool" does not exist
 **Symptom:** `asyncpg.exceptions.UndefinedTableError: relation "proxy_pool" does not exist`.
@@ -300,7 +491,7 @@ does not change the fix (top up), just confirms it end to end.
 
 ### Fetcher `fetch()` argument order — url FIRST, tenant SECOND
 `Level1Fetcher.fetch(url, tenant_id, proxy=None, overrides=None)` takes the URL
-first (`fetcher/level_1.py:32`). Calling `fetch(tenant_id, url)` (tenant-first, the
+first (`fetcher/level_1.py:68`). Calling `fetch(tenant_id, url)` (tenant-first, the
 intuitive order) passes the tenant slug as the URL → httpx raises
 `"Request URL is missing an 'http://' or 'https://' protocol"`, classified as
 `NETWORK_TIMEOUT`. This looks like a broken/proxy-less engine but is a caller bug.
@@ -418,7 +609,7 @@ validator machinery can make this manifest as an intermittent concurrency
 race rather than a deterministic failure on the very first request.
 **Fix:** import the type at module level, not inside whichever function
 happens to use it as a return annotation.
-**Full evidence:** `.claude/MEMORY.md` → Technical Debt (round 23) — this was
+**Full evidence:** `.claude/knowledge/technical-debt.md` (round 23) — this was
 found by the first-ever real run of `tests/load/locustfile.py`, itself a
 separate lesson: an unrun load test is not a passing load test.
 
@@ -450,3 +641,74 @@ caught via a live `/metrics` cross-check against real running containers.
 hit the real `/metrics` endpoint, and grep the output for every metric name
 referenced in `monitoring/alerts/prometheus_rules.yml` — don't just confirm
 the Python code compiles and the call site exists.
+
+---
+
+## Live-Test Infra Failures (Round 28)
+
+### `tests/live/test_escalation_ladder.py` fails with `FailureCategory.SSRF_BLOCKED`, not an escalation bug
+**Symptom:** `test_l1_correctly_fails_against_standard_challenge` (and the
+L2/L3 variants, if unskipped) hard-fail with `AssertionError: Expected
+200, got None` — looks like a broken escalation ladder.
+**Meaning:** It isn't. `result.failure_category ==
+FailureCategory.SSRF_BLOCKED` — `core/ssrf_guard.py`'s `DENIED_NETWORKS`
+(127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
+never weakened for test convenience) rejected the mirror URL before any
+fetch happened. `CHALLENGE_MIRROR_URL`'s default (`http://127.0.0.1:8090`)
+and this host's own docker-bridge address are *always* in a denied range
+by construction — this test can never pass against them, for anyone.
+**First (wrong) diagnosis:** concluded a *separate* external VPS was
+needed to test the escalation ladder for real, echoing the test file's own
+"requires... a real VPS" framing at face value without verifying it.
+**Actual fix — point `CHALLENGE_MIRROR_URL` at this host's Tailscale
+interface instead:** `100.64.0.0/10` (Tailscale's CGNAT range) is **not**
+in `SSRFGuard.DENIED_NETWORKS` at all, and — unlike this host's NAT'd
+egress-only public IP (`curl ifconfig.me`-style; times out on self-connect
+from the same box, classic hairpin-NAT, a separate unrelated networking
+quirk) — it's a real, directly-bound interface, so self-testing actually
+works: `ip -4 addr show tailscale0` → `CHALLENGE_MIRROR_URL=http://<that
+IP>:8090 pytest tests/live/test_escalation_ladder.py -m live`. Verified
+end to end: L1 correctly rejected, L2 solved the standard tier in ~5.1s,
+L3 the strict tier in ~13.8s — matching the file's own recorded historical
+timings almost exactly. This is what "the real VPS" in the file's original
+docstring actually meant.
+**Fix applied to the test file itself:** a `_skip_if_ssrf_blocked` helper
+now turns the SSRF-blocked case into an honest `pytest.skip` with a clear
+reason, instead of a confusing bare assertion failure that reads like a
+product bug.
+**General lesson:** `result.failure_category` is always the first thing to
+check on an unexpected live-test failure before assuming the code under
+test is broken — a `SSRFBlockedError`/`NETWORK_TIMEOUT`/etc. failure
+category means the *test's own target address* is the problem, not the
+escalation ladder.
+
+## Why Did This URL Climb to L3? (Round 64)
+
+Read the result's `escalations` list (`GET /v1/jobs/{id}`, or the
+`level_rejected` worker log line). Each entry names the level, the exact
+check (`reason`), the HTTP status, the L2 engine, and the proxy source.
+
+- `proxy_source: "pool"` with `status:403` (or `failure:detection_block`)
+  and a following `level_N_gateway_retry_ms` in `timings`: the target
+  refuses free datacenter exits, not the level. Live on Jumia (round 64),
+  forced to L2 the same URLs returned 200 with ~600 links through the
+  gateway. Since round 64 that retry happens at the blocked level instead
+  of only the last one.
+- `signature:<text>` on a page that looks fine to you: a broad literal in
+  `ChallengeDetector.CHALLENGE_SIGNATURES` (e.g. `_challenge`,
+  `access denied`) matched the site's own markup — a detector false
+  positive to fix there, with the captured HTML as the regression test.
+- `js_gated`: an SPA shell; escalation to a browser is correct.
+
+- A slow L2 with no rejection at all: grep the worker log for
+  `l2_botasaurus_fallback` — Botasaurus failing inside L2 (e.g.
+  `CloudflareDetectionException`) before Camoufox answers is not an
+  escalation, so it never shows in `escalations`.
+
+Level memory (Redis, 24 h TTL, every 20th URL of a domain re-probes
+everything) decides three things per domain: the START level
+(`levelhint:{tenant}:{domain}`), whether to skip the free pool
+(`levelhint:poolblock:...`) and whether to skip Botasaurus at L2
+(`levelhint:botafail:...`). A job that skipped either shows
+`pool_skipped_known_block` in the worker log, or no Botasaurus attempt at
+all. Delete `levelhint*` for the domain to force a cold, full attempt.

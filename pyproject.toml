@@ -50,7 +50,18 @@ dependencies = [
     "boto3==1.43.52",
     "python-dotenv==1.2.2",
     "scrapy==2.17.0",
-    "maxminddb==2.8.2",
+    # Runs api + the 3 self-healing daemons (harvester, dlq-reaper,
+    # webhook-sweeper) as one supervised container — see docker/supervisord.conf.
+    # Round 67 — 4.3.0 loads its entry points and resources through importlib
+    # on Python 3.8+, so the runtime setuptools pin (<81, for 4.2.5's
+    # pkg_resources import) is gone with it: that pin held setuptools on a
+    # release with a known vulnerability (PYSEC-2026-3447, fixed in 83.0.0).
+    "supervisor==4.3.0",
+    # Round 33: local HTML->markdown fallback (services/markdown_fallback.py)
+    # so FetchResult.markdown is populated even when Firecrawl isn't
+    # configured (FIRECRAWL_API_KEY/FIRECRAWL_BASE_URL both unset) — see
+    # that module's docstring.
+    "markdownify==1.2.3",
     "opentelemetry-api==1.44.0",
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
@@ -59,6 +70,9 @@ dependencies = [
     "opentelemetry-instrumentation-asyncpg==0.65b0",
     "opentelemetry-instrumentation-redis==0.65b0",
 ]
+
+[project.scripts]
+scraper-engine = "scraper_engine.cli.entrypoint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -145,12 +159,27 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_engine/browser", "src/scraper_engine/fetcher", "src/scraper_engine/services", "src/scraper_engine/storage", "src/scraper_engine/orchestrator", "src/scraper_engine/api"]
+# Round 62 — branch coverage on. Line coverage alone reported 100% while 33
+# decision branches inside those same "100%" files had never been taken one
+# way (see .claude/knowledge/technical-debt.md round 62, coverage audit).
+# The 100%-lines guarantee is NOT relaxed by this: tools/check_coverage_
+# ratchet.py still fails on a single missed line, and additionally holds
+# missing branches to a budget that may only ever shrink.
+branch = true
+source = ["src/scraper_engine/core", "src/scraper_engine/proxy", "src/scraper_engine/browser", "src/scraper_engine/fetcher", "src/scraper_engine/services", "src/scraper_engine/storage", "src/scraper_engine/orchestrator", "src/scraper_engine/api", "src/scraper_engine/scrapy_project", "src/scraper_engine/cli", "src/scraper_engine/observability"]
 
 [tool.coverage.report]
 # Per-spec §10, round 28: CI gate enforces 100% across every package in
 # [tool.coverage.run] source except browser/, which needs a real Firefox
 # process (~80MB RSS, not available in CI runners) and is measured only
 # where possible (session_state, pool init) without being gated.
+# Round 62 turned branch=true on (blended ~99.33% then) and made
+# tools/check_coverage_ratchet.py the real gate: zero missed LINES plus an
+# absolute missed-BRANCH budget that may only shrink. Round 64 burned that
+# budget to 0 and widened the gate to cli/observability/scrapy_project, so
+# the blended figure is 100% again and this is back at 100 — as a backstop.
+# The ratchet stays authoritative: it names the offending file and fails
+# when the count FALLS without the budget being lowered, which a
+# percentage cannot do.
 fail_under = 100
-include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*", "src/scraper_engine/fetcher/*", "src/scraper_engine/services/*", "src/scraper_engine/storage/*", "src/scraper_engine/api/*"]
+include = ["src/scraper_engine/core/*", "src/scraper_engine/proxy/*", "src/scraper_engine/orchestrator/*", "src/scraper_engine/fetcher/*", "src/scraper_engine/services/*", "src/scraper_engine/storage/*", "src/scraper_engine/api/*", "src/scraper_engine/scrapy_project/*", "src/scraper_engine/cli/*", "src/scraper_engine/observability/*"]

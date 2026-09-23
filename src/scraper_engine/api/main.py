@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -20,42 +21,68 @@ def create_app() -> FastAPI:
     cfg = load_config()
     bootstrap_observability(cfg.observability)
 
+    # Round 62 — one zero-arg async callable per dependency, each building
+    # its client fresh so wait_for_dependency can call it as many times as
+    # the outage lasts. Defined here rather than inline in the lifespan
+    # purely so the retry call sites below stay one line each.
+    async def _start_pg() -> Any:
+        from scraper_engine.storage.postgres_client import PostgresClient
+
+        # DB traffic goes through PgBouncer (invariant G-05) via the single
+        # configured DSN — no hardcoded connection string, no pooler bypass.
+        pg = PostgresClient(cfg.storage.database_url, pool_size=2)
+        await pg.start()
+        return pg
+
+    async def _start_redis() -> Any:
+        from scraper_engine.storage.redis_client import RedisClient
+
+        redis = RedisClient(redis_url=cfg.storage.redis_url)
+        await redis.start()
+        return redis
+
+    async def _start_s3() -> Any:
+        from scraper_engine.storage.s3_client import S3Client
+
+        s3 = S3Client(
+            endpoint_url=cfg.s3.endpoint_url,
+            access_key=cfg.s3.access_key,
+            secret_key=cfg.s3.secret_key,
+            bucket=cfg.s3.bucket,
+        )
+        await s3.start()
+        return s3
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Connect Postgres, Redis, and initialise TenantResolver at startup."""
         import scraper_engine.api.dependencies as deps
         from scraper_engine.api.auth import TenantResolver
         from scraper_engine.core.ssrf_guard import SSRFGuard
+        from scraper_engine.core.startup import wait_for_dependency
         from scraper_engine.orchestrator.job_queue import build_queue
-        from scraper_engine.storage.postgres_client import PostgresClient
-        from scraper_engine.storage.redis_client import RedisClient
-        from scraper_engine.storage.s3_client import S3Client
 
         if deps._ssrf_guard is None:
             deps._ssrf_guard = SSRFGuard(cfg.ssrf_guard.additional_denied_cidrs)
 
         if deps._storage_pg is None:
-            # DB traffic goes through PgBouncer (invariant G-05) via the single
-            # configured DSN — no hardcoded connection string, no pooler bypass.
-            pg = PostgresClient(cfg.storage.database_url, pool_size=2)
-            await pg.start()
+            # Round 62 — every .start() below waits for its dependency
+            # instead of raising out of the lifespan on the first refused
+            # connection. Raising here exits uvicorn, and enough fast exits
+            # in a row latch supervisord into FATAL permanently; see
+            # core/startup.py's module docstring for the outage that
+            # produced this. Each client is constructed INSIDE the retried
+            # callable, not once outside it, so a half-initialised pool from
+            # a failed attempt is never reused on the next one.
+            pg = await wait_for_dependency("postgres", _start_pg)
             deps._storage_pg = pg
             deps._tenant_resolver = TenantResolver(pg=pg)
 
         if deps._storage_redis is None:
-            redis = RedisClient(redis_url=cfg.storage.redis_url)
-            await redis.start()
-            deps._storage_redis = redis
+            deps._storage_redis = await wait_for_dependency("redis", _start_redis)
 
         if deps._storage_s3 is None:
-            s3 = S3Client(
-                endpoint_url=cfg.s3.endpoint_url,
-                access_key=cfg.s3.access_key,
-                secret_key=cfg.s3.secret_key,
-                bucket=cfg.s3.bucket,
-            )
-            await s3.start()
-            deps._storage_s3 = s3
+            deps._storage_s3 = await wait_for_dependency("s3", _start_s3)
 
         if deps._queue is None:
             deps._queue = build_queue(cfg.storage.redis_url)

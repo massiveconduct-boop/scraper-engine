@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from scraper_engine.browser._botasaurus_nav_check import BotasaurusNavigationError
 from scraper_engine.core import budget
 from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
@@ -33,9 +34,30 @@ class TestBotasaurusWrapper:
             assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"
-        fetch.assert_called_once_with(URL, _proxy().url(), None)
+        fetch.assert_called_once_with(URL, _proxy().auth_url(), None, 0, 1500, None)
         # Released after the call, not held open
         assert budget.BROWSER_SEMAPHORE.locked() is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_html_embeds_credentials_for_paid_gateway_proxy(self):
+        """Round 40 — a paid-gateway Proxy carries username/password; the
+        string handed to Botasaurus (single-string proxy kwarg, no dict
+        support) must be the credential-embedded form, not the bare one."""
+        gateway_proxy = Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+        wrapper = BotasaurusWrapper()
+        with patch.object(wrapper, "_botasaurus_fetch", return_value="<html>ok</html>") as fetch:
+            await wrapper.fetch_html(URL, proxy=gateway_proxy, tenant_id=TENANT)
+        fetch.assert_called_once_with(
+            URL, "http://user123:pass456@gw.dataimpulse.com:823", None, 0, 1500, None
+        )
 
     def test_parallel_always_forced_to_one(self):
         """caller-supplied config cannot override parallel — closes F-32."""
@@ -90,6 +112,18 @@ class TestBotasaurusWrapper:
             def short_random_sleep(self):
                 calls.append(("short_random_sleep", ()))
 
+            def set_locale_and_timezone(self, locale=None, timezone_id=None):
+                calls.append(("set_locale_and_timezone", (locale, timezone_id)))
+
+            def enable_human_mode(self):
+                calls.append(("enable_human_mode", ()))
+
+            def before_request_sent(self, handler):
+                calls.append(("before_request_sent", (handler,)))
+
+            def after_response_received(self, handler):
+                calls.append(("after_response_received", (handler,)))
+
         def fake_browser(**kwargs):
             captured.update(kwargs)
 
@@ -133,6 +167,98 @@ class TestBotasaurusWrapper:
         assert captured["remove_default_browser_check_argument"] is True
         assert captured["close_on_crash"] is True
         assert "max_retry" not in captured  # 0 (off) means omitted, not sent as 0
+        assert captured["block_images"] is False
+        assert captured["block_images_and_css"] is False
+
+    def test_block_images_kwargs_forwarded_when_enabled(self):
+        """Round 59 — real botasaurus_driver.Driver kwargs, opt-in."""
+        wrapper = BotasaurusWrapper(block_images=True, block_images_and_css=True)
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert captured["block_images"] is True
+        assert captured["block_images_and_css"] is True
+
+    def test_extensions_kwarg_forwarded_when_configured(self):
+        """Round 60 — each item must expose .load(with_command_line_option=False),
+        not be a raw path string (see browser/_botasaurus_extension.py::LocalExtension)."""
+        wrapper = BotasaurusWrapper(extensions=["/tmp/some-extension"])
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        forwarded = captured["extensions"]
+        assert len(forwarded) == 1
+        assert forwarded[0].load(with_command_line_option=False) == "/tmp/some-extension"
+
+    def test_extensions_kwarg_absent_by_default(self):
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert "extensions" not in captured
+
+    def test_lang_kwarg_forwarded_when_configured(self):
+        """Round 60 — Driver(lang=...) is the --lang= Chrome flag, drives
+        navigator.language (driver.py:2153's own docstring note)."""
+        wrapper = BotasaurusWrapper(lang="en-US")
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert captured["lang"] == "en-US"
+
+    def test_lang_kwarg_absent_by_default(self):
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert "lang" not in captured
+
+    def test_locale_and_timezone_applied_before_navigation(self):
+        """Round 60 — driver.set_locale_and_timezone() must be called before
+        driver.get()/google_get() per driver.py:2148-2150's own docstring."""
+        wrapper = BotasaurusWrapper(locale="en_US", timezone="America/New_York")
+        captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert calls[0] == ("set_locale_and_timezone", ("en_US", "America/New_York"))
+        assert calls[1][0] in ("get", "google_get")
+
+    def test_locale_and_timezone_not_called_by_default(self):
+        wrapper = BotasaurusWrapper()
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert not any(name == "set_locale_and_timezone" for name, _args in calls)
+
+    def test_enable_human_mode_called_when_configured(self):
+        wrapper = BotasaurusWrapper(humanize_mouse=True)
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert ("enable_human_mode", ()) in calls
+
+    def test_enable_human_mode_not_called_by_default(self):
+        wrapper = BotasaurusWrapper()
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert not any(name == "enable_human_mode" for name, _args in calls)
+
+    def test_network_capture_registered_when_configured(self):
+        wrapper = BotasaurusWrapper(capture_network_events=True)
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None, events_sink=[])
+        assert any(name == "before_request_sent" for name, _args in calls)
+        assert any(name == "after_response_received" for name, _args in calls)
+
+    def test_network_capture_not_registered_by_default(self):
+        wrapper = BotasaurusWrapper()
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None, events_sink=[])
+        assert not any(name == "before_request_sent" for name, _args in calls)
+        assert not any(name == "after_response_received" for name, _args in calls)
 
     def test_tiny_profile_enabled_only_when_profile_present(self):
         wrapper = BotasaurusWrapper()
@@ -164,6 +290,79 @@ class TestBotasaurusWrapper:
         assert "user_agent" not in captured
         assert "window_size" not in captured
 
+    def test_navigation_to_chromium_error_page_raises_not_silently_succeeds(self):
+        """Round 57 — driver.get()/google_get() never raise for a real
+        network-level failure; Chromium silently renders its own
+        chrome-error:// interstitial instead. This must surface as a real
+        exception, not a fake success carrying that interstitial as
+        `page_html`."""
+        wrapper = BotasaurusWrapper()
+
+        class _FailedNavDriver:
+            page_html = "<html>This site can't be reached</html>"
+            current_url = "chrome-error://chromewebdata/"
+
+            def google_get(self, url, bypass_cloudflare=False):
+                pass
+
+            def get(self, url):
+                pass
+
+            def short_random_sleep(self):
+                pass
+
+        def fake_browser(**kwargs):
+            def decorator(fn):
+                def call(*a, **kw):
+                    return fn(_FailedNavDriver(), None)
+
+                return call
+
+            return decorator
+
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            pytest.raises(BotasaurusNavigationError) as exc_info,
+        ):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        assert URL in str(exc_info.value)
+        # Must fail BEFORE any further processing of the fake page.
+        assert "This site can't be reached" not in str(exc_info.value)
+
+    def test_autoscroll_invoked_when_scroll_passes_configured(self):
+        """Round 58 — the one-shot Botasaurus fetch now scrolls (lazy-load/
+        infinite-scroll) when scroll_passes>0, mirroring the Camoufox
+        pipeline's existing behavior."""
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            wrapper._botasaurus_fetch(
+                URL, "http://1.2.3.4:8080", None, scroll_passes=3, scroll_wait_ms=250
+            )
+        autoscroll.assert_called_once()
+        assert autoscroll.call_args.kwargs == {
+            "max_passes": 3,
+            "wait_ms": 250,
+            "humanize": False,
+        }
+
+    def test_autoscroll_not_invoked_by_default(self):
+        wrapper = BotasaurusWrapper()
+        captured, _calls, fake_browser = self._fake_browser_harness()
+        with (
+            patch("botasaurus.browser.browser", side_effect=fake_browser),
+            patch(
+                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
+            ) as autoscroll,
+        ):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
+        autoscroll.assert_not_called()
+
 
 class TestLevel2BotasaurusFallback:
     @pytest.mark.asyncio
@@ -183,6 +382,29 @@ class TestLevel2BotasaurusFallback:
     async def test_falls_back_to_camoufox_when_botasaurus_raises(self):
         botasaurus = AsyncMock()
         botasaurus.fetch_html.side_effect = RuntimeError("driver crashed")
+        fetcher = Level2Fetcher(botasaurus=botasaurus)
+
+        with patch.object(
+            fetcher, "_fetch_via_camoufox", new=AsyncMock(return_value="camoufox-result")
+        ) as camoufox_fallback:
+            result = await fetcher.fetch(URL, tenant_id=TENANT, proxy=_proxy())
+
+        assert result == "camoufox-result"
+        camoufox_fallback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_camoufox_when_botasaurus_hits_chromium_error_page(self):
+        """Round 57 — a BotasaurusNavigationError (the new, specific
+        exception the source-level fix raises) must fall back to Camoufox
+        exactly like any other Botasaurus failure, via the existing
+        `except (Exception, SystemExit): return None` in
+        _fetch_via_botasaurus — no Level2Fetcher change was needed for this."""
+        botasaurus = AsyncMock()
+        botasaurus.fetch_html.side_effect = BotasaurusNavigationError(
+            f"Botasaurus/Chromium failed to navigate to {URL!r} — landed on "
+            f"its own internal error page (current_url='chrome-error://"
+            f"chromewebdata/') instead of the real target."
+        )
         fetcher = Level2Fetcher(botasaurus=botasaurus)
 
         with patch.object(

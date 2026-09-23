@@ -1,7 +1,8 @@
 # tests/unit/test_level_1.py
-"""Level1Fetcher — plain-httpx redirect chain, timeout/exception handling,
-and JA3-path markdown conversion. Complements test_level1_ja3_wiring.py,
-which covers the JA3-first/httpx-fallback wiring but not these branches."""
+"""Level1Fetcher — plain-httpx redirect chain and timeout/exception
+handling. Complements test_level1_ja3_wiring.py, which covers the
+JA3-first/httpx-fallback wiring but not these branches. Markdown conversion
+moved to Worker.process_job in round 29 — see test_worker.py."""
 
 from unittest.mock import AsyncMock
 
@@ -12,7 +13,6 @@ from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.fetcher.level_1 import Level1Fetcher
 from scraper_engine.fetcher.scrapling_wrapper import ScraplingResponse
-from scraper_engine.services.botasaurus_requests_client import Ja3Response
 
 
 class _FakeResponse:
@@ -77,19 +77,64 @@ class TestPlainHttpxRedirects:
         assert result.html == "<html>final</html>"
         assert result.http_status == 200
 
+
+class _StatusClient:
+    def __init__(self, status_code):
+        self._status_code = status_code
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        return _FakeResponse(self._status_code, text="<html>error page</html>")
+
+
+class TestPlainHttpxStatusClassification:
+    """Round 43 — a plain HTTP failure status now carries a real
+    failure_category instead of falling through untagged."""
+
     @pytest.mark.asyncio
-    async def test_redirect_hop_calls_firecrawl_markdown(self, monkeypatch):
-        monkeypatch.setattr(httpx, "AsyncClient", _RedirectThenFinalClient)
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# final"
-        fetcher = Level1Fetcher(firecrawl_client=firecrawl)
+    async def test_404_classified_as_detection_block(self, monkeypatch):
+        """Round 45 — a 404 from L1 (no JS, easily fingerprinted) is treated
+        the same as any other block status: worth a real browser's chance,
+        not an immediate, definitive failure. Live-caught: this exact
+        deployment's own target domains returned a 404-shaped response for
+        what was actually a Cloudflare bot-management block."""
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(404))
+        fetcher = Level1Fetcher()
 
         result = await fetcher.fetch("http://example.com", TenantId("system"))
 
-        assert result.markdown == "# final"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>final</html>", "http://example.com"
-        )
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+
+    @pytest.mark.asyncio
+    async def test_403_classified_as_detection_block(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(403))
+        fetcher = Level1Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+
+    @pytest.mark.asyncio
+    async def test_5xx_left_uncategorized(self, monkeypatch):
+        """5xx isn't classified here — ChallengeDetector.CHALLENGE_STATUS_CODES
+        already handles it downstream in worker.py's escalation logic."""
+        monkeypatch.setattr(httpx, "AsyncClient", _StatusClient(503))
+        fetcher = Level1Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category is None
 
 
 class TestPlainHttpxExceptions:
@@ -115,29 +160,6 @@ class TestPlainHttpxExceptions:
         assert result.error_message == "unexpected boom"
 
 
-class TestJa3MarkdownConversion:
-    @pytest.mark.asyncio
-    async def test_ja3_success_path_calls_firecrawl_markdown(self):
-        session = AsyncMock()
-        session.get.return_value = Ja3Response(
-            status_code=200, text="<html>ja3</html>", location=None
-        )
-        ja3 = AsyncMock()
-        ja3.open_session.return_value = session
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# ja3"
-
-        fetcher = Level1Fetcher(ja3_client=ja3, firecrawl_client=firecrawl)
-
-        result = await fetcher.fetch("http://example.com", TenantId("system"))
-
-        assert result.success is True
-        assert result.markdown == "# ja3"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>ja3</html>", "http://example.com"
-        )
-
-
 class TestScraplingWiring:
     @pytest.mark.asyncio
     async def test_uses_scrapling_result_when_it_succeeds(self):
@@ -152,6 +174,21 @@ class TestScraplingWiring:
         assert result.success is True
         assert result.html == "<html>scrapling</html>"
         scrapling.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scrapling_404_classified_as_detection_block(self):
+        """Round 45 — the scrapling path's own status-based classification,
+        same fix as plain httpx's in TestPlainHttpxStatusClassification."""
+        scrapling = AsyncMock()
+        scrapling.fetch.return_value = ScraplingResponse(
+            status_code=404, text="<html>gone</html>", location=None
+        )
+        fetcher = Level1Fetcher(scrapling_client=scrapling)
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
 
     @pytest.mark.asyncio
     async def test_follows_redirect_and_revalidates_ssrf(self):
@@ -218,19 +255,67 @@ class TestScraplingWiring:
         assert result.success is True
         assert result.html == "<html>final</html>"
 
+
+class _EndlessRedirectClient:
+    def __init__(self, *a, **kw):
+        self.calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url):
+        self.calls += 1
+        return _FakeResponse(302, text="<html>moved</html>", location="/again", is_redirect=True)
+
+
+class TestRedirectLimit:
+    """Round 64 — each engine's redirect loop fell out of
+    `for _ in range(MAX_REDIRECTS)` with a 3xx still in hand and then computed
+    `success = status < 400`, so an endless redirect was a SUCCESS whose
+    content was the redirect body. It must be a DETECTION_BLOCK (escalates to
+    a real browser) instead."""
+
+    def _assert_redirect_limit(self, result):
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.http_status == 302
+        assert "Redirect limit" in (result.error_message or "")
+
     @pytest.mark.asyncio
-    async def test_scrapling_success_calls_firecrawl_markdown(self):
+    async def test_httpx_endless_redirect_is_a_failure(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _EndlessRedirectClient)
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_ja3_endless_redirect_is_a_failure(self):
+        response = AsyncMock()
+        response.status_code = 302
+        response.location = "/again"
+        response.text = "<html>moved</html>"
+        session = AsyncMock()
+        session.get.return_value = response
+        ja3 = AsyncMock()
+        ja3.open_session.return_value = session
+        result = await Level1Fetcher(ja3_client=ja3).fetch("http://example.com", TenantId("system"))
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_scrapling_endless_redirect_is_a_failure(self):
         scrapling = AsyncMock()
         scrapling.fetch.return_value = ScraplingResponse(
-            status_code=200, text="<html>scrapling</html>", location=None
+            status_code=302, text="<html>moved</html>", location="/again"
         )
-        firecrawl = AsyncMock()
-        firecrawl.convert_to_markdown.return_value = "# scrapling"
-        fetcher = Level1Fetcher(scrapling_client=scrapling, firecrawl_client=firecrawl)
-
-        result = await fetcher.fetch("http://example.com", TenantId("system"))
-
-        assert result.markdown == "# scrapling"
-        firecrawl.convert_to_markdown.assert_awaited_once_with(
-            "<html>scrapling</html>", "http://example.com"
+        result = await Level1Fetcher(scrapling_client=scrapling).fetch(
+            "http://example.com", TenantId("system")
         )
+        self._assert_redirect_limit(result)
+
+    @pytest.mark.asyncio
+    async def test_a_chain_that_ends_inside_the_limit_still_succeeds(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _RedirectThenFinalClient)
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+        assert result.success is True

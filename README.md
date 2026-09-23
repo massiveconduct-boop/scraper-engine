@@ -20,10 +20,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env   # add CapSolver/Firecrawl keys if using those services
+# .env is gitignored — never commit real secrets. If a key is ever exposed,
+# rotate it immediately at the provider rather than just removing it from the file.
 
 docker compose up -d postgres redis pgbouncer
 alembic upgrade head
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000 --reload
 
 curl http://localhost:8000/v1/health
 ```
@@ -47,7 +49,6 @@ mypy src/scraper_engine/core/ src/scraper_engine/proxy/ src/scraper_engine/orche
 | `core/`, `proxy/`, `browser/`, `fetcher/`, `orchestrator/`, `api/`, `storage/`, `config/`, `cli/`, `observability/`, `services/` | Application source — see `CLAUDE.md` → Module Map for responsibilities |
 | `tests/` | Unit, integration, chaos, and live test suites |
 | `tests/fixtures/challenge_mirror/` | Self-hosted Cloudflare-like test target used for live L2/L3 anti-detection verification |
-| `tests/fixtures/judge_server.py` | Self-hosted proxy judge used by the promotion integration test |
 | `docs/reference/` | API reference |
 | `docs/guides/` | Deployment and operational guides |
 | `.claude/knowledge/` | Living architecture, decisions, standards, troubleshooting, and operations docs |

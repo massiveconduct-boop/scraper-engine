@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Scraper Engine Test Marker Extension",
+  "version": "1.0",
+  "description": "Round 60 live-verification fixture — proves Driver(extensions=[LocalExtension(...)]) actually loads an unpacked extension. Not shipped/used in production paths.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

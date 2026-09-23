@@ -3,7 +3,15 @@
 **Purpose:** System design, invariants, module interactions, data flow.
 **Scope:** Complete system architecture. Does NOT duplicate the specification — references it.
 **When to read:** Understanding how components connect; adding new modules; debugging cross-cutting concerns.
-**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`
+**Keywords:** design invariants, escalation ladder, proxy pipeline, browser
+pool, PgBouncer, API routing, SSRF enforcement, fetcher construction,
+CAPTCHA solving, observability, tracing, botasaurus, metrics, data flow,
+repository layout, src layout, webhook outbox, webhook sweeper, Slack
+notifications, proxy pool health, proxy self-healing, DLQ auto-retry,
+partial_failure.
+**Dependencies:** none — describes the system as built; cross-references
+`decisions.md` for WHY and `technical-debt.md` for full round history.
+**Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`, `.claude/knowledge/technical-debt.md`
 
 **Path note (round 27):** every bare package path below (`core/`, `proxy/`,
 `browser/pool.py`, etc.) means `src/scraper_engine/<that path>` — all
@@ -30,11 +38,222 @@ See "Repository Layout" near the end of this file for the full picture.
 PENDING → CIRCUIT_CHECK → FETCHING_L1 → PARSING_L1
                                       ↘ failure → ESCALATING_L2 → FETCHING_L2 → PARSING_L2
                                                                                ↘ failure → ESCALATING_L3 → FETCHING_L3
-                                                                                                              ↘ failure → DEAD_LETTER
-Non-retryable (SSRF, quota, proxy exhausted): direct → DEAD_LETTER
+                                                                                                              ↘ failure → dead-lettered (per-URL)
+Non-retryable (SSRF, quota, proxy exhausted, unresolvable host): direct → dead-lettered (per-URL)
+Cache hit (round 29): reused, no escalation attempted at all — see below
+Cancellation (round 29): checked once per URL, before escalation starts
 ```
 
 Levels: L1 (httpx/Scrapling, timeout 20s, any proxy), L2 (Botasaurus+Camoufox, timeout 40s, anonymous+ proxy), L3 (Camoufox-only, timeout 60s, elite proxy).
+
+**Note on `DEAD_LETTER` (corrected round 29):** `JobStatus.DEAD_LETTER` is a
+valid enum value and DB CHECK-constraint entry, but no code path has ever
+set a job's *status* to it — "dead-lettered" above means the per-URL entry
+written to the `dead_letter_queue` table (`DeadLetterQueue.enqueue`,
+readable via `GET /v1/jobs/{job_id}/dlq`), which is a different thing from
+the job's own terminal `status` (which lands on `FAILED` if no URL in the
+job succeeded, `COMPLETED` if at least one did — see `Worker.process_job`'s
+status derivation). Earlier versions of this doc conflated the two.
+
+**`COMPLETED` no longer implies "every URL succeeded" (round 34):**
+`JobStatusResponse.partial_failure` (bool) is `True` when `status ==
+COMPLETED` but at least one URL landed in the DLQ alongside a success —
+computed identically in `Worker.process_job` and
+`api/routes.py::get_job`. A webhook/poller must check this flag, not just
+`status`, to know whether a "COMPLETED" job was actually clean. See
+`decisions.md` → "`partial_failure` as an Additive Boolean" for why this
+is a field, not a new `JobStatus` value.
+
+**DLQ entries are no longer all permanent (round 34):** `dead_letter_queue`
+rows split into `PERMANENT_FAILURE_CATEGORIES` (`SSRF_BLOCKED`,
+`QUOTA_EXCEEDED`, `HOST_UNREACHABLE`) and `TRANSIENT_FAILURE_CATEGORIES`
+(`PROXY_EXHAUSTED`, `CIRCUIT_OPEN`) — both sets defined in
+`orchestrator/worker.py`. Transient entries are auto-retried by
+`proxy/dlq_reaper.py` once the condition that caused them clears (proxy
+pool tier back to HEALTHY, circuit breaker back to CLOSED), up to
+`config.dlq_reaper.max_auto_retries` attempts (`dead_letter_queue.
+auto_retry_count`). `storage/dlq.py::enqueue` UPSERTs on `(job_id, url)`
+so a repeat failure updates the same row instead of resetting the
+counter via a fresh insert. See "Notifications & Proxy Self-Healing"
+below for the full round-34 picture.
+
+**Per-URL loop order (round 29), top to bottom inside `Worker.process_job`:**
+1. Cooperative cancellation check (`_is_cancelled` — one Postgres point
+   read per URL, not per fetch attempt). If the job's `scrape_jobs.status`
+   is already `CANCELLED` (set by `DELETE /v1/jobs/{job_id}`), the whole
+   URL loop stops here; results already recorded for prior URLs are kept.
+2. Cache-reuse check (`_check_cache`, skippable per-request via
+   `config_overrides.bypass_cache`) — see "Scrape Result Caching" below.
+3. The escalation ladder itself (unchanged shape from round 1, plus
+   markdown conversion and `on_result` persistence — see below).
+
+Every terminal outcome for a URL — success, a synthesized failure
+`FetchResult` from any of the three failure paths, or a cache hit — is now
+appended to `results` (not just successes, see technical-debt.md round-29
+item 2) and, if the caller (`orchestrator/tasks.py`) supplied one, awaited
+through `on_result` immediately (see "Incremental Persistence" below).
+
+## Scrape Result Caching (Round 29)
+
+Before attempting L1, `Worker._check_cache(tenant_id, url)` looks up a
+fresh (`extracted_at` within `CACHE_TTL_DAYS = 7`, a sliding window — see
+`.claude/knowledge/decisions.md`) successful `scrape_results` row for that
+exact URL, scoped to the tenant. A hit builds a `FetchResult` with
+`from_cache=True` directly from the stored row (`markdown`, `extracted`,
+`html_snapshot_url` carried forward, `html` deliberately left `None` — no
+S3 re-upload needed) and skips the escalation ladder entirely: no
+circuit-breaker/politeness/proxy cost, no quota consumption for that URL.
+A caller forces a fresh scrape via `config_overrides.bypass_cache: true`.
+`S3Client.SUCCESS_RETENTION_DAYS` (round 29: bumped 1 → 7) must stay ≥
+`CACHE_TTL_DAYS`, or a cache hit's `html_snapshot_url` could point at an
+already-expired S3 object.
+
+## Incremental Persistence & Real Progress (Round 29)
+
+`Worker.process_job` accepts an optional `on_result: Callable[[FetchResult],
+Awaitable[None]]`, awaited once per URL the instant it reaches a terminal
+outcome. `orchestrator/tasks.py::_run_scrape` builds a closure over
+`pg`/`s3`/`tenant_id`/`job_id` and passes it as `on_result`; the closure
+calls `_persist_one_result` (the per-item body `_persist_results` was
+split into — the batch wrapper still exists, used only by the bulk-crawl
+path, which has no per-item callback available since
+`ScrapyAdapter.run_spider` returns a full batch). This replaced the old
+"batch-persist everything after the whole job finishes" model, which is
+what makes two things possible: `GET /v1/jobs/{job_id}`'s `progress` field
+is now `len(result_rows) / len(urls)` while the job is `PROCESSING` (a real
+fraction, not the old hardcoded `0.5`), and job cancellation (below) can
+actually take effect mid-job with prior-URL results already durable.
+
+## Job Cancellation (Round 29)
+
+`DELETE /v1/jobs/{job_id}` does an atomic `UPDATE scrape_jobs SET status =
+'CANCELLED' WHERE status <> ALL(terminal_values) RETURNING status` (404 if
+no row exists at all, 409 if the row exists but was already terminal), then
+best-effort calls `queue.fetch_job(job_id).cancel()` (rq 2.10.0's real
+`Job.cancel()`) to pull a still-queued job before it's ever dequeued.
+`job_id` is now passed explicitly to `_queue.enqueue(...)` at submission
+time so rq's internal job id matches `scrape_jobs.job_id` — required for
+`fetch_job(job_id)` to find the right job at all. An already-dequeued,
+in-flight job is caught instead by `Worker._is_cancelled`'s per-URL check
+(see loop order above). `orchestrator/tasks.py::_run_scrape_job` also
+guards against a cancel that races ahead of rq actually dequeuing the job:
+its initial job-row read now includes `status`, and returns immediately if
+already `CANCELLED` instead of unconditionally flipping it to `PROCESSING`.
+
+## Idempotent Submission (Round 29)
+
+`POST /v1/scrape`/`/v1/crawl` accept an `Idempotency-Key` header. Before
+the quota charge, `scrape_jobs` is queried for a live (not `FAILED`/
+`CANCELLED`/`DEAD_LETTER`) job with that same key; if found, it's returned
+as-is — no new row, no new quota deduction, no new enqueue. See
+`.claude/knowledge/decisions.md` for why this is a non-unique index +
+query-time exclusion rather than a DB uniqueness constraint.
+
+---
+
+## Notifications & Proxy Self-Healing (Round 34)
+
+Two related subsystems, built together because pool-health alerts flow
+through the same delivery mechanism as per-job webhooks.
+
+**Webhook delivery — transactional outbox, not fire-and-forget.**
+`orchestrator/webhook_events.py::WebhookEvent`/`WebhookEventType` is the
+shape everything produces: `job.completed`/`failed`/`partial_failure`/
+`cancelled`, `proxy_pool.degraded`/`critical`/`recovered`.
+`orchestrator/webhook_dispatch.py::enqueue_and_deliver_webhook_event` is
+the single delivery entry point both `orchestrator/tasks.py` (per-job) and
+`proxy/harvester_daemon.py` (pool-health, see below) call: it writes a row
+to `webhook_outbox` (migration `007`, per-tenant-schema, mirrors
+`dead_letter_queue`'s shape — `storage/webhook_outbox.py`) *before*
+attempting delivery, then makes one immediate best-effort attempt via
+`WebhookDispatcher` (now `config.webhook`-driven, not hardcoded). A failed
+or crashed attempt leaves the row `pending`; a standalone
+`orchestrator/webhook_sweeper.py` daemon (own supervised OS process —
+round 35 moved it, `proxy-harvester`, and `dlq-reaper` from their own
+`docker-compose.yml` services into the `api` container via supervisord,
+see "Container Topology (Round 35)" below — `_run_periodic`-shaped like
+`harvester_daemon.py` — the loop
+helper lives in `core/periodic.py` now, shared by both) sweeps every 30s
+with exponential backoff, marking `dead` after `config.webhook.
+max_retries` sweep-level attempts. `orchestrator/slack_formatter.py`
+renders `WebhookEvent` into Slack's `{"text", "blocks"}` shape when the
+target URL contains `hooks.slack.com`; any other URL gets the raw event
+dict (backward compatible). Why split this way rather than one function
+in `tasks.py`: `.claude/knowledge/decisions.md` → "`webhook_dispatch.py`
+Split From `tasks.py`".
+
+**Proxy pool self-healing — event-driven, not purely timer-driven.**
+`ProxyManager.get_proxy`'s exhaustion path (`proxy/manager.py`) sets a
+debounced Redis kick key (`SET proxy:harvest:kick NX EX 30`) and publishes
+to `proxy:events:exhausted`; `harvester_daemon.py` runs a ~5s-poll watcher
+task (independent of its existing timer-driven `_run_periodic` loops) that
+reacts to the key — gated by a separate 60s cooldown key — and runs an
+out-of-band `harvester.harvest_once()` cycle. See `decisions.md` →
+"Debounced Redis Kick + Pub/Sub, Not Pub/Sub Alone" for why both the key
+and the publish exist. `proxy/pool_health.py::PoolHealthMonitor` computes
+per-tier (1/2/3) validated-proxy counts each health cycle, classifies
+HEALTHY/DEGRADED/CRITICAL against `config.proxy_tiers.
+degraded_below_count`/`critical_below_count`, persists state in Redis, and
+returns only real transitions. A transition into DEGRADED/CRITICAL or back
+to HEALTHY ("recovered") both (a) logs, and (b) — when
+`config.webhook.ops_webhook_url` is set — enqueues a `WebhookEvent` through
+the outbox/sweeper/Slack-formatter path above. **Known overlap, not
+reconciled:** `operations.md`'s pre-existing `ProxyPoolCriticallyLow`
+Prometheus/Alertmanager rule already alerts to Slack on low proxy counts
+(round 25) via a completely different mechanism (threshold+duration on a
+scraped gauge) — this round's ops-webhook path was built without
+cross-referencing it. See `technical-debt.md`'s round-34 entry, "Open
+thread" paragraph, before extending either one.
+
+**Transient DLQ auto-retry.** `proxy/dlq_reaper.py` (own daemon, same
+shape) polls `DeadLetterQueue.list_retryable()` per tenant every 60s for
+`TRANSIENT_FAILURE_CATEGORIES` entries under their retry cap, checks
+eligibility by reading current state (never mutating it — see
+`decisions.md` for why `CircuitBreaker.state()` not `allow_request()`),
+and re-enqueues the *same* `job_id` via the rq producer
+(`orchestrator/job_queue.py::build_queue`) so `GET /v1/jobs/{job_id}`
+keeps tracking the same job through a second attempt. See the DLQ note
+in the "Escalation State Machine" section above for the
+permanent/transient category split and the `(job_id, url)` UPSERT that
+carries `auto_retry_count` across repeat failures.
+
+**Container Topology (Round 35).** `proxy-harvester`, `dlq-reaper`, and
+`webhook-sweeper` — described above as separate daemons — are no longer
+separate `docker-compose.yml` services/containers. Root cause: the
+documented dev bring-up command never named them, so on a real deployment
+they simply never started, and the proxy pool went stale with no
+operator-visible signal (see `technical-debt.md` round-35 entry). Fixed by
+running all 4 long-running processes (`api` + the 3 daemons) as supervised
+subprocesses of one container via `supervisord` (`docker/supervisord.conf`,
+`Dockerfile`'s `CMD`) — each `autorestart`s independently, so one daemon
+crash-looping doesn't take the others or the API down. `worker-l1/l2/l3`
+stay separate compose services (different scaling unit — horizontally
+scaled compute/browser workhorses, not lightweight always-on loops).
+Operationally: `docker exec scraper_engine-api-1 supervisorctl status`
+replaces `docker compose ps` for checking these 3; see `operations.md` →
+"Self-healing daemons live inside the `api` container now" for the full
+command reference. This does not change any of the process-boundary
+reasoning elsewhere in this doc (separate OS process, separate in-process
+metrics registry, etc.) — only the container each process runs in.
+
+**Daemon Liveness in `/v1/health` (Round 36).** Closes the round-35
+"Open follow-up" — `/v1/health` previously only reflected `api`'s own
+Postgres/Redis/S3 reachability, with no signal at all for the 3 daemons
+above. `core/periodic.py::run_periodic` now optionally writes a Redis
+heartbeat (`heartbeat:<job-name>`, TTL = 3x the job's own interval) after
+every cycle attempt when a `redis` client is passed — all 7 periodic jobs
+across the 3 daemons pass one now. `api/health.py::_check_daemon_liveness`
+reads those keys grouped by owning daemon (`proxy-harvester`:
+harvest/promotion/health/pool_health/retention; `dlq-reaper`: dlq_reap;
+`webhook-sweeper`: webhook_sweep) — Redis's own TTL expiry is the
+staleness detector, no manual age math. Result surfaces as a new
+`daemons` field, **informational only** — does not affect `/v1/health`'s
+`healthy`/HTTP-status gate (a status-affecting first attempt broke a
+real pre-existing test on a legitimate cold-start/standalone-testing
+case; see `decisions.md` → "Daemon Liveness in `/v1/health` Is
+Informational, Not Status-Affecting" for the full story, and → "Heartbeat-
+via-Redis Over Supervisor RPC for Daemon Liveness" for why this reads
+Redis heartbeats rather than querying supervisord's own RPC socket).
 
 ---
 
@@ -55,11 +274,248 @@ harvest_once()
           └─ broker.find() → validate → JSON stdout → persist
 ```
 
-**Self-hosted judge:** `judge_server.py` on port 8089. Echoes headers + origin. Replaces httpbin.org dependency.
+**Proxy validation target:** `proxy/harvester.py::JUDGE_URLS` — a small
+ordered list of independent, differently-hosted public IP-echo endpoints
+(`httpbingo.org`, `api.ipify.org`, `postman-echo.com`, all plain-HTTP —
+HTTPS would need CONNECT tunneling, which many free HTTP-only proxies
+can't do). `_http_validate()` tries each in order, stopping at the first
+200; `health_monitor.py::check_one()` imports the same list rather than
+keeping its own, so both stay in sync. Round 32 tried a self-hosted
+loopback judge (`proxy/judge_server.py`, port 8089) first — architecturally
+unfixable: when a request is routed through a forward proxy, the *proxy*
+resolves "127.0.0.1," not us, so a loopback judge can never validate a
+real third-party proxy no matter how correctly it runs. Then tried a
+single public target (`httpbin.org`, matching `health_monitor.py`'s prior
+choice) — found it live-down (persistent 503s) while building the fix,
+directly demonstrating why proxy scoring must never depend on one public
+service. `judge_server.py` remains as a deterministic, network-independent
+stand-in for tests only (`tests/unit/test_judge_server.py`,
+`tests/integration/test_promotion.py`) — not the production judge. See
+`.claude/knowledge/decisions.md` for the full decision record and
+`.claude/knowledge/troubleshooting.md` → "All Pool Proxies Score 25".
 
 **Source diversity:** 8 URLs across 6 operators (proxyscrape.com, openproxylist.xyz, TheSpeedX/GitHub, monosans/GitHub, pubproxy.com, geonode.com). 5 real failure domains (GitHub CDN shared by two repos).
 
 **Scoring:** Two-tier. TCP-only=25 (below L1 threshold 40 — cannot be selected). HTTP-validated=60. `promote_tcp_only()` background job re-validates TCP-only proxies.
+
+**ASN classification (`proxy/asn_classifier.py`, Round 35 rewrite).**
+`build_asn_classifier()` unconditionally returns `ReverseDnsAsnClassifier`
+— a DNS PTR-hostname lookup (`loop.getnameinfo()`) matched against the
+same `_DATACENTER_KEYWORDS`/`_MOBILE_KEYWORDS` lists a MaxMind org-name
+lookup would have used. Previously (round 22–34) this was
+`MaxMindAsnClassifier`, gated on `GEOIP_ASN_DB_PATH` pointing at a
+downloaded GeoLite2-ASN database — never actually set on this repo's
+deployments, so every proxy silently scored `asn_class="unknown"` forever,
+permanently zeroing `scoring.py`'s 10-point `ASN_BONUS` dimension. Root-
+caused round 35 (see `technical-debt.md`): combined with the round-35
+container-topology fix above, the pool's max achievable score sat at
+exactly 69.8 — 0.2 points under `config.proxy_tiers.min_score_level_2`'s
+70.0 floor — so L2/L3 always failed `proxy_exhausted`. Reverse-DNS was
+chosen over fixing the MaxMind wiring because it needs no third-party
+account/license key/database file to maintain (user-directed, see
+`decisions.md`) — trade-off is lower precision (some datacenters skip a
+descriptive PTR record, some residential ISPs set one).
+
+---
+
+## Paid Gateway Proxy (Round 40)
+
+Toggleable paid rotating-gateway residential proxy (DataImpulse) for L2/L3,
+alongside — never replacing — the free-pool pipeline above. Off by default
+(`config.dataimpulse.enabled: false`); `config.dataimpulse.strategy`
+(`free_only` / `paid_only` / `free_first`) only takes effect once enabled.
+Full WHY: `decisions.md` → "Toggleable Paid Proxy Gateway". Full round
+narrative incl. the two Docker-image bugs found live-verifying this:
+`technical-debt.md`'s round-40 entry.
+
+```
+Worker._fetch_with_proxy()            [orchestrator/worker.py]
+  strategy = free_only unless config.dataimpulse.enabled
+  │
+  ├─ paid_only  → build_gateway_proxy() → ProxyLease(...) directly
+  │                (pm.get_proxy() never called)
+  │
+  ├─ free_first → pm.get_proxy() as today
+  │                └─ ProxyPoolExhaustedError → build_gateway_proxy() fallback
+  │
+  └─ free_only  → pm.get_proxy() as today, unchanged (default)
+```
+
+- **`proxy/paid_gateway.py::build_gateway_proxy()`** — pure function, 4 env
+  vars (`DATAIMPULSE_PROXY_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`,
+  `DATAIMPULSE_PASSWORD`; note the host/port names are the user's own
+  choice, not the originally-planned `DATAIMPULSE_GATEWAY_*`), no network
+  I/O, no DB row. Returns `None` on any missing/invalid var — callers treat
+  `None` as a hard misconfiguration, never a silent fallback (see
+  `Worker.__init__`'s fail-fast startup check below).
+- **`core/models.py::Proxy`** gained `username`/`password`/
+  `source: Literal["pool","paid_gateway"]` (all optional/defaulted — zero
+  effect on any existing free-pool `Proxy`) and `auth_url()`
+  (`user:pass@host:port`, identical to `url()` when unauthenticated).
+- **Deliberately bypasses `ProxyManager` entirely for a gateway lease** —
+  no `_select_candidate`, no domain-ban check, no `lease_preflight`, and
+  `mark_success`/`mark_failure` are skipped (`_fetch_with_proxy` checks
+  `lease.proxy.source == "pool"` before calling either). A rotating
+  gateway's exit IP changes server-side per connection — there's no fixed
+  identity worth scoring, banning, or preflighting. See `decisions.md` for
+  the full reasoning.
+- **`Worker.__init__`** calls `build_gateway_proxy()` eagerly when
+  `dataimpulse.enabled=true` and raises `RuntimeError` if it returns
+  `None` — fails the job process at construction time, not silently
+  mid-fetch (RQ forks one process per job).
+- **Credential plumbing to the actual fetch:**
+  `browser/camoufox_wrapper.py` adds `username`/`password` keys to the
+  `proxy={"server": ...}` dict Playwright/Camoufox already accepts natively.
+  Botasaurus takes a single proxy *string* (no dict support) — its two call
+  sites (`fetcher/botasaurus_wrapper.py`, `browser/botasaurus_pool.py`)
+  use `.auth_url()` instead of `.url()`.
+- **Two Docker-image dependencies added** (`Dockerfile`, `system-base`
+  stage): `nodejs` and `npm` — required by Botasaurus's own
+  `botasaurus_proxy_authentication` helper for ANY credentialed proxy
+  (local anonymizing-proxy chain via a lazily-`npm install`ed `proxy-chain`
+  package), invisible before round 40 since no proxy this system used ever
+  carried credentials. A related live-caught bug:
+  `fetcher/level_2.py::_fetch_via_botasaurus`'s `except Exception:` didn't
+  catch the `SystemExit` that library raises when Node is missing — fixed
+  to `except (Exception, SystemExit):` (deliberately not a bare `except:`,
+  to keep `asyncio.CancelledError`/`KeyboardInterrupt` propagating).
+- **RESOLVED (round 41)** — see "Xvfb Display-Contention Lock" below for
+  the root cause and fix. `paid_only`/`free_first` are now live-verified
+  reliable for L2 (4 rounds of increasingly concurrent real jobs, zero
+  crash-attributable job failures).
+- **Credential refusal (round 66).** A proxy's 407 is `PROXY_AUTH_FAILED`
+  (`fetcher/_failure.py`). From the gateway it means the account (plan out of
+  traffic): no new-session retry, no later level, URL DLQ'd at once, circuit
+  untouched. The DLQ reaper re-drives those entries only once
+  `paid_gateway.gateway_accepts_credentials()` gets a 200 through the gateway
+  (answer cached 120s). From a free proxy it is that proxy: `mark_failure`
+  and one fresh-lease retry, then normal escalation.
+
+---
+
+## Xvfb Display-Contention Lock (Round 41)
+
+Closes round 40's open thread above. Two compounding bugs, both in
+third-party code, worked around rather than patched (no vendored forks):
+
+1. **botasaurus_driver's Xvfb launch picks a display number by scanning
+   disk, not atomically.** `botasaurus_driver/core/config.py`'s
+   `Config.__call__()` calls `pyvirtualdisplay.Display(visible=False,
+   size=(1920, 1080))`, whose `_search_for_display()` lists
+   `/tmp/.X*-lock` files and picks `max(existing) + 3` — a plain
+   list-then-guess, not a claim. Camoufox's own launcher
+   (`camoufox/virtdisplay.py::VirtualDisplay.get()`) is race-free by
+   contrast: it launches Xvfb with `-displayfd`, so Xvfb itself claims a
+   free number atomically and reports it back over a pipe. Two engines
+   sharing one worker process (`Level2Fetcher.fetch()`'s Botasaurus-then-
+   Camoufox fallback, `core.budget.BROWSER_SEMAPHORE` permitting several
+   concurrent browser launches) meant a Botasaurus launch's stale-scan
+   guess could collide with a Camoufox (or another Botasaurus) launch
+   that had grabbed a real number moments earlier —
+   `_XSERVTransSocketUNIXCreateListener: ...SocketCreateListener() failed
+   / server already running`. Because this raises before
+   `botasaurus_driver` ever returns a `Driver` object, application code
+   had no handle to `close()` and clean up the half-started Xvfb process.
+2. **`pyvirtualdisplay.Display.stop()` never unlinks its lock/socket
+   files.** It `SIGKILL`s the Xvfb subprocess and waits for exit, but
+   SIGKILL bypasses Xvfb's own atexit cleanup, so `/tmp/.X<N>-lock` and
+   `/tmp/.X11-unix/X<N>` are left on disk even though the process is
+   gone — feeding bad guesses to bug (1) for every future launch,
+   compounding over a long-lived worker process's lifetime. (Camoufox's
+   own `virtdisplay.py::kill()` already does this cleanup correctly for
+   its own displays — this gap is specific to botasaurus_driver's use of
+   `pyvirtualdisplay`.)
+
+**Fix — `core/budget.py::XVFB_LOCK`**, a new process-wide `asyncio.Lock`
+(alongside `BROWSER_SEMAPHORE`) serializing every Xvfb spinup *and*
+teardown across both engines:
+- `browser/camoufox_wrapper.py` — held across `__aenter__`'s launch call
+  and, separately, across `__aexit__`'s `self._browser.__aexit__()`
+  teardown call. Not held across the fetch itself, so
+  `BROWSER_SEMAPHORE`'s real concurrency ceiling is unaffected.
+- `fetcher/botasaurus_wrapper.py::fetch_html()` — held for the *entire*
+  call. Botasaurus's `@browser` decorator bundles launch+navigate+close
+  into one synchronous call with no seam to release early — an accepted
+  throughput trade for correctness.
+- `browser/botasaurus_pool.py` — held around launching a driver and
+  around closing one (`_close_entry`), never across navigation (round 64:
+  it used to wrap launch + navigate + scroll, and since every gateway
+  attempt is a new identity, every L2 fetch relaunched and stalled all
+  other browser launches in the worker for 40-130s).
+
+**Fix — `browser/_xvfb_cleanup.py::cleanup_stale_display()`** — new,
+best-effort proactive removal of a just-closed Botasaurus driver's
+`/tmp/.X<N>-lock`/`/tmp/.X11-unix/X<N>` files (reaches into
+botasaurus_driver's private `Config._display` attribute; no public API
+exists). Wired into `botasaurus_pool.py::_close_driver()` and
+`botasaurus_wrapper.py::_botasaurus_fetch()`'s `finally` block (captured
+via closure, since the `@browser` decorator never exposes the `Driver`
+back to the caller after its own internal close).
+
+**What this does and doesn't guarantee:** live verification (4 rounds of
+concurrent real jobs against nairametrics.com, up to 4 simultaneous
+2-URL jobs = 8 L2 fetches, `dataimpulse.strategy: paid_only`) showed the
+underlying collision (`SocketCreateListener() failed`) can still
+occasionally log — Xvfb's own `-displayfd` internal retry logic absorbs
+a transient collision on a stale socket file — but it no longer
+propagates into a crashed browser session or an unrecoverable job.
+Zero job failures, zero stuck jobs, zero tracebacks attributable to it
+across all 4 verification rounds, versus the pre-fix behavior (crashed
+CDP/websocket connection, `"Connection to remote host was lost -
+goodbye"`, no way to clean up the orphaned Xvfb process). This is a
+concurrency-race fix, not a guarantee the warning line disappears
+entirely — the warning is now cosmetic noise, not a failure mode.
+
+---
+
+## proxy_exhausted Mislabeling + browser_sessions Schema Regression (Round 42)
+
+User-requested ("taken care of once and for all"): two stacked bugs behind
+every `proxy_exhausted` DLQ entry, neither one about proxy supply.
+
+**Bug 1 — terminal-failure mislabeling.** `orchestrator/worker.py::
+process_job`'s per-URL `for level in LEVELS: ... else:` loop fabricated
+`PROXY_EXHAUSTED`/"All fetch levels exhausted" whenever all 3 levels
+failed for ANY reason not in `DLQ_ELIGIBLE_CATEGORIES` — which by design
+(round 37) is most real proxy-adjacent failures (`BROWSER_CRASH`,
+`NETWORK_TIMEOUT`), since those categories are meant to escalate rather
+than DLQ early. Proven live under `dataimpulse.strategy=paid_only`, where
+`ProxyManager.get_proxy()` is structurally never called — yet
+`proxy_exhausted` still appeared. Fixed: the branch now tracks
+`last_level_result` and reports its real category/message; falls back to
+the old label only when literally no level was ever attempted (every
+politeness slot stayed busy). `proxy/dlq_reaper.py` gained its own
+(separate from `worker.py`'s `TRANSIENT_FAILURE_CATEGORIES`, which also
+gates early-break-vs-escalate) transient list covering `BROWSER_CRASH`/
+`NETWORK_TIMEOUT` too, same tier-health eligibility check as
+`PROXY_EXHAUSTED`.
+
+**Bug 2 — the real failure the mislabeling hid.** Fixing bug 1 exposed
+every remaining terminal failure as `browser_crash / column
+"storage_state" does not exist`. Root cause: migration 002 fixed
+`browser_sessions`' columns (`domain`/`storage_state`/`last_used_at`/
+`expires_at`, matching `browser/session_state.py`), but migrations
+004/005/007 each redefine `create_tenant_schema()` wholesale and each
+copy-pasted the *original* broken 001 shape — silently reverting 002's
+fix every time. Every live tenant schema on this deployment had the
+broken shape (verified directly, 100% affected). Invisible in practice
+because `BrowserPool.lease()`'s `session_mgr.save()` call swallows its
+own exception (warning-only), and `retention_reaper.py` already
+defensively swallows per-tenant schema drift — only
+`SessionStateManager.load()` (called unconditionally by `BrowserPool.
+acquire()` on any Camoufox cold-start for a not-yet-warm domain,
+effectively every first L3 attempt per domain per job) was unguarded,
+and its crash is exactly what bug 1 was mislabeling. Fixed: new migration
+`008_fix_browser_sessions_schema_regression.py` — restores the correct
+`browser_sessions` block in `create_tenant_schema()` and drops+recreates
+every existing tenant schema's table to match (safe: no schema under the
+broken shape could have held real data, since both read and write paths
+failed identically against it).
+
+Live-verified together: the same URLs that previously crashed with
+`storage_state` errors under `paid_only` now complete successfully, zero
+`storage_state` errors in logs, zero new DLQ entries. Full narrative,
+every detail: `.claude/knowledge/technical-debt.md`'s round-42 entry.
 
 ---
 
@@ -114,6 +570,12 @@ harvest_once()
 **Design:** Hot-browser pool with real reuse. `pool.start(N)` launches N Camoufox instances and stores live contexts in an asyncio.Queue. `pool.lease(proxy, domain)` is the async context manager — returns a live context, guarantees release (structural cleanup per invariant §1.1.6).
 
 **Key methods:**
+- **Round 65:** with host admission on (`host_capacity.enabled`),
+  `orchestrator/tasks.py` builds the pool with `prewarm_count=0` and
+  `park_spares=False` — every healthy instance is closed on release instead
+  of parked, because a parked spare runs outside any host seat and, with a
+  rotated gateway session per attempt, is never reused. The parking rules
+  below apply only with admission off.
 - `start()` — launches prewarm_count browsers, stores (context, wrapper, idle_since)
 - `acquire(domain)` — classifies drained items as selected/keep/teardown per idle timeout + domain matching
 - `release(ctx, healthy)` — healthy returns to pool, unhealthy tears down
@@ -131,11 +593,134 @@ harvest_once()
 
 ---
 
+### Browser Permits Across Engines (Round 64)
+
+`core.budget.BROWSER_SEMAPHORE` is the process-wide ceiling on live
+browsers. Every engine takes a permit through
+`core.budget.acquire_browser_permit()`:
+
+- **Reclaim on arrival.** While no permit is free it calls registered
+  reclaimers — `BrowserPool._evict_oldest_spare`, held by weak reference —
+  each of which closes one PARKED instance (never one mid-fetch). With
+  nothing left to reclaim it waits: genuine contention.
+- **Hand over on return.** While blocked it counts as a waiter
+  (`permit_waiters()`); `BrowserPool.release(healthy=True)` closes a
+  returning instance instead of parking it when someone is waiting and no
+  permit is free.
+- `CamoufoxWrapper.__aenter__` and `BotasaurusWrapper` hold their permit for
+  the browser's life / the one-shot fetch. `BotasaurusPool` holds one only
+  while a fetch runs; a parked driver holds none (a parked permit-holder is
+  the round-63 deadlock), and parked drivers are bounded by
+  `botasaurus.max_pooled_drivers` instead.
+- `XVFB_LOCK` covers display spinup and teardown only (launch/close), never
+  navigation — except `BotasaurusWrapper`'s one-shot `@browser` path, which
+  has no seam to split.
+
+**Sizing.** Every figure here is per rq work-horse: each container runs one
+job at a time in its own forked process with its own semaphore, so a host's
+worst case is containers × `camoufox.max_total_instances`.
+`AppConfig` rejects `politeness.max_concurrent_urls_per_job` above
+`camoufox.max_total_instances`; the RAM-aware cap can still lower the real
+ceiling at startup, and `orchestrator/tasks.py` logs
+`browser_ceiling_below_url_concurrency` when it does. Round 65 adds the
+host-wide limit below; with it on, this per-process ceiling is only a
+safety net and the warning is silent.
+
+### Host-Wide Browser Admission (Round 65)
+
+One browser budget per **host**, shared by every worker process on it, in
+`orchestrator/host_capacity.py`. Off unless `HOST_CAPACITY_ENABLED=true`
+(`host_capacity.enabled`). Why: 3 worker containers × 5 concurrent URLs put
+15 renders on a 4-core host (load avg 58-69 measured), because each process
+sized its own semaphore as if it owned the machine.
+
+- **One claim per render, three things at once.** Before every browser
+  render — each pass of `Worker._fetch_with_proxy` (first render, pool
+  retry, gateway rotation) and process_job's gateway retry — the worker
+  claims, in one Lua script (`CLAIM_LUA`): a seat of `weight` units, the
+  website's politeness slot (same `politeness:turns:{tenant}:{domain}` key
+  as `politeness.py`, against this request's own cap), and the website's
+  delay (`politeness:last:…`). All or nothing, so nothing is held while
+  waiting for something else. The claim is taken before the proxy lease.
+  L1 keeps the old slot path; browser levels skip it when admission is on.
+- **The line.** Waiters sit in `hc:{host}:waiters` ordered by the URL's
+  first-enqueue time (kept across levels and retries). A caller wins only if
+  no older waiter could claim right now; waiters whose site is full or still
+  inside its delay are skipped; while another tenant waits, one tenant holds
+  at most `ceil(target × tenant_share)` units; the first render on an idle
+  host is always admitted. Self-claim only — the script never grants to
+  anyone but its caller, so a dead waiter is never handed a seat. Waiters
+  poll every 0.5-1.0s (no pub/sub).
+- **Leases.** Seats, slots and waiters carry their own Redis-`TIME` expiry,
+  purged by every script: a killed process's seats return within
+  `lease_ttl_seconds` (90). Holders renew every 20s; past
+  `max_hold_seconds` (900) renewal stops and `seat_overheld` is logged — work
+  is never cancelled from here. A claim inside a claim (same task) raises
+  `NestedClaimError`: it could deadlock a full host.
+- **Bounded waiting.** `min(per_url_admission_cap_seconds, rq deadline −
+  deadline_margin_seconds)`; `tasks.py::_job_deadline` reads the rq job. On
+  expiry the URL gets a `CAPACITY_TIMEOUT` row before rq's hard kill (which
+  writes nothing per URL). Redis failures → `DEPENDENCY_UNAVAILABLE`. Neither
+  touches the circuit breaker or level memory. The DLQ reaper re-drives
+  `CAPACITY_TIMEOUT` only when the host has spare capacity, with a
+  60s × 2^n backoff shared with the other contention categories.
+- **Sizing — `orchestrator/capacity_controller.py`.** A supervisord program in
+  the api container; one leader per host (`hc:{host}:leader`). Every 5s:
+  CPU PSI "some avg10" (host-wide inside containers; load/core fallback) and
+  MemAvailable, with someone waiting and a 10s dwell → below
+  `cpu_pressure_low` straight to `in_use + waiters`, between the marks
+  +`raise_step_fraction` (25%) of itself, either way never past the whole
+  browsers `MemAvailable - mem_available_floor_mb` holds
+  (`browser_memory_mb`, 1200). Over `cpu_pressure_high` (90) or under the
+  memory floor: ×0.7, 15s dwell. Clamped to `[min_units, max_units or
+  MemTotal / browser_memory_mb]`. Round 66 rewrote all of that — see
+  decisions.md → "A Limiter That Only Limits When the Host Is Actually
+  Strained". The target key has a TTL; missing → `default_units or cores`. Other programs'
+  load shrinks our share — we yield, we cannot control them.
+- **Host id** (`core/host_identity.py`): `SCRAPER_HOST_ID`, else the kernel
+  `boot_id` every container on a host shares.
+- **Parked browsers keep their seat (round 67).** When a pool parks a
+  browser for reuse it keeps the seat of the render that launched it:
+  `SeatKeeper.retain()` reads the claim from a contextvar (`_ACTIVE_CLAIM`),
+  the claim's exit then returns only the politeness slot
+  (`RELEASE_SLOT_LUA`), and the keeper renews the seat from then on. One
+  seat is one browser: a render whose seat already went to another parked
+  instance closes its browser (round 66's behaviour). A render that reuses a
+  parked browser hands that browser's seat back, since its own claim now
+  covers it. The keeper (one per job, a task in `tasks.py::_run_scrape`)
+  gives a seat back when the pool closes that instance (`discard()`), when
+  anyone waits in the host's line and the seat has been idle
+  `idle_grace_seconds` (2s), after `idle_seat_seconds` (45s) idle with
+  nobody waiting, or when its lease is lost. The last case closes exactly
+  that browser (`_close_parked(seat)`), not the oldest one. So `in_use`
+  counts live browsers. A browser used on a paid-gateway session is never
+  parked, admission or not (`Proxy.reusable()`), because each gateway
+  attempt has a fresh `sessid` that no later request asks for.
+  `HOST_CAPACITY_REUSE_BROWSERS=false` restores
+  close-on-release. Prewarm stays off under admission (and for
+  `max_level < 2`).
+- **Measured browser weight (round 67).** Each keeper publishes what its
+  process's live browsers weigh (`core/browser_rss.py`: summed RSS per
+  browser process tree) to `hc:{host}:browser_rss`, at most once per
+  controller interval. The controller charges the mean, clamped to
+  `[min_browser_memory_mb, browser_memory_mb]` (400, 1200), and falls back
+  to 1200 until two browsers are reported. It can only loosen the constant:
+  summed RSS over-counts pages shared between processes. Live readings were
+  870-1200 MB.
+- `RQ_WORKERS_PER_CONTAINER` > 1 runs `rq worker-pool` so a small job starts
+  without waiting for a big one — only with admission on. Timings gain
+  `admission_wait_ms`; `level_N_ms` becomes render time only.
+  `/v1/health` → `browser_capacity`; `/metrics` → `host_capacity_*`,
+  `host_admission_*`, `host_cpu_pressure`.
+- **Not covered:** `/v1/crawl` (Scrapy, no browser); process-local waits
+  inside a held seat (`XVFB_LOCK`, CapSolver) are not reported separately.
+  Scripts build some keys from waiter data: not Redis Cluster/ACL-key safe.
+
 ## PgBouncer
 
 **Architecture:** `pgbouncer-init` Docker service auto-regenerates SCRAM userlist from Postgres `pg_authid.rolpassword`. PgBouncer mounts shared volume. Zero manual steps.
 
-**Transaction pooling:** `PostgresClient.acquire()` wraps SET search_path in `BEGIN...COMMIT` to ensure all statements hit the same backend connection.
+**Transaction pooling:** `PostgresClient.acquire()` wraps SET search_path in `BEGIN...COMMIT` to ensure all statements hit the same backend connection. On success: `SET search_path=public` then `COMMIT`. On any exception (including cancellation): `ROLLBACK` only, no `SET search_path` attempt — a failed query aborts the transaction server-side, so issuing anything but ROLLBACK/COMMIT there would itself raise `InFailedSQLTransactionError`, masking the real error and skipping COMMIT entirely, which returned the connection to the pool mid-transaction (this was also the source of the "Resetting connection with an active transaction" error-level log noise from asyncpg's own pool-release safety net — see `.claude/knowledge/troubleshooting.md`).
 
 ---
 
@@ -149,6 +734,36 @@ All routes enforce 4 invariants per blueprint:
 4. **DB persistence** — `INSERT INTO scrape_jobs` before returning. `GET /v1/jobs/{job_id}` queries live `scrape_jobs` table. 404 on missing.
 
 **Startup:** `api/main.py` uses `lifespan` context manager to initialize `PostgresClient`, `RedisClient`, and `TenantResolver` singletons. `@app.on_event("startup")` was unreliable in FastAPI 0.139.2.
+
+**Caller-facing surface expanded (Round 56).** Five capabilities that
+already existed internally had no route exposing them to a caller — surfaced
+as 4 independently-shipped routes plus a CLI wrapper, each following the
+same 4-invariant shape above:
+
+- `GET /v1/jobs` — tenant-scoped job list (`status`/`limit`/`offset`
+  filters), same schema-per-tenant isolation as `GET /v1/jobs/{job_id}`.
+- `GET /v1/dlq` — tenant-wide dead-letter listing, the caller-facing sibling
+  of the existing per-job `GET /v1/jobs/{job_id}/dlq`
+  (`DeadLetterQueue.list_for_tenant`'s `job_id=None` mode, previously only
+  used internally by ops tooling and the `dlq_size` gauge).
+- `GET /v1/quota` — remaining daily quota for the calling tenant
+  (`QuotaManager` already tracked this; a caller previously only discovered
+  its limit by hitting a `429`).
+- `GET /v1/webhook-events` — static reflection of `WebhookEventType`'s
+  values and `WebhookEvent`'s JSON schema, no DB/Redis touch.
+- `cli/` gained a caller-facing `api` subcommand group (`scrape`/`jobs`/
+  `job`/`quota`/`dlq`) that wraps these routes over `httpx` instead of
+  talking to storage directly — distinct from the ops subcommands
+  (`serve`/`worker`/`harvest`/…), which still touch Postgres/Redis directly.
+
+Caught along the way: FastAPI's `Query(...)` marker never resolves to its
+plain value when a route function is called directly (every test in
+`api/routes.py`'s module does this, bypassing FastAPI's DI) — `list_jobs`/
+`list_dlq` use plain `int` params with a manual `_validate_pagination()`
+helper (422 on out-of-range) instead.
+
+Full detail: `.claude/knowledge/technical-debt.md` round-56 entry. Endpoint
+request/response shapes: `docs/reference/api-reference.md`.
 
 ---
 
@@ -393,12 +1008,14 @@ the tenant-isolation invariant (spec §1.1 #3). `BotasaurusPool` instead
 constructs raw `botasaurus.browser.Driver` instances itself (bypassing the
 `@browser` decorator and botasaurus's pool entirely) and keys reuse the same
 safe way `browser/pool.py::BrowserPool` already keys Camoufox contexts:
-proxy + domain match → reuse via `driver.requests.get(url)` (verified: this
-runs as an in-page JS `fetch()` through the driver's own tab, so it inherits
-that tab's live cookies/TLS session natively — no separate cookie-jar
-plumbing needed); mismatch → close the old driver, build a new one. One
-instance per rq job, same construction/shutdown bracket as `BrowserPool` in
-`orchestrator/tasks.py::_run_scrape`. Wired opt-in through
+proxy identity (`Proxy.identity_key()`, round 63) + domain match → reuse
+the live driver and NAVIGATE it (round 63: it used to be an in-page
+`driver.requests.get(url)` with no JS, which made L2 results depend on URL
+order); otherwise launch a new driver, evicting the oldest idle one once
+`botasaurus.max_pooled_drivers` (default 2, round 64) are held. One pool
+per rq job, same construction/shutdown bracket as `BrowserPool` in
+`orchestrator/tasks.py::_run_scrape`. A fetch holds a `BROWSER_SEMAPHORE`
+permit only while it runs (see "Browser Permits Across Engines"). Wired opt-in through
 `Worker`/`fetcher/factory.py::build_level2_fetcher()`/`Level2Fetcher` —
 `None` (default off in tests) preserves exactly the pre-round-26 one-shot
 behavior.
@@ -457,8 +1074,143 @@ against `challenge-mirror` returns real content
 (`<h1>Verified Content</h1>`) with `google_get(bypass_cloudflare=True)` and
 `short_random_sleep()` both genuinely executing, and a 2-URL same-domain
 `BotasaurusPool.fetch()` run confirms exactly one `Driver()` construction
-across both calls (the 2nd fetch used `driver.requests.get()`, not a new
-browser launch) — both are now real, not just source-cited + mocked.
+across both calls (the 2nd fetch reused the driver; at the time it used
+`driver.requests.get()`, replaced by real navigation in round 63) — both
+are now real, not just source-cited + mocked.
+
+**Silent-false-success on a Chromium internal error page (Round 57).**
+`botasaurus_driver`'s navigation never raises when Chromium lands on its own
+internal `chrome-error://` page (a DNS failure, a connection reset, etc.) —
+it returns normally, so a genuinely failed navigation looked identical to a
+successful one to every caller. Fixed with a dedicated post-navigation
+check, `browser/_botasaurus_nav_check.py::raise_if_navigation_failed()`
+(checks `driver.current_url` for the `chrome-error://` scheme), called from
+both real-navigation Botasaurus paths (`fetcher/botasaurus_wrapper.py`,
+`browser/botasaurus_pool.py`). Live-verified with a real Chromium launch
+against a deliberately unreachable host.
+
+**Missing autoscroll (Round 58).** `Level2Fetcher._fetch_via_botasaurus`
+never autoscrolled, silently dropping any lazy-loaded content below the
+fold — every other fetch path already autoscrolled. Fixed via
+`browser/_botasaurus_scroll.py::botasaurus_autoscroll()`, a sync port of
+the same height-stability algorithm the Playwright/Camoufox paths use
+(`driver.run_js` scroll + height-poll loop, since Botasaurus's `Driver` API
+is synchronous, not `page.evaluate()`). Live-verified against a real
+infinite-scroll page.
+
+**RAM-aware concurrency cap + image/CSS blocking (Round 59).**
+`core/budget.py::resolve_browser_max_total_instances()` — opt-in
+(`camoufox.ram_aware_concurrency_enabled`, default off) ceiling on live
+browser instances, delegating to Botasaurus's own
+`calc_max_parallel_browsers()` (reads `psutil.virtual_memory().available`);
+can only reduce the configured `BROWSER_SEMAPHORE` size, never raise it.
+Calibrated against a real measured Botasaurus/Chromium headful launch RSS
+(804.7MB on the host measured, isolated via before/after PID diff) rather
+than Camoufox's much lighter figure, since the semaphore is shared across
+both engines and Botasaurus is the heavier one. Separately,
+`block_images`/`block_images_and_css` (`BotasaurusConfig`, opt-in) wired
+into both real-navigation Botasaurus paths as real `botasaurus_driver.
+Driver` kwargs — live-verified: a real launch with `block_images=True`
+showed the page's `<img>` tag present in the DOM but never loaded
+(`naturalWidth` stayed 0).
+
+**Extensions, lang/locale/timezone, mouse simulation, CDP network capture
+(Round 60).** Four more opt-in `BotasaurusConfig` fields, each independently
+implemented and live-verified: `extensions` via new
+`browser/_botasaurus_extension.py::LocalExtension` (Driver needs
+`.load()`-exposing objects, not raw paths); `driver.
+set_locale_and_timezone()` for locale/timezone spoof (live-verified
+correct); `driver.enable_human_mode()` + humanized per-scroll-pass
+`move_mouse_to_point()`; and raw CDP request/response capture via new
+`browser/_botasaurus_network_capture.py`, persisted as
+`FetchResult.network_events` / `scrape_results.network_events` (migration
+`010`). **Known, documented limitation:** `Driver(lang=...)` was live-tested
+to have zero effect on `navigator.language`/`Accept-Language` despite its
+own docstring's claim — kept as a real but ineffective config field rather
+than silently dropped, since a JS-injection workaround hit a separate
+confirmed upstream CDP bug (`Page.enable()` CBOR error), out of scope to
+chase. A same-session independent review before merge found and fixed 3
+real defects: a resource leak in `_new_driver_fetch` (3 new post-launch
+calls sat outside the existing try/except, reintroducing round-41's
+display-contention precondition on failure), `GET /v1/jobs/{id}` never
+returning the new `network_events` column, and reused-driver fetches
+silently dropping network-event capture into a dead first-call list
+(CDP hooks are tab-scoped, registered once at launch — fixed with a
+redirect indirection).
+
+Full detail for rounds 57-60: `.claude/knowledge/technical-debt.md`'s
+per-round entries.
+
+---
+
+## Scrapling Engine + Structured Extraction (Round 28)
+
+Two modules — `fetcher/scrapling_wrapper.py::ScraplingWrapper` and
+`fetcher/adaptive_selector.py::AdaptiveSelector` — existed fully unit-tested
+but with zero production callers until this round; both are now real.
+
+**Scrapling engine (`Level1Fetcher`'s third first-attempt path):**
+`base.yaml`'s `levels.level_1.engine: scrapling` was declared config but
+never read — L1 always used plain httpx regardless. `fetcher/factory.py::
+build_level1_fetcher` now constructs a `ScraplingWrapper` whenever
+`engine == "scrapling"` and threads it in as `scrapling_client`. Dispatch
+order in `Level1Fetcher.fetch()`: JA3 client (if enabled) → Scrapling (if
+engine says so) → plain httpx fallback — same first-attempt/fallback shape
+as every other engine chain in this codebase (L2's Botasaurus-then-
+Camoufox, L1's own JA3-then-httpx).
+
+`ScraplingWrapper.fetch()` always calls `scrapling.fetchers.AsyncFetcher.
+get(..., follow_redirects=False)` and returns a raw `ScraplingResponse
+(status_code, text, location)` — it does **not** follow redirects itself.
+`Level1Fetcher._fetch_via_scrapling` drives its own redirect loop over
+that response, revalidating `self._ssrf_guard` on every hop before
+following it (spec §1.1 #4 — see `.claude/knowledge/decisions.md` →
+"Scrapling Engine — Manual Redirect Loop" for the full why/alternatives).
+Real dependency gotcha: `scrapling==0.4.11` alone doesn't install
+`curl_cffi`, which `AsyncFetcher` needs at import time — fixed by
+declaring `curl_cffi>=0.15.0` directly rather than the `scrapling
+[fetchers]` extra, which pins a `playwright` version that conflicts with
+`camoufox`. See `.claude/knowledge/operations.md` Known Operational Gaps
+#12 and `.claude/knowledge/technical-debt.md`.
+
+**Structured extraction (`Worker.process_job`'s post-fetch step):**
+`core.models.FetchResult.extracted` and `ConfigOverrides.extraction_schema`
+were both declared and even already *persisted*
+(`orchestrator/tasks.py` already `json.dumps`'d `result.extracted`) but
+nothing ever populated the field. Wired once, centrally, in
+`orchestrator/worker.py::Worker.process_job`, immediately after any
+level's fetch succeeds and before the result is appended — applies
+uniformly regardless of which level (L1/L2/L3) actually won, with zero
+duplication across the three fetcher classes. Calls `AdaptiveSelector()
+.extract(result.html, schema=request.config_overrides.extraction_schema
+if request.config_overrides else None)` — content/title/link extraction
+via bs4 selectors (falls back to regex if `bs4` isn't importable), `schema`
+just echoed back into the result if the caller provided one (the class
+doesn't do schema-guided extraction beyond that yet).
+
+**Live-verified for real**, not just unit-tested:
+`tests/live/test_scrapling_engine_wiring.py` proves the factory-built
+client is real, a plain GET/2-hop redirect/404 all work against real
+`httpbin.org`/`example.com` traffic, and `AdaptiveSelector` correctly
+extracts title+content from real HTML (and correctly omits `title` when a
+real page genuinely has none). Full story, including the live-testing
+process that found the `curl_cffi` gap: `.claude/knowledge/
+technical-debt.md`.
+
+**Round 29 addendum — markdown conversion moved here too.** Firecrawl
+markdown conversion (`services/firecrawl_client.py`) previously lived
+entirely inside `fetcher/level_1.py` (three separate inline call sites,
+one per L1 internal code path) and so never ran for a URL that had to
+escalate to L2/L3. It's now called from the exact same spot as
+`AdaptiveSelector` above — right after any level's fetch succeeds, before
+`results.append(result)` — for the identical "applies regardless of which
+level won" reason. `Level1Fetcher` no longer references Firecrawl at all.
+`build_firecrawl_client()` also now accepts `FIRECRAWL_BASE_URL` (a
+self-hosted Firecrawl instance) as an alternative to `FIRECRAWL_API_KEY` —
+a self-hosted instance typically needs no key, so either one alone is
+enough to build a working client. See `.claude/knowledge/decisions.md` →
+"Markdown Conversion Centralized in Worker.process_job" for the full
+before/after and alternatives considered.
 
 ---
 
@@ -532,9 +1284,15 @@ drift): `.claude/knowledge/troubleshooting.md`, round-27 entries.
 package — they stay at repo root, unmoved, per standard src-layout
 convention. `tests/fixtures/` holds real, actively-used test
 infrastructure: `challenge_mirror/` (self-hosted Cloudflare-like test
-target, BD-05) and `judge_server.py` (self-hosted proxy judge, used by the
-promotion integration test) — both genuine working components, not scratch,
-which is why they live under `tests/` rather than being archived.
+target, BD-05) — a genuine working component, not scratch, which is why it
+lives under `tests/` rather than being archived. `judge_server.py` used to
+live here too, but round 32 found it wasn't actually test-only — it's a
+real runtime dependency of `proxy/harvester.py`'s production validation
+path (nothing else ever started it, which is exactly why that path was
+silently broken in every real deployment). Promoted to
+`src/scraper_engine/proxy/judge_server.py`; the promotion integration test
+now imports and starts it directly from there instead of via a
+subprocess pointed at a fixture path.
 
 Two directories exist purely as local, gitignored scratch space — never
 pushed to GitHub, but not deleted either:

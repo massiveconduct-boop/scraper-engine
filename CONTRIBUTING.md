@@ -9,6 +9,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env
+# .env is gitignored — never commit real secrets. If a key is ever exposed,
+# rotate it immediately at the provider rather than just removing it from the file.
 docker compose up -d postgres redis pgbouncer
 alembic upgrade head
 
@@ -19,13 +21,14 @@ pre-commit install
 runs `ruff check --fix`, `ruff format`, and the same scoped `mypy --strict`
 CI runs, so lint/format/type issues are caught before they reach a PR.
 
-`pip install -e ".[dev]"` registers every top-level package (`api`, `core`,
-`proxy`, etc.) via an editable-install finder, so imports resolve to their
-real path regardless of the process's current working directory — you don't
-need `PYTHONPATH` tricks or to run commands from the repo root specifically.
+`pip install -e ".[dev]"` registers the single `scraper_engine` package (everything
+lives under `src/scraper_engine/` — see CLAUDE.md's Module Map) via an
+editable-install finder, so imports resolve to their real path regardless of
+the process's current working directory — you don't need `PYTHONPATH` tricks
+or to run commands from the repo root specifically.
 
-**Import style:** absolute cross-package imports (`from core.tenant import
-TenantId`), single-dot same-package imports are fine (`from .schema import
+**Import style:** absolute cross-package imports (`from scraper_engine.core.tenant
+import TenantId`), single-dot same-package imports are fine (`from .schema import
 AppConfig` inside `config/`), no deep relative imports (`from ..x` /
 `from ...x`) — none exist in this codebase, keep it that way.
 

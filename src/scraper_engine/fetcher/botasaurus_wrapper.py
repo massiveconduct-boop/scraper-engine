@@ -87,6 +87,14 @@ class BotasaurusWrapper:
         use_random_sleep: bool = True,
         hashed_fingerprint: bool = True,
         max_retry: int = 0,
+        block_images: bool = False,
+        block_images_and_css: bool = False,
+        extensions: list[str] | None = None,
+        lang: str | None = None,
+        locale: str | None = None,
+        timezone: str | None = None,
+        humanize_mouse: bool = False,
+        capture_network_events: bool = False,
     ) -> None:
         self.config: dict[str, object] = dict(config or {})
         self._bypass_cloudflare = bypass_cloudflare
@@ -96,6 +104,14 @@ class BotasaurusWrapper:
         self._use_random_sleep = use_random_sleep
         self._hashed_fingerprint = hashed_fingerprint
         self._max_retry = max_retry
+        self._block_images = block_images
+        self._block_images_and_css = block_images_and_css
+        self._extensions = extensions or []
+        self._lang = lang
+        self._locale = locale
+        self._timezone = timezone
+        self._humanize_mouse = humanize_mouse
+        self._capture_network_events = capture_network_events
 
     async def fetch_html(
         self,
@@ -103,24 +119,64 @@ class BotasaurusWrapper:
         proxy: Proxy,
         tenant_id: TenantId,
         session_id: str | None = None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
     ) -> str:
-        """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox."""
-        async with budget.BROWSER_SEMAPHORE:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None,
-                self._botasaurus_fetch,
-                url,
-                proxy.url(),
-                session_id,
-            )
+        """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox.
 
-    def _botasaurus_fetch(self, url: str, proxy_url: str, session_id: str | None) -> str:
+        Round 41 — also holds budget.XVFB_LOCK for this call's whole
+        duration. Botasaurus's own @browser decorator bundles launch+
+        navigate+close into one synchronous call with no seam to release the
+        lock right after launch (unlike CamoufoxWrapper, which can release
+        immediately after __aenter__/__aexit__), so this path serializes the
+        full fetch rather than just the launch/close moments — an accepted
+        throughput trade for closing the Xvfb display-collision crash. See
+        core/budget.py::XVFB_LOCK.
+
+        Round 58 — scroll_passes/scroll_wait_ms wire lazy-load/infinite-
+        scroll support into this path (previously only the Camoufox fallback
+        pipeline scrolled; see browser/_botasaurus_scroll.py).
+        """
+        # Round 64 — the permit goes through the shared protocol so a fetch
+        # blocked behind parked browsers gets them reclaimed (see
+        # core/budget.py::acquire_browser_permit).
+        await budget.acquire_browser_permit()
+        try:
+            async with budget.xvfb_lock():
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self._botasaurus_fetch,
+                    url,
+                    proxy.auth_url(),
+                    session_id,
+                    scroll_passes,
+                    scroll_wait_ms,
+                    events_sink,
+                )
+        finally:
+            budget.BROWSER_SEMAPHORE.release()
+
+    def _botasaurus_fetch(
+        self,
+        url: str,
+        proxy_url: str,
+        session_id: str | None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
+    ) -> str:
         """Synchronous Botasaurus fetch, run in executor — Botasaurus's driver
         management is Selenium-based (no native asyncio API to await on)."""
         from botasaurus.browser import Driver, browser
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
+
+        from scraper_engine.browser._botasaurus_extension import LocalExtension
+        from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_network_capture import register_network_capture
+        from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
 
         decorator_kwargs: dict[str, object] = {
             "headless": False,
@@ -137,7 +193,13 @@ class BotasaurusWrapper:
             "tiny_profile": self._tiny_profile and session_id is not None,
             "remove_default_browser_check_argument": self._remove_default_browser_check_argument,
             "close_on_crash": self._close_on_crash,
+            "block_images": self._block_images,
+            "block_images_and_css": self._block_images_and_css,
         }
+        if self._extensions:
+            decorator_kwargs["extensions"] = [LocalExtension(p) for p in self._extensions]
+        if self._lang:
+            decorator_kwargs["lang"] = self._lang
         if self._max_retry > 0:
             decorator_kwargs["max_retry"] = self._max_retry
         if self._hashed_fingerprint and session_id is not None:
@@ -151,9 +213,24 @@ class BotasaurusWrapper:
 
         bypass_cloudflare = self._bypass_cloudflare
         use_random_sleep = self._use_random_sleep
+        locale = self._locale
+        timezone = self._timezone
+        humanize_mouse = self._humanize_mouse
+        capture_network_events = self._capture_network_events
+        # Round 41 — stashed so we can clean up this Driver's Xvfb lock/socket
+        # files (see browser/_xvfb_cleanup.py) after the decorator's own
+        # internal close runs; botasaurus's @browser decorator owns close
+        # itself (never exposes the Driver back to us), so this closure is
+        # the only way to reach it.
+        captured_driver: list[Driver] = []
 
         @browser(**decorator_kwargs)  # type: ignore[untyped-decorator]
         def _fetch(driver: Driver, _data: object = None) -> str:
+            captured_driver.append(driver)
+            if capture_network_events and events_sink is not None:
+                register_network_capture(driver, events_sink)
+            if humanize_mouse:
+                driver.enable_human_mode()
             # botasaurus's own decorator always calls the wrapped function as
             # func(driver, data) — POSITIONALLY (browser_decorator.py's
             # run_task) — so a second parameter with a default value (e.g.
@@ -165,12 +242,33 @@ class BotasaurusWrapper:
             # expected"), which looked like a Chrome/CDP incompatibility but
             # wasn't — url must be read from the outer closure, never from a
             # same-named parameter default.
+            if locale or timezone:
+                # Must be applied before navigation — driver.py:2148-2150's
+                # own docstring: "call this before navigating".
+                driver.set_locale_and_timezone(locale=locale or None, timezone_id=timezone or None)
             if bypass_cloudflare:
                 driver.google_get(url, bypass_cloudflare=True)
             else:
                 driver.get(url)
+            raise_if_navigation_failed(driver, url)
             if use_random_sleep:
                 driver.short_random_sleep()
+            if scroll_passes > 0:
+                botasaurus_autoscroll(
+                    driver,
+                    max_passes=scroll_passes,
+                    wait_ms=scroll_wait_ms,
+                    humanize=humanize_mouse,
+                )
             return str(driver.page_html)
 
-        return str(_fetch())
+        try:
+            return str(_fetch())
+        finally:
+            if captured_driver:
+                import contextlib
+
+                from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
+
+                with contextlib.suppress(Exception):
+                    cleanup_stale_display(captured_driver[0])

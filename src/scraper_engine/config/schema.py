@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LevelConfig(BaseModel):
@@ -15,6 +15,10 @@ class LevelConfig(BaseModel):
     engine: Literal["scrapling", "camoufox", "botasaurus+camoufox"]
     proxy_tier_min_score: float
     timeout_seconds: int
+    # Round 47 — base.yaml's level_2/level_3 values are now a shared
+    # ${CAPSOLVER_ENABLED:true} placeholder, not a hardcoded literal: this
+    # gates real spend (CapSolver's $1.00/day ceiling), and a source-blind
+    # consuming service had no way to turn it off without a rebuild.
     capsolver_enabled: bool = False
     # L2/L3 wait strategy — config-driven, not hardcoded (round 12.1)
     goto_wait_until: str = "load"
@@ -51,6 +55,42 @@ class CamoufoxConfig(BaseModel):
     humanize: float = Field(default=1.5, ge=0.0, le=5.0)
     headless_mode: str = "virtual"
     max_total_instances: int = 8
+    # Round 59 — RAM-aware concurrency cap (core/budget.py::
+    # resolve_browser_max_total_instances). Default off: a brand-new,
+    # unvalidated-in-production capability that changes semaphore sizing
+    # from a live runtime reading instead of a static number, same
+    # opt-in-by-default convention as l1_ja3_client_enabled above. Can
+    # only ever REDUCE max_total_instances at runtime, never raise it
+    # above this configured ceiling.
+    ram_aware_concurrency_enabled: bool = False
+    # Measured 2026-08-17 (this session): one real headful Botasaurus/
+    # Chromium launch (headless=False, enable_xvfb_virtual_display=True —
+    # the exact shape production uses), full process tree (main + renderer/
+    # GPU/utility subprocesses, isolated via before/after PID diff) =
+    # 804.7MB RSS (~0.79GB), rounded up slightly for margin. Deliberately
+    # NOT Camoufox's own measured 80.1MB headless figure (see
+    # core/budget.py's "Measured 2026-07-22" comment) — BROWSER_SEMAPHORE
+    # is shared across both engines, and Botasaurus (headful, via Xvfb) is
+    # the heavier of the two, so calibrating against it is the
+    # conservative choice.
+    ram_aware_avg_instance_gb: float = 0.8
+    # Round 46 — verified against Camoufox's own docs (Context7
+    # /daijro/camoufox): for Firefox 149+ (we run 152), the library's own
+    # README/docs explicitly recommend fingerprint_preset=True — it samples
+    # a REAL, captured browser fingerprint (312 real presets bundled for
+    # our version) instead of a synthetic/statistically-generated one,
+    # officially described as more convincing evasion. `os` is pinned to
+    # "linux" (not randomized to windows/macos) because Camoufox's own
+    # "Known Limitations" doc explicitly warns the opposite is
+    # counterproductive: "it is recommended to run Camoufox on the OS that
+    # matches the fingerprint profile... the per-context patches are
+    # designed to make each context appear as a different person on the
+    # same OS, not to impersonate a different OS" — every worker here runs
+    # Linux (Docker), so a Windows/macOS fingerprint would create exactly
+    # the OS-level/JS-fingerprint mismatch that advanced bot detection
+    # looks for.
+    fingerprint_preset: bool = True
+    os: str = "linux"
 
 
 class BotasaurusConfig(BaseModel):
@@ -65,6 +105,12 @@ class BotasaurusConfig(BaseModel):
     max_retry defaults to 0 (off) to keep today's single-attempt behavior
     unless explicitly opted into. l1_ja3_client_enabled defaults to False —
     a brand-new L1 code path with no live-traffic validation yet.
+
+    Round 47 — l1_ja3_client_enabled is now a base.yaml ${VAR:default}
+    placeholder (BOTASAURUS_L1_JA3_CLIENT_ENABLED), same fix as
+    DataImpulseConfig/LevelConfig.capsolver_enabled below: a
+    source-blind consuming service couldn't opt into this without a
+    rebuild.
     """
 
     bypass_cloudflare: bool = True
@@ -75,6 +121,74 @@ class BotasaurusConfig(BaseModel):
     hashed_fingerprint: bool = True
     max_retry: int = 0
     l1_ja3_client_enabled: bool = False
+    # Round 59 — real botasaurus_driver.Driver kwargs (verified against the
+    # installed 4.0.93 source: core/browser.py applies them independently,
+    # block_images_and_css is not a superset flag). Default off: blocking
+    # images/CSS can break sites whose content or lazy-load/JS behavior
+    # depends on them, so this is opt-in, not a default-on "free win" like
+    # bypass_cloudflare above.
+    block_images: bool = False
+    block_images_and_css: bool = False
+    # Round 60 — Driver(extensions=[...]) is real (installed
+    # botasaurus_driver 4.0.100 driver.py:2074), but each item must be an
+    # object exposing .load(with_command_line_option=False) -> str
+    # (core/config.py:83-89's create_extensions_string), not a raw path
+    # string — see browser/_botasaurus_extension.py::LocalExtension, which
+    # wraps one of these directory paths. Default empty: no extension
+    # artifact ships with this repo, so this is pure capability wiring
+    # until a caller configures a path.
+    extensions: list[str] = Field(default_factory=list)
+    # Round 60 — three genuinely independent settings, not one value in two
+    # formats. `lang` is the Driver ctor's real `--lang=` Chrome flag,
+    # forwarded correctly (confirmed on the real chrome://version command
+    # line) — but driver.py:2153's own docstring claim that it drives JS-
+    # visible `navigator.language` did NOT hold up live: on the installed
+    # botasaurus_driver 4.0.100 / Playwright Chromium 1228 build, neither
+    # `--lang=de-DE` nor `--lang=de` changed navigator.language,
+    # navigator.languages, or the Accept-Language request header (checked
+    # via a real CDP before_request_sent hook) — verified live, not a docs
+    # guess. A JS-injection workaround (CDP Page.addScriptToEvaluateOnNew
+    # Document via driver.run_on_new_document()) was tried and hits a
+    # separate real upstream bug: driver.run_cdp_command(cdp.page.enable())
+    # itself throws ChromeException("Invalid parameters ... CBOR: map start
+    # expected") in this installed version — confirmed not a general zero-
+    # param-command issue (cdp.dom.enable()/cdp.runtime.enable() both
+    # succeed the same way), so this is Page-domain-specific breakage in
+    # the installed package, out of scope to patch here. Field kept and
+    # wired anyway since it's a real, correctly-forwarded kwarg that may
+    # behave differently on other Chromium builds — just don't rely on it
+    # for navigator.language spoofing against this stack today.
+    # `locale`/`timezone` are a separate, fully-working per-tab CDP
+    # override via driver.set_locale_and_timezone() (ICU underscore locale,
+    # e.g. "en_US", IANA timezone e.g. "America/New_York") driving
+    # Intl/Date.toLocaleString formatting and the JS timezone, called before
+    # first navigation on the fresh-launch path only (browser/botasaurus_
+    # pool.py's _reuse_fetch does an in-page JS fetch(), not a navigation —
+    # nothing to (re)apply there, same reasoning as round 58's autoscroll).
+    lang: str | None = None
+    locale: str | None = None
+    timezone: str | None = None
+    # Round 60 — driver.enable_human_mode() (driver.py:2123-2137) makes every
+    # subsequent mouse call (move_mouse_to_point/click_at_point/etc.) route
+    # through botasaurus_humancursor's curved-movement simulation instead of
+    # an instant CDP jump. Explicit per-scroll-pass movement is wired via
+    # browser/_botasaurus_scroll.py::botasaurus_autoscroll(humanize=...).
+    # Default off: no live-traffic validation yet, and headless mouse-move
+    # support isn't guaranteed identical to headful.
+    humanize_mouse: bool = False
+    # Round 60 — driver.before_request_sent()/after_response_received()
+    # (driver.py:760,793) are real CDP hooks, live-verified to actually fire
+    # with real request/response headers. Opt-in: captures full request/
+    # response metadata for every network request a fetch makes, which can
+    # be large and isn't needed by default.
+    capture_network_events: bool = False
+    # Round 64 — how many live Botasaurus drivers one job may keep. It was
+    # exactly one, behind one lock, so a job's concurrent URLs queued
+    # single-file at L2 (live: 43s, 65s, 89s, 58s, 134s for five URLs that
+    # each took well under a minute alone). Parked drivers hold no
+    # BROWSER_SEMAPHORE permit (only an in-flight fetch does), so this is
+    # the bound on idle Chrome processes per job.
+    max_pooled_drivers: int = Field(default=2, ge=1)
 
 
 class ProxyHarvesterConfig(BaseModel):
@@ -87,17 +201,162 @@ class ProxyHarvesterConfig(BaseModel):
     health_interval_seconds: int = 300
 
 
+class ProxyTierConfig(BaseModel):
+    """Reliability-score gate ProxyManager.get_proxy() requires per escalation
+    level. L3's own ceiling (min_score_level_3) can be genuinely unreachable
+    with free-only proxy sources — allow_tier2_fallback_for_tier3 is a
+    togglable stopgap letting L3 borrow a tier-2-caliber proxy instead of
+    hard-exhausting, only tried after a real tier-3-caliber proxy search
+    comes up empty. Meant to be flipped off again once paid/higher-quality
+    proxy sources make min_score_level_3 reliably reachable on its own."""
+
+    min_score_level_1: float = 40.0
+    min_score_level_2: float = 70.0
+    min_score_level_3: float = 90.0
+    allow_tier2_fallback_for_tier3: bool = False
+    # Round 39 — same single-hop stopgap as allow_tier2_fallback_for_tier3,
+    # one tier down: L2 tries a real tier-2-caliber proxy first and only
+    # falls back to a tier-1-caliber one if that search comes up genuinely
+    # empty. Added after round 39's scoring-race/GREATEST-ratchet fixes
+    # corrected years of silently-inflated scores back down to their real
+    # values pool-wide — tier 2's *honest* supply crashed from a
+    # fake-inflated ~45 to a real 4 in the same session, live-observed
+    # starving a real production job (research_agent tenant, 47-URL batch,
+    # only 10 succeeded, remainder DLQ'd as proxy_exhausted). Does not
+    # cascade into a second hop (a tier-2 fallback never further falls to
+    # tier... there is no tier 0) — same bounded shape as the tier-3 case.
+    allow_tier1_fallback_for_tier2: bool = False
+    # Pool-health thresholds (round 34, proxy/pool_health.py) — validated-proxy
+    # counts per tier below which the tier is DEGRADED / CRITICAL. Independent
+    # of the score gates above: those decide whether one request can find a
+    # proxy, these decide whether the pool as a whole is healthy enough to
+    # keep serving requests without emptying out.
+    degraded_below_count: int = 20
+    critical_below_count: int = 5
+
+
 class PolitenessConfig(BaseModel):
     default_concurrency: int = 2
     default_delay_seconds: float = 5.0
     slot_ttl_seconds: int = 120
+    # Round 61 — orchestrator/worker.py's per-level slot-acquisition retry
+    # budget. Before this, a busy slot got exactly one 1s nap before the
+    # level loop moved on to the NEXT level (wrong: a busy slot means "wait,"
+    # not "this level failed") — under concurrent same-domain dispatch
+    # (max_concurrent_urls_per_job URLs racing default_concurrency slots,
+    # which is usually a much smaller number), a URL could burn through all
+    # 3 levels in ~3s of napping without a single real fetch attempt, then
+    # permanently DLQ as "no attempt ever made." Now retries the SAME level
+    # with slot_retry_interval_seconds backoff until slot_wait_timeout_seconds
+    # of real wall-clock elapses, giving concurrent siblings genuine time to
+    # finish and release their slot before conceding.
+    # Round 63 — raised from 30.0. 30s could not cover even ONE slot-holder:
+    # a worst-case Level-3 attempt is ~85s of configured waits alone
+    # (post_load_fixed_wait_ms + max_total_wait_ms + 10 scroll passes + a
+    # post-captcha re-poll) on top of level_3.timeout_seconds for the
+    # navigation itself. So under concurrent same-domain dispatch the losing
+    # siblings reliably ran out the budget on EVERY level and the URL DLQ'd
+    # having never once been fetched — round 61 made the wait real but left
+    # it an order of magnitude too short, which is what an external consumer
+    # hit as "a 5-URL job never completed". 300s covers two full L3 holders
+    # deep. Round 63 also stopped a timeout here from advancing to the next
+    # level (a busy slot never said anything about the current level), so
+    # this budget is now the URL's whole politeness allowance, not a
+    # per-level one.
+    slot_wait_timeout_seconds: float = 300.0
+    slot_retry_interval_seconds: float = 1.0
+    # Round 63 — ceilings for the per-request politeness overrides on
+    # core/models.py::ConfigOverrides. A caller running a trusted bulk crawl
+    # can raise concurrency and drop the delay for its own job, but only
+    # within these operator-set bounds: orchestrator/worker.py clamps every
+    # request against them, so the blast radius of a caller asking for "as
+    # fast as possible" stays something the operator chose.
+    max_request_concurrency: int = 10
+    min_request_delay_seconds: float = 0.5
+    # Round 65 — ceiling for ConfigOverrides.timeout_seconds (the per-render
+    # navigation timeout). A render holds a host browser seat for as long as
+    # it runs, so an unbounded caller timeout was an unbounded seat hold.
+    max_request_timeout_seconds: int = Field(default=300, ge=1)
+    # Round 49 — orchestrator/worker.py::Worker.process_job's per-job URL
+    # dispatch semaphore size. Was strictly sequential before this (root
+    # cause of slow large-batch job runs, round 45). Deliberately below
+    # core.budget.BROWSER_SEMAPHORE's size (8) so one job doesn't already
+    # saturate the whole worker process's browser budget on its own —
+    # this bounds "how many URLs from THIS job are in flight at once,"
+    # BROWSER_SEMAPHORE separately bounds "how many live browsers exist in
+    # this process across every job," and a concurrent task simply queues
+    # on BROWSER_SEMAPHORE once this job's own budget is saturated.
+    max_concurrent_urls_per_job: int = 5
+
+
+class EscalationConfig(BaseModel):
+    """Round 63 — cross-job memory of which level actually works for a domain.
+
+    The L1->L2->L3 ladder was entered at L1 for every URL of every job, with
+    no record anywhere of what had just worked. For a domain that only ever
+    succeeds at L3 that means paying a doomed L1 attempt plus a doomed L2
+    browser launch before the one attempt that can work — measured by an
+    external consumer at ~140s of the 169s a single Jumia product page spent
+    in PROCESSING, against a 27.6s real fetch. `level_used` was already
+    written to scrape_results; nothing read it back to decide anything.
+
+    orchestrator/level_memory.py stores the hint. It only ever SKIPS levels
+    that recently failed for this domain — escalation above the hint is
+    untouched, so the hint can make a job faster but never make a fetch that
+    would have succeeded fail.
+    """
+
+    level_memory_enabled: bool = True
+    # Round 64: 3600 -> 86400. Round 63 kept this short so a stale hint
+    # could cost at most an hour of unnecessary high levels, but that job is
+    # already done by `reprobe_every` (every Nth URL runs the full ladder and
+    # rewrites the hint), independently of the TTL. The short TTL only
+    # bought a full-ladder climb on every URL of any crawl that started more
+    # than an hour after the last one — live, a 10-URL Jumia rerun paid
+    # L1+L2 on every URL for exactly that reason. A day covers the common
+    # "same site again later today" shape; the re-probe covers staleness.
+    level_memory_ttl_seconds: int = 86400
+    # Staleness guard: every Nth URL for a domain ignores the hint and runs
+    # the full ladder, so a target that gets EASIER (challenge lifted, WAF
+    # rule relaxed) is rediscovered instead of paying L3 forever. Without
+    # this the hint is a one-way ratchet — the TTL alone would only re-probe
+    # after a full hour of inactivity, which a continuous crawl never has.
+    # 0 disables re-probing.
+    reprobe_every: int = 20
+
+
+class ExtractionConfig(BaseModel):
+    """Round 63 — limits for fetcher/adaptive_selector.py's extraction."""
+
+    # Was a hardcoded `links[:100]` slice of the raw DOM order. On a real
+    # Jumia catalog page rendered at L3 the hydrated nav mega-menu alone
+    # supplies ~100 links before the first product link, so the cap filled
+    # with site navigation and returned ZERO product URLs — while the same
+    # page snapshotted earlier at L2 (before hydration) returned them all.
+    # That read as "L3 loses product links"; it was the cap. Kept as a limit
+    # rather than removed so a pathological page can't return a
+    # multi-megabyte link list, but set well above any real page's nav.
+    max_links: int = 1000
 
 
 class CircuitBreakerConfig(BaseModel):
     failure_threshold: float = 0.95
     attempt_threshold: int = 20
     cooldown_seconds: int = 600
-    max_cooldown_seconds: int = 3600
+    # Round 43 — reduced from 3600s (1hr). A scraping job stalled for an
+    # hour on a domain that's likely recovered within minutes is a heavy
+    # cost for a system whose job timeouts are already scaled in single-
+    # digit minutes per URL; 1hr was calibrated for a much higher-stakes
+    # circuit (e.g. a payments API) than "come back and try this domain
+    # again." 20 minutes still gives 2 full exponential doublings of
+    # meaningful backoff (10min -> 20min) before capping, still enough to
+    # break a thundering-herd re-attack pattern.
+    max_cooldown_seconds: int = 1200
+    # Round 43 — how long a failure streak stays "live" before Redis expires
+    # it. Without this, failures from one job (e.g. a crashed or hard-killed
+    # run) sit forever and silently feed an unrelated later job's trip
+    # decision. See orchestrator/circuit_breaker.py's constructor docstring.
+    failure_streak_ttl_seconds: int = 600
 
 
 class CapSolverConfig(BaseModel):
@@ -135,6 +394,132 @@ class PgBouncerConfig(BaseModel):
     pool_mode: str = "transaction"
     max_client_conn: int = 500  # [CONFIRMED — BD-06]
     default_pool_size: int = 20
+
+
+class WebhookConfig(BaseModel):
+    """Retry/timeout knobs for orchestrator/webhook.py::WebhookDispatcher
+    (round 34 — previously hardcoded in the class's own __init__ defaults).
+    ops_webhook_url is a distinct, operator-level sink (proxy pool health
+    transitions, see proxy/pool_health.py) — not scoped to any one tenant's
+    job, so it lives here rather than on the per-job scrape_jobs.webhook_url
+    column."""
+
+    max_retries: int = 3
+    timeout_seconds: int = 10
+    backoff_base_seconds: float = 2.0
+    ops_webhook_url: str | None = None
+
+
+class DlqReaperConfig(BaseModel):
+    """proxy/dlq_reaper.py tuning (round 34) — auto-retries DLQ entries in
+    orchestrator/worker.py's TRANSIENT_FAILURE_CATEGORIES once the condition
+    that DLQ'd them has since cleared. max_auto_retries caps re-attempts per
+    entry so a flapping pool/circuit can't loop a job forever."""
+
+    interval_seconds: int = 60
+    max_auto_retries: int = 3
+    batch_size_per_tenant: int = 20
+
+
+class HostCapacityConfig(BaseModel):
+    """Round 65 — one browser budget per HOST, shared by every worker process
+    on it (orchestrator/host_capacity.py), sized by a pressure-driven controller
+    (orchestrator/capacity_controller.py).
+
+    Before this, each rq work-horse sized core.budget.BROWSER_SEMAPHORE as if
+    it owned the machine: 3 worker containers x 5 concurrent URLs put 15
+    renders on a 4-core host (load avg 58-69, measured live) and slowed every
+    one of them. Units, not browsers: a render costs `*_weight` units, and the
+    controller moves the host total between `min_units` and `max_units`.
+    `None` for default means "the host's CPU count"; `None` for max means
+    "as many browsers as the host's total memory holds" (round 66, see
+    `browser_memory_mb`).
+    """
+
+    enabled: bool = False
+    min_units: float = Field(default=1.0, gt=0)
+    max_units: float | None = Field(default=None, gt=0)
+    # What workers use when the controller's target key is missing (controller
+    # down, or not started yet) — a safe static fallback, never "unlimited".
+    default_units: float | None = Field(default=None, gt=0)
+    camoufox_weight: float = Field(default=1.0, gt=0)
+    botasaurus_weight: float = Field(default=1.0, gt=0)
+    # Round 67 — a browser parked for reuse keeps the seat of the render that
+    # launched it (orchestrator/host_capacity.py::SeatKeeper), instead of both
+    # pools closing every browser on release. False restores round 66's
+    # close-on-release, which is what the live A/B compares against.
+    reuse_browsers: bool = True
+    # A retained seat is only reclaimed once it has been idle this long, so a
+    # browser parked a moment ago survives long enough for the next URL of the
+    # same job to reuse it.
+    idle_grace_seconds: float = Field(default=2.0, ge=0)
+    # An idle browser holds its seat at most this long even with nobody
+    # waiting — past it the seat (and its RAM) go back to the host.
+    idle_seat_seconds: float = Field(default=45.0, gt=0)
+    # While another tenant is waiting, one tenant holds at most
+    # ceil(target * tenant_share) units.
+    tenant_share: float = Field(default=0.6, gt=0, le=1)
+    lease_ttl_seconds: int = Field(default=90, ge=10)
+    renew_interval_seconds: int = Field(default=20, ge=1)
+    # A holder past this stops renewing (its seat returns to the pool within
+    # one lease TTL). The render itself is never cancelled from here.
+    max_hold_seconds: int = Field(default=900, ge=60)
+    waiter_ttl_seconds: int = Field(default=10, ge=2)
+    poll_min_seconds: float = Field(default=0.5, gt=0)
+    poll_max_seconds: float = Field(default=1.0, gt=0)
+    per_url_admission_cap_seconds: float = Field(default=1800.0, gt=0)
+    # Stop waiting this long before rq's own job deadline, so the URL still
+    # gets a CAPACITY_TIMEOUT row instead of being lost to rq's hard kill.
+    deadline_margin_seconds: float = Field(default=240.0, ge=0)
+    cancel_check_interval_seconds: float = Field(default=10.0, gt=0)
+    # Controller (orchestrator/capacity_controller.py).
+    controller_interval_seconds: int = Field(default=5, ge=1)
+    cpu_pressure_low: float = Field(default=40.0, ge=0, le=100)
+    # Round 66 — 80 -> 90. Live (4 cores, free-pool Wikipedia renders): 20
+    # browsers ran at CPU PSI median 66 / p90 87 with no failures caused by
+    # load, and cutting at 80 held the host at 2-4 browsers while it idled.
+    # The harmful overload seen (Jumia, round 65) sat at a median of 93.
+    cpu_pressure_high: float = Field(default=90.0, ge=0, le=100)
+    # Round 66 — between the two marks the target keeps climbing by this
+    # fraction of itself (at least one unit) per raise, instead of freezing.
+    raise_step_fraction: float = Field(default=0.25, gt=0)
+    mem_available_floor_mb: int = Field(default=1536, ge=0)
+    # Round 66 — memory one browser needs, for the memory-derived ceiling and
+    # for how far one raise may go. Measured peaks on a trivial page: Camoufox
+    # 916 MiB, Botasaurus 1167 MiB; real pages need more.
+    # Round 67 — this is now the FALLBACK and the upper clamp: workers publish
+    # what their live browsers actually use (core/browser_rss.py) and the
+    # controller sizes on that, never charging more than this constant.
+    browser_memory_mb: int = Field(default=1200, gt=0)
+    # Floor for that measurement: a sample below this is treated as a bad
+    # reading (a browser still starting up). With `browser_memory_mb` as the
+    # ceiling, a measurement can only loosen round 66's constant, never
+    # tighten it — summed RSS over-counts pages shared between a browser's
+    # processes, and real MemAvailable still gates every raise.
+    min_browser_memory_mb: int = Field(default=400, gt=0)
+    # Round 66 — 30 -> 10: one CPU PSI avg10 window, i.e. long enough for the
+    # browsers the last raise admitted to show up in the reading.
+    raise_dwell_seconds: int = Field(default=10, ge=0)
+    cut_dwell_seconds: int = Field(default=15, ge=0)
+    cut_factor: float = Field(default=0.7, gt=0, lt=1)
+    target_ttl_seconds: int = Field(default=120, ge=10)
+
+    @model_validator(mode="after")
+    def bounds_are_coherent(self) -> HostCapacityConfig:
+        if self.max_units is not None and self.min_units > self.max_units:
+            raise ValueError(
+                f"host_capacity.min_units ({self.min_units}) exceeds max_units ({self.max_units})"
+            )
+        if self.cpu_pressure_low >= self.cpu_pressure_high:
+            raise ValueError("host_capacity.cpu_pressure_low must be below cpu_pressure_high")
+        if self.poll_min_seconds > self.poll_max_seconds:
+            raise ValueError("host_capacity.poll_min_seconds exceeds poll_max_seconds")
+        if self.renew_interval_seconds * 2 >= self.lease_ttl_seconds:
+            raise ValueError(
+                "host_capacity.renew_interval_seconds must be under half of "
+                "lease_ttl_seconds, so one missed renewal never loses a live lease"
+            )
+        return self
 
 
 class SessionRetentionConfig(BaseModel):
@@ -183,6 +568,94 @@ class S3Config(BaseModel):
     bucket: str = "scraper-snapshots"
 
 
+class DataImpulseConfig(BaseModel):
+    """Toggle for the paid rotating-gateway proxy source (round 40). Disabled
+    by default so the free-pool system (proxy/manager.py) behaves exactly as
+    before until explicitly turned on — see proxy/paid_gateway.py for the
+    gateway itself and orchestrator/worker.py::_fetch_with_proxy for the
+    strategy branch. Host/port/credentials are deliberately NOT here — same
+    split as CapSolverConfig: tuning lives in config, secrets are read
+    directly via os.environ.get() in the provider's own factory function.
+
+    Round 47 — both fields below are ${VAR:default} placeholders in
+    base.yaml (DATAIMPULSE_ENABLED / DATAIMPULSE_STRATEGY), not literal
+    values, so a deployment can flip this purely via container env — no
+    source edit, no image rebuild. Fixes a real gap: a consuming service
+    with credentials already reaching its container via env had no way to
+    actually turn the gateway on, since this was previously the one
+    hardcoded, non-overridable setting in the whole config file."""
+
+    enabled: bool = False
+    # free_only: unchanged today's behavior. paid_only: L2/L3 skip the scored
+    # free pool entirely, always use the gateway. free_first: try the free
+    # pool as today, only fall to the gateway on ProxyPoolExhaustedError.
+    strategy: Literal["free_only", "paid_only", "free_first"] = "free_only"
+    # Round 62 — ISO-3166 alpha-2 exit country for the gateway, rendered as
+    # DataImpulse's `__cr.<iso2>` username parameter (proxy/paid_gateway.py).
+    # Empty means "no country pin, gateway picks" — the pre-round-62
+    # behavior. Tuning, not a secret, so it lives here rather than in env
+    # alongside the credentials, same split the module's docstring sets out.
+    country: str = ""
+    # Round 62 — how many EXTRA gateway attempts, each on a brand-new sticky
+    # session (= a brand-new exit IP), a level gets after a DETECTION_BLOCK.
+    # 0 restores the pre-round-62 behavior of accepting the first block as
+    # final. The ceiling is deliberately low: every retry is a full browser
+    # render through paid residential bandwidth, and a target that blocks 3
+    # distinct residential IPs in a row is not blocking on IP reputation.
+    rotate_on_block_retries: int = Field(default=2, ge=0, le=10)
+    # Round 62 — pin the gateway's exit to one autonomous system, as
+    # DataImpulse's `__asn.<number>` username parameter (bare AS number, no
+    # "AS" prefix). None is the default and costs nothing; setting it DOUBLES
+    # the bandwidth bill, per DataImpulse's own docs, so it is opt-in per
+    # deployment rather than a global default. proxy/paid_gateway.py's module
+    # docstring has the measurement: on the Jumia target from
+    # DEVELOPER_REPORT.md one ASN was 0-for-9 against Cloudflare and made up
+    # most of the country's pool, which took the unpinned success rate to
+    # 1-in-12; pinning a clean ASN took it to 12-of-12. The documented
+    # `noasn` exclusion parameter is deliberately NOT modelled here — it is
+    # accepted by the gateway and then ignored, verified live.
+    asn: int | None = None
+
+    @field_validator("asn", mode="before")
+    @classmethod
+    def _empty_asn_is_none(cls, v: object) -> object:
+        """base.yaml renders this as `${DATAIMPULSE_ASN:}`, and an unset env
+        var leaves the empty STRING, not None — the loader substitutes text
+        and never re-types it. Without this, the default config fails
+        validation outright ("unable to parse string as an integer"), i.e.
+        every process refuses to start unless the var happens to be set."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def _asn_requires_country(self) -> DataImpulseConfig:
+        """An ASN pin without a country pin is rejected by the gateway.
+
+        Verified live 2026-09-20: `login__asn.29465;sessid.N` fails proxy
+        auth on 6 of 6 attempts, while `login__cr.ng;asn.29465;sessid.N`
+        succeeds on 6 of 6. DataImpulse will not resolve an `asn.` parameter
+        that has no `cr.` alongside it.
+
+        Caught the hard way — `DATAIMPULSE_ASN` was set without
+        `DATAIMPULSE_COUNTRY` and every gateway request 407'd at fetch time,
+        which surfaces as an opaque per-request proxy failure rather than
+        anything pointing at config. Failing at load time instead means the
+        process refuses to start with a message naming the actual fix, in
+        the same spirit as Worker.__init__'s eager build_gateway_proxy()
+        check (a bad gateway config should fail loud once, not degrade every
+        fetch silently).
+        """
+        if self.asn is not None and not self.country.strip():
+            raise ValueError(
+                "dataimpulse.asn is set but dataimpulse.country is empty. "
+                "DataImpulse rejects an `asn.` username parameter with no `cr.` "
+                "alongside it (407). Set DATAIMPULSE_COUNTRY (e.g. 'ng' for "
+                "AS29465 MTN Nigeria), or unset DATAIMPULSE_ASN."
+            )
+        return self
+
+
 class AppConfig(BaseModel):
     """Root configuration schema matching config/base.yaml."""
 
@@ -193,10 +666,39 @@ class AppConfig(BaseModel):
     camoufox: CamoufoxConfig = Field(default_factory=CamoufoxConfig)
     botasaurus: BotasaurusConfig = Field(default_factory=BotasaurusConfig)
     proxy_harvester: ProxyHarvesterConfig = Field(default_factory=ProxyHarvesterConfig)
+    proxy_tiers: ProxyTierConfig = Field(default_factory=ProxyTierConfig)
+    dataimpulse: DataImpulseConfig = Field(default_factory=DataImpulseConfig)
     politeness: PolitenessConfig = Field(default_factory=PolitenessConfig)
+    host_capacity: HostCapacityConfig = Field(default_factory=HostCapacityConfig)
+    escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     capsolver: CapSolverConfig = Field(default_factory=CapSolverConfig)
     ssrf_guard: SSRFGuardConfig = Field(default_factory=SSRFGuardConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     pgbouncer: PgBouncerConfig = Field(default_factory=PgBouncerConfig)
     session_retention: SessionRetentionConfig = Field(default_factory=SessionRetentionConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    dlq_reaper: DlqReaperConfig = Field(default_factory=DlqReaperConfig)
+
+    @model_validator(mode="after")
+    def url_concurrency_fits_the_browser_ceiling(self) -> AppConfig:
+        """Round 64 — `politeness.max_concurrent_urls_per_job` and
+        `camoufox.max_total_instances` were tuned independently and nothing
+        related them. Every in-flight URL can need a live browser at L2/L3, so
+        a job allowed more concurrent URLs than the process allows browsers
+        just queues the excess on BROWSER_SEMAPHORE while holding their
+        politeness slots — slower than asking for fewer URLs, and a config
+        nobody chose on purpose. Both are per rq work-horse (one job per
+        process), so this is the comparison that matters. The RAM-aware cap
+        can still lower the real ceiling at startup; orchestrator/tasks.py
+        warns when it does."""
+        urls = self.politeness.max_concurrent_urls_per_job
+        browsers = self.camoufox.max_total_instances
+        if urls > browsers:
+            raise ValueError(
+                f"politeness.max_concurrent_urls_per_job ({urls}) exceeds "
+                f"camoufox.max_total_instances ({browsers}); each in-flight URL "
+                "can need its own browser"
+            )
+        return self

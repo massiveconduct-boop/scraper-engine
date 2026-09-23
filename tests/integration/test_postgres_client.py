@@ -1,6 +1,7 @@
 # tests/integration/test_postgres_client.py
 """PostgresClient integration tests — real Postgres + tenant scoping."""
 
+import asyncpg
 import pytest
 
 from scraper_engine.core.tenant import TenantId
@@ -55,6 +56,23 @@ class TestPostgresClient:
         row = await pg.fetchrow(system, "SELECT 1 AS one")
         assert row is not None
         assert row["one"] == 1
+
+    @pytest.mark.asyncio
+    async def test_acquire_failing_query_does_not_mask_error_or_poison_pool(self, pg):
+        """A failed query inside acquire() must surface its own real exception,
+        not InFailedSQLTransactionError from the finally block's own cleanup —
+        and must not leave the connection mid-transaction when it's returned
+        to the pool (see storage/postgres_client.py::acquire)."""
+        system = TenantId("system")
+        with pytest.raises(asyncpg.exceptions.UndefinedTableError):
+            async with pg.acquire(system) as conn:
+                await conn.execute("SELECT * FROM this_table_does_not_exist")
+
+        # A fresh acquire on the same pool must succeed immediately — proves
+        # no connection came back poisoned/mid-transaction.
+        async with pg.acquire(system) as conn:
+            result = await conn.fetchval("SELECT 1")
+            assert result == 1
 
     @pytest.mark.asyncio
     async def test_acquire_before_start_raises(self):

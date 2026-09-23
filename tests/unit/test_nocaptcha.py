@@ -30,6 +30,7 @@ class TestSolveAwsWaf:
 
         monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
         client = nc.NoCaptchaAIClient("k", _budget())
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=True))
 
         result = await client.solve_aws_waf(
             TENANT, "http://x", awsKey="key1", awsIv="iv1", awsContext="ctx1"
@@ -54,11 +55,112 @@ class TestSolveGeetestChallenge:
 
         monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
         client = nc.NoCaptchaAIClient("k", _budget())
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=True))
 
         result = await client.solve_geetest(TENANT, "cid", "http://x", challenge="ch123")
 
         assert result == "gt-tok"
         assert captured["challenge"] == "ch123"
+
+
+class TestSolveTokenPlanGate:
+    """_solve_token must skip the dead 120s poll when has_active_plan() is
+    False — round-22 bug closed for real (previously has_active_plan was
+    only wired into the manual validate_captcha_keys preflight tool)."""
+
+    @pytest.mark.asyncio
+    async def test_no_active_plan_skips_solve_anticaptcha(self, monkeypatch):
+        solve_called = False
+
+        async def fake_solve(**kw):
+            nonlocal solve_called
+            solve_called = True
+            return "should-not-be-reached"
+
+        monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
+        client = nc.NoCaptchaAIClient("k", _budget())
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=False))
+
+        result = await client.solve_recaptcha_v2(TENANT, "sk", "http://x")
+
+        assert result is None
+        assert solve_called is False
+
+    @pytest.mark.asyncio
+    async def test_plan_check_unreachable_fails_open(self, monkeypatch):
+        """None (endpoint unreachable) must not be treated as a confirmed
+        no-plan verdict — a transient blip shouldn't permanently disable
+        solving."""
+        solve_called = False
+
+        async def fake_solve(**kw):
+            nonlocal solve_called
+            solve_called = True
+            return "tok"
+
+        monkeypatch.setattr(nc, "solve_anticaptcha", fake_solve)
+        client = nc.NoCaptchaAIClient("k", _budget())
+        monkeypatch.setattr(client, "has_active_plan", AsyncMock(return_value=None))
+
+        result = await client.solve_recaptcha_v2(TENANT, "sk", "http://x")
+
+        assert result == "tok"
+        assert solve_called is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_callers_share_one_network_call(self, monkeypatch):
+        """Two has_active_plan() calls racing on a cold cache must not each
+        make their own network call — the second must see the first's
+        just-published result after acquiring the lock (double-checked
+        locking's inner re-check)."""
+        import asyncio
+
+        resp = MagicMock()
+        resp.json.return_value = {"plan": {"planType": "pro"}}
+        http_client = AsyncMock()
+
+        async def slow_get(*a, **k):
+            await asyncio.sleep(0.05)
+            return resp
+
+        http_client.get = slow_get
+        http_client.__aenter__.return_value = http_client
+        http_client.__aexit__.return_value = False
+
+        import httpx
+
+        get_mock = MagicMock(return_value=http_client)
+        monkeypatch.setattr(httpx, "AsyncClient", get_mock)
+
+        client = nc.NoCaptchaAIClient("k", _budget())
+
+        results = await asyncio.gather(client.has_active_plan(), client.has_active_plan())
+
+        assert results == [True, True]
+        assert get_mock.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_has_active_plan_result_is_cached_across_solve_calls(self, monkeypatch):
+        """The plan endpoint must not be hit on every solve — that would add
+        a network round-trip to every single captcha solve."""
+        resp = MagicMock()
+        resp.json.return_value = {"plan": {}}
+        http_client = AsyncMock()
+        http_client.get.return_value = resp
+        http_client.__aenter__.return_value = http_client
+        http_client.__aexit__.return_value = False
+
+        import httpx
+
+        get_mock = MagicMock(return_value=http_client)
+        monkeypatch.setattr(httpx, "AsyncClient", get_mock)
+
+        client = nc.NoCaptchaAIClient("k", _budget())
+
+        assert await client.has_active_plan() is False
+        assert await client.has_active_plan() is False
+        assert await client.has_active_plan() is False
+        assert get_mock.call_count == 1
 
 
 class TestGetBalance:

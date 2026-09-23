@@ -11,6 +11,9 @@ services._anticaptcha.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from typing import TYPE_CHECKING
 
 from scraper_engine.services._anticaptcha import get_balance as _get_balance
@@ -38,6 +41,14 @@ PLAN_URL = "https://api.nocaptchaai.com/balance"
 
 PROVIDER = "nocaptchaai"
 
+logger = logging.getLogger(__name__)
+
+# Re-check has_active_plan at most this often. A stuck-idle solve wastes 120s
+# (60x2s poll in _anticaptcha.solve_anticaptcha) every single time it fires;
+# re-checking every call would add a network round-trip to every solve, so
+# this trades a bounded staleness window for that cost.
+_PLAN_CACHE_TTL_SECONDS = 300.0
+
 
 class NoCaptchaAIClient:
     """Client for the NoCaptchaAI CAPTCHA solving service (primary provider)."""
@@ -49,8 +60,25 @@ class NoCaptchaAIClient:
     def __init__(self, api_key: str, budget: CapSolverBudget) -> None:
         self._api_key = api_key
         self._budget = budget
+        self._plan_cache: bool | None = None
+        self._plan_cache_at: float = 0.0
+        self._plan_lock = asyncio.Lock()
 
     async def _solve_token(self, tenant_id: TenantId, task: dict[str, object]) -> str | None:
+        # Round-22 bug, closed for real here: a funded key with no active plan
+        # authenticates and accepts worker-slot-based tasks (everything routed
+        # through this method) but never solves them — the provider sits at
+        # status "idle" forever with errorId 0, so solve_anticaptcha's 60x2s
+        # poll always runs to exhaustion before returning None. Skip that
+        # guaranteed-dead round-trip when we already know the plan is inactive;
+        # captcha_solver.py's fallback-to-CapSolver path picks up from here.
+        if await self.has_active_plan() is False:
+            logger.warning(
+                "nocaptchaai_no_active_plan task=%s — skipping dead 120s poll, "
+                "falling through to fallback provider",
+                task.get("type"),
+            )
+            return None
         return await solve_anticaptcha(
             provider=PROVIDER,
             api_key=self._api_key,
@@ -169,13 +197,39 @@ class NoCaptchaAIClient:
         balance). False means worker-slot-based types (reCAPTCHA/Turnstile/
         GeeTest/MTCaptcha) will accept tasks but never solve them — see
         PLAN_URL's docstring. Returns None if the plan endpoint itself
-        couldn't be reached (distinct from a confirmed no-plan account)."""
-        import httpx
+        couldn't be reached (distinct from a confirmed no-plan account).
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                data = (await client.get(PLAN_URL, params={"apiKey": self._api_key})).json()
-        except Exception:
-            return None
-        plan = data.get("plan") or {}
-        return bool(plan.get("planType") or plan.get("planId"))
+        Cached for _PLAN_CACHE_TTL_SECONDS — this is on the hot path of every
+        token-based solve (_solve_token), not just the manual preflight tool,
+        so it must not add a network round-trip to every single solve call.
+        A stale "no plan" reading self-heals within the TTL window once the
+        account is actually fixed, with no restart needed.
+        """
+        now = time.monotonic()
+        if self._plan_cache is not None and (now - self._plan_cache_at) < _PLAN_CACHE_TTL_SECONDS:
+            return self._plan_cache
+
+        async with self._plan_lock:
+            # Re-check after acquiring the lock: a concurrent caller may have
+            # already refreshed it while we were waiting.
+            now = time.monotonic()
+            if (
+                self._plan_cache is not None
+                and (now - self._plan_cache_at) < _PLAN_CACHE_TTL_SECONDS
+            ):
+                return self._plan_cache
+
+            import httpx
+
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    data = (await client.get(PLAN_URL, params={"apiKey": self._api_key})).json()
+            except Exception:
+                # Endpoint unreachable: fail open (None), never cache a
+                # transient network blip as a confirmed no-plan verdict.
+                return None
+            plan = data.get("plan") or {}
+            result = bool(plan.get("planType") or plan.get("planId"))
+            self._plan_cache = result
+            self._plan_cache_at = time.monotonic()
+            return result

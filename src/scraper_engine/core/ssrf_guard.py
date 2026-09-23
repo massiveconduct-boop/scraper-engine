@@ -37,7 +37,16 @@ class SSRFGuard:
         denied range. Checking only the first `getaddrinfo` result would let a
         multi-record DNS answer (public IP first, private IP second) slip past —
         so every candidate address is checked, not just one."""
-        hosts = await self._resolve_hosts(url)
+        self._check_hosts(url, await self._resolve_hosts(url))
+
+    def validate_sync(self, url: str) -> None:
+        """Blocking twin of validate(), for code that has no event loop to
+        await on — the Scrapy crawl subprocess's downloader middleware
+        (scrapy_project/middlewares/ssrf_middleware.py, round 64). Same
+        resolution, same deny list, so the two paths cannot drift apart."""
+        self._check_hosts(url, self._resolve_hosts_sync(url))
+
+    def _check_hosts(self, url: str, hosts: list[str]) -> None:
         for host in hosts:
             addr = ipaddress.ip_address(host)
             for net in self._denied:
@@ -58,20 +67,26 @@ class SSRFGuard:
     async def _resolve_hosts(url: str) -> list[str]:
         """Resolve every address a host resolves to via async DNS lookup using
         getaddrinfo in an executor (not just the first record — see validate())."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, SSRFGuard._resolve_hosts_sync, url)
+
+    @staticmethod
+    def _resolve_hosts_sync(url: str) -> list[str]:
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
         hostname = parsed.hostname
         if hostname is None:
             raise ValueError(f"Cannot extract hostname from URL: {url}")
-
-        loop = asyncio.get_running_loop()
-
-        def _resolve() -> list[str]:
+        try:
             info = socket.getaddrinfo(hostname, None)
-            addrs = {str(sockaddr[0]) for _family, _, _, _, sockaddr in info}
-            if not addrs:
-                raise SSRFBlockedError(url=url, host=hostname, network="<unresolvable>")
-            return list(addrs)
-
-        return await loop.run_in_executor(None, _resolve)
+        except socket.gaierror as err:
+            # Unresolvable host (NXDOMAIN, no DNS record, etc.) — treat the
+            # same as "resolved to nothing", not an unhandled crash. A dead
+            # domain is exactly the kind of per-URL outcome a scrape batch
+            # must tolerate without aborting the whole submission.
+            raise SSRFBlockedError(url=url, host=hostname, network="<unresolvable>") from err
+        addrs = {str(sockaddr[0]) for _family, _, _, _, sockaddr in info}
+        if not addrs:
+            raise SSRFBlockedError(url=url, host=hostname, network="<unresolvable>")
+        return list(addrs)

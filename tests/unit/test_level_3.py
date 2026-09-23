@@ -23,13 +23,14 @@ def _proxy() -> Proxy:
 
 
 class FakePage:
-    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False):
+    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False, nav_status=200):
         self._html = html
         self.goto_exc = goto_exc
         self.trigger_route_block = trigger_route_block
         self._route_handler = None
         self.wait_calls = 0
         self.evaluate_calls = 0
+        self.nav_status = nav_status
 
     async def route(self, pattern, handler):
         self._route_handler = handler
@@ -44,6 +45,9 @@ class FakePage:
             await self._route_handler(fake_route)
         if self.goto_exc:
             raise self.goto_exc
+        # Real Playwright Response, not None (round 33 — see test_level_2.py's
+        # identical fake for the full rationale).
+        return SimpleNamespace(status=self.nav_status)
 
     async def wait_for_load_state(self, state, timeout):
         return None
@@ -91,6 +95,40 @@ class TestFetch:
         assert result.success is True
         assert result.html == _REAL_HTML
         fake_wrapper_cls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reports_real_navigation_status_not_hardcoded_200(self, monkeypatch):
+        """Round 33 — same fix/rationale as Level2Fetcher's identical test:
+        http_status must carry the real page.goto() response status, not a
+        hardcoded 200."""
+        page = FakePage(nav_status=504)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level3Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is True
+        assert result.http_status == 504
+
+    @pytest.mark.asyncio
+    async def test_navigation_404_reported_as_success_for_worker_to_classify(self, monkeypatch):
+        """Round 45 — same fix as Level2Fetcher's identical test: 404 is no
+        longer an immediate definitive failure here — worker.py's
+        centralized is_challenge_page check (404 now in
+        ChallengeDetector.CHALLENGE_STATUS_CODES) is what decides whether
+        the final level's own result still looks blocked and must be
+        downgraded, since a browser render can't be trusted to distinguish
+        a real 404 from a disguised anti-bot block on its own."""
+        page = FakePage(nav_status=404)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+        fetcher = Level3Fetcher()
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is True
+        assert result.http_status == 404
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):
@@ -160,3 +198,68 @@ class TestMaybeSolveCaptcha:
         )
 
         assert result == _CHALLENGE_HTML
+
+
+class TestPostLoadFixedWait:
+    """Round 63 — post_load_fixed_wait_ms is paid only by pages that look
+    like a challenge.
+
+    It used to run unconditionally, before anything had looked at the page,
+    so every L3 fetch spent 10s (the live value) whether or not there was a
+    proof-of-work solver to wait for. A domain that escalates to L3 tends to
+    stay there for a whole crawl, so that was 10s times every URL of the job
+    for the majority of pages that render fine once a real browser asks.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clean_page_skips_the_fixed_wait(self, monkeypatch):
+        page = FakePage()
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.level_3.CamoufoxWrapper",
+            MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))),
+        )
+        fetcher = Level3Fetcher(post_load_fixed_wait_ms=10000, scroll_passes=0)
+
+        result = await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is True
+        assert result.html == _REAL_HTML
+        assert page.wait_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_challenge_page_still_pays_the_full_budget(self, monkeypatch):
+        page = FakePage(html=_CHALLENGE_HTML)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.level_3.CamoufoxWrapper",
+            MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))),
+        )
+        fetcher = Level3Fetcher(
+            post_load_fixed_wait_ms=10000,
+            max_total_wait_ms=30000,
+            retry_wait_increment_ms=5000,
+            scroll_passes=0,
+            challenge_detector=ChallengeDetector(),
+        )
+
+        await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        # One fixed wait, then the poll loop's 5s increments to the 30s ceiling.
+        assert page.wait_calls == 5
+
+    @pytest.mark.asyncio
+    async def test_blocking_nav_status_counts_as_needing_settling(self, monkeypatch):
+        """A 403 body can read as ordinary content; the status is what makes
+        it a challenge. Passing the real nav status into the first check (not
+        a hardcoded 200) is what keeps those pages on the settling path."""
+        page = FakePage(nav_status=403)
+        monkeypatch.setattr(
+            "scraper_engine.fetcher.level_3.CamoufoxWrapper",
+            MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page))),
+        )
+        fetcher = Level3Fetcher(
+            post_load_fixed_wait_ms=10000, scroll_passes=0, challenge_detector=ChallengeDetector()
+        )
+
+        await fetcher.fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert page.wait_calls > 0

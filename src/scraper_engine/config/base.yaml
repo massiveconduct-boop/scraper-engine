@@ -24,7 +24,13 @@ levels:
     engine: botasaurus+camoufox
     proxy_tier_min_score: 70.0
     timeout_seconds: 40
-    capsolver_enabled: true
+    # Round 47 — same fix as dataimpulse below: this gates real spend
+    # (CAPSOLVER_API_KEY has a $1.00/day hard ceiling, config/schema.py's
+    # CapSolverConfig) and was one more hardcoded, non-overridable literal
+    # a source-blind consumer couldn't flip without a rebuild. Shared
+    # across both levels (one on/off decision, not per-level) since
+    # there's no known case for wanting L2 on and L3 off independently.
+    capsolver_enabled: "${CAPSOLVER_ENABLED:true}"
     goto_wait_until: "domcontentloaded"
     networkidle_timeout_ms: 5000
     max_total_wait_ms: 15000
@@ -35,7 +41,7 @@ levels:
     engine: camoufox
     proxy_tier_min_score: 90.0
     timeout_seconds: 60
-    capsolver_enabled: true
+    capsolver_enabled: "${CAPSOLVER_ENABLED:true}"
     goto_wait_until: "load"
     post_load_fixed_wait_ms: 10000
     max_total_wait_ms: 30000
@@ -48,6 +54,13 @@ camoufox:
   humanize: 1.5
   headless_mode: virtual
   max_total_instances: 8  # measured per-instance RSS: ~80MB (Camoufox v152, virtual headless)
+  fingerprint_preset: true  # real captured fingerprints, officially recommended for FF149+
+  os: linux  # matches the real host OS — see schema.py's CamoufoxConfig docstring
+  # Round 59 — opt-in RAM-aware concurrency cap, see schema.py's
+  # CamoufoxConfig docstring for the calc_max_parallel_browsers()
+  # reasoning. Env-overridable, same fix as l1_ja3_client_enabled below.
+  ram_aware_concurrency_enabled: "${RAM_AWARE_CONCURRENCY_ENABLED:false}"
+  ram_aware_avg_instance_gb: 0.8  # measured 2026-08-17, see schema.py comment
 
 # Round 26: Botasaurus capability upgrade — every field verified against the
 # real installed botasaurus/botasaurus_driver source (see config/schema.py's
@@ -60,7 +73,25 @@ botasaurus:
   random_sleep_enabled: true
   hashed_fingerprint: true
   max_retry: 0
-  l1_ja3_client_enabled: false
+  # Round 47 — same fix as capsolver_enabled/dataimpulse above: was a
+  # hardcoded literal, no way to opt in without a rebuild.
+  l1_ja3_client_enabled: "${BOTASAURUS_L1_JA3_CLIENT_ENABLED:false}"
+  # Round 59 — real botasaurus_driver.Driver kwargs, see schema.py's
+  # BotasaurusConfig docstring. Env-overridable, same reasoning.
+  block_images: "${BOTASAURUS_BLOCK_IMAGES:false}"
+  block_images_and_css: "${BOTASAURUS_BLOCK_IMAGES_AND_CSS:false}"
+  # Round 60 — local unpacked-extension directory paths, see schema.py's
+  # BotasaurusConfig docstring. Plain list literal, same pattern as
+  # ssrf_guard.additional_denied_cidrs below (lists in this file aren't
+  # env-templated).
+  extensions: []
+  # Round 60 — three independent settings, see schema.py's BotasaurusConfig
+  # docstring. Optional-string env pattern, same shape as ops_webhook_url.
+  lang: "${BOTASAURUS_LANG:}"
+  locale: "${BOTASAURUS_LOCALE:}"
+  timezone: "${BOTASAURUS_TIMEZONE:}"
+  humanize_mouse: "${BOTASAURUS_HUMANIZE_MOUSE:false}"
+  capture_network_events: "${BOTASAURUS_CAPTURE_NETWORK_EVENTS:false}"
 
 proxy_harvester:
   sources:
@@ -70,16 +101,111 @@ proxy_harvester:
     - proxripper
   interval_seconds: 600
 
+proxy_tiers:
+  min_score_level_1: 40.0
+  min_score_level_2: 70.0
+  min_score_level_3: 90.0
+  # Fallback for when tier-3-caliber (90+) proxies are genuinely scarce:
+  # when true, L3 tries a real tier-3-caliber proxy first and only falls
+  # back to a tier-2-caliber one (min_score_level_2) if that search comes
+  # up genuinely empty — never skips the tier-3 search entirely.
+  #
+  # Originally framed (round 33) as a stopgap specifically for free-only
+  # proxy sources, on the assumption that 90+ scores were structurally
+  # unreachable without paid proxies. Round 38 found and fixed two real
+  # scoring bugs (a latency-measurement bug inflating recorded response
+  # times, and response_time_ms being frozen at its first-ever reading
+  # instead of refreshed by later health checks) that were the actual
+  # cause — free sources DO produce real 90+ proxies once scored
+  # correctly (5 confirmed live post-fix). Turn back off once L3 supply
+  # is confirmed to hold up over time under real traffic, not
+  # necessarily gated on adding paid proxies.
+  allow_tier2_fallback_for_tier3: true
+  # Round 39 — same fallback, one tier down. Live-caught the same session
+  # the tier-3 comment above describes further correction happening in:
+  # fixing the scoring bugs that inflated L3 also exposed that L2's score
+  # column had been inflated the same way, and correcting it dropped L2's
+  # real supply from ~45 (fake) to 4 (real) — below critical_below_count,
+  # which starved a live 47-URL production job down to 10 successes, all
+  # DLQ'd as proxy_exhausted. Turn back off once L2 supply is confirmed to
+  # hold up over time under real traffic (same graduation condition as
+  # allow_tier2_fallback_for_tier3 above).
+  allow_tier1_fallback_for_tier2: true
+  # Round 34 — proxy/pool_health.py thresholds: validated-proxy counts per
+  # tier below which that tier is DEGRADED / CRITICAL.
+  degraded_below_count: 20
+  critical_below_count: 5
+
+# Round 40 — paid rotating-gateway residential proxy (DataImpulse), toggleable
+# alongside the free-pool system above rather than replacing it. Disabled by
+# default: enabled=false means free-pool behavior is byte-for-byte unchanged.
+# strategy only takes effect when enabled=true. See
+# config/schema.py::DataImpulseConfig and proxy/paid_gateway.py. Credentials
+# (DATAIMPULSE_PROXY_HOST/DATAIMPULSE_PORT/DATAIMPULSE_USERNAME/
+# DATAIMPULSE_PASSWORD) are read from the environment directly, never here.
+#
+# Round 47 — enabled/strategy moved to ${VAR:default} placeholders (same
+# pattern every other setting on this page already uses). Before this,
+# these two were the only literal, non-overridable values in the whole
+# file — a caller who wanted the paid gateway on had no way to turn it on
+# short of editing this YAML and rebuilding the image. Consuming services
+# (e.g. research_agent) that only set container env vars, with no source
+# bind-mount and no visibility into this repo's compose file, were stuck
+# even though DataImpulse credentials were already reaching the container
+# via env. Now DATAIMPULSE_ENABLED=true/DATAIMPULSE_STRATEGY=paid_only (or
+# free_first) in the api/worker containers' env is enough — no image
+# rebuild, no file edit. loader.py's env-var resolution runs on raw
+# strings; pydantic's default (non-strict) bool validation accepts
+# "true"/"false" case-insensitively for the `enabled` field.
+dataimpulse:
+  enabled: "${DATAIMPULSE_ENABLED:false}"
+  strategy: "${DATAIMPULSE_STRATEGY:free_only}"  # free_only | paid_only | free_first
+  # Round 62 — see schema.py::DataImpulseConfig. country is an ISO-3166
+  # alpha-2 code ("ng", "us"); empty means no country pin.
+  country: "${DATAIMPULSE_COUNTRY:}"
+  rotate_on_block_retries: "${DATAIMPULSE_ROTATE_ON_BLOCK_RETRIES:2}"
+  # Round 62 — empty means "no ASN pin", which is the right default: the
+  # parameter doubles DataImpulse's bandwidth rate. Set it per deployment for
+  # a target that blocks a whole operator range. Measured on the Jumia target
+  # (see proxy/paid_gateway.py): unpinned 1-of-12, asn=29465 (MTN Nigeria)
+  # 6-of-6, asn=36873 (Airtel Nigeria) 6-of-6.
+  asn: "${DATAIMPULSE_ASN:}"
+
 politeness:
   default_concurrency: 2
   default_delay_seconds: 5.0
   slot_ttl_seconds: 120
+  max_concurrent_urls_per_job: 5
+  slot_wait_timeout_seconds: 300.0
+  slot_retry_interval_seconds: 1.0
+  max_request_concurrency: 10
+  min_request_delay_seconds: 0.5
+
+# Round 65 — host-wide browser admission (orchestrator/host_capacity.py). Off until
+# live-verified; see config/schema.py::HostCapacityConfig for every knob.
+host_capacity:
+  enabled: ${HOST_CAPACITY_ENABLED:false}
+  # Round 67 — false restores round 66's close-on-release under admission.
+  reuse_browsers: ${HOST_CAPACITY_REUSE_BROWSERS:true}
+  min_units: 1.0
+  tenant_share: 0.6
+  lease_ttl_seconds: 90
+  renew_interval_seconds: 20
+
+escalation:
+  level_memory_enabled: true
+  level_memory_ttl_seconds: 86400
+  reprobe_every: 20
+
+extraction:
+  max_links: 1000
 
 circuit_breaker:
   failure_threshold: 0.95
   attempt_threshold: 20
   cooldown_seconds: 600
-  max_cooldown_seconds: 3600
+  max_cooldown_seconds: 1200
+  failure_streak_ttl_seconds: 600
 
 capsolver:
   # Per-tenant daily ceiling lives in the tenants.capsolver_daily_credit_ceiling
@@ -104,3 +230,39 @@ session_retention:
   browser_sessions_ttl_days: 30
   domain_ban_history_retention_days: 7
   cleanup_interval_seconds: 3600
+
+# Round 34 — orchestrator/webhook.py delivery tuning + the operator-facing
+# ops channel (proxy pool health alerts, see proxy_tiers.degraded_below_count
+# / critical_below_count above). ops_webhook_url is unset by default — pool
+# health transitions are still logged either way (proxy/harvester_daemon.py),
+# this just adds a webhook push on top when configured.
+#
+# Deliberately complementary to monitoring/alerts/prometheus_rules.yml's
+# ProxyPoolCriticallyLow rule (routed via Alertmanager to SLACK_WEBHOOK_URL
+# in .env), not a duplicate of it — decided in the round-34 knowledge audit
+# after finding the two were built independently with no awareness of each
+# other. Different failure domains and different latency: Alertmanager's
+# rule needs Prometheus scraping + a 5-minute sustained condition before it
+# fires, and stops working if this app's own Redis/Postgres/webhook-outbox
+# pipeline is what's broken; this path fires on the next health cycle (no
+# extra sustained-duration wait), is per-tier (Alertmanager's rule is
+# pool-wide), and keeps working if Prometheus/Alertmanager themselves are
+# down. Recommended setup: point this at a DIFFERENT Slack channel/webhook
+# than SLACK_WEBHOOK_URL — e.g. a fast per-tier signal channel — rather
+# than the same one Alertmanager posts to, so the two don't read as a
+# confusing double-alert for the same event. See
+# .claude/knowledge/decisions.md → "Keep Both Pool-Health Alert Paths" for
+# the full reasoning.
+webhook:
+  max_retries: 3
+  timeout_seconds: 10
+  backoff_base_seconds: 2.0
+  ops_webhook_url: "${OPS_WEBHOOK_URL:}"
+
+# Round 34 — proxy/dlq_reaper.py: auto-retries DLQ entries in
+# orchestrator/worker.py's TRANSIENT_FAILURE_CATEGORIES once the pool/circuit
+# that caused them has recovered.
+dlq_reaper:
+  interval_seconds: 60
+  max_auto_retries: 3
+  batch_size_per_tenant: 20

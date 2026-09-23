@@ -14,10 +14,12 @@ htmlcov/
 .mypy_cache/
 *.log
 .DS_Store
-.wolf/
+.wolf/*
+!.wolf/OPENWOLF.md
 profiles/
-.claude/
-!.claude/knowledge/
+.claude/*
+!.claude/knowledge
 !.claude/MEMORY.md
 .archive/
 .local/
+coverage.json

@@ -55,6 +55,33 @@ RETRY_MATRIX: dict[FailureCategory, RetryStrategy] = {
     FailureCategory.HOST_UNREACHABLE: RetryStrategy(
         max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
     ),
+    FailureCategory.NOT_FOUND: RetryStrategy(
+        max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
+    ),
+    # Round 63 — pure politeness contention against one domain. Worth
+    # retrying (the blocker is sibling URLs finishing, which they will), but
+    # with a long base delay: retrying quickly just re-enters the same queue
+    # the URL already waited out, and adds load to the domain the delay
+    # exists to protect.
+    FailureCategory.POLITENESS_TIMEOUT: RetryStrategy(
+        max_attempts=2, base_delay_seconds=30.0, max_delay_seconds=120.0, retryable=True
+    ),
+    # Round 65 — host browser capacity ran out for this URL's whole wait
+    # budget. Same shape as POLITENESS_TIMEOUT, longer delays: the host was
+    # saturated, and an eager retry adds to exactly that load.
+    FailureCategory.CAPACITY_TIMEOUT: RetryStrategy(
+        max_attempts=2, base_delay_seconds=60.0, max_delay_seconds=300.0, retryable=True
+    ),
+    # Round 65 — our own Redis failed or timed out. Usually a blip; retry soon.
+    FailureCategory.DEPENDENCY_UNAVAILABLE: RetryStrategy(
+        max_attempts=3, base_delay_seconds=5.0, max_delay_seconds=60.0, retryable=True
+    ),
+    # Round 66 — the proxy refused our credentials. Backing off changes
+    # nothing; only a different proxy (orchestrator/worker.py, free pool only)
+    # or a topped-up gateway account (proxy/dlq_reaper.py's probe) can.
+    FailureCategory.PROXY_AUTH_FAILED: RetryStrategy(
+        max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
+    ),
 }
 
 

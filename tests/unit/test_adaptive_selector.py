@@ -90,3 +90,83 @@ class TestExtractRegexFallback:
 
         assert "title" not in result
         assert "plain text" in result["content"]
+
+
+class TestLinkExtraction:
+    """Round 63 — what `links` used to be was `hrefs[:100]` in raw DOM order:
+    relative, un-deduped, and truncated at 100.
+
+    Those three only bite together, and they did on a real Jumia catalog page
+    rendered at L3: the hydrated nav mega-menu emits ~100 links before the
+    first product, so the whole budget went to site navigation and not one
+    product URL came back. The identical page captured earlier at L2, before
+    that hydration, returned them all — which read as "L3 loses product
+    links" when it was the cap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_jumia_shape_nav_menu_no_longer_crowds_out_products(self):
+        nav = "".join(f'<a href="/category/{i}">c{i}</a>' for i in range(100))
+        products = "".join(f'<a href="/product-{i}.html">p{i}</a>' for i in range(24))
+        html = f"<html><body><main>{'x' * 200}{nav}{products}</main></body></html>"
+
+        result = await AdaptiveSelector().extract(html, base_url="https://www.jumia.com.ng/")
+
+        links = result["links"]
+        assert len(links) == 124
+        product_links = [link for link in links if "product-" in link]
+        assert len(product_links) == 24
+        assert product_links[0] == "https://www.jumia.com.ng/product-0.html"
+
+    @pytest.mark.asyncio
+    async def test_relative_links_are_absolutised_against_the_page(self):
+        html = (
+            "<html><body><main>" + "x" * 200 + '<a href="/a">a</a>'
+            '<a href="b.html">b</a><a href="https://other.example/c">c</a>'
+            "</main></body></html>"
+        )
+        result = await AdaptiveSelector().extract(
+            html, base_url="https://site.example/shop/index.html"
+        )
+        assert result["links"] == [
+            "https://site.example/a",
+            "https://site.example/shop/b.html",
+            "https://other.example/c",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_without_a_base_url_links_stay_as_authored(self):
+        html = "<html><body><main>" + "x" * 200 + '<a href="/a">a</a></main></body></html>'
+        result = await AdaptiveSelector().extract(html)
+        assert result["links"] == ["/a"]
+
+    @pytest.mark.asyncio
+    async def test_duplicates_are_dropped_preserving_first_seen_order(self):
+        html = (
+            "<html><body><main>" + "x" * 200 + '<a href="/a">1</a><a href="/b">2</a>'
+            '<a href="/a">3</a></main></body></html>'
+        )
+        result = await AdaptiveSelector().extract(html)
+        assert result["links"] == ["/a", "/b"]
+
+    @pytest.mark.asyncio
+    async def test_non_page_schemes_and_bare_fragments_are_dropped(self):
+        html = (
+            "<html><body><main>" + "x" * 200 + '<a href="javascript:void(0)">j</a>'
+            '<a href="MAILTO:x@y.z">m</a><a href="tel:+123">t</a>'
+            '<a href="#top">f</a><a href="  ">blank</a><a href="/real">r</a>'
+            "</main></body></html>"
+        )
+        result = await AdaptiveSelector().extract(html)
+        assert result["links"] == ["/real"]
+
+    @pytest.mark.asyncio
+    async def test_cap_still_bounds_a_pathological_page(self):
+        html = (
+            "<html><body><main>"
+            + "x" * 200
+            + "".join(f'<a href="/{i}">{i}</a>' for i in range(50))
+            + "</main></body></html>"
+        )
+        result = await AdaptiveSelector(max_links=10).extract(html)
+        assert len(result["links"]) == 10

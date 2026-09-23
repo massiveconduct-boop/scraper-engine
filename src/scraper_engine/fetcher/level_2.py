@@ -8,6 +8,7 @@ Botasaurus always runs with parallel=1 (our orchestrator owns concurrency).
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, cast
@@ -26,6 +27,8 @@ from scraper_engine.fetcher._failure import classify_fetch_exception
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from scraper_engine.browser.botasaurus_pool import BotasaurusPool
@@ -133,10 +136,21 @@ class Level2Fetcher:
         domain = urlparse(url).hostname or "unknown"
         assert self._botasaurus is not None
         session_id = f"{tenant_id}:{domain}"
+        # Populated in place by botasaurus_pool.py/botasaurus_wrapper.py's own
+        # config.botasaurus.capture_network_events toggle — stays empty (and
+        # network_events below stays None) when that toggle is off, so this
+        # is a harmless no-op pass-through by default.
+        network_events: list[dict[str, object]] = []
         try:
             if self._botasaurus_pool is not None:
                 html = await self._botasaurus_pool.fetch(
-                    url, proxy=proxy, domain=domain, session_id=session_id
+                    url,
+                    proxy=proxy,
+                    domain=domain,
+                    session_id=session_id,
+                    scroll_passes=self._scroll_passes,
+                    scroll_wait_ms=self._scroll_wait_ms,
+                    events_sink=network_events,
                 )
             else:
                 html = await self._botasaurus.fetch_html(
@@ -144,12 +158,45 @@ class Level2Fetcher:
                     proxy=proxy,
                     tenant_id=tenant_id,
                     session_id=session_id,
+                    scroll_passes=self._scroll_passes,
+                    scroll_wait_ms=self._scroll_wait_ms,
+                    events_sink=network_events,
                 )
-        except Exception:
+        except (Exception, SystemExit) as exc:
+            # Round 40 — live-caught: botasaurus_driver's own proxy-auth
+            # helper (javascript_fixes.check_node(), reached only when the
+            # proxy string carries embedded credentials — see Dockerfile's
+            # nodejs comment) calls sys.exit(1) instead of raising when Node
+            # isn't on PATH. SystemExit is a BaseException, not Exception, so
+            # a bare `except Exception` here let it skip this module's own
+            # documented "falls back to Camoufox on failure" contract and
+            # crash the whole RQ job instead. Deliberately NOT a bare
+            # `except:` — that would also swallow asyncio.CancelledError
+            # (job cancellation, orchestrator/worker.py's `_is_cancelled`
+            # path) and KeyboardInterrupt, both of which must keep
+            # propagating.
+            #
+            # Round 64 — logged. This fallback was silent: a live Jumia run
+            # spent 80-360s per URL at L2 and nothing said whether Botasaurus
+            # was failing, how, or how long it took before Camoufox ran.
+            logger.warning(
+                "l2_botasaurus_fallback reason=exception:%s elapsed_ms=%d url=%s",
+                type(exc).__name__,
+                int((time.monotonic() - start) * 1000),
+                url,
+            )
             return None
-        if self._challenge_detector.is_challenge_page(html, 200, short_page_is_suspect=False):
+        reason = self._challenge_detector.challenge_reason(html, 200, short_page_is_suspect=False)
+        if reason is not None:
+            logger.warning(
+                "l2_botasaurus_fallback reason=%s elapsed_ms=%d url=%s",
+                reason,
+                int((time.monotonic() - start) * 1000),
+                url,
+            )
             return None
         return FetchResult(
+            engine="botasaurus",
             url=url,
             success=True,
             http_status=200,
@@ -157,6 +204,7 @@ class Level2Fetcher:
             level_used=2,
             proxy_used=proxy.key(),
             duration_ms=int((time.monotonic() - start) * 1000),
+            network_events=network_events or None,
         )
 
     async def _fetch_via_camoufox(
@@ -188,7 +236,9 @@ class Level2Fetcher:
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
                 try:
-                    await page.goto(url, wait_until=self._goto_wait_until, timeout=timeout * 1000)
+                    nav_response = await page.goto(
+                        url, wait_until=self._goto_wait_until, timeout=timeout * 1000
+                    )
                 except Exception:
                     route_guard.raise_if_blocked()
                     raise
@@ -226,10 +276,31 @@ class Level2Fetcher:
                     html = await safe_content(page)
                 duration_ms = int((time.monotonic() - start) * 1000)
 
+                nav_status = nav_response.status if nav_response is not None else 200
+                # Round 45 — a 404 here is NOT treated as an immediate,
+                # definitive failure (round 43 did that; wrong — see
+                # ChallengeDetector.CHALLENGE_STATUS_CODES's round-45 comment
+                # for why 404 can be a disguised anti-bot block). It's now in
+                # CHALLENGE_STATUS_CODES alongside 403/429/5xx, so
+                # worker.py's centralized is_challenge_page check decides
+                # whether to escalate — same path every other block-status
+                # already goes through. Only if it's STILL present after the
+                # final level does worker.py convert it to a real failure.
                 return FetchResult(
+                    engine="camoufox",
                     url=url,
                     success=True,
-                    http_status=200,
+                    # The real navigation status, not a hardcoded 200 — a
+                    # free proxy's own upstream dying still renders a page
+                    # Playwright considers a successful navigation (no
+                    # exception), but nav_response.status carries the truth
+                    # (e.g. 502/504) so ChallengeDetector's
+                    # CHALLENGE_STATUS_CODES check (worker.py's centralized
+                    # classification, round 33) can actually see it instead
+                    # of every gateway failure looking identical to a real
+                    # 200. None only for edge navigations Playwright doesn't
+                    # attach a Response to (e.g. about:blank).
+                    http_status=nav_status,
                     html=html,
                     level_used=2,
                     proxy_used=proxy.key() if proxy else "none",
@@ -237,6 +308,7 @@ class Level2Fetcher:
                 )
         except Exception as exc:
             return FetchResult(
+                engine="camoufox",
                 url=url,
                 success=False,
                 level_used=2,
@@ -316,6 +388,7 @@ class Level2Fetcher:
                 await browser.close()
                 duration_ms = int((time.monotonic() - start) * 1000)
                 return FetchResult(
+                    engine="raw_playwright",
                     url=url,
                     success=True,
                     http_status=200,
@@ -326,6 +399,7 @@ class Level2Fetcher:
                 )
         except Exception as exc:
             return FetchResult(
+                engine="raw_playwright",
                 url=url,
                 success=False,
                 level_used=2,

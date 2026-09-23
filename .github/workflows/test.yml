@@ -28,6 +28,15 @@ jobs:
           # run a 3.11+3.12 matrix) — without it, uv resolves against whatever
           # interpreter compiled the lockfile and can pick a package version that
           # doesn't support the floor (numpy==2.5.1 requires >=3.12, broke the 3.11 job).
+          # Round 67 — start from the committed locks: uv keeps every pin already
+          # in the output file unless pyproject.toml forces a change, so this
+          # fails when a dependency changed without relocking, not whenever a
+          # newer release appears on PyPI (a fresh resolve made the check fail
+          # on its own over time: PR #31, ~40 packages "drifted" in two months
+          # with pyproject untouched). Upgrading pins stays deliberate
+          # (Dependabot / a manual `uv pip compile --upgrade`).
+          cp requirements-lock.txt /tmp/check-lock.txt
+          cp requirements-dev-lock.txt /tmp/check-dev-lock.txt
           uv pip compile pyproject.toml --python-version 3.11 --emit-index-url --no-header -o /tmp/check-lock.txt
           uv pip compile pyproject.toml --extra dev --python-version 3.11 --emit-index-url --no-header -o /tmp/check-dev-lock.txt
           diff requirements-lock.txt /tmp/check-lock.txt
@@ -69,6 +78,8 @@ jobs:
             exit 1
           fi
           echo "OK — force_engine test seam has zero production call sites"
+      - name: CLAUDE.md size gate (fail on diary regrowth)
+        run: bash tools/check_claude_md_size.sh
       - name: mypy strict (baseline now empty — any error fails the build)
         run: |
           mypy src/scraper_engine/core/ src/scraper_engine/proxy/ src/scraper_engine/orchestrator/ src/scraper_engine/api/ src/scraper_engine/storage/ src/scraper_engine/fetcher/ src/scraper_engine/browser/ src/scraper_engine/observability/ --ignore-missing-imports >/tmp/mypy.out 2>&1 || true
@@ -207,7 +218,12 @@ jobs:
       # integration+chaos suite is actually run with --cov and enforced —
       # fail_under=100 in pyproject.toml was previously dead config that no
       # `pytest` invocation in this file ever passed --cov to.
-      - run: python -m pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=short --cov=src/scraper_engine --cov-report=term-missing --cov-report=xml --cov-fail-under=100
+      - run: python -m pytest tests/unit/ tests/integration/ tests/chaos/ -v --tb=short --cov=src/scraper_engine --cov-report=term-missing --cov-report=xml --cov-report=json:coverage.json --cov-fail-under=100
+      # Round 62 — the real gate: zero missed lines plus a missed-branch
+      # budget that only shrinks. The budget reached 0 in round 64, so
+      # --cov-fail-under above is back at 100 as a backstop. See the
+      # script's docstring.
+      - run: python tools/check_coverage_ratchet.py coverage.json
 
   # Builds and publishes the image CI has been proving works — only on a real
   # merge to main (never on pull_request, so a fork PR never gets registry

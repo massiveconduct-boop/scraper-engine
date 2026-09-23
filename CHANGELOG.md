@@ -7,6 +7,51 @@ bug found, every design decision and why) lives in `.claude/MEMORY.md` and
 
 ## [Unreleased]
 
+- **Round 33 — fix: SSRF crash on unresolvable hosts, whole-batch rejection
+  on one bad URL, markdown-only-with-Firecrawl.** Three caller-facing
+  issues closed:
+  1. `SSRFGuard._resolve_hosts` let a bare `socket.gaierror` (dead/
+     unresolvable domain) propagate uncaught — one bad address in a
+     `/v1/scrape` batch 500'd the *entire* request instead of failing just
+     that URL. Now caught and converted to `SSRFBlockedError` like every
+     other unresolvable-host case.
+  2. `POST /v1/scrape` and `POST /v1/crawl` rejected the whole batch with
+     `403` if even 1 of N submitted URLs was SSRF-blocked. Both now
+     partition valid vs. blocked URLs, only reject outright when *every*
+     URL is blocked, and only charge quota for the valid ones. `/v1/scrape`
+     still passes blocked URLs through to the escalation pipeline (which
+     already turns them into a proper per-URL `ssrf_blocked` failure
+     result without crashing); `/v1/crawl` filters them out before they
+     reach Scrapy (which has no SSRF check of its own) and persists a
+     synthetic failed result for each so they're not silently dropped.
+  3. `FetchResult.markdown` was only ever populated when Firecrawl was
+     configured (`FIRECRAWL_API_KEY`/`FIRECRAWL_BASE_URL`) — without it, a
+     caller only got `extracted` (title/body/links), never markdown or raw
+     HTML inline (raw HTML was always S3-pointer-only, `html_snapshot_url`,
+     never embedded in the response — that part was working as designed,
+     just undocumented clearly). Added `services/markdown_fallback.py`, a
+     local HTML→Markdown converter (`markdownify` + `bs4`, no external
+     service needed) used whenever Firecrawl isn't configured, so
+     `markdown` is now populated unconditionally.
+
+- **Round 33 follow-up — fix: gateway/proxy error pages and browser-internal
+  plain-text pages silently accepted as successful scrapes.** Root cause
+  was deeper than a missing signature list: `level_2.py`/`level_3.py`
+  hardcoded `http_status=200` on every browser-level fetch, discarding
+  Playwright's real navigation `Response` entirely, so `ChallengeDetector`'s
+  own status-code check never saw a real 502/504/500. Fixed by capturing
+  and reporting the real `page.goto()` response status, adding 500/502/504
+  to `CHALLENGE_STATUS_CODES`, and adding two structural content heuristics
+  as a backstop for paths that can't expose a real status: one for generic
+  gateway-error pages (short body + a 5xx number near an error word,
+  verified against 3 real pages captured live from 3 unrelated free
+  proxies), and one for Camoufox/Firefox's own internal plain-text-viewer
+  wrapper (found live while re-verifying the first fix — a proxy's raw
+  `text/plain` diagnostic body was rendered through this wrapper and slipped
+  past the gateway-error check, which requires vocabulary this page didn't
+  use). See `.wolf/buglog.json` → `bug-r32-07`, `bug-r33-04` for the full
+  investigation.
+
 - **Round 28 — chore: coverage gate wired for real + 7 senior-dev-review
   findings closed.** `pyproject.toml`'s `[tool.coverage.report] fail_under`
   was declared but no CI `pytest` invocation ever passed `--cov` — the gate

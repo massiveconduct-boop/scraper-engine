@@ -1,6 +1,13 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Updated 2026-07-29 after round 28 (real coverage gate wired to 100% + 7 other senior-dev-review findings closed — version, CI Python matrix, dependency lockfile, vulnerability scanning, `py.typed`, governance files, pre-commit hooks; see `.claude/MEMORY.md` → Technical Debt for full round-28 story). Source code is fully implemented — not blueprint phase.
+Project identity, operating rules, and navigation. Currently at round 67.
+**Never a diary.** Audits at rounds 28, 57 and 66 each removed dated
+per-round narrative from this exact spot (`decisions.md` →
+"Knowledge-Audit: Round-57 CLAUDE.md Diary Regression"); a 1800-word gate
+(`tools/check_claude_md_size.sh`) now fails the build on regrowth. A new
+round's story goes in `.claude/knowledge/technical-debt.md` — start there,
+not here — and, if it fits in a clause, in "Evolution history" below.
+Source code is fully implemented, not blueprint phase.
 
 ## Project Identity
 
@@ -15,41 +22,92 @@ Async Python multi-level web scraping system. Levels: L1 (HTTP/Scrapling), L2 (B
 5. **Prefer `ctx_execute` over `Bash` for long-running commands.** Bash tool has 120s timeout (signal 16, exit 144). Harvest cycles take ~25s.
 6. **Tests run with `docker compose up -d postgres redis pgbouncer` first.** Integration/chaos tests need infrastructure. PgBouncer must be running for G-05.
 
+## OpenWolf
+
+@.wolf/OPENWOLF.md
+
+Session order (quick-glance version of the import above): `.wolf/STATUS.md` first (current quest, next steps, decisions) → `.wolf/anatomy.md` before opening any file → `.wolf/cerebrum.md` Do-Not-Repeat before generating code → `.wolf/buglog.json` before fixing any bug.
+
+### OpenWolf CLI
+
+```bash
+openwolf status      # daemon health, last session stats, file integrity
+openwolf scan        # force full anatomy rescan (after adding/renaming/deleting files)
+openwolf report      # token report: estimated vs measured
+openwolf dashboard   # browser dashboard (127.0.0.1:18799)
+openwolf bug         # bug memory management
+openwolf daemon      # daemon management
+openwolf cron        # cron task management
+```
+
+`openwolf scan` regenerates `.wolf/anatomy.md` from `.wolf/anatomy-index.json`. Descriptions in `anatomy.md` may be edited (they are absorbed on the next scan) but never reorder or reformat the file.
+
+**`cerebrum.md`'s Decision Log vs `.claude/knowledge/decisions.md` (round 34):** these overlap in purpose and already drifted once (see `decisions.md` → "OpenWolf ↔ `.claude/knowledge/` Division of Labor"). `cerebrum.md` stays OpenWolf's fast session-local capture — don't hand-edit it. Any decision logged there with real lasting architectural consequence must also be written to `.claude/knowledge/decisions.md` in the same session — that file is what `CLAUDE.md`'s Navigation section actually sends readers to.
+
 ## Architecture
 
 - **Runtime:** Python 3.12, asyncio, FastAPI, uvicorn
 - **Browser:** Camoufox v0.5.4 (Firefox 152), semaphore-gated pool with `lease()` context manager
 - **Proxy:** 8-URL sources across 6 operators, TCP probe + HTTP validation, two-tier scoring
 - **Storage:** PostgreSQL 16 (PgBouncer transaction-pooling), Redis 7, S3/MinIO
-- **Testing:** pytest 9.1.1, 611 unit+integration+chaos tests pass (1 skip, 0 error, as of round 28) + 12 live + load suite. Captcha/Camoufox live tests skipped in CI. **Coverage gate (`fail_under=100` in `pyproject.toml`) is wired for real (round 28) — CI's `chaos` job runs the full suite with `--cov-fail-under=100`. Real measured coverage: 100% across every package in `[tool.coverage.run] source` except `browser/` (needs real Firefox, not available in CI).**
-- **Execution pipeline wired end-to-end (round 22).** `POST /v1/scrape`/`POST /v1/crawl` enqueue onto real `rq` queue (`orchestrator/job_queue.py`); `orchestrator/tasks.py` is rq entry point that builds `Worker` + deps, drives `process_job`persists results (`scrape_results`S3 snapshots), and fires webhook. Live-verified: real HTTP job through running containers, `PENDING → COMPLETED`MinIO snapshot confirmed. See `.claude/MEMORY.md` → Open Threads for full evidence.
-- **Security-hardened (round 22 follow-up).** SSRF re-validated at fetch time and per redirect hop, not at submit time (closed DNS-rebind TOCTOU gap — see `.claude/knowledge/architecture.md` → SSRF Enforcement). CORS no longer pairs wildcard origin with credentials. `GET /health`'s `proxy_pool_size` now reflects live pool (was always 0). Live-proven, not tested — see `.claude/MEMORY.md` → Open Threads.
-- **Observability fully wired + real tracing deployed (round 24, PR #7).** Structured JSON logging and tracing were previously never invoked (`configure_logging()`/`configure_tracing()` had zero call sites) — now bootstrapped once per process via `observability/bootstrap.py`. Real distributed tracing: Jaeger (`docker-compose.yml`UI `:16686`) + process-wide httpx/asyncpg/redis auto-instrumentation + `scrape_job` root span per rq job + `proxy_daemon_{name}` span per harvester cycle. Live-verified via Jaeger's own query API (not log silence). `/metrics` now respects `metrics_enabled` `SSRFGuard` accepts `additional_denied_cidrs`new retention reaper enforces `browser_sessions`/`domain_ban_history` TTLs. See `.claude/knowledge/architecture.md` → "Observability & Tracing" `.claude/MEMORY.md` → Open Threads (round 24) for full story, including subtle rq-fork/`BatchSpanProcessor` bug found and fixed along way.
-- **Round 24's 5 unwired-config gaps closed (round 25), plus 3 more found same way + Botasaurus restored for real.** `BrowserPool` is now constructed per-job and leased by L2/L3 (rq forks fresh process per job, so pool's lifetime is one job, not one process); `CapSolverBudget` now reads real per-tenant ceiling (`tenants.capsolver_daily_credit_ceiling`), and real bug was found alongside it — `_spend_key()` ignored `tenant_id` entirely, pooling every tenant's spend into one global counter; Camoufox's `geoip`/`humanize`/`headless_mode`/`max_total_instances` now flow from config; `fetcher/botasaurus_wrapper.py` was deleted as dead code, then **restored and wired for real** per authoritative spec §3.6 after follow-up ask — `Level2Fetcher` now tries Botasaurus first, falling back to existing Camoufox pipeline on failure or detected challenge page; `PgBouncerConfig` documented informational-only (unchanged, cosmetic). Also found + fixed: 7 dead Prometheus alert metrics (rq's fork-per-job model means in-process gauges from worker code never reach `/metrics` — fixed via Redis/Postgres-backed scrape-time refresh, see `.claude/knowledge/architecture.md` → "Metrics: Cross-Process Emission Pattern"), `BrowserPool` correctness bug where ANY mismatch (not idle timeout) destroyed live browser instead of keeping it pooled, `proxy_source_healthy` having same cross-process gap as alert metrics. Full detail: `.claude/MEMORY.md` → Technical Debt (round 25). Botasaurus capability-upgrade research (not yet implemented — next quest) also in that section.
-- **Botasaurus capability upgrade (round 26).** Every API re-verified against real installed `botasaurus`/`botasaurus_driver`/`botasaurus_requests` source before wiring, not README. `google_get(bypass_cloudflare=True)` replaces plain `get()` in `fetcher/botasaurus_wrapper.py` (free Cloudflare-tier bypass), plus `tiny_profile`/`remove_default_browser_check_argument`/`close_on_crash`/`max_retry`/`HASHED` fingerprinting, all config-driven via new `config.botasaurus: BotasaurusConfig`. New `browser/botasaurus_pool.py::BotasaurusPool` reuses one live driver across same-domain URLs within job (opt-in, one per rq job like `BrowserPool`) — deliberately does **not** use botasaurus's own `reuse_driver=True`since reading its source found that mechanism is unkeyed global pool that would leak proxy/tenant state across fetches (spec §1.1 #3 risk). New `services/botasaurus_requests_client.py` wires JA3-TLS-fingerprint-matched client into L1, config-gated off by default. Live end-to-end verification against `challenge-mirror` initially failed and was first misdiagnosed as Chrome/CDP version mismatch — real cause was genuine bug in `fetcher/botasaurus_wrapper.py`botasaurus's decorator always calls wrapped function positionally (`func(driver, data)`), which silently clobbered keyword-default `target_url` param with `None`so every fetch navigated nowhere. Fixed (read URL from closure instead), then live-confirmed for real: `google_get(bypass_cloudflare=True)` fetches real content from `challenge-mirror` `BotasaurusPool` reuse is confirmed via exactly one `Driver()` construction across two same-domain fetches. Full story: `.claude/knowledge/architecture.md` → "Botasaurus Capability Upgrade".
-- **Repo layout professionalization + src/ consolidation (round 27).** Historical per-round reports moved out of `docs/` into gitignored `.archive/{evidence,directive,closure,other}/` (categorized, kept on disk, off GitHub); `challenge-mirror/`  `judge_server.py` (real test infra) moved to `tests/fixtures/` `specs/` and unused scripts moved to separate gitignored `.local/`. Added `LICENSE` (Apache 2.0), `NOTICE` `CONTRIBUTING.md` `CHANGELOG.md`. `alembic.ini`'s `script_location` fixed to be cwd-independent (`%(here)s` token) — documented production migration command was silently broken inside containers. **Then 12 top-level packages were consolidated under `src/scraper_engine/`** (455 import statements rewritten) — see Module Map below `.claude/knowledge/architecture.md` → "Repository Layout" for full story, including three real bugs rewrite surfaced (a parameter/module name-shadowing near-miss, string-based `mock.patch`/rq-job-queue module references invisible to static import checks, `types-redis` stub-vs-real-types CI/local mismatch). Verified beyond static analysis: real job submitted through rebuilt live API went `PENDING → COMPLETED`.
-- **Coverage gate wired for real + 7 other senior-dev-review findings closed (round 28).** `pyproject.toml`'s `fail_under` was declared (90, then 100) but no CI `pytest` invocation ever passed `--cov` — the gate never ran; real measured coverage was 72%. Now wired into CI's `chaos` job and brought to 100% (~370 missing lines closed across ~20 files, `fetcher/`+`services/` were the bulk of the gap). Two real bugs found writing the tests: `fetcher/scrapling_wrapper.py` called a nonexistent `scrapling.get()` (fixed to the real `scrapling.fetchers.AsyncFetcher.get()` API), and `pyproject.toml`'s `dependencies = [...]` was TOML-nested under the wrong table, so `pip install -e .` had been installing zero runtime dependencies. Also: version `0.1.0`→`1.0.0` + `CHANGELOG.md` + a documented release process; CI Python matrix now 3.11+3.12; `requirements-lock.txt`/`requirements-dev-lock.txt` (`uv pip compile`) replace 3 hand-duplicated dependency lists in CI/Dockerfile, with a CI drift check; `pip-audit` + Dependabot; `py.typed`; `SECURITY.md`/`CODEOWNERS`/issue-PR templates; `.pre-commit-config.yaml` (ruff + scoped `mypy --strict`, verified via `pre-commit run --all-files`). Full story: `.claude/MEMORY.md` → Technical Debt (round 28).
+- **Testing:** pytest 9.1.1, unit+integration+chaos suite + 18 live + load suite (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate: the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES plus an absolute missed-BRANCH budget that may only shrink, at 0 since round 64; `--cov-fail-under=100` is a backstop.** It covers 10 packages (core, proxy, orchestrator, fetcher, services, storage, api, scrapy_project, cli, observability); `browser/` is measured-but-ungated (needs a real Firefox) and `config/` is outside it. Chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. History of the gate's exclusions, regressions and audits (rounds 34, 35, 62, 64): `.claude/knowledge/technical-debt.md`.
 - **Linting:** ruff (clean), mypy `--strict` clean (baseline retired round 18)
+- **Evolution history (one clause per round; a round-28 audit moved the
+  full narrative out of this file, round-57 and round-66 audits re-trimmed
+  regrowths — see decisions.md → "Knowledge-Audit: Round-57 CLAUDE.md Diary
+  Regression". Rounds 22-62 are one line each here; the story is in
+  technical-debt.md):** pipeline + SSRF + observability + pools + src/
+  layout + coverage gate + caching (22-29), proxy self-healing, ASN
+  classification, daemon liveness and L2/L3 leasing (34-37), harvest growth
+  and scoring fixes (38-39), paid gateway + Xvfb contention (40-41),
+  failure-category, circuit-breaker and challenge-detection fixes (42-46),
+  env-overridable toggles + gateway-fallback gaps + concurrent dispatch
+  (47-49), fingerprint crash + DLQ/orphan-job reliability (50-55),
+  unrouted capabilities as API/CLI (56), Botasaurus false-success,
+  autoscroll, `block_images`, extensions/locale/mouse/network capture
+  (57-60), CAPTCHA no-plan check + politeness slot retry (61),
+  gateway exit-IP rotation + measured ASN pin + branch-coverage ratchet
+  (62), bulk-crawl throughput — per-domain level memory, politeness
+  rewrite, stuck-job reaper, browser-permit deadlock, per-phase timing
+  (63), a remaining-issues sweep — gateway retry at every level,
+  `escalations`, cross-engine browser permits, crawl SSRF on redirects,
+  per-domain skip hints, 0-branch gate over 10 packages (64), host-wide
+  browser admission — seat + politeness slot claimed together,
+  pressure-sized, off by default (65), a proxy's 407 as its own
+  `proxy_auth_failed` category (terminal on the gateway, re-driven only
+  after a probe succeeds), a host-admission controller that only limits a
+  strained host (measured on free heavy targets, not paid Jumia runs),
+  `display_lock_wait_ms`, and Botasaurus drivers closing on release under
+  admission (66), parked browsers keeping their render's host seat under
+  admission and a measured per-browser memory weight (67).
+  Current design, topic-organized: `.claude/knowledge/architecture.md`.
+  Full chronological history, every bug, every root cause:
+  `.claude/knowledge/technical-debt.md`. WHY each call was made:
+  `.claude/knowledge/decisions.md`.
 
 ## Module Map
 
 All packages below live under `src/scraper_engine/` (e.g. `core/` means
 `src/scraper_engine/core/`imported as `scraper_engine.core`) — moved there
-from repo-root-level packages in src-layout consolidation.
+from repo-root-level packages in src-layout consolidation. This table is
+current-state only, no round citations — for how any of this got here,
+see `.claude/knowledge/architecture.md` (design) and
+`.claude/knowledge/technical-debt.md` (full round-by-round history).
 
 | Package | Responsibility |
 |---|---|
-| `core/` | Domain models, TenantId, SSRF guard, retry, budget, quota |
-| `proxy/` | Harvester (multi-source + broker subprocess), Manager, Scoring, Lease, `asn_classifier.py` (real MaxMind GeoLite2-ASN classification, env-gated on `GEOIP_ASN_DB_PATH`, round 22) |
-| `browser/` | CamoufoxWrapper (now takes `geoip`/`humanize`/`headless_mode`, round 25), session state. `pool.py::BrowserPool` (hot-browser `lease()`) is wired into L2/L3 as of round 25 — one pool per rq job (see `.claude/knowledge/architecture.md` → "Browser Pool"). `botasaurus_pool.py::BotasaurusPool` (round 26) — same one-per-rq-job shape, reuses one live Botasaurus driver across same-domain URLs |
-| `fetcher/` | Level1/2/3 fetchers, `factory.py` (DI, CI-gated), `_content_utils` (shared guard/poll/scroll), `challenge_detector`, `_failure`, `botasaurus_wrapper.py` (round 25 — real Botasaurus fetch attempt tried before the Camoufox pipeline in L2; capability-upgraded round 26, see `.claude/knowledge/architecture.md` → "Botasaurus Integration" / "Botasaurus Capability Upgrade") |
-| `orchestrator/` | Worker (escalation state machine), CircuitBreaker, PolitenessController, `job_queue.py` (rq producer), `tasks.py` (rq consumer entry point — persists results, dispatches webhook), WebhookDispatcher |
-| `api/` | FastAPI routes (wired: SSRF guard, tenant auth, per-tenant quota, DB persist, rq enqueue, composite health check). Middleware |
-| `storage/` | PostgresClient (BEGIN...COMMIT PgBouncer isolation), RedisClient, S3Client, DLQ |
+| `core/` | Domain models, TenantId, SSRF guard, retry, budget, quota. `periodic.py` — shared polling-loop helper (with optional Redis liveness heartbeat) reused by the webhook sweeper and DLQ reaper. `budget.py` — `XVFB_LOCK` (process-wide lock serializing headful-browser display spinup/teardown), `resolve_browser_max_total_instances()` (opt-in RAM-aware ceiling on live browser instances) and `acquire_browser_permit()` — the one way ANY engine takes a `BROWSER_SEMAPHORE` permit: reclaims parked instances via registered pools and counts waiters, so a pool hands a returning instance's permit over instead of parking it. `models.py` — `Proxy` (paid-gateway auth fields), `FetchResult` (`network_events` from Botasaurus CDP capture). `startup.py` — `wait_for_dependency()`, the unbounded-by-default dependency wait every process's startup uses instead of exiting when Postgres/Redis/S3 isn't up yet. `host_identity.py` — which physical host a process is on (`SCRAPER_HOST_ID`, else kernel `boot_id`). `browser_rss.py` — what this process's live browsers weigh |
+| `proxy/` | Harvester (multi-source + broker subprocess), Manager (leasing, TCP+HTTPS-CONNECT preflight, SQL-side candidate exclusion, exhaustion wakes the harvester), `net_probe.py` (shared probe primitives), Scoring, Lease, `asn_classifier.py` (reverse-DNS ASN classification), `health_monitor.py` (rolling re-validation + rescoring), `pool_health.py` (per-tier HEALTHY/DEGRADED/CRITICAL state machine), `dlq_reaper.py` (transient-DLQ auto-retry daemon), `paid_gateway.py` (toggleable DataImpulse gateway proxy; renders the provider's username grammar — per-attempt `sessid` rotation for a fresh exit IP, optional `asn` pin, `cr` country), `retention_reaper.py` |
+| `browser/` | `CamoufoxWrapper` (geoip/humanize/headless, geoip-launch fallback, holds `XVFB_LOCK`), `pool.py::BrowserPool` (hot-browser `lease()`, one per rq job), `botasaurus_pool.py::BotasaurusPool` (up to `max_pooled_drivers` drivers per job, reused per proxy-identity+domain, navigated for real, display lock around launch/close only; `block_images`, `extensions`, `lang`/locale/timezone spoof, human-mode mouse, network-event capture — all opt-in via `BotasaurusConfig`), `_xvfb_cleanup.py`, `_botasaurus_nav_check.py` (`chrome-error://` silent-failure detection), `_botasaurus_scroll.py` (autoscroll port for Botasaurus's sync Driver API), `_botasaurus_extension.py`, `_botasaurus_network_capture.py` |
+| `fetcher/` | Level1/2/3 fetchers, `factory.py` (DI, CI-gated), `_content_utils` (shared guard/poll/scroll), `challenge_detector` (incl. Chromium net-error structural check), `_failure`, `_captcha.py` (DOM detect→solve→inject→re-poll), `botasaurus_wrapper.py` (Botasaurus first-attempt, same feature set as `botasaurus_pool`), `level_2.py` (Botasaurus→Camoufox fallback; the real `FetchResult`-construction site for L2, including `network_events`), `scrapling_wrapper.py` (L1's third engine option), `adaptive_selector.py` (structured extraction, called from `Worker`) |
+| `orchestrator/` | `Worker` — escalation state machine: cache-reuse check, cooperative cancellation, DLQ transient/permanent split, two independent retry budgets (one same-level free-pool retry on proxy-attributable failure; a separate `rotate_on_block_retries` gateway budget that rotates the exit IP on a detected block), concurrent URL dispatch bounded by `politeness.max_concurrent_urls_per_job` (default 5, `asyncio.Semaphore`), per-URL `timings` breakdown, and a per-domain start level from `level_memory`. `CircuitBreaker`, `PolitenessController`, `job_queue.py` (rq producer), `tasks.py` (rq consumer — persists each result as it lands, webhook outbox, `network_events` column), `level_memory.py` (per-domain `DomainPlan`: where to start the ladder, whether to skip the free proxy pool, whether to skip Botasaurus at L2 — skip-only, with a periodic re-probe), `host_capacity.py` (host-wide browser admission: one Lua claim grants a browser seat, the website's politeness slot and its delay together per render; leases with their own expiry; off unless `HOST_CAPACITY_ENABLED`), `capacity_controller.py` (supervisord daemon sizing that budget from host CPU PSI / MemAvailable), `stuck_job_reaper.py` (reconciles PENDING/PROCESSING rows against rq — reachability is checked against rq's OWN registry keys and `rq:executions:{job_id}`, never hardcoded key names or bare-id `zscore`, which is what made it reap live jobs; `updated_at` is also touched per result so "stale" means "not progressing"), `WebhookDispatcher`, `webhook_events.py`/`webhook_dispatch.py`/`webhook_sweeper.py`/`slack_formatter.py` |
+| `api/` | FastAPI routes — SSRF guard (scrape targets and webhook URLs), tenant auth, per-tenant quota, DB persist, rq enqueue (fails loud on enqueue error, no orphaned PENDING rows), composite health check with per-daemon liveness, `Idempotency-Key` dedup, job cancellation, `GET /v1/jobs`/`/v1/quota`/`/v1/dlq`/`/v1/webhook-events`, Middleware |
+| `storage/` | `PostgresClient` (BEGIN...COMMIT PgBouncer isolation), `RedisClient`, `S3Client`, `DLQ` (UPSERT on `(job_id, url)`, `auto_retry_count`), `webhook_outbox.py` (transactional outbox) |
 | `config/` | Pydantic schema, YAML loader |
-| `cli/` | Entrypoint |
-| `observability/` | `bootstrap.py` (round 24 — single call wiring logging+tracing into every process), structured JSON logging (`logging.py`, stdlib-bridged via `ProcessorFormatter`), real distributed tracing (`tracing.py` — Jaeger + httpx/asyncpg/redis auto-instrumentation), Prometheus metrics |
-| `services/` | CAPTCHA solving — NoCaptchaAI primary + CapSolver fallback (`captcha_solver`, `nocaptcha`, `capsolver`, `_anticaptcha`). Wired into L2/L3 fetch path (round 20); key-health preflight `tools/validate_captcha_keys.py` (round 21). `scrapy_adapter.py` — bulk crawl (subprocess-isolated, round 22), `firecrawl_client.py` — markdown conversion wired into L1 (round 22, env-gated on `FIRECRAWL_API_KEY`), `botasaurus_requests_client.py` — JA3-TLS-fingerprint client wired into L1 (round 26, config-gated on `config.botasaurus.l1_ja3_client_enabled`, default off) |
+| `cli/` | Entrypoint. Ops subcommands (`serve`/`worker`/`harvest`/`reap`/`check`/`create-tenant`) talk directly to Postgres/Redis. Caller-facing `api` subcommand group (`scrape`/`jobs`/`job`/`quota`/`dlq`) wraps the real `/v1` HTTP API via `httpx` instead of touching storage directly. Inside the coverage gate since round 64 |
+| `observability/` | `bootstrap.py` (wires logging+tracing per process), structured JSON logging, distributed tracing (Jaeger + httpx/asyncpg/redis auto-instrumentation), Prometheus metrics |
+| `services/` | CAPTCHA solving — NoCaptchaAI primary + CapSolver fallback, key-health preflight tool. `scrapy_adapter.py` (subprocess-isolated bulk crawl), `firecrawl_client.py` + `markdown_fallback.py` (markdown conversion, applies at any escalation level), `botasaurus_requests_client.py` (JA3-TLS L1 client, opt-in), `extraction_engine_client.py` (optional schema-driven extraction, falls back to `AdaptiveSelector`) |
+| `scrapy_project/` | Settings + downloader middlewares/pipeline for `services/scrapy_adapter.py`'s subprocess-isolated bulk crawl (`POST /v1/crawl`): `SSRFMiddleware` (every request incl. each redirect hop), `ProxyMiddleware` (the proxy `orchestrator/tasks.py::_run_crawl_job` leased, passed in as `CRAWL_PROXY_URL`), `DedupPipeline`. The spider itself is defined inline in the adapter; items are collected after the pipelines via `item_scraped` |
 
 ## Navigation
 
@@ -59,6 +117,7 @@ from repo-root-level packages in src-layout consolidation.
 - **Standards:** `.claude/knowledge/standards.md`
 - **Troubleshooting:** `.claude/knowledge/troubleshooting.md`
 - **Operations:** `.claude/knowledge/operations.md`
+- **Technical debt & full round history:** `.claude/knowledge/technical-debt.md` (not force-loaded — open it when you need full story, not every session)
 - **Specification:** `.local/specs/scraper-engine-blueprint-v2.md` (authoritative, local-only — not tracked in git)
 - **CI:** `.github/workflows/test.yml` (lint incl. mypy-strict + grep-gates; unit/integration/chaos with real PgBouncer via docker compose, round 23; build-and-push to GHCR on merge to main, round 22) | mypy baseline retired (empty)
 
@@ -67,8 +126,9 @@ from repo-root-level packages in src-layout consolidation.
 ```bash
 source .venv/bin/activate
 pre-commit install  # one-time per clone
-docker compose up -d postgres redis pgbouncer minio && alembic upgrade head
-pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-fail-under=100   # 611 pass / 1 skip / 0 error / 100% (round 28)
+docker compose up -d postgres redis pgbouncer minio migrate   # migrate applies alembic upgrade head, then exits
+pytest tests/unit/ tests/integration/ tests/chaos/ --cov=src/scraper_engine --cov-report=json:coverage.json --cov-fail-under=100
+python tools/check_coverage_ratchet.py coverage.json   # the real gate: 0 missed lines + branch budget
 ruff check . --exclude 'tests/fixtures/challenge_mirror'
 ```
 

@@ -4,14 +4,27 @@ Tests Camoufox wrapper, pool, and session state with mocks.
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from scraper_engine.browser.pool import BrowserPool
 from scraper_engine.browser.session_state import SessionStateManager
+from scraper_engine.core import budget
 from scraper_engine.core.models import Proxy, ProxyProtocol
 from scraper_engine.core.tenant import TenantId
+
+
+def _camoufox_installed() -> bool:
+    """Same "run local, skip CI" gate as tests/chaos/test_safe_content_guard.py —
+    True only if the Camoufox browser binary is actually fetched."""
+    try:
+        from camoufox.pkgman import installed_verstr
+
+        return bool(installed_verstr())
+    except Exception:
+        return False
 
 
 class TestAcquireDoubleIssue:
@@ -30,7 +43,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         # First acquire — should get the fake context
         ctx1 = await pool.acquire()
@@ -63,7 +76,7 @@ class TestAcquireDoubleIssue:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
@@ -106,20 +119,29 @@ class TestBrowserPool:
         assert pool._prewarm_count == 5
         assert pool._max_idle_seconds == 600
 
-    @pytest.mark.skip(
-        reason=(
-            "CamoufoxWrapper requires real Firefox process (~80MB) + geoip check "
-            "— runs on host, not CI"
-        )
+    @pytest.mark.skipif(
+        not _camoufox_installed(),
+        reason="Camoufox browser binary not installed (run `camoufox fetch`); skipped in CI",
     )
     async def test_pool_acquire_when_empty_creates_new(self, tenant, proxy):
-        """Pool without warm instances creates a new wrapper on acquire."""
+        """Pool without warm instances creates a new wrapper on acquire.
+
+        geoip=False: camoufox's geoip resolution dials out through the
+        configured proxy at launch time to resolve a public IP — the
+        fixture proxy (1.2.3.4:8080) is intentionally fake/non-routable,
+        and this test isn't exercising geoip behavior, so disable it here
+        rather than depend on a real working proxy just to launch."""
         from scraper_engine.browser.pool import BrowserPool
 
-        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
-        wrapper = await pool.acquire(proxy=proxy)
-        assert isinstance(wrapper, object)
-        assert wrapper.proxy == proxy
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, geoip=False)
+        try:
+            ctx = await pool.acquire(proxy=proxy)
+            assert ctx is not None
+            # acquire() returns the live BrowserContext, not the wrapper
+            # that created it — the wrapper stays tracked internally.
+            assert pool._active_wrappers[-1].proxy == proxy
+        finally:
+            await pool.shutdown()
 
     async def test_release_healthy_returns_to_pool(self, tenant):
         from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
@@ -152,7 +174,7 @@ class TestBrowserPool:
         fake_wrapper._last_domain = None
         fake_wrapper.proxy = None
         fake_wrapper.__aexit__ = AsyncMock()
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         with patch.object(pool, "_active_wrappers", [fake_wrapper]):
             ctx = await pool.acquire(domain="example.com")
@@ -172,7 +194,7 @@ class TestBrowserPool:
         fake_wrapper._last_domain = "other.example"
         fake_wrapper.proxy = None
         fake_wrapper.__aexit__ = AsyncMock()
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         with (
             patch.object(pool, "_active_wrappers", [fake_wrapper]),
@@ -187,6 +209,61 @@ class TestBrowserPool:
         assert ctx is fresh_ctx  # built fresh rather than reusing the mismatch
         fake_wrapper.__aexit__.assert_not_awaited()  # NOT destroyed
         assert pool._pool.qsize() == 1  # mismatched wrapper stayed pooled
+
+    async def test_start_skips_failed_prewarm_slot_and_continues(self, tenant):
+        """Round 51 — audited 33 real historical full-job crashes, all with
+        the same "0 results for any URL" signature: BrowserPool.start()'s
+        prewarm loop used to let ANY single instance's launch failure (not
+        just the WebGL data-gap camoufox_wrapper.py's own fallback already
+        handles) propagate straight out of start(), aborting the whole job
+        before any URL was attempted. Prewarming is documented as "purely a
+        latency optimization" (class docstring) — acquire() already
+        launches fresh on-demand when the pool is empty, so one slot's
+        failure must be skipped, not fatal."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            good_ctx_1, good_ctx_2 = object(), object()
+            good_1 = MagicMock()
+            good_1.__aenter__ = AsyncMock(return_value=good_ctx_1)
+            failing = MagicMock()
+            failing.__aenter__ = AsyncMock(side_effect=RuntimeError("launch boom"))
+            good_2 = MagicMock()
+            good_2.__aenter__ = AsyncMock(return_value=good_ctx_2)
+            mock_cw.side_effect = [good_1, failing, good_2]
+
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=3)
+            await pool.start()  # must not raise
+
+        assert pool._started is True
+        assert len(pool._active_wrappers) == 2
+        assert pool._pool.qsize() == 2
+
+    async def test_start_survives_every_prewarm_slot_failing(self, tenant):
+        """Degrades all the way to zero hot instances rather than crashing
+        the job — acquire() building fresh on-demand is the documented
+        fallback for exactly this case."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            failing = MagicMock()
+            failing.__aenter__ = AsyncMock(side_effect=RuntimeError("launch boom"))
+            mock_cw.return_value = failing
+
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=2)
+            await pool.start()  # must not raise
+
+        assert pool._started is True
+        assert pool._active_wrappers == []
+        assert pool._pool.qsize() == 0
+
+    async def test_start_still_raises_on_prewarm_count_misconfiguration(self, tenant):
+        """The prewarm_count > max_total_instances check is a real
+        misconfiguration, not a per-instance launch failure — must still
+        raise, and must raise before attempting any launch (nothing to
+        clean up)."""
+        with patch("scraper_engine.browser.pool.CamoufoxWrapper") as mock_cw:
+            pool = BrowserPool(tenant_id=tenant, prewarm_count=5, max_total_instances=2)
+            with pytest.raises(ValueError, match="exceeds"):
+                await pool.start()
+
+        mock_cw.assert_not_called()
 
 
 class TestSessionIsolation:
@@ -368,7 +445,7 @@ class TestSessionIsolation:
         fake_ctx = object()
         fake_wrapper = MagicMock()
         fake_wrapper._last_domain = None
-        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time()))
+        await pool._pool.put((fake_ctx, fake_wrapper, asyncio.get_event_loop().time(), None))
 
         ctx1 = await pool.acquire()
         assert ctx1 is fake_ctx
@@ -386,6 +463,324 @@ class TestSessionIsolation:
             mock_cw.side_effect = make_mock
             ctx2 = await pool.acquire()
             assert ctx2 is not fake_ctx
+
+
+class TestCamoufoxWrapperGeoipFallback:
+    """Round 37 — CamoufoxWrapper._launch_with_geoip_fallback: a proxy that
+    passes lease-time preflight can still fail Camoufox's own internal
+    geoip IP-lookup (camoufox/ip.py::public_ip, 6 third-party services
+    tried internally) — live-caught. AsyncCamoufox is mocked directly at
+    its import source (camoufox.async_api.AsyncCamoufox) — no existing
+    test in this file exercises the real launch path with a controllable
+    mock, so these are new coverage, not a rewrite of existing tests."""
+
+    @pytest.mark.asyncio
+    async def test_launch_succeeds_without_fallback(self, tenant):
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        camoufox_ctor.assert_called_once()
+        assert camoufox_ctor.call_args.kwargs["geoip"] is True
+        # Round 46 — real fingerprint presets + host-OS-matched os=, per
+        # Camoufox's own docs (see config/schema.py::CamoufoxConfig).
+        assert camoufox_ctor.call_args.kwargs["fingerprint_preset"] is True
+        assert camoufox_ctor.call_args.kwargs["os"] == "linux"
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_without_geoip_on_invalid_ip(self, tenant, caplog):
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["geoip"] is True
+        assert camoufox_ctor.call_args_list[1].kwargs["geoip"] is False
+        for call in camoufox_ctor.call_args_list:
+            assert call.kwargs["fingerprint_preset"] is True
+            assert call.kwargs["os"] == "linux"
+
+    @pytest.mark.asyncio
+    async def test_launch_reraises_invalid_ip_when_geoip_already_disabled(self, tenant):
+        """Defensive: geoip=False means Camoufox never calls its own
+        internal IP-lookup, so InvalidIP shouldn't fire in practice — but
+        if it somehow does, there's no further fallback available."""
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, geoip=False)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(InvalidIP),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_other_exception_propagates_without_fallback(self, tenant):
+        """A non-InvalidIP launch failure (e.g. a genuinely dead proxy) must
+        not trigger the geoip fallback — only the specific geoip-lookup
+        failure mode should retry."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(RuntimeError),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_without_fingerprint_preset_on_webgl_data_gap(
+        self, tenant, caplog
+    ):
+        """Round 49 — live-caught: fingerprint_preset=True samples a real
+        captured fingerprint whose (vendor, renderer) isn't covered by
+        camoufox's separate webgl_data.db lookup table
+        (camoufox/webgl/sample.py::sample_webgl, verified against the
+        actual installed package source) — a genuine gap between camoufox's
+        two internal datasets, not something our config controls. Before
+        this, it crashed the ENTIRE job (BrowserPool.start()'s prewarm loop
+        runs outside process_job's per-URL try/except)."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError(
+                'No WebGL data found for vendor "Intel Open Source Technology Center" '
+                'and renderer "Intel(R) HD Graphics 400, or similar"'
+            )
+        )
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["fingerprint_preset"] is True
+        # Round 51 — must be None, not False: verified against the actual
+        # installed camoufox/utils.py::launch_options, whose preset branch
+        # is guarded by `is not None`, not truthiness. False satisfies
+        # `is not None` exactly like True and draws another real preset
+        # from the same pool — a no-op against this exact crash. Only None
+        # reaches the true BrowserForge synthetic path.
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
+        for call in camoufox_ctor.call_args_list:
+            assert call.kwargs["geoip"] is True
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_even_when_fingerprint_preset_starts_disabled(self, tenant):
+        """Round 51 — a caller-supplied fingerprint_preset=False is exactly
+        as exposed to the webgl_data.db gap as True (camoufox's `is not
+        None` check treats them identically), so the retry guard must not
+        use fingerprint_preset's own value as the "already tried" marker —
+        it must still get one real fallback attempt (to None) here."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        succeeding_instance = MagicMock()
+        succeeding_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[failing_instance, succeeding_instance])
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, fingerprint_preset=False)
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[0].kwargs["fingerprint_preset"] is False
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
+
+    @pytest.mark.asyncio
+    async def test_launch_reraises_webgl_error_when_fallback_already_spent(self, tenant):
+        """Defensive: once the fingerprint fallback has actually been used
+        (fingerprint_preset=None) and the same gap fires again, there's no
+        further fallback — must re-raise, not loop forever."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant, fingerprint_preset=False)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(ValueError, match="No WebGL data found"),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        assert camoufox_ctor.call_count == 2
+        assert camoufox_ctor.call_args_list[1].kwargs["fingerprint_preset"] is None
+
+    @pytest.mark.asyncio
+    async def test_launch_unrelated_value_error_propagates_without_fallback(self, tenant):
+        """A ValueError that isn't the WebGL-data-gap shape must not
+        trigger the fallback — proves the message-match is scoped, not a
+        blanket "retry on any ValueError" that would mask unrelated bugs."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        failing_instance = MagicMock()
+        failing_instance.__aenter__ = AsyncMock(side_effect=ValueError("some unrelated error"))
+        camoufox_ctor = MagicMock(return_value=failing_instance)
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor),
+            pytest.raises(ValueError, match="some unrelated error"),
+        ):
+            await wrapper._launch_with_geoip_fallback()
+
+        camoufox_ctor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_across_both_invalid_ip_and_webgl_gap(self, tenant):
+        """Both fallbacks can stack in one launch — InvalidIP on the first
+        attempt, then a WebGL data-gap on the retry, succeeding on the
+        third attempt with both geoip and fingerprint_preset disabled."""
+        from camoufox.exceptions import InvalidIP
+
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        first = MagicMock()
+        first.__aenter__ = AsyncMock(side_effect=InvalidIP("boom"))
+        second = MagicMock()
+        second.__aenter__ = AsyncMock(
+            side_effect=ValueError('No WebGL data found for vendor "X" and renderer "Y"')
+        )
+        third = MagicMock()
+        third.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(side_effect=[first, second, third])
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            result = await wrapper._launch_with_geoip_fallback()
+
+        assert result is fake_context
+        assert camoufox_ctor.call_count == 3
+        assert camoufox_ctor.call_args_list[2].kwargs["geoip"] is False
+        assert camoufox_ctor.call_args_list[2].kwargs["fingerprint_preset"] is None
+
+    @pytest.mark.asyncio
+    async def test_launch_includes_credentials_when_proxy_has_them(self, tenant):
+        """Round 40 — a paid-gateway Proxy (proxy/paid_gateway.py) carries
+        username/password; the launch's proxy dict must forward them
+        alongside server, since Camoufox/Playwright's proxy= option natively
+        accepts username/password but nothing set them before round 40."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(
+                id=-1,
+                ip="gw.dataimpulse.com",
+                port=823,
+                protocol=ProxyProtocol.HTTP,
+                username="user123",
+                password="pass456",
+                source="paid_gateway",
+            ),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            await wrapper._launch_with_geoip_fallback()
+
+        proxy_config = camoufox_ctor.call_args.kwargs["proxy"]
+        assert proxy_config == {
+            "server": "http://gw.dataimpulse.com:823",
+            "username": "user123",
+            "password": "pass456",
+        }
+
+    @pytest.mark.asyncio
+    async def test_launch_omits_credentials_for_free_pool_proxy(self, tenant):
+        """Regression guard: a plain free-pool Proxy (no username/password)
+        must not gain those keys — the dict stays exactly {"server": ...}."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+
+        fake_context = MagicMock()
+        camoufox_instance = MagicMock()
+        camoufox_instance.__aenter__ = AsyncMock(return_value=fake_context)
+        camoufox_ctor = MagicMock(return_value=camoufox_instance)
+
+        wrapper = CamoufoxWrapper(
+            proxy=Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP),
+            tenant_id=tenant,
+        )
+        with patch("camoufox.async_api.AsyncCamoufox", camoufox_ctor):
+            await wrapper._launch_with_geoip_fallback()
+
+        proxy_config = camoufox_ctor.call_args.kwargs["proxy"]
+        assert proxy_config == {"server": "http://1.2.3.4:8080"}
+
+    @pytest.mark.asyncio
+    async def test_aenter_releases_semaphore_when_launch_fails(self, tenant):
+        """__aenter__'s existing except-release-reraise contract must still
+        hold when the failure comes from inside _launch_with_geoip_fallback
+        (not just a bare AsyncCamoufox() call as before the extraction)."""
+        from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
+        from scraper_engine.core import budget
+
+        wrapper = CamoufoxWrapper(proxy=None, tenant_id=tenant)
+        wrapper._launch_with_geoip_fallback = AsyncMock(side_effect=RuntimeError("boom"))
+
+        before = budget.BROWSER_SEMAPHORE._value
+        with pytest.raises(RuntimeError):
+            await wrapper.__aenter__()
+        assert budget.BROWSER_SEMAPHORE._value == before
 
 
 class TestSessionState:
@@ -456,3 +851,522 @@ class TestSessionState:
             assert state["cookies"][0]["name"] == "sid"
 
         asyncio.run(run())
+
+
+class _FakeWrapper:
+    """Stands in for CamoufoxWrapper with the one property that matters here:
+    it holds a real BROWSER_SEMAPHORE permit from __aenter__ to __aexit__."""
+
+    instances: list["_FakeWrapper"] = []
+
+    def __init__(self, proxy=None, **_kwargs):
+        self.proxy = proxy
+        self._context = None
+        self._isolated_ctx = None
+        self._last_domain = None
+        self.closed = False
+        _FakeWrapper.instances.append(self)
+
+    async def __aenter__(self):
+        from scraper_engine.core import budget
+
+        await budget.acquire_browser_permit()
+        self._context = object()
+        self._isolated_ctx = object()
+        return self._isolated_ctx
+
+    async def __aexit__(self, *_exc):
+        from scraper_engine.core import budget
+
+        self.closed = True
+        budget.BROWSER_SEMAPHORE.release()
+
+
+class TestParkedSparesNeverStarveALaunch:
+    """Round 63 — a pooled spare must not be able to starve a new launch.
+
+    release(healthy=True) returns a context to the queue but does NOT release
+    BROWSER_SEMAPHORE, so an idle spare goes on holding its permit. acquire()
+    keeps a non-matching spare pooled and launches a fresh instance instead,
+    so once every permit is held by idle spares the next launch blocks on the
+    semaphore forever — nothing is running, so nothing will ever release it.
+    Round 62 made this ordinary: the paid gateway presents a fresh sessid per
+    attempt, so `proxy` differs on nearly every attempt and the mismatch
+    branch is taken nearly every time.
+
+    The deadlock has two orderings and both are covered: spares already
+    parked when the launch arrives (evict them), and spares parked while the
+    launch is already waiting (release() must hand the permit on instead of
+    parking). A first fix covered only the former, keyed on the pool's own
+    instance count; live, a 10-URL job still finished 9 of 10 and then hung
+    with 8 idle instances parked behind the 10th URL's launch.
+    """
+
+    @pytest.fixture
+    def one_permit(self, monkeypatch):
+        from scraper_engine.browser import pool as pool_mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        monkeypatch.setattr(budget, "_reclaimers", [])
+        monkeypatch.setattr(pool_mod, "CamoufoxWrapper", _FakeWrapper)
+        _FakeWrapper.instances = []
+        return sem
+
+    @staticmethod
+    def _proxy(port):
+        return Proxy(id=port, ip="10.0.0.1", port=port, protocol=ProxyProtocol.HTTP)
+
+    async def test_a_spare_parked_while_a_launch_waits_is_handed_over(self, tenant, one_permit):
+        """The live deadlock: the waiter arrived while every instance was
+        leased, then a sibling finished and returned its instance healthy."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx_a = await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(pool.acquire(proxy=self._proxy(2)))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        await pool.release(ctx_a, healthy=True)
+        ctx_b = await asyncio.wait_for(waiter, timeout=1)
+
+        assert ctx_b is not ctx_a
+        assert _FakeWrapper.instances[0].closed
+        assert pool._pool.qsize() == 0
+        assert budget.permit_waiters() == 0
+
+    async def test_a_spare_already_parked_is_evicted_for_a_launch(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx_a = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx_a, healthy=True)
+        assert pool._pool.qsize() == 1
+
+        await asyncio.wait_for(pool.acquire(proxy=self._proxy(2)), timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert [w.proxy.port for w in pool._active_wrappers] == [2]
+
+    async def test_another_engine_reclaims_a_parked_spare(self, tenant, one_permit):
+        """Round 64 — Botasaurus takes permits too. A Botasaurus fetch waiting
+        behind a parked Camoufox spare must get it reclaimed, or the round-63
+        deadlock returns across engines."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        await asyncio.wait_for(budget.acquire_browser_permit(), timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert pool._active_wrappers == []
+
+    async def test_another_engine_waiting_gets_a_returning_instance_handed_over(
+        self, tenant, one_permit
+    ):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(budget.acquire_browser_permit())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert budget.permit_waiters() == 1
+
+        await pool.release(ctx, healthy=True)
+        await asyncio.wait_for(waiter, timeout=1)
+
+        assert _FakeWrapper.instances[0].closed
+        assert pool._pool.qsize() == 0
+
+    async def test_a_shut_down_pool_is_no_longer_asked_to_reclaim(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        assert len(budget._reclaimers) == 1
+        await pool.shutdown()
+        assert budget._reclaimers == []
+
+    async def test_release_closes_instead_of_parking_when_parking_is_off(self, tenant, one_permit):
+        """Round 65 — under host admission a parked spare would run outside
+        any host seat, and a rotated gateway identity means none is reused."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, park_spares=False)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+        assert pool._active_wrappers == []
+
+    async def test_release_parks_when_nobody_is_waiting(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        assert pool._pool.qsize() == 1
+        assert not _FakeWrapper.instances[0].closed
+
+    async def test_no_eviction_while_a_permit_is_free(self, tenant, monkeypatch):
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(budget, "_reclaimers", [])
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        spare = _FakeWrapper()
+        await spare.__aenter__()
+        pool._active_wrappers = [spare]
+        await pool._pool.put((spare._isolated_ctx, spare, time.monotonic(), None))
+
+        await budget.acquire_browser_permit()
+
+        assert not spare.closed
+        assert pool._pool.qsize() == 1
+
+    async def test_no_eviction_when_every_instance_is_genuinely_leased_out(
+        self, tenant, one_permit
+    ):
+        """An empty pool with no free permit is real contention — the caller
+        must wait, not tear down a browser someone else is mid-fetch with."""
+        from scraper_engine.core import budget
+
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.acquire(proxy=self._proxy(1))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budget.acquire_browser_permit(), timeout=0.1)
+        assert not _FakeWrapper.instances[0].closed
+        assert one_permit.locked()
+
+    async def test_oldest_spare_goes_first(self, tenant, monkeypatch):
+        from scraper_engine.core import budget
+
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(budget, "_reclaimers", [])
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        old, new = _FakeWrapper(), _FakeWrapper()
+        for w in (old, new):
+            await w.__aenter__()
+            pool._active_wrappers.append(w)
+            await pool._pool.put((w._isolated_ctx, w, time.monotonic(), None))
+
+        await asyncio.wait_for(budget.acquire_browser_permit(), timeout=1)
+
+        assert old.closed and not new.closed
+        assert pool._active_wrappers == [new]
+
+    async def test_a_failing_teardown_does_not_loop_forever(self, tenant, one_permit):
+        """Eviction exists to unblock a launch; a spare whose teardown raises
+        (and so never frees its permit) must be dropped, and the loop must
+        stop once the pool is empty rather than spin."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await one_permit.acquire()
+        spare = MagicMock()
+        spare._context = "ctx-1"
+        spare._isolated_ctx = None
+        spare.__aexit__ = AsyncMock(side_effect=RuntimeError("browser already gone"))
+        pool._active_wrappers = [spare]
+        await pool._pool.put(("ctx-1", spare, time.monotonic(), None))
+
+        from scraper_engine.core import budget
+
+        # The spare is dropped even though its teardown never frees the
+        # permit; with nothing left to evict the caller then waits (bounded
+        # here by the timeout) instead of spinning.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(budget.acquire_browser_permit(), timeout=0.1)
+
+        assert pool._active_wrappers == []
+        assert pool._pool.qsize() == 0
+
+    async def test_a_cancelled_launch_is_not_counted_as_a_live_browser(self, tenant, one_permit):
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        await pool.acquire(proxy=self._proxy(1))
+        waiter = asyncio.create_task(pool.acquire(proxy=self._proxy(2)))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert [w.proxy.port for w in pool._active_wrappers] == [1]
+        from scraper_engine.core import budget
+
+        assert budget.permit_waiters() == 0
+
+    async def test_a_cancelled_lease_frees_its_permit(self, tenant, one_permit):
+        """`except Exception` in lease() let CancelledError skip both the
+        teardown and the park branch, leaking the instance and its permit."""
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0)
+        with pytest.raises(asyncio.CancelledError):
+            async with pool.lease(proxy=self._proxy(1)):
+                raise asyncio.CancelledError
+        assert _FakeWrapper.instances[0].closed
+        assert not one_permit.locked()
+        assert pool._active_wrappers == []
+
+
+class TestCancelledLaunchReleasesPermit:
+    """Round 63 — CamoufoxWrapper.__aenter__ caught only Exception, so a
+    launch cancelled mid-flight kept its BROWSER_SEMAPHORE permit forever,
+    and a browser whose new_context() failed was left running unowned."""
+
+    async def test_cancelled_launch_releases_the_permit(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("cancel"))
+        monkeypatch.setattr(
+            wrapper,
+            "_launch_with_geoip_fallback",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await wrapper.__aenter__()
+        assert not sem.locked()
+
+    async def test_failed_new_context_closes_the_launched_browser(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(budget, "BROWSER_SEMAPHORE", sem)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("ctxfail"))
+        browser = MagicMock()
+        browser.__aexit__ = AsyncMock(return_value=None)
+        context = MagicMock()
+        context.new_context = AsyncMock(side_effect=RuntimeError("context refused"))
+
+        async def _launch():
+            wrapper._browser = browser
+            return context
+
+        monkeypatch.setattr(wrapper, "_launch_with_geoip_fallback", _launch)
+        with pytest.raises(RuntimeError, match="context refused"):
+            await wrapper.__aenter__()
+        browser.__aexit__.assert_awaited_once()
+        assert not sem.locked()
+
+
+class TestBoundedBrowserTeardown:
+    """Round 63 — no XVFB_LOCK critical section may block forever.
+
+    XVFB_LOCK is process-wide and both the launch and the teardown hold it,
+    and `budget.BROWSER_SEMAPHORE.release()` runs only AFTER the teardown's
+    lock block. So one wedged Camoufox (dead CDP pipe, an Xvfb that will not
+    exit) froze every browser operation in the worker permanently AND leaked
+    every permit. Live-caught twice on a 10-URL Jumia job: 8 live browsers,
+    an idle event loop, zero log output, the job stalled mid-run until RQ's
+    job timeout killed the work-horse.
+
+    A timeout can leak a browser process. That is the better failure: a
+    leaked browser costs memory on one worker until it recycles, an
+    unbounded wait costs every remaining URL of every job it would run.
+    """
+
+    @staticmethod
+    def _wedged_wrapper(monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+
+        monkeypatch.setattr(mod, "_BROWSER_TEARDOWN_TIMEOUT_SECONDS", 0.05)
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("teardown"))
+        hung = MagicMock()
+
+        async def _never_returns(*_a, **_k):
+            await asyncio.sleep(3600)
+
+        hung.__aexit__ = _never_returns
+        wrapper._browser = hung
+        return wrapper
+
+    async def test_a_hung_teardown_releases_the_browser_permit(self, monkeypatch):
+        from scraper_engine.core import budget
+
+        wrapper = self._wedged_wrapper(monkeypatch)
+        await budget.BROWSER_SEMAPHORE.acquire()
+        before = budget.BROWSER_SEMAPHORE._value
+
+        await wrapper.__aexit__()
+
+        assert budget.BROWSER_SEMAPHORE._value == before + 1
+
+    async def test_a_hung_teardown_does_not_keep_xvfb_lock(self, monkeypatch):
+        """The load-bearing property: the NEXT browser operation must be able
+        to proceed. Holding XVFB_LOCK is what turned one stuck browser into a
+        dead worker."""
+        from scraper_engine.core import budget
+
+        wrapper = self._wedged_wrapper(monkeypatch)
+
+        await wrapper.__aexit__()
+
+        assert not budget.XVFB_LOCK.locked()
+
+    async def test_a_normal_teardown_is_unchanged(self, monkeypatch):
+        from scraper_engine.browser import camoufox_wrapper as mod
+        from scraper_engine.core import budget
+
+        wrapper = mod.CamoufoxWrapper(proxy=None, tenant_id=TenantId("teardown"))
+        browser = MagicMock()
+        browser.__aexit__ = AsyncMock(return_value=None)
+        wrapper._browser = browser
+        await budget.BROWSER_SEMAPHORE.acquire()
+        before = budget.BROWSER_SEMAPHORE._value
+
+        await wrapper.__aexit__()
+
+        browser.__aexit__.assert_awaited_once()
+        assert wrapper._browser is None
+        assert budget.BROWSER_SEMAPHORE._value == before + 1
+        assert not budget.XVFB_LOCK.locked()
+
+
+class _FakeKeeper:
+    """Stands in for orchestrator/host_capacity.py::SeatKeeper — hands out one
+    seat id per render and records what comes back."""
+
+    def __init__(self, seats=("seat-1", "seat-2", "seat-3")):
+        self._seats = list(seats)
+        self.released: list[str] = []
+        self.reclaimers: list[object] = []
+
+    def register_reclaimer(self, reclaim):
+        self.reclaimers.append(reclaim)
+
+    def retain(self):
+        return self._seats.pop(0) if self._seats else None
+
+    async def discard(self, seat):
+        self.released.append(seat)
+
+
+@pytest.mark.asyncio
+class TestParkedBrowsersKeepTheirHostSeat:
+    """Round 67 — under host admission a parked browser keeps the seat of the
+    render that launched it, so the host budget still counts it. Rounds 65-66
+    closed every browser on release instead, which cost a cold browser per
+    render (light pages, measured: a render's median 24.1s -> 28.4s)."""
+
+    @pytest.fixture
+    def permits(self, monkeypatch):
+        from scraper_engine.browser import pool as pool_mod
+        from scraper_engine.core import budget as budget_mod
+
+        monkeypatch.setattr(budget_mod, "BROWSER_SEMAPHORE", asyncio.Semaphore(4))
+        monkeypatch.setattr(budget_mod, "_reclaimers", [])
+        monkeypatch.setattr(pool_mod, "CamoufoxWrapper", _FakeWrapper)
+        _FakeWrapper.instances = []
+
+    @staticmethod
+    def _proxy(port):
+        return Proxy(id=port, ip="10.0.0.1", port=port, protocol=ProxyProtocol.HTTP)
+
+    async def test_the_pool_offers_the_keeper_a_browser_to_reclaim(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        assert keeper.reclaimers == [pool._close_parked]
+
+    async def test_a_parked_browser_carries_its_seat(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1), domain="a.example")
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 1
+        assert pool._pool.get_nowait()[3] == "seat-1"
+        assert keeper.released == []
+
+    async def test_a_paid_gateway_browser_is_closed_not_parked(self, tenant, permits):
+        """Every gateway attempt gets a fresh sessid, so nothing can ask for
+        this browser again: parking it would only hold a seat and RAM."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        gateway = Proxy(
+            id=-1,
+            ip="gw.example",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="u__sessid.1",
+            password="p",
+            source="paid_gateway",
+        )
+        ctx = await pool.acquire(proxy=gateway)
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+        # No seat was retained for it.
+        assert keeper._seats == ["seat-1", "seat-2", "seat-3"]
+
+    async def test_a_browser_with_no_seat_to_keep_is_closed(self, tenant, permits):
+        """One seat is one browser: a render whose seat already keeps another
+        instance alive cannot park a second one."""
+        keeper = _FakeKeeper(seats=())
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+
+        await pool.release(ctx, healthy=True)
+
+        assert pool._pool.qsize() == 0
+        assert _FakeWrapper.instances[0].closed
+
+    async def test_reusing_a_parked_browser_hands_its_seat_back(self, tenant, permits):
+        """The render that reuses it holds a seat of its own — keeping both
+        would count one browser twice."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        proxy = self._proxy(1)
+        ctx = await pool.acquire(proxy=proxy, domain="a.example")
+        await pool.release(ctx, healthy=True)
+
+        again = await pool.acquire(proxy=proxy, domain="a.example")
+
+        assert again is ctx
+        assert keeper.released == ["seat-1"]
+
+    async def test_a_browser_torn_down_on_its_idle_timeout_gives_its_seat_back(
+        self, tenant, permits
+    ):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(
+            tenant_id=tenant, prewarm_count=0, max_idle_seconds=0, seat_keeper=keeper
+        )
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+        await asyncio.sleep(0.01)
+
+        await pool.acquire(proxy=self._proxy(2))
+
+        assert keeper.released == ["seat-1"]
+
+    async def test_a_reclaimed_browser_gives_its_seat_back(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        assert await pool._close_parked() is True
+        assert keeper.released == ["seat-1"]
+        # Nothing parked any more.
+        assert await pool._close_parked() is False
+
+    async def test_the_keeper_can_reclaim_the_browser_holding_a_given_seat(self, tenant, permits):
+        """A lapsed seat must close the browser that held it, not whichever
+        parked browser happens to be oldest — the others stay parked."""
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        first = await pool.acquire(proxy=self._proxy(1))
+        second = await pool.acquire(proxy=self._proxy(2))
+        await pool.release(first, healthy=True)
+        await pool.release(second, healthy=True)
+
+        assert await pool._close_parked("seat-missing") is False
+        assert pool._pool.qsize() == 2
+        assert await pool._close_parked("seat-2") is True
+
+        assert keeper.released == ["seat-2"]
+        assert [w.closed for w in _FakeWrapper.instances] == [False, True]
+        assert pool._pool.qsize() == 1
+        assert pool._pool.get_nowait()[3] == "seat-1"
+
+    async def test_job_end_gives_every_seat_back(self, tenant, permits):
+        keeper = _FakeKeeper()
+        pool = BrowserPool(tenant_id=tenant, prewarm_count=0, seat_keeper=keeper)
+        ctx = await pool.acquire(proxy=self._proxy(1))
+        await pool.release(ctx, healthy=True)
+
+        await pool.shutdown()
+
+        assert keeper.released == ["seat-1"]

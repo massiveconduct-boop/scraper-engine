@@ -7,7 +7,11 @@ Closes F-14/F-13/F-12: all resource acquisitions bounded by explicit ceilings.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import time
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,6 +29,167 @@ BROWSER_SEMAPHORE = asyncio.Semaphore(8)
 
 # Bounds outstanding CAPTCHA long-poll tasks, preventing FD exhaustion (F-13)
 CAPSOLVER_CONCURRENCY = asyncio.Semaphore(10)
+
+# Serializes both the spinup AND the teardown of any headfull browser that
+# uses a virtual X display (Botasaurus's Chromium via
+# enable_xvfb_virtual_display=True, Camoufox's Firefox via headless_mode=
+# "virtual"). Round 41: even with launches serialized (this lock's first
+# cut), the crash still reproduced live — worker-l3 logs showed a browser's
+# CDP/websocket connection die mid-navigation ("Connection to remote host
+# was lost. - goodbye"), and 0.17s later a fresh Xvfb launch (round 37's
+# same-level retry-with-fresh-proxy, orchestrator/worker.py::
+# _fetch_with_proxy, firing immediately on a BROWSER_CRASH-category
+# failure) collided with the crashed browser's own display, still not torn
+# down: "_XSERVTransSocketUNIXCreateListener ... SocketCreateListener()
+# failed ... server already running". Xvfb's own -displayfd flag (used by
+# both engines, confirmed live in this environment) claims a display number
+# atomically at launch — that alone doesn't stop a *later* launch from
+# colliding with an *earlier* instance whose close is still in flight
+# (browser.__aexit__ tearing down Xvfb takes real wall-clock time, and a
+# retry racing right behind a crash doesn't wait for it). Holding this lock
+# across close too means a new launch can never start while a previous
+# instance's Xvfb is still being torn down. Scoped narrowly (the
+# spinup/teardown calls themselves, not full fetch bodies where avoidable)
+# so BROWSER_SEMAPHORE's real fetch concurrency stays mostly unaffected;
+# Botasaurus's one-shot @browser-decorator path (fetcher/botasaurus_wrapper.py)
+# bundles launch+navigate+close with no seam to split, so it holds this for
+# its whole call instead — an accepted throughput trade for correctness.
+XVFB_LOCK = asyncio.Lock()
+
+# Round 66 — how long the current URL spent WAITING for XVFB_LOCK. Every
+# launch and close is serialized behind it per process, so under concurrency a
+# render can hold a browser seat (and a politeness slot) while doing nothing
+# but queueing for the display. Round 65 saw 8 seats in use with 3 live
+# browsers on short renders and had no number to explain it; this is that
+# number. Per task: orchestrator/worker.py starts one meter per URL (each URL
+# runs in its own asyncio task, which copies the context), so concurrent URLs
+# never add to each other's total.
+_display_wait: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar(
+    "display_wait", default=None
+)
+
+
+def start_display_wait_meter() -> list[float]:
+    """Start metering XVFB_LOCK waits for the current task. Returns the
+    accumulator (seconds, in element 0) that xvfb_lock() adds to."""
+    meter = [0.0]
+    _display_wait.set(meter)
+    return meter
+
+
+@contextlib.asynccontextmanager
+async def xvfb_lock() -> AsyncIterator[None]:
+    """Hold XVFB_LOCK, charging the time spent waiting for it to the current
+    task's meter, if one is running. The only way code should take the lock."""
+    start = time.monotonic()
+    async with XVFB_LOCK:
+        meter = _display_wait.get()
+        if meter is not None:
+            meter[0] += time.monotonic() - start
+        yield
+
+# Round 64 — one way to take a BROWSER_SEMAPHORE permit, for every engine.
+#
+# A pooled browser that is PARKED (idle, kept warm for reuse) still holds its
+# permit. Round 63 found that this deadlocks a launch that needs a permit
+# while every permit sits on an idle spare, and fixed it inside
+# browser/pool.py::BrowserPool (evict parked spares on arrival, hand a
+# returning instance's permit to a waiting launch). That fix only knew about
+# BrowserPool's OWN launches. Once a second engine (Botasaurus) takes permits
+# too, a Botasaurus fetch waiting behind parked Camoufox spares would hang in
+# exactly the same way, because nothing on its path could evict them.
+#
+# So the protocol lives here instead: every permit is taken through
+# acquire_browser_permit(), which (1) asks registered reclaimers — pools that
+# can close a parked instance — to free permits while none is free, and
+# (2) counts itself as a waiter while blocked, so a pool that is about to
+# park an instance can see someone is waiting (permit_waiters()) and close it
+# instead. Reclaimers are held by weak reference: a pool that is dropped
+# without shutdown() must not be kept alive, or called, by this module.
+_permit_waiters = 0
+_reclaimers: list[weakref.WeakMethod[Callable[[], Awaitable[bool]]]] = []
+
+
+def register_permit_reclaimer(reclaim: Callable[[], Awaitable[bool]]) -> None:
+    """Register a bound async method that closes one parked instance and
+    returns True, or returns False when it has none to close."""
+    _reclaimers.append(weakref.WeakMethod(reclaim))
+
+
+def unregister_permit_reclaimer(reclaim: Callable[[], Awaitable[bool]]) -> None:
+    _reclaimers[:] = [r for r in _reclaimers if r() is not None and r() != reclaim]
+
+
+def permit_waiters() -> int:
+    """How many callers are blocked in acquire_browser_permit() right now."""
+    return _permit_waiters
+
+
+async def acquire_browser_permit() -> None:
+    """Take one BROWSER_SEMAPHORE permit, reclaiming parked instances first.
+
+    Returns once a permit is held. The caller releases it with
+    `BROWSER_SEMAPHORE.release()`, exactly as before. With every permit held
+    by an instance that is genuinely mid-fetch, this waits — that is real
+    contention the ceiling exists to absorb.
+    """
+    global _permit_waiters
+    while BROWSER_SEMAPHORE.locked():
+        _reclaimers[:] = [r for r in _reclaimers if r() is not None]
+        for ref in list(_reclaimers):
+            reclaim = ref()
+            if reclaim is not None and await reclaim():
+                break
+        else:
+            break
+    _permit_waiters += 1
+    try:
+        await BROWSER_SEMAPHORE.acquire()
+    finally:
+        _permit_waiters -= 1
+
+
+def resolve_browser_max_total_instances(
+    configured_max: int,
+    *,
+    enabled: bool,
+    average_ram_per_instance_gb: float,
+) -> int:
+    """Round 59 — RAM-aware ceiling for BROWSER_SEMAPHORE, answering a real
+    constraint observed on this project's own dev host (swap sitting at
+    7.5/8GB used with near-zero free margin).
+
+    Returns `configured_max` unchanged when `enabled` is False (the
+    default) — zero botasaurus/psutil dependency on that path. When
+    enabled, delegates to botasaurus's own `calc_max_parallel_browsers()`
+    (reads `psutil.virtual_memory().available`), passing `configured_max`
+    as its own `max` param — this can only REDUCE the ceiling below the
+    static config value when the host is genuinely short on RAM right now,
+    never raise it above, so enabling this can't regress an
+    already-tuned deployment.
+
+    `average_ram_per_instance_gb` should reflect the heavier of the two
+    engines sharing BROWSER_SEMAPHORE (Botasaurus's headful Chromium via
+    Xvfb, not Camoufox's lighter headless Firefox) — see
+    config/schema.py::CamoufoxConfig.ram_aware_avg_instance_gb's comment
+    for the measured value this project calibrates against.
+
+    Called once at process startup by configure_budget()'s caller
+    (orchestrator/tasks.py) — same "resize once, before any fetch begins"
+    contract configure_budget() itself already documents; this does not
+    re-evaluate RAM mid-process.
+    """
+    if not enabled:
+        return configured_max
+    from botasaurus.calc_max_parallel_browsers import calc_max_parallel_browsers
+
+    return int(
+        calc_max_parallel_browsers(
+            average_ram_per_instance=average_ram_per_instance_gb,
+            min=1,
+            max=configured_max,
+        )
+    )
 
 
 def configure_budget(

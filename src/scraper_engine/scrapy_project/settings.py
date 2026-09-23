@@ -3,8 +3,8 @@
 
 BOT_NAME = "scraper_engine"
 
-SPIDER_MODULES = ["scraper_engine.scrapy_project.spiders"]
-NEWSPIDER_MODULE = "scraper_engine.scrapy_project.spiders"
+# No SPIDER_MODULES: services/scrapy_adapter.py defines its spider inline
+# (round 64 removed the never-loaded spiders/generic_spider.py).
 
 ROBOTSTXT_OBEY = False
 
@@ -29,15 +29,23 @@ RETRY_HTTP_CODES = [500, 502, 503, 504, 522, 524, 408, 429]
 DOWNLOAD_TIMEOUT = 30
 
 # Middlewares — lower number = higher priority (closer to engine)
+# SSRFMiddleware first so a blocked hop is never proxied or fetched (round
+# 64 — invariant #4 on every redirect). TenantMiddleware was removed: it
+# copied a `tenant_id` the inline spider never has.
 DOWNLOADER_MIDDLEWARES: dict[str, int] = {
-    "scraper_engine.scrapy_project.middlewares.tenant_middleware.TenantMiddleware": 100,
+    "scraper_engine.scrapy_project.middlewares.ssrf_middleware.SSRFMiddleware": 50,
     "scraper_engine.scrapy_project.middlewares.proxy_middleware.ProxyMiddleware": 200,
 }
 
+# Leased by orchestrator/tasks.py::_run_crawl_job and set per crawl by
+# services/scrapy_adapter.py; None only when no proxy could be leased at all.
+CRAWL_PROXY_URL: str | None = None
+
 # Pipelines — lower number = higher priority
+# StoragePipeline was removed (round 64): it only bumped a counter;
+# persistence is orchestrator/tasks.py's job once items cross back.
 ITEM_PIPELINES: dict[str, int] = {
     "scraper_engine.scrapy_project.pipelines.dedup_pipeline.DedupPipeline": 100,
-    "scraper_engine.scrapy_project.pipelines.storage_pipeline.StoragePipeline": 200,
 }
 
 # Logging

@@ -2,7 +2,7 @@
 """Proxy scoring engine tests — spec §3.3."""
 
 from scraper_engine.core.models import AnonymityLevel, AsnClass
-from scraper_engine.proxy.scoring import ScoringEngine
+from scraper_engine.proxy.scoring import ScoringEngine, compute_success_rate
 
 
 class TestScoringEngine:
@@ -90,3 +90,61 @@ class TestScoringEngine:
     def test_average_latency_returns_none_when_no_data(self) -> None:
         engine = ScoringEngine()
         assert engine.average_latency("1.1.1.1", 9999) is None
+
+    def test_first_time_elite_residential_fast_proxy_clears_l2_and_l3(self) -> None:
+        """Regression test (round 32): before this fix, success_rate
+        defaulting to 50.0 and weighted at 45% meant even a theoretically
+        perfect first-time proxy topped out around 56/100 — below L2's 70
+        and L3's 90, making it mathematically impossible for ANY proxy to
+        ever clear those tiers regardless of real quality. success_rate=None
+        (no real track record yet) must redistribute that weight instead."""
+        engine = ScoringEngine()
+        perfect = engine.compute_score(
+            latency_ms=0,
+            success_rate=None,
+            anonymity=AnonymityLevel.ELITE,
+            asn=AsnClass.RESIDENTIAL,
+            last_validated_seconds_ago=0,
+        )
+        assert perfect.total >= 90.0
+
+    def test_first_time_transparent_unknown_proxy_stays_below_l2(self) -> None:
+        """The realistic free-proxy case (transparent anonymity, unknown ASN
+        — this session's live pool was 100% this combination) must still
+        score meaningfully below L2's 70 threshold on first validation alone
+        — the fix makes L2 reachable for genuinely good proxies, not
+        universally easier to reach."""
+        engine = ScoringEngine()
+        realistic = engine.compute_score(
+            latency_ms=200,
+            success_rate=None,
+            anonymity=AnonymityLevel.TRANSPARENT,
+            asn=AsnClass.UNKNOWN,
+            last_validated_seconds_ago=0,
+        )
+        assert realistic.total < 70.0
+
+    def test_real_success_rate_can_push_proven_proxy_past_l2(self) -> None:
+        """Once real usage history exists (success_rate is a measured
+        value, not None), a proxy that keeps succeeding should be able to
+        climb into L2 territory even without elite anonymity — the
+        "proven over time" half of the lifecycle."""
+        engine = ScoringEngine()
+        proven = engine.compute_score(
+            latency_ms=200,
+            success_rate=95.0,
+            anonymity=AnonymityLevel.TRANSPARENT,
+            asn=AsnClass.UNKNOWN,
+            last_validated_seconds_ago=0,
+        )
+        assert proven.total >= 70.0
+
+
+class TestComputeSuccessRate:
+    def test_none_at_zero_attempts(self) -> None:
+        assert compute_success_rate(0, 0) is None
+
+    def test_correct_percentage(self) -> None:
+        assert compute_success_rate(3, 1) == 75.0
+        assert compute_success_rate(0, 5) == 0.0
+        assert compute_success_rate(5, 0) == 100.0

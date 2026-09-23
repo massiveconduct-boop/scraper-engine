@@ -14,6 +14,9 @@ import redis.asyncio as aioredis
 if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
 
+_SOCKET_TIMEOUT_SECONDS = 5.0
+_HEALTH_CHECK_INTERVAL_SECONDS = 30
+
 
 class RedisClient:
     """Tenant-scoped Redis client with automatic key prefixing."""
@@ -23,8 +26,23 @@ class RedisClient:
         self._client: aioredis.Redis | None = None
 
     async def start(self) -> None:
-        """Connect to Redis."""
-        self._client = aioredis.from_url(self._redis_url, encoding="utf-8", decode_responses=True)
+        """Connect to Redis.
+
+        Round 65 — bounded socket timeouts. Without them a Redis that stops
+        answering (paused, partitioned, blackholed — anything short of a
+        refused connection) blocks every call forever: slot waits never time
+        out and slot heartbeats silently stall. Nothing in this codebase uses
+        a blocking Redis command (BLPOP, XREAD BLOCK, pub/sub), so a 5s read
+        timeout cannot cut off a legitimate long call.
+        """
+        self._client = aioredis.from_url(
+            self._redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=_SOCKET_TIMEOUT_SECONDS,
+            health_check_interval=_HEALTH_CHECK_INTERVAL_SECONDS,
+        )
 
     @property
     def raw(self) -> aioredis.Redis:

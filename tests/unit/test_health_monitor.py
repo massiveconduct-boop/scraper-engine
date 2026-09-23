@@ -6,15 +6,30 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from scraper_engine.core.models import AnonymityLevel, AsnClass
 from scraper_engine.proxy.health_monitor import HealthMonitor
 
 
 @pytest.fixture
 def pg():
     pg = AsyncMock()
-    pg.fetch.return_value = [{"ip": "1.2.3.4", "port": 8080}]
+    pg.fetch.return_value = [
+        {
+            "ip": "1.2.3.4",
+            "port": 8080,
+            "protocol": "HTTP",
+            "global_success_count": 0,
+            "global_failure_count": 0,
+        }
+    ]
     pg.execute.return_value = "DELETE 0"
-    pg.fetchrow.return_value = {"n": 1}
+
+    async def default_fetchrow(_tenant, query, *_params):
+        if "RETURNING global_success_count" in query:
+            return {"global_success_count": 0, "global_failure_count": 0}
+        return {"n": 1}
+
+    pg.fetchrow.side_effect = default_fetchrow
     return pg
 
 
@@ -33,25 +48,148 @@ class TestHealthMonitor:
     @pytest.mark.asyncio
     async def test_check_all_validates(self, pg, redis):
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=True):
+        with patch.object(
+            hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+        ):
             result = await hm.check_all()
             assert result["validated"] == 1
             assert result["downgraded"] == 0
 
     @pytest.mark.asyncio
+    async def test_check_all_rescoring_uses_fresh_reading(self, pg, redis):
+        """Round 38: a passing validation must UPDATE anonymity_level/
+        asn_class/response_time_ms/reliability_score from the fresh
+        check_one() reading, not just bump last_validated."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            await hm.check_all()
+        update_call = next(
+            c for c in pg.fetchrow.await_args_list if "SET anonymity_level" in c.args[1]
+        )
+        assert update_call.args[2] == AnonymityLevel.ELITE.value
+        assert update_call.args[3] == AsnClass.RESIDENTIAL.value
+        assert update_call.args[4] == 40
+        score_call = next(
+            c
+            for c in pg.execute.await_args_list
+            if "SET reliability_score" in c.args[1]
+        )
+        assert isinstance(score_call.args[2], float)
+
+    @pytest.mark.asyncio
+    async def test_check_all_rescores_from_fresh_counts_not_stale_batch_snapshot(
+        self, pg, redis
+    ):
+        """Round 39: the `rows` snapshot fetched once at the top of check_all
+        can go stale during the per-proxy validate+classify I/O — real
+        mark_success/mark_failure traffic can move global_success_count/
+        global_failure_count in that window. Confirmed live: proxies with
+        double-digit real failure counts still carried scores that only
+        matched compute_score()'s zero-track-record branch, because the
+        write used the stale snapshot instead of the row's current state.
+        Scoring must re-read counts fresh right before the write."""
+        pg.fetch.return_value = [
+            {
+                "ip": "1.2.3.4",
+                "port": 8080,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,  # stale: batch snapshot has no track record
+            }
+        ]
+
+        async def fetchrow_with_real_failures(_tenant, query, *_params):
+            if "RETURNING global_success_count" in query:
+                return {"global_success_count": 0, "global_failure_count": 17}
+            return {"n": 1}
+
+        pg.fetchrow.side_effect = fetchrow_with_real_failures
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            await hm.check_all()
+        score_call = next(
+            c
+            for c in pg.execute.await_args_list
+            if "SET reliability_score" in c.args[1]
+        )
+        # success_rate=0/17 must cap the score well below the ~97 the stale
+        # zero-track-record snapshot would have produced.
+        assert score_call.args[2] < 60
+
+    @pytest.mark.asyncio
+    async def test_check_all_skips_row_deleted_before_rescore_write(self, pg, redis):
+        """A proxy can be deleted (e.g. the end-of-cycle `reliability_score <= 0`
+        sweep from a concurrent cycle, or a DLQ/pruning path) between the batch
+        `rows` read and this row's RETURNING write landing — the UPDATE...
+        RETURNING then matches nothing. Must skip cleanly, not crash on a
+        None `fresh` row."""
+
+        async def fetchrow_returns_none_for_returning(_tenant, query, *_params):
+            if "RETURNING global_success_count" in query:
+                return None
+            return {"n": 1}
+
+        pg.fetchrow.side_effect = fetchrow_returns_none_for_returning
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(True, AnonymityLevel.ELITE, AsnClass.RESIDENTIAL, 40),
+        ):
+            result = await hm.check_all()
+        assert result["validated"] == 0
+        assert not any(
+            "SET reliability_score" in c.args[1] for c in pg.execute.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_check_all_downgrades(self, pg, redis):
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=False):
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(False, AnonymityLevel.TRANSPARENT, AsnClass.UNKNOWN, None),
+        ):
             result = await hm.check_all()
             assert result["validated"] == 0
             assert result["downgraded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_check_all_downgrade_refreshes_last_validated(self, pg, redis):
+        """Regression: a failed check must still bump last_validated, or the
+        rolling ORDER BY last_validated ASC LIMIT 100 coverage design gets
+        stuck re-picking the same failing rows forever, starving the rest
+        of the pool of ever being re-checked. Confirmed live: 61% of a real
+        pool went over an hour untouched despite the cycle running every
+        5-8 minutes, because failures never advanced their timestamp."""
+        hm = HealthMonitor(pg=pg, redis=redis)
+        with patch.object(
+            hm,
+            "check_one",
+            return_value=(False, AnonymityLevel.TRANSPARENT, AsnClass.UNKNOWN, None),
+        ):
+            await hm.check_all()
+        downgrade_call = next(
+            c for c in pg.execute.await_args_list if "reliability_score - 20.0" in c.args[1]
+        )
+        assert "last_validated = NOW()" in downgrade_call.args[1]
 
     @pytest.mark.asyncio
     async def test_check_all_writes_pool_size_metric(self, pg, redis):
         """api/health.py reads metrics:proxy_pool_size for GET /health's
         proxy_pool_size — this was previously never written anywhere."""
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch.object(hm, "check_one", return_value=True):
+        with patch.object(
+            hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+        ):
             await hm.check_all()
         redis.set.assert_awaited_once()
         args, kwargs = redis.set.await_args
@@ -59,19 +197,80 @@ class TestHealthMonitor:
         assert args[2] == "1"
 
     @pytest.mark.asyncio
-    async def test_check_one_returns_bool(self, pg, redis):
-        hm = HealthMonitor(pg=pg, redis=redis)
-        with patch("httpx.AsyncClient.get") as mock_get:
-            mock_get.return_value.status_code = 200
-            result = await hm.check_one("1.2.3.4", 8080)
-            assert result is True
+    async def test_check_one_delegates_to_http_validate(self, pg, redis):
+        """check_one now delegates to ProxyHarvester._http_validate (round
+        38) instead of a hand-rolled duplicate JUDGE_URLS loop, so both
+        modules share one validation + accurate-latency implementation."""
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(True, AnonymityLevel.ELITE, 42)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis)
+            is_valid, anonymity, asn, latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert is_valid is True
+        assert anonymity == AnonymityLevel.ELITE
+        assert asn == AsnClass.UNKNOWN  # NullAsnClassifier default when none injected
+        assert latency_ms == 42
 
     @pytest.mark.asyncio
-    async def test_check_one_failure(self, pg, redis):
+    async def test_check_one_failure_returns_none_latency(self, pg, redis):
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(False, AnonymityLevel.TRANSPARENT, None)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis)
+            is_valid, anonymity, asn, latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert is_valid is False
+        assert anonymity == AnonymityLevel.TRANSPARENT
+        assert asn == AsnClass.UNKNOWN
+        assert latency_ms is None
+
+    @pytest.mark.asyncio
+    async def test_check_all_bounds_concurrency(self, pg, redis):
+        """Round 38 regression: check_all must not validate all rows fully
+        sequentially or fully unbounded — must respect HEALTH_CHECK_CONCURRENCY.
+        Confirmed live: sequential validation (judge round-trip + a DNS
+        classify() call per row) turned a 100-row cycle into 15-25+ minutes
+        against a configured 300s interval before this fix."""
+        from scraper_engine.proxy.health_monitor import HEALTH_CHECK_CONCURRENCY
+
+        pg.fetch.return_value = [
+            {
+                "ip": f"1.2.3.{i}",
+                "port": 8080,
+                "protocol": "HTTP",
+                "global_success_count": 0,
+                "global_failure_count": 0,
+            }
+            for i in range(20)
+        ]
         hm = HealthMonitor(pg=pg, redis=redis)
-        with patch("httpx.AsyncClient.get", side_effect=OSError("refused")):
-            result = await hm.check_one("1.2.3.4", 8080)
-            assert result is False
+        in_flight = {"current": 0, "max": 0}
+
+        async def slow_check_one(ip, port, protocol="HTTP"):
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+            await asyncio.sleep(0.01)
+            in_flight["current"] -= 1
+            return True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50
+
+        with patch.object(hm, "check_one", slow_check_one):
+            await hm.check_all()
+        assert in_flight["max"] <= HEALTH_CHECK_CONCURRENCY
+        assert in_flight["max"] > 1, "test is meaningless if nothing ran concurrently"
+
+    @pytest.mark.asyncio
+    async def test_check_one_uses_injected_classifier(self, pg, redis):
+        classifier = AsyncMock()
+        classifier.classify.return_value = "residential"
+        with patch(
+            "scraper_engine.proxy.health_monitor.ProxyHarvester._http_validate",
+            AsyncMock(return_value=(True, AnonymityLevel.ELITE, 42)),
+        ):
+            hm = HealthMonitor(pg=pg, redis=redis, asn_classifier=classifier)
+            _is_valid, _anonymity, asn, _latency_ms = await hm.check_one("1.2.3.4", 8080, "HTTP")
+        assert asn == AsnClass.RESIDENTIAL
+        classifier.classify.assert_awaited_once_with("1.2.3.4")
 
     @pytest.mark.asyncio
     async def test_run_forever_logs_and_loops(self, pg, redis, monkeypatch):
@@ -82,7 +281,9 @@ class TestHealthMonitor:
 
         monkeypatch.setattr("scraper_engine.proxy.health_monitor.asyncio.sleep", fake_sleep)
         with (
-            patch.object(hm, "check_one", return_value=True),
+            patch.object(
+                hm, "check_one", return_value=(True, AnonymityLevel.ELITE, AsnClass.UNKNOWN, 50)
+            ),
             pytest.raises(asyncio.CancelledError),
         ):
             await hm.run_forever(interval_seconds=1)

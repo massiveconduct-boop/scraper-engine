@@ -14,42 +14,66 @@ applies the exact same proxy+domain matching discipline BrowserPool already
 uses for Camoufox, just for a botasaurus Driver instead of a Playwright
 context.
 
-First fetch for a (proxy, domain) pair in this job: no match, construct a
-fresh Driver directly (bypassing the @browser decorator entirely, so
-botasaurus's own pool is never touched), navigate via
-`driver.google_get(url, bypass_cloudflare=True)`, and keep the live Driver.
-Second+ fetch for the *same* (proxy, domain): reuse it via
-`driver.requests.get(url)` — verified (botasaurus_driver/requests.py) to run
-the fetch as an in-page `fetch()` call through the browser's own JS context,
-so it inherits that tab's live cookies/session/TLS fingerprint natively, no
-separate cookie-jar plumbing needed — skipping a full browser relaunch
-entirely. A proxy or domain mismatch closes the old driver and starts fresh,
-same as BrowserPool.
+First fetch for a (proxy identity, domain) pair in this job: no match,
+construct a fresh Driver directly (bypassing the @browser decorator
+entirely, so botasaurus's own pool is never touched) and navigate it. A later
+fetch for the same pair reuses that live driver and navigates it again,
+skipping the relaunch and the Xvfb display cycle.
 
-Only one driver is held at a time (this pool optimizes the common "N pages,
-one domain" crawl-job shape, not concurrent multi-domain fetches within a
-single job) — a mismatch simply replaces it rather than growing unbounded.
+Round 64 — up to `botasaurus.max_pooled_drivers` drivers per job (was
+exactly one behind one lock, which serialized a job's concurrent URLs at
+L2). Two more corrections in the same pass:
+- `budget.XVFB_LOCK` is held only around launching and closing a driver —
+  the display lifecycle it exists for — not across navigation. It used to
+  wrap launch AND navigate AND scroll, and since the paid gateway presents a
+  new session per attempt (so reuse never matches and every fetch
+  relaunches), one L2 fetch blocked every other browser launch and teardown
+  in the worker for its full 40-130s.
+- A fetch now holds a `BROWSER_SEMAPHORE` permit while it runs, taken via
+  `budget.acquire_browser_permit()` like every other engine. This pool never
+  took one, so its Chrome was invisible to the browser ceiling and to the
+  RAM-aware cap. A PARKED driver deliberately holds no permit — a parked
+  permit-holder is exactly the round-63 deadlock.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from typing import TYPE_CHECKING, Any
+
+from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
+from scraper_engine.core import budget
 
 if TYPE_CHECKING:
     from scraper_engine.config.schema import BotasaurusConfig
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.orchestrator.host_capacity import SeatKeeper
 
 
 class _PooledDriver:
-    __slots__ = ("driver", "proxy_key", "domain")
+    __slots__ = ("driver", "proxy_key", "domain", "busy", "last_used", "events_sink", "seat")
 
-    def __init__(self, driver: Any, proxy_key: str, domain: str) -> None:
-        self.driver = driver
+    def __init__(self, proxy_key: str, domain: str) -> None:
+        # Round 67 — the host seat this driver holds while parked, or None
+        # (admission off, or the driver is checked out and its render's own
+        # claim is what covers it).
+        self.seat: str | None = None
+        # None until launched: an entry is reserved (busy) before its driver
+        # exists, so the pool's size cap counts launches in flight too.
+        self.driver: Any = None
         self.proxy_key = proxy_key
         self.domain = domain
+        self.busy = True
+        self.last_used = time.monotonic()
+        # Round 60 finding, kept per driver now that several can run at once:
+        # CDP network hooks are registered once at launch and stay live for
+        # the driver's pooled lifetime, but every fetch() brings its own sink.
+        # The hook reads this attribute at event time, so each fetch's events
+        # land in that fetch's own list.
+        self.events_sink: list[dict[str, object]] | None = None
 
 
 class BotasaurusPool:
@@ -61,15 +85,31 @@ class BotasaurusPool:
         self,
         tenant_id: TenantId,
         config: BotasaurusConfig,
+        park_drivers: bool = True,
+        seat_keeper: SeatKeeper | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._config = config
-        self._entry: _PooledDriver | None = None
-        # Serializes access to the single held driver — Level2Fetcher fetches
-        # are already gated one-at-a-time overall by core.budget.BROWSER_
-        # SEMAPHORE, but this lock keeps this pool's own reuse/evict decision
-        # atomic regardless of that external ceiling.
-        self._lock = asyncio.Lock()
+        # Round 67 — a parked driver keeps the seat of the render that
+        # launched it, so the host budget still counts it (see
+        # orchestrator/host_capacity.py::SeatKeeper). Without a keeper
+        # (admission off) every seat here is None.
+        self._seat_keeper = seat_keeper
+        if seat_keeper is not None:
+            seat_keeper.register_reclaimer(self._close_parked)
+        # Round 66 — False under host admission (orchestrator/host_capacity.py):
+        # a parked driver holds no host seat, so it is load the host budget
+        # cannot see. Live, free pool, 97 URLs with admission on: 8 seats in
+        # use, 20 live browsers. With a fresh proxy per attempt a parked
+        # driver's proxy almost never matches again, so it was not saving a
+        # relaunch either. Same fix round 65 made to BrowserPool (park_spares).
+        self._park_drivers = park_drivers
+        self._max_drivers = max(1, config.max_pooled_drivers)
+        self._entries: list[_PooledDriver] = []
+        # Guards _entries and every entry's `busy` flag; notified whenever an
+        # entry is freed or dropped, which is what a fetch waiting for a
+        # slot under the cap wakes on.
+        self._cond = asyncio.Condition()
 
     async def fetch(
         self,
@@ -77,77 +117,262 @@ class BotasaurusPool:
         proxy: Proxy,
         domain: str,
         session_id: str | None,
+        scroll_passes: int = 0,
+        scroll_wait_ms: int = 1500,
+        events_sink: list[dict[str, object]] | None = None,
     ) -> str:
-        """Fetch `url`, reusing the pooled driver when it already belongs to
-        this exact (proxy, domain) pair, else (re)launching one."""
+        """Fetch `url` with a driver belonging to this exact (proxy identity,
+        domain) pair — an idle pooled one if there is one, else a fresh launch.
+
+        Round 63 — reuse navigates for real (it used to be an in-page
+        `driver.requests.get`, no JS), and is keyed on `Proxy.identity_key()`
+        so a rotated paid-gateway session relaunches instead of silently
+        keeping a blocked exit IP. Round 64 — see the module docstring.
+
+        Any failure closes that driver rather than returning it to the pool:
+        a driver whose navigation failed is not one to hand the next URL.
+        """
         loop = asyncio.get_running_loop()
-        async with self._lock:
-            entry = self._entry
-            if entry is not None and entry.proxy_key == proxy.key() and entry.domain == domain:
-                return await loop.run_in_executor(None, self._reuse_fetch, entry.driver, url)
-
-            if entry is not None:
-                await loop.run_in_executor(None, self._close_driver, entry.driver)
-                self._entry = None
-
-            driver, html = await loop.run_in_executor(
-                None, self._new_driver_fetch, url, proxy, session_id
-            )
-            self._entry = _PooledDriver(driver, proxy.key(), domain)
+        entry = await self._checkout(proxy.identity_key(), domain)
+        entry.events_sink = events_sink
+        try:
+            await budget.acquire_browser_permit()
+            try:
+                if entry.driver is None:
+                    async with budget.xvfb_lock():
+                        entry.driver = await loop.run_in_executor(
+                            None, self._launch_driver, entry, proxy, session_id
+                        )
+                html = await loop.run_in_executor(
+                    None, self._navigate, entry.driver, url, scroll_passes, scroll_wait_ms
+                )
+                # Round 67 — a paid-gateway session is single-use, so its
+                # driver is closed, not parked (Proxy.reusable).
+                parked_idle = (
+                    self._park_drivers
+                    and proxy.reusable()
+                    and await loop.run_in_executor(None, self._park, entry.driver)
+                )
+                if parked_idle and self._seat_keeper is not None:
+                    # Round 67 — park it only if it can keep this render's
+                    # seat: a driver the host budget cannot see is what round
+                    # 66 closed on release.
+                    entry.seat = self._seat_keeper.retain()
+                    parked_idle = entry.seat is not None
+            finally:
+                budget.BROWSER_SEMAPHORE.release()
+        except BaseException:
+            await self._discard(entry)
+            raise
+        if not parked_idle:
+            await self._discard(entry)
             return html
+        await self._checkin(entry)
+        return html
 
-    def _new_driver_fetch(self, url: str, proxy: Proxy, session_id: str | None) -> tuple[Any, str]:
-        """Synchronous — constructs and navigates a fresh Driver, run in the
-        executor same as BotasaurusWrapper._botasaurus_fetch (Selenium-style
-        driver management has no native asyncio API to await on)."""
+    async def _checkout(self, proxy_key: str, domain: str) -> _PooledDriver:
+        """Reserve an entry: an idle match, else a new slot under the cap,
+        else the oldest idle entry's slot (closing it), else wait."""
+        evicted: _PooledDriver | None = None
+        reused: _PooledDriver | None = None
+        async with self._cond:
+            while True:
+                for e in self._entries:
+                    if not e.busy and e.proxy_key == proxy_key and e.domain == domain:
+                        e.busy = True
+                        reused = e
+                        break
+                if reused is not None:
+                    break
+                entry = _PooledDriver(proxy_key, domain)
+                if len(self._entries) < self._max_drivers:
+                    self._entries.append(entry)
+                    return entry
+                idle = [e for e in self._entries if not e.busy]
+                if idle:
+                    evicted = min(idle, key=lambda e: e.last_used)
+                    self._entries.remove(evicted)
+                    self._entries.append(entry)
+                    break
+                await self._cond.wait()
+        if reused is not None:
+            # This fetch launches nothing — its own claim covers the driver it
+            # just took over, so the seat that kept it parked goes back to the
+            # host (round 67).
+            seat, reused.seat = reused.seat, None
+            await self._release_seat(seat)
+            return reused
+        await self._close_entry(evicted)
+        return entry
+
+    async def _checkin(self, entry: _PooledDriver) -> None:
+        async with self._cond:
+            entry.busy = False
+            entry.last_used = time.monotonic()
+            self._cond.notify_all()
+
+    async def _discard(self, entry: _PooledDriver) -> None:
+        await self._close_entry(entry)
+        async with self._cond:
+            if entry in self._entries:
+                self._entries.remove(entry)
+            self._cond.notify_all()
+
+    async def _close_parked(self, seat: str | None = None) -> bool:
+        """Close the parked driver holding `seat`, or the longest-idle one for
+        None, freeing the host seat it holds. False when there is no such
+        driver — for None, every entry is mid-fetch, which is real contention.
+        Registered with the SeatKeeper (round 67)."""
+        async with self._cond:
+            idle = [e for e in self._entries if not e.busy]
+            if seat is not None:
+                idle = [e for e in idle if e.seat == seat]
+            if not idle:
+                return False
+            entry = min(idle, key=lambda e: e.last_used)
+            self._entries.remove(entry)
+            self._cond.notify_all()
+        await self._close_entry(entry)
+        return True
+
+    async def _release_seat(self, seat: str | None) -> None:
+        """Hand a parked driver's host seat back. No-op with admission off."""
+        if seat is not None and self._seat_keeper is not None:
+            await self._seat_keeper.discard(seat)
+
+    async def _close_entry(self, entry: _PooledDriver | None) -> None:
+        """Close a driver under XVFB_LOCK (round 41: a teardown must never
+        overlap a launch's display spinup). No-op for an unlaunched entry."""
+        if entry is None:
+            return
+        seat, entry.seat = entry.seat, None
+        await self._release_seat(seat)
+        if entry.driver is None:
+            return
+        driver, entry.driver = entry.driver, None
+        loop = asyncio.get_running_loop()
+        async with budget.xvfb_lock():
+            await loop.run_in_executor(None, self._close_driver, driver)
+
+    def _launch_driver(self, entry: _PooledDriver, proxy: Proxy, session_id: str | None) -> Any:
+        """Synchronous — constructs and prepares a fresh Driver, run in the
+        executor under XVFB_LOCK (Selenium-style driver management has no
+        native asyncio API to await on). Navigation is `_navigate`'s job, run
+        after the lock is released (round 64)."""
         from botasaurus.browser import Driver
         from botasaurus.user_agent import UserAgent
         from botasaurus.window_size import WindowSize
+
+        from scraper_engine.browser._botasaurus_extension import LocalExtension
+        from scraper_engine.browser._botasaurus_network_capture import register_network_capture
 
         cfg = self._config
         kwargs: dict[str, object] = {
             "headless": False,
             "enable_xvfb_virtual_display": True,
-            "proxy": proxy.url(),
+            "proxy": proxy.auth_url(),
             "profile": session_id,
             # tiny_profile requires a profile (verified live — botasaurus_driver's
             # Config raises ValueError("Profile must be given when using tiny
             # profile") otherwise) — see fetcher/botasaurus_wrapper.py's same gate.
             "tiny_profile": cfg.tiny_profile and session_id is not None,
             "remove_default_browser_check_argument": cfg.remove_default_browser_check_argument,
+            "block_images": cfg.block_images,
+            "block_images_and_css": cfg.block_images_and_css,
         }
+        if cfg.extensions:
+            kwargs["extensions"] = [LocalExtension(p) for p in cfg.extensions]
+        if cfg.lang:
+            kwargs["lang"] = cfg.lang
         if cfg.hashed_fingerprint and session_id is not None:
             kwargs["user_agent"] = UserAgent.HASHED
             kwargs["window_size"] = WindowSize.HASHED
         driver = Driver(**kwargs)
         try:
-            if cfg.bypass_cloudflare:
-                driver.google_get(url, bypass_cloudflare=True)
-            else:
-                driver.get(url)
-            if cfg.random_sleep_enabled:
-                driver.short_random_sleep()
-            return driver, str(driver.page_html)
-        except Exception:
+            # Round 60 finding: these three calls were originally outside this
+            # try block. Any of them raising (e.g. enable_human_mode()'s
+            # lazy botasaurus_humancursor import failing, or a CDP command
+            # throwing — schema.py's own docstring already documents a live-
+            # confirmed CDP bug on a different domain in this installed
+            # version) would leak the just-launched driver/Xvfb display with
+            # no _close_driver() call, reintroducing the display-contention
+            # precondition round 41's XVFB_LOCK was built to close. Moved
+            # inside so any failure here is caught by the except below.
+            if cfg.capture_network_events:
+                register_network_capture(driver, lambda: entry.events_sink)
+            if cfg.humanize_mouse:
+                driver.enable_human_mode()
+            if cfg.locale or cfg.timezone:
+                # Must be applied before navigation — driver.py:2148-2150's own
+                # docstring: "call this before navigating".
+                driver.set_locale_and_timezone(
+                    locale=cfg.locale or None, timezone_id=cfg.timezone or None
+                )
+            return driver
+        except BaseException:
             self._close_driver(driver)
             raise
 
-    def _reuse_fetch(self, driver: Any, url: str) -> str:
-        """Synchronous — reuses the live driver's in-page fetch client."""
-        response = driver.requests.get(url)
-        if self._config.random_sleep_enabled:
+    def _navigate(
+        self, driver: Any, url: str, scroll_passes: int = 0, scroll_wait_ms: int = 1500
+    ) -> str:
+        """Synchronous — navigate a launched driver to `url` and return its HTML.
+
+        Used for both a fresh launch and a reuse, so the two can never again
+        fetch differently (round 63: reuse used to be an in-page
+        `driver.requests.get` with no JS). Deliberately NOT under
+        budget.XVFB_LOCK: no display is created or destroyed here.
+        """
+        from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
+        from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
+
+        cfg = self._config
+        if cfg.bypass_cloudflare:
+            driver.google_get(url, bypass_cloudflare=True)
+        else:
+            driver.get(url)
+        raise_if_navigation_failed(driver, url)
+        if cfg.random_sleep_enabled:
             driver.short_random_sleep()
-        return str(response.text)
+        if scroll_passes > 0:
+            botasaurus_autoscroll(
+                driver,
+                max_passes=scroll_passes,
+                wait_ms=scroll_wait_ms,
+                humanize=cfg.humanize_mouse,
+            )
+        return str(driver.page_html)
+
+    def _park(self, driver: Any) -> bool:
+        """Leave a driver on about:blank before it goes back to the pool.
+
+        Round 65 — a parked driver holds no browser permit and no host seat,
+        on the premise that an idle browser costs no CPU. It was not idle: it
+        kept the last page open, and that page's scripts kept running. The
+        next checkout navigates for real anyway, so nothing is lost. A driver
+        that cannot even do this is not one to hand the next URL (False).
+        """
+        try:
+            driver.get("about:blank")
+        except Exception:
+            return False
+        return True
 
     def _close_driver(self, driver: Any) -> None:
         with contextlib.suppress(Exception):
             driver.close()
+        # Round 41 — driver.close() SIGKILLs the Xvfb display without
+        # unlinking its lock/socket files (see browser/_xvfb_cleanup.py).
+        # Best-effort, never lets cleanup failure mask the real close above.
+        with contextlib.suppress(Exception):
+            cleanup_stale_display(driver)
 
     async def shutdown(self) -> None:
-        """Close the held driver, if any — called once at job end, same
-        bracket BrowserPool.shutdown() is called in (orchestrator/tasks.py)."""
-        async with self._lock:
-            if self._entry is not None:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._close_driver, self._entry.driver)
-                self._entry = None
+        """Close every held driver — called once at job end, same bracket
+        BrowserPool.shutdown() is called in (orchestrator/tasks.py). Each
+        close runs under budget.XVFB_LOCK (round 41)."""
+        async with self._cond:
+            entries, self._entries = self._entries, []
+            self._cond.notify_all()
+        for entry in entries:
+            await self._close_entry(entry)

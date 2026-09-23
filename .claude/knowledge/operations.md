@@ -2,36 +2,54 @@
 
 **Purpose:** Infrastructure, deployment, CI, monitoring, alerts.
 **Scope:** How to run, deploy, monitor, and debug this system in production.
-**When to read:** Deploying; setting up CI; configuring alerts; production incidents.
-**Related:** `docs/guides/deployment.md`, `.claude/knowledge/architecture.md`
+**When to read:** Deploying; setting up CI; configuring alerts; production incidents; adding a new dependency; changing the CI job matrix.
+**Keywords:** CI pipeline, GitHub Actions, branch protection, required
+status checks, docker compose, PgBouncer, monitoring, Prometheus, alerts,
+scaling, config-driven timeouts, known operational gaps, lockfiles,
+dependency drift, webhook sweeper, DLQ reaper, proxy pool health, Slack
+alerting overlap.
+**Dependencies:** `.github/workflows/test.yml`, `docker-compose.yml`,
+`pyproject.toml`, `requirements-lock.txt` / `requirements-dev-lock.txt` —
+this document describes their live, current behavior; check those files
+directly if this doc and reality ever disagree.
+**Related:** `docs/guides/deployment.md`, `.claude/knowledge/architecture.md`, `.claude/knowledge/technical-debt.md`
 
 ---
 
 ## Infrastructure
 
-| Service | Image | Port | Purpose |
-|---|---|---|---|
-| PostgreSQL | 16-alpine | 5432 | Primary database |
-| PgBouncer | edoburu/pgbouncer:latest | 6432 | Connection pooler (transaction mode) |
-| Redis | 7-alpine | 6379 | Queue + cache |
-| MinIO | minio/minio:latest | 9000 | S3-compatible storage |
-| API | uvicorn | 8000 | FastAPI server |
-| Workers L1/L2/L3 | RQ | — | Escalation-level queue workers |
-| Proxy harvester | standalone Python | — | Background proxy collection |
-| Prometheus | prom/prometheus:latest | 9090 | Metrics collection + alert evaluation |
-| Alertmanager | prom/alertmanager:latest | 9093 | Alert routing to Slack (two-tier: default + paging-channel) |
-| PgBouncer init | postgres:16-alpine | — | SCRAM userlist auto-regeneration |
-| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | Distributed tracing backend — round 24 |
+| Service | Image | Port | Override var | Purpose |
+|---|---|---|---|---|
+| PostgreSQL | 16-alpine | 5432 | `POSTGRES_PORT` | Primary database |
+| PgBouncer | edoburu/pgbouncer:latest | 6432 | `PGBOUNCER_PORT` | Connection pooler (transaction mode) |
+| PgBouncer exporter | prometheuscommunity/pgbouncer-exporter | 9127 | `PGBOUNCER_EXPORTER_PORT` | Real pool-state metrics for Prometheus |
+| Redis | 7-alpine | 6379 | `REDIS_PORT` | Queue + cache |
+| MinIO | minio/minio:latest | 9000 (API), 9001 (console) | `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` | S3-compatible storage |
+| API | uvicorn | 8000 | `API_PORT` | FastAPI server |
+| Workers L1/L2/L3 | RQ | — | — | Escalation-level queue workers |
+| Proxy harvester | standalone Python | — | — | Background proxy collection + self-healing (round 34 — reacts to a Redis kick signal from exhausted requests, not just its own timer; also runs the per-tier pool-health cycle) |
+| Webhook sweeper | standalone Python | — | — | Round 34 — drains `webhook_outbox` (retries failed/crashed deliveries with backoff; the rq work-horse that made the original attempt is too short-lived to own retry state) |
+| DLQ reaper | standalone Python | — | — | Round 34 — auto-retries `dead_letter_queue` entries in the transient category (`PROXY_EXHAUSTED`, `CIRCUIT_OPEN`) once the condition that caused them clears |
+| `migrate` | same image as `api` | — | — | One-shot `alembic upgrade head`, gates every Postgres-writing service via `depends_on: condition: service_completed_successfully` — see Migrations below |
+| Prometheus | prom/prometheus:latest | 9090 | `PROMETHEUS_PORT` | Metrics collection + alert evaluation. Live `docker-compose.yml` service (previously config-only — `infra/prometheus/prometheus.yml` existed, git-tracked, but was never wired in) |
+| Alertmanager | prom/alertmanager:latest | 9093 | `ALERTMANAGER_PORT` | Alert routing to Slack (two-tier: default + paging-channel). Live `docker-compose.yml` service — same "config existed, never wired" story as Prometheus |
+| PgBouncer init | postgres:16-alpine | — | — | SCRAM userlist auto-regeneration |
+| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | `JAEGER_UI_PORT`, `JAEGER_OTLP_GRPC_PORT`, `JAEGER_OTLP_HTTP_PORT` | Distributed tracing backend — round 24 |
+
+Every host-side port above is overridable via its env var (e.g. `API_PORT=8010 docker compose up -d`) or by setting it in `.env` — container-to-container traffic is unaffected since services address each other by service name, not host port. Ports shown are the defaults, unchanged from before this was made overridable.
+
+---
+
+## Migrations
+
+`docker compose up -d` runs `alembic upgrade head` automatically via a one-shot `migrate` init service (same shape as `pgbouncer-init`) — every Postgres-writing service (`api`, `worker-l1/l2/l3`) declares `depends_on: migrate: condition: service_completed_successfully`, so nothing starts against a stale schema. A fresh `docker compose up -d` no longer requires a manual `alembic upgrade head` step. To manually re-run or check migration state (e.g. after adding a new migration file to an already-running stack): `docker compose run --rm migrate` or `docker compose exec api alembic upgrade head` (both work; `alembic upgrade head` is idempotent).
 
 ---
 
 ## Quick Start
 
 ```bash
-docker compose up -d postgres redis pgbouncer
-docker compose up -d pgbouncer-init  # one-time — waits for postgres, generates SCRAM userlist
-alembic upgrade head
-docker compose up -d  # start remaining services
+docker compose up -d  # migrations run automatically via the `migrate` service
 ```
 
 ---
@@ -46,13 +64,41 @@ docker compose logs -f  # watch logs
 **Container vs host hostnames (round 20 deploy fix).** `.env` sets
 `REDIS_URL=redis://localhost:6379/0` and `DATABASE_URL=...@localhost:5432...`
 for **host** tools (alembic, `tools/` scripts). Inside containers `localhost`
-is the container itself, so the app services (`api`, `worker-l1/l2/l3`,
-`proxy-harvester`) each carry a compose `environment:` block overriding these to
+is the container itself, so the app services (`api`, `worker-l1/l2/l3`)
+each carry a compose `environment:` block overriding these to
 the service hostnames — `redis://redis:6379/0` and
 `...@pgbouncer:6432/scraper_engine` (DB through PgBouncer, invariant G-05).
 Compose `environment:` wins over `env_file:`, so `.env` keeps localhost while
 containers get service names. Symptom if missing:
 `Error 111 connecting to localhost:6379. Connection refused`, workers Exited(1).
+
+**Self-healing daemons live inside the `api` container now (Round 35).**
+`proxy-harvester`, `dlq-reaper`, and `webhook-sweeper` are no longer
+separate `docker-compose.yml` services/containers — they were, but nobody
+was starting them (the documented Quick Start command never mentioned
+them by name), so the proxy pool went stale with zero operator-visible
+signal. `docker/supervisord.conf` now runs all 4 long-running processes
+(`api` + the 3 daemons) as supervised subprocesses of one `scraper_engine-
+api-1` container; `worker-l1/l2/l3` stay separate (different scaling
+unit). Practical consequences:
+- `docker compose ps` no longer shows `proxy-harvester`/`dlq-reaper`/
+  `webhook-sweeper` rows — that's expected, not a regression.
+- Check daemon health with `docker exec scraper_engine-api-1
+  supervisorctl status` (no `-c` flag needed — the conf is also copied to
+  `/etc/supervisor/supervisord.conf`, supervisorctl's default search
+  path). Expect all 4 `RUNNING`.
+- Each daemon crash-restarts independently (`autorestart=true`,
+  `startretries=10`) without taking the others or the API down — verified
+  live by `kill -9`-ing `proxy-harvester`'s PID and confirming
+  `supervisorctl status` showed a new PID within ~6s while `api` kept
+  serving `/v1/health` throughout.
+- Old troubleshooting/decisions/operations entries that say "the
+  `proxy-harvester` container" meant a literal separate container at the
+  time they were written — as of round 35, read that as "the
+  `proxy-harvester` process inside the `api` container." The process-
+  boundary reasoning in those entries (separate OS process, separate
+  in-process metrics registry, etc.) is still accurate; only the
+  container topology changed.
 
 ---
 
@@ -71,12 +117,32 @@ containers get service names. Symptom if missing:
 
 ## Monitoring
 
+Prometheus + Alertmanager are live `docker-compose.yml` services (round-N fix — the config below existed and was accurate long before that, but nothing actually ran it; `docker compose up -d` now starts both for real). `SLACK_WEBHOOK_URL` in `.env` is picked up automatically by compose's own variable interpolation and substituted into Alertmanager's config at container start by `monitoring/alertmanager/docker-entrypoint.sh`.
+
 ### Prometheus Metrics
 - `proxy_pool_validated_count` — proxies with score ≥40 (L1 threshold). Updated by `harvest_once()`.
 - Additional metrics in `observability/metrics.py`.
 
 ### Alerts
 - `ProxyPoolCriticallyLow`: fires when `proxy_pool_validated_count < 5` for 5 minutes. Severity: critical.
+  **Round 34 note — a second, independent pool-health-alerting path now
+  exists, deliberately, not as an unreconciled duplicate.**
+  `proxy/pool_health.py::PoolHealthMonitor` computes its own per-tier
+  HEALTHY/DEGRADED/CRITICAL state every health cycle and, when
+  `config.webhook.ops_webhook_url` is set, pushes a `proxy_pool.critical`/
+  `degraded`/`recovered` event straight to Slack via the new webhook-
+  outbox/sweeper path (`.claude/knowledge/architecture.md` →
+  "Notifications & Proxy Self-Healing") — event-driven, not a scraped-
+  gauge-plus-duration rule like this one. Built independently of this
+  rule, then reconciled same-day in a knowledge audit: **decision is to
+  keep both**, since they fail independently (this rule needs Prometheus
+  + a 5-minute sustained condition and goes dark if the app's own
+  delivery pipeline breaks; the event-driven path needs that pipeline
+  healthy and goes dark if Prometheus/Alertmanager are down) — each
+  covers the other's blind spot. `config/base.yaml` recommends pointing
+  `ops_webhook_url` at a different Slack channel than `SLACK_WEBHOOK_URL`
+  so the two don't read as a confusing double-alert. Full reasoning:
+  `.claude/knowledge/decisions.md` → "Keep Both Pool-Health Alert Paths".
 - `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined and all now backed by real metrics (round 25 — see below).
 - Rules in `monitoring/alerts/prometheus_rules.yml`. 11 rules as of round 25 (was 12 — `BrowserPoolExhausted` removed, see below), `promtool check rules` validated against a real Prometheus container.
 - **`BrowserPoolExhausted` REMOVED (round 25), not fixed.** Its expr was
@@ -132,19 +198,55 @@ containers get service names. Symptom if missing:
 
 ## CI Pipeline (Live)
 
-**File:** `.github/workflows/test.yml` — 5 jobs, GitHub Actions hosted, green as of round 25.
+**File:** `.github/workflows/test.yml` — 5 named jobs (`lint`/`unit`/
+`integration`/`chaos`/`build-and-push`), but `unit`/`integration`/`chaos`
+each run a `strategy.matrix.python-version: ["3.11", "3.12"]` (round 28), so
+7 real check contexts report per run. GitHub Actions hosted, green as of
+round 28 (PR #15).
 
 **Jobs (each `needs:` the previous):**
-- **lint (round 13-18, paths updated round 27 for the src/ layout):** `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error across `src/scraper_engine/{core,proxy,orchestrator,api,storage,fetcher,browser,observability}`) + grep-gates (no direct fetcher construction outside `factory.py`; `force_engine` never in production) + `tests/fixtures/challenge_mirror` ruff baseline + mypy-shrinkage advisory. **Coverage gate is NOT run here or anywhere** — see Known Operational Gaps below, round-27 finding, OPEN for next session.
-- **unit:** explicit `pip install` dependency list (no `pip install -e ".[dev]"` — GitHub's runner resolves differently; also see "Known Operational Gaps" #12 on this list drifting from `pyproject.toml` — this exact drift caused a real round-27 mypy failure, see below); 341 tests as of round 27. Note: `types-redis` was removed from `pyproject.toml`'s dev extras in round 27 (stale stub shadowing real redis-py 8.0.1's own inline types) — do not re-add it.
-- **integration:** Postgres 16 + Redis 7 as GitHub Actions `services:`. Alembic upgrade head before tests. Runs the *full* `tests/integration/` — `test_promotion.py` is no longer excluded (round 23; see below).
+- **lint:** `pip install -r requirements-dev-lock.txt` (single source of
+  pinned versions, round 28 — see Known Operational Gaps #12) + a drift
+  check (`uv pip compile --python-version 3.11 ...` into `/tmp`, diffed
+  against the committed lockfiles, fails the build on drift) + `pip-audit
+  -r requirements-lock.txt` (round 28, fails on known vulnerabilities) +
+  `ruff check` + **mypy `--strict`** (baseline empty; fails on ANY error
+  across `src/scraper_engine/{core,proxy,orchestrator,api,storage,fetcher,
+  browser,observability}`) + grep-gates (no direct fetcher construction
+  outside `factory.py`; `force_engine` never in production) +
+  `tests/fixtures/challenge_mirror` ruff baseline + mypy-shrinkage
+  advisory. Python 3.12 only — mypy/ruff don't need matrix coverage.
+- **unit / integration:** `python-version` matrix (3.11 + 3.12, round 28);
+  install is `pip install -r requirements-dev-lock.txt` +
+  `pip install -e . --no-deps` (was a hand-listed ~40-package `pip install`
+  line per job through round 27 — see Known Operational Gaps #12).
+  `integration` additionally brings up `minio` via the project's own
+  `docker compose` (round 28 — `tests/integration/test_s3_client.py`/
+  `test_api_main.py` need a real S3-compatible endpoint; GitHub Actions
+  service containers can't override a container's CMD, which `minio`'s
+  image requires, so it can't be a bare `services:` entry like
+  postgres/redis are).
 - **chaos:** **Real PgBouncer, not GH Actions `services:`** (round 23) — a bare
   `services:` container pair can't produce the SCRAM-auth-off-a-live-`pg_authid`
   transaction pooling that G-05's test needs, so this job runs
-  `docker compose up -d postgres redis pgbouncer` instead (reusing the
+  `docker compose up -d postgres redis pgbouncer minio` instead (reusing the
   project's own `pgbouncer-init` dependency chain from `docker-compose.yml`),
-  polls `:6432` for TCP readiness, then runs the *full* `tests/chaos/` —
-  `test_pgbouncer_search_path_isolation.py` is no longer excluded either.
+  polls `:6432` for TCP readiness, then runs the combined
+  `tests/unit/ tests/integration/ tests/chaos/` suite with `--cov=
+  src/scraper_engine --cov-fail-under=100 --cov-report=json:coverage.json`,
+  followed by a second step running `tools/check_coverage_ratchet.py
+  coverage.json` (round 28 wired the gate; round 62 split it in two). The
+  other two jobs run without `--cov` since this job re-runs everything
+  anyway with full infra up.
+
+  **The ratchet script is the gate; `--cov-fail-under` is a backstop.**
+  The ratchet enforces zero missed LINES plus an absolute missed-BRANCH
+  budget that may only shrink — it fails if the count rises AND if it falls
+  without `BRANCH_BUDGET` being lowered. Round 62 introduced it at 33
+  branches (blended ~99.3%, so `fail_under` was lowered to 99); round 64
+  burned the budget to **0** and widened the gate to 10 packages, so
+  `fail_under` is **100** again (pyproject.toml; CI passes the same value).
+  See `.claude/knowledge/technical-debt.md` rounds 62 and 64.
 - **build-and-push (round 22):** builds the root `Dockerfile`, pushes to GHCR
   (`ghcr.io/<owner>/<repo>:<sha>` and `:latest`) via the automatic
   `GITHUB_TOKEN` — no new secret needed. Gated `if: github.event_name ==
@@ -156,9 +258,17 @@ containers get service names. Symptom if missing:
 
 **Run URL:** https://github.com/massiveconduct-boop/scraper-engine/actions
 
+**Branch protection on `main`:** required status checks must list the exact
+7 job-context names above (`lint`, `unit (3.11)`, `unit (3.12)`,
+`integration (3.11)`, `integration (3.12)`, `chaos (3.11)`, `chaos (3.12)`),
+not the bare job names — see Known Operational Gaps #15 for what happens
+when this drifts.
+
 **Still excluded from CI (by design, unchanged):**
 - 2 Camoufox-dependent unit tests (binary ~300MB, run locally)
 - L2/L3 live escalation tests (Camoufox + challenge mirror)
+- `browser/` package's own coverage (needs real Firefox) — real local
+  number checked round 28: 84%, not gated
 
 **Historical note (superseded round 23):** `test_promotion.py` and
 `test_pgbouncer_search_path_isolation.py` used to be permanently `--ignore`'d
@@ -183,6 +293,43 @@ were once excluded.
 | Redis | Single | Sentinel for HA |
 | Prometheus | 1 instance | Federation for multi-DC |
 | Alertmanager | 1 instance | Cluster mode for HA |
+
+### Host-wide browser admission (round 65)
+
+Off by default. Turn on per deploy, all workers together (stop them first —
+old and new workers must not run side by side):
+
+```bash
+docker compose stop worker-l1 worker-l2 worker-l3
+HOST_CAPACITY_ENABLED=true RQ_WORKERS_PER_CONTAINER=2 \
+  docker compose up -d --force-recreate --no-deps api worker-l1 worker-l2 worker-l3
+```
+
+- Only raise `RQ_WORKERS_PER_CONTAINER` above 1 together with
+  `HOST_CAPACITY_ENABLED=true`: without the host limit, more workers means
+  more concurrent renders.
+- Round 66 — what the controller does now: raises to `in_use + waiters`
+  below `cpu_pressure_low`, +25% of itself between the marks, never past the
+  whole browsers free memory holds; cuts x0.7 only above `cpu_pressure_high`
+  (90) or under `mem_available_floor_mb`; ceiling = MemTotal /
+  `browser_memory_mb` (1200) unless `max_units` is set. Every change is
+  logged: `docker compose logs api | grep host_capacity_target`.
+- Round 66 — measured cost of turning it on: both browser pools close on
+  release (nothing runs outside a seat), so every render starts a cold
+  browser. On light pages through the free pool that doubled render time
+  (32s -> 60s median). It paid off on heavy pages (1808s/83 ok vs 2182s/80
+  ok unlimited) and did not on light ones (982s vs 528s) — leave it off for
+  light workloads until the parked-seat change lands (technical-debt.md,
+  round 66, OPEN).
+- Watch: `/v1/health` → `browser_capacity` (`in_use_units`, `target_units`,
+  `waiters`); `/metrics` → `host_capacity_*`, `host_admission_*`,
+  `host_cpu_pressure`. Target changes are logged by the api container's
+  `capacity-controller` program (`host_capacity_target up/down`).
+- Rollback: redeploy the same services without the two variables; old and
+  new Redis keys expire on their own.
+- Failure signatures: `capacity_timeout` (no seat within the URL's wait
+  budget — host saturated), `dependency_unavailable` (Redis failed or timed
+  out). Both are transient and re-driven by the DLQ reaper.
 
 ---
 
@@ -272,7 +419,7 @@ levels:
     per rq job, leased by `Level2Fetcher`/`Level3Fetcher` via
     `fetcher/factory.py`. Also fixed a real correctness bug found while
     wiring it in (mismatch used to destroy live browsers instead of keeping
-    them pooled). Full story: `.claude/MEMORY.md` → Technical Debt (round
+    them pooled). Full story: `.claude/knowledge/technical-debt.md` (round
     25); `.claude/knowledge/architecture.md` → "Browser Pool".
 9. **CapSolver budget was a single hardcoded global ceiling (RESOLVED round
     25).** `CapSolverBudget` now reads the real per-tenant DB column
@@ -282,12 +429,12 @@ levels:
     the DB column, kept as the single source of truth.) Also fixed a real
     bug found alongside it: `_spend_key()` ignored `tenant_id`, pooling every
     tenant's spend into one Redis key regardless of ceiling. Full story:
-    `.claude/MEMORY.md` → Technical Debt (round 25).
+    `.claude/knowledge/technical-debt.md` (round 25).
 10. **Camoufox config entirely ignored (RESOLVED round 25).**
     `geoip`/`humanize`/`headless_mode` now flow into `CamoufoxWrapper`'s
     constructor from config; `max_total_instances` now sizes
     `BROWSER_SEMAPHORE` via a new `configure_budget()` called once at rq
-    worker process startup. Full story: `.claude/MEMORY.md` → Technical Debt
+    worker process startup. Full story: `.claude/knowledge/technical-debt.md`
     (round 25).
 11. **`fetcher/botasaurus_wrapper.py` — deleted, then restored for real
     (RESOLVED round 25).** Was orphaned (never imported, `botasaurus` not a
@@ -295,10 +442,24 @@ levels:
     real per an explicit follow-up ask (the authoritative spec §3.6
     designs a real implementation). `level_2.engine` config now genuinely
     reflects what runs. Full story + the reversal reasoning:
-    `.claude/MEMORY.md` → Technical Debt (round 25);
+    `.claude/knowledge/technical-debt.md` (round 25);
     `.claude/knowledge/decisions.md` → "Botasaurus".
 12. **Dependency declarations live in 5 separate places, none read from each
-    other (OPEN — known drift risk, structural fix planned for round 28).**
+    other (RESOLVED round 28 — see `.claude/knowledge/technical-debt.md`,
+    round 28, for the full story).** `requirements-lock.txt` (runtime) /
+    `requirements-dev-lock.txt` (+dev extras), generated via `uv pip
+    compile --python-version 3.11 --no-header`, are now the single source
+    every job and the Dockerfile install from; a `lint`-job step
+    regenerates both into `/tmp` and diffs against committed, failing the
+    build on drift. **`--python-version 3.11` is load-bearing, not
+    cosmetic** — without it, `uv` resolves against whatever interpreter
+    ran the compile, and can silently pick a version that doesn't support
+    `requires-python`'s floor (`numpy==2.5.1`, needs Python >=3.12, broke
+    the `unit (3.11)` CI job the first time this lockfile setup shipped,
+    round 28 — caught by real CI, not local testing, since this box's dev
+    venv is 3.12). Regenerate with the exact command in `CONTRIBUTING.md`,
+    not a bare `uv pip compile`.
+    Original finding (kept for context — the drift class this closes):
     `pyproject.toml`'s `dependencies` list, the Dockerfile's `deps` stage
     (a hardcoded `RUN pip install ...` line, "mirrors .github/workflows/
     test.yml" per its own comment — but only by convention, not by any
@@ -318,14 +479,14 @@ levels:
     argument CI's mypy (correctly, using the real types) rejected. Fixed by
     removing `types-redis` from `pyproject.toml`'s dev extras (confirmed via
     `git stash` that the underlying conflict predated the round-27 change
-    that exposed it) — but this only patches the one symptom. The
-    structural fix (round 28, see `.claude/MEMORY.md` → Technical Debt,
-    round 27 "NEXT QUEST", item 4) is still open. **Operator checklist when
-    adding any new Python dependency:** update `pyproject.toml`,
-    `Dockerfile`'s `deps` stage, and every `pip install` block in
-    `.github/workflows/test.yml`, then rebuild + `docker run --rm <image>
-    python -c "import <pkg>"` to actually confirm it landed — don't trust
-    that editing `pyproject.toml` alone did anything.
+    that exposed it) — that patched the one symptom; the structural fix
+    (single lockfile, everything installs from it) is the round-28 work
+    described above. **Operator checklist when adding any new Python
+    dependency:** update `pyproject.toml`, regenerate both lockfiles with
+    the `CONTRIBUTING.md` command (`--python-version 3.11`, not a bare `uv
+    pip compile`), then `pip install -r requirements-dev-lock.txt` +
+    `python -c "import <pkg>"` locally to actually confirm it resolves —
+    don't trust that editing `pyproject.toml` alone did anything.
 13. **`proxy_source_healthy` had the same cross-process gap as the round-25
     alert metrics (RESOLVED round 25 follow-up).** Set inside the
     `proxy-harvester` container, invisible to the `api` process's
@@ -333,17 +494,51 @@ levels:
     gauge at scrape time. Missed by the original round-25 audit (the Gauge
     object exists and is called somewhere, so a naive check doesn't catch
     it) — found only via a live `/metrics` cross-check after the rest of
-    round 25 landed. Full story: `.claude/MEMORY.md` → Technical Debt
+    round 25 landed. Full story: `.claude/knowledge/technical-debt.md`
     (round 25 follow-up).
-    Full finding: `.claude/MEMORY.md` → Technical Debt (round 24).
-14. **Coverage gate is dead config (OPEN — round 27 finding, NEXT QUEST,
-    priority item for round 28).** `[tool.coverage.report] fail_under = 90`
-    in `pyproject.toml` is declared but never enforced — none of the three
-    pytest invocations in `.github/workflows/test.yml` (`unit`/
-    `integration`/`chaos`) pass `--cov`. Real measured coverage: 82%, not
-    90%. `orchestrator/job_queue.py` 0% (untested), `proxy/harvester.py`
-    47%, `orchestrator/worker.py` 67%. Same bug class as #8-11 above
-    (config/gate declared, nothing actually calls it) — the sixth
-    occurrence of this exact pattern in this codebase's history. Full
-    finding + full 8-item list: `.claude/MEMORY.md` → Technical Debt
-    (round 27, "Senior-dev review findings").
+    Full finding: `.claude/knowledge/technical-debt.md` (round 24).
+14. **Coverage gate was dead config (RESOLVED round 28; SCOPE CORRECTED
+    round 62 — see below).**
+    `[tool.coverage.report] fail_under` was declared (90, then 100) but
+    never enforced — none of the three pytest invocations in
+    `.github/workflows/test.yml` passed `--cov`. Real measured coverage at
+    the time: 72% once `include` was corrected to match `[tool.coverage.
+    run] source`'s 8 packages (was silently only gating 3). Same bug class
+    as #8-11 above (config/gate declared, nothing actually calls it) — the
+    sixth occurrence of this exact pattern in this codebase's history, and
+    the reason round 28 treated it as the top priority rather than another
+    one-off patch. Now wired into the `chaos` job (see CI Pipeline above)
+    and brought to 100% across every package in scope except `browser/`
+    (documented exclusion, needs real Firefox). A round-34 knowledge audit
+    caught a real regression to 97.91% (round 34 shipped 3 daemon `run()`
+    functions and 2 single lines untested, plus regressed
+    `harvester_daemon.py` from 100%) and closed it same-day — real
+    measured coverage as of the fix is 99.57%, gate passes except for
+    `services/botasaurus_requests_client.py` (56%, confirmed pre-existing,
+    aarch64-sandbox-only, not a CI blocker on the x86_64 runners — see
+    `.claude/knowledge/technical-debt.md`'s round-34 "Coverage gap" entry).
+    Full story + the other 7
+    findings closed alongside it: `.claude/knowledge/technical-debt.md`
+    (round 28).
+15. **CI job matrix changes can silently break branch protection (RESOLVED
+    round 28, found post-merge while watching real CI).** Adding
+    `strategy.matrix.python-version` to `unit`/`integration`/`chaos`
+    changed their reported check names from `unit`/`integration`/`chaos`
+    to `unit (3.11)`/`unit (3.12)`/etc. `main`'s branch protection
+    `required_status_checks.contexts` still listed the old bare names —
+    GitHub has no way to reconcile "a required check that will never exist
+    again" with "these new checks that did run and passed," so it left the
+    PR permanently `mergeStateStatus: BLOCKED` even with all 7 real checks
+    green (`gh pr merge` reported "not mergeable" with no explanation
+    pointing at this — surfaced only by fetching
+    `required_pull_request_reviews.required_approving_review_count` (0,
+    ruling out a review block) and `required_status_checks.contexts`
+    directly via `gh api repos/.../branches/main/protection`). Fixed by
+    `PATCH`ing the protection rule's `required_status_checks` to the 7
+    real context names (`lint`, `unit (3.11)`, `unit (3.12)`,
+    `integration (3.11)`, `integration (3.12)`, `chaos (3.11)`,
+    `chaos (3.12)`). **Operator checklist when adding/removing a
+    `strategy.matrix` on any required job:** update `main`'s branch
+    protection required status checks in the same change — a passing CI
+    run is not sufficient evidence the PR is actually mergeable; check
+    `gh pr view <n> --json mergeStateStatus` too.

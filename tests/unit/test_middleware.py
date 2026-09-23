@@ -75,6 +75,20 @@ class TestSecurityHeaders:
         assert r.headers.get("x-frame-options") == "DENY"
         assert r.headers.get("strict-transport-security") is not None
 
+    def test_does_not_set_a_server_header(self, hardened_app):
+        """SecurityHeadersMiddleware must not set Server itself — uvicorn
+        appends its own Server: uvicorn unconditionally at the protocol
+        layer regardless of what the ASGI app already sent, so an app-level
+        `response.headers["Server"] = ""` doesn't replace it, it just adds
+        a second, empty Server header alongside uvicorn's real one
+        (production symptom: every response carried two Server headers,
+        one "uvicorn", one blank). Suppressing uvicorn's own header is a
+        launch-config concern (--no-server-header / server_header=False),
+        not something the app can fix by touching response.headers."""
+        client = TestClient(hardened_app)
+        r = client.get("/test")
+        assert "server" not in r.headers
+
 
 class TestCORS:
     def test_cors_headers_present(self, hardened_app):

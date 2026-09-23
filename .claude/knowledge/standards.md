@@ -3,6 +3,8 @@
 **Purpose:** Conventions for writing code, tests, and reports in this project.
 **Scope:** All new code, tests, reports, commits.
 **When to read:** Before writing any code, test, or report.
+**Keywords:** coding conventions, test patterns, lint rules, ruff, mypy strict, commit style, report format.
+**Dependencies:** `pyproject.toml` (`[tool.ruff]`, `[tool.mypy]` — this doc explains the conventions those enforce, doesn't duplicate the config itself).
 **Related:** `.claude/knowledge/architecture.md`, `.claude/knowledge/decisions.md`
 
 ---
@@ -38,7 +40,7 @@ When adding a Prometheus gauge: define it in `observability/metrics.py`, update 
 
 ### Integration Tests
 - Require Docker (Postgres, Redis, PgBouncer).
-- Start infrastructure: `docker compose up -d postgres redis pgbouncer && alembic upgrade head`.
+- Start infrastructure: `docker compose up -d postgres redis pgbouncer migrate` (the `migrate` service applies `alembic upgrade head` then exits).
 - Verify migration state before running: `alembic current` must equal `alembic heads`.
 - Test real database interactions, schema creation, concurrency.
 - Tests that mutate global tables (`DELETE FROM proxy_pool`) against the live DB are documented as a known risk. Acceptable on disposable CI instances; not acceptable if DB is shared.
@@ -71,12 +73,11 @@ Every report must have: Header Metadata (date, spec ref), Environment & Infrastr
 - "Documented as limitation" is NOT closure — it's a placeholder.
 
 ### mypy Baseline Management
-- `tools/mypy-baseline.txt` contains known type findings (23 entries). Committed to repo.
+- `tools/mypy-baseline.txt` is EMPTY since round 18 (ratcheted to zero) — mypy `--strict` is fully clean, any error at all fails the build now. The mechanism below still runs (an empty baseline is a valid baseline), it just has nothing left in it to diff against.
 - CI ratchet step diffs current mypy output (`grep "^error:"` lines) against baseline via `comm -13`.
-- Any NEW error beyond baseline fails the build. Known findings are advisory.
+- Any NEW error beyond baseline fails the build.
 - `mypy==2.3.0` pinned in `pyproject.toml` — no version drift between local and CI.
-- PRs touching files in the baseline should resolve those entries, shrinking the baseline over time.
-- Local and CI produce different finding counts due to different stub resolution (pydantic, starlette versions). Baseline is CI-specific.
+- Local and CI produce different finding counts due to different stub resolution (pydantic, starlette versions) — relevant again only if the baseline is ever reopened.
 
 ### Banned Patterns
 - Paraphrased commands (`python -c "harvest + pool query"` instead of actual code)
@@ -92,5 +93,9 @@ Every report must have: Header Metadata (date, spec ref), Environment & Infrastr
 
 - Conventional Commits format: `fix:`, `feat:`, `docs:`, `test:`, `chore:`
 - Reference issue/gap IDs in body (F-02, G-05, BD-01)
-- Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude &lt;actual model name of the session that made the
+  commit&gt; &lt;noreply@anthropic.com&gt; — not a fixed model name; different
+  sessions across this project's history have run different Claude
+  models, and the trailer should reflect whichever one actually did the
+  work
 - Subject ≤50 chars, body only when "why" isn't obvious from the diff

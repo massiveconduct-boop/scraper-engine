@@ -19,6 +19,19 @@ class TestExceptions:
         assert "127.0.0.1" in str(exc)
         assert exc.url == "http://127.0.0.1/admin"
         assert isinstance(exc, ScraperEngineError)
+        assert exc.is_unresolvable is False
+
+    def test_ssrf_blocked_error_unresolvable_host(self):
+        """A dead/unresolvable domain is NOT a real SSRF block — the
+        message must say so plainly (not the self-contradictory "resolved
+        to X in denied range <unresolvable>"), and is_unresolvable must let
+        callers route it to a different FailureCategory."""
+        exc = SSRFBlockedError(
+            "https://dead-domain.example/", "dead-domain.example", "<unresolvable>"
+        )
+        assert exc.is_unresolvable is True
+        assert "could not be resolved" in str(exc)
+        assert "denied range" not in str(exc)
 
     def test_proxy_pool_exhausted(self):
         exc = ProxyPoolExhaustedError("example.com", 2, 5)

@@ -26,6 +26,23 @@ class TestProxy:
         )
         assert proxy.url() == "http://1.2.3.4:8080"
 
+    def test_auth_url_matches_url_when_no_credentials(self) -> None:
+        proxy = Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP)
+        assert proxy.auth_url() == proxy.url() == "http://1.2.3.4:8080"
+
+    def test_auth_url_embeds_credentials_when_present(self) -> None:
+        proxy = Proxy(
+            id=-1,
+            ip="gw.dataimpulse.com",
+            port=823,
+            protocol=ProxyProtocol.HTTP,
+            username="user123",
+            password="pass456",
+            source="paid_gateway",
+        )
+        assert proxy.auth_url() == "http://user123:pass456@gw.dataimpulse.com:823"
+        assert proxy.url() == "http://gw.dataimpulse.com:823"  # unchanged, no credentials
+
     def test_key_uniqueness(self) -> None:
         p1 = Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP)
         p2 = Proxy(id=2, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTPS)
@@ -36,6 +53,14 @@ class TestProxy:
             Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP, reliability_score=150)
         with pytest.raises(ValidationError):
             Proxy(id=1, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP, reliability_score=-10)
+
+    def test_only_a_paid_gateway_session_is_single_use(self):
+        """Round 67 — a browser launched on a gateway session is never asked
+        for again (fresh sessid per attempt), so pools must not park it."""
+        pool = Proxy(id=1, ip="1.2.3.4", port=80, protocol=ProxyProtocol.HTTP)
+        gateway = pool.model_copy(update={"source": "paid_gateway"})
+        assert pool.reusable() is True
+        assert gateway.reusable() is False
 
 
 class TestScrapeRequest:

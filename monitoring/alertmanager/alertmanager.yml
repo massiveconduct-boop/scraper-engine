@@ -27,6 +27,14 @@ route:
         severity: critical
       receiver: paging-channel
       repeat_interval: 30m   # critical alerts nag more often than default
+    - match:
+        severity: info
+      receiver: default
+      # Round 61 — info-severity alerts (currently just DeadLetterQueuePileLarge,
+      # prometheus_rules.yml) are housekeeping nudges, not active-incident
+      # signals; same #alerts channel as default (no dedicated info channel
+      # configured), but far less frequent re-notification than the 4h default.
+      repeat_interval: 24h
 
 receivers:
   - name: default

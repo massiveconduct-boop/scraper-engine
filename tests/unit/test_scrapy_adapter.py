@@ -114,26 +114,79 @@ class TestRunSpiderSubprocess:
         captured = {}
 
         class FakeCrawlerProcess:
+            """Stands in for Scrapy: runs parse(), then fires item_scraped
+            only for items the (simulated) pipelines keep — here, all but a
+            duplicate URL, like DedupPipeline."""
+
             def __init__(self, settings):
                 captured["settings"] = settings
 
-            def crawl(self, spider_cls):
+            def create_crawler(self, spider_cls):
                 captured["spider_cls"] = spider_cls
+                crawler = MagicMock()
+                crawler.signals.connect.side_effect = lambda handler, signal: captured.update(
+                    handler=handler
+                )
+                return crawler
+
+            def crawl(self, crawler):
+                pass
 
             def start(self):
                 spider = captured["spider_cls"]()
-                fake_response = MagicMock()
-                fake_response.url = "http://example.com"
-                fake_response.css.return_value.get.return_value = "Example Title"
-                list(spider.parse(fake_response))
+                seen = set()
+                for url in ("http://example.com", "http://example.com"):
+                    fake_response = MagicMock()
+                    fake_response.url = url
+                    fake_response.css.return_value.get.return_value = "Example Title"
+                    for item in spider.parse(fake_response):
+                        if item["url"] in seen:
+                            continue  # dropped by a pipeline: no item_scraped
+                        seen.add(item["url"])
+                        captured["handler"](item=item, response=fake_response, spider=spider)
 
         monkeypatch.setattr("scrapy.crawler.CrawlerProcess", FakeCrawlerProcess)
-        monkeypatch.setattr("scrapy.utils.project.get_project_settings", lambda: {})
+        monkeypatch.setattr(
+            "scrapy.utils.project.get_project_settings",
+            lambda: __import__("scrapy.settings", fromlist=["Settings"]).Settings(),
+        )
 
         queue = MagicMock()
         sa._run_spider_subprocess("titles", ["http://example.com"], queue)
 
         queue.put.assert_called_once_with([{"url": "http://example.com", "title": "Example Title"}])
+
+    def test_names_the_settings_module_and_forwards_the_proxy(self, monkeypatch):
+        """Round 64 — settings used to load only if the child's cwd led to
+        scrapy.cfg (otherwise: no SSRF middleware, no proxy, no dedup), and
+        the leased proxy has to reach ProxyMiddleware as CRAWL_PROXY_URL."""
+        from scrapy.settings import Settings
+
+        captured = {}
+
+        class FakeCrawlerProcess:
+            def __init__(self, settings):
+                captured["proxy"] = settings.get("CRAWL_PROXY_URL")
+
+            def create_crawler(self, spider_cls):
+                return MagicMock()
+
+            def crawl(self, crawler):
+                pass
+
+            def start(self):
+                pass
+
+        monkeypatch.delenv("SCRAPY_SETTINGS_MODULE", raising=False)
+        monkeypatch.setattr("scrapy.crawler.CrawlerProcess", FakeCrawlerProcess)
+        monkeypatch.setattr("scrapy.utils.project.get_project_settings", Settings)
+
+        sa._run_spider_subprocess("t", ["http://example.com"], MagicMock(), "http://u:p@gw:823")
+
+        import os
+
+        assert os.environ["SCRAPY_SETTINGS_MODULE"] == "scraper_engine.scrapy_project.settings"
+        assert captured["proxy"] == "http://u:p@gw:823"
 
     def test_puts_exception_on_queue_when_crawl_fails(self, monkeypatch):
         monkeypatch.setattr(

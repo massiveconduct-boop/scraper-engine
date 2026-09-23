@@ -27,11 +27,17 @@ def tenant():
 
 @pytest.fixture
 def worker():
-    redis = AsyncMock()
+    # Round 63 — the politeness controller and the level-memory Redis reads
+    # both have contracts a bare AsyncMock cannot satisfy (held_slot is an
+    # async context manager; the hint read must return something int()
+    # accepts or None). Shared with tests/unit/test_worker.py rather than
+    # re-stubbed here.
+    from tests.unit.test_worker import make_politeness_mock, make_redis_mock
+
+    redis = make_redis_mock()
     cb = AsyncMock()
     cb.allow_request.return_value = True
-    pc = AsyncMock()
-    pc.acquire_slot.return_value = True
+    pc = make_politeness_mock()
     dlq = AsyncMock()
     return Worker(redis=redis, circuit_breaker=cb, politeness=pc, dlq=dlq)
 

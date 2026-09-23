@@ -1,83 +1,191 @@
 services:
+  # Runs the api process plus the 4 self-healing daemons (proxy-harvester,
+  # dlq-reaper, webhook-sweeper, stuck-job-reaper) together under
+  # supervisord (see docker/supervisord.conf) -- one container to start
+  # instead of 5 separate services an operator has to remember to bring
+  # up. Each daemon
+  # crash-restarts independently; `restart: unless-stopped` + the
+  # healthcheck below are the last-resort recovery if supervisord itself dies.
   api:
     build: .
-    command: uvicorn scraper_engine.api.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - extraction-scraper-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # worker-l1/l2/l3 are 3 replicas of the SAME worker pulling from ONE queue
   # ("scraper-jobs"), not per-level queues — Worker.process_job already runs
   # the full L1->L2->L3 escalation internally, per URL, in a single job. Three
   # separate rq workers just gives 3x horizontal concurrency on that one queue.
   worker-l1:
+    restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - extraction-scraper-net
 
   worker-l2:
+    restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - extraction-scraper-net
 
   worker-l3:
+    restart: unless-stopped
     build: .
-    command: rq worker scraper-jobs
+    # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
+    # this container (rq worker-pool), so a small job no longer waits for a
+    # big one to finish before it can start. Only raise it together with
+    # HOST_CAPACITY_ENABLED=true: that host-wide browser limit is what then
+    # bounds renders — without it, more workers means more concurrent
+    # renders. 1 (the default) runs exactly the old single worker.
+    command: >-
+      sh -c 'if [ "$${RQ_WORKERS_PER_CONTAINER:-1}" -gt 1 ];
+      then exec rq worker-pool -n "$${RQ_WORKERS_PER_CONTAINER}" scraper-jobs;
+      else exec rq worker scraper-jobs; fi'
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Round 65 — host-wide browser admission (off by default). Passed
+      # through explicitly: env_file only carries what .env itself sets.
+      HOST_CAPACITY_ENABLED: ${HOST_CAPACITY_ENABLED:-false}
+      HOST_CAPACITY_REUSE_BROWSERS: ${HOST_CAPACITY_REUSE_BROWSERS:-true}
+      RQ_WORKERS_PER_CONTAINER: ${RQ_WORKERS_PER_CONTAINER:-1}
       DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
       S3_ENDPOINT: http://minio:9000
+      # extraction-engine integration -- reached over the shared external network
+      # below, only set when that project's own compose is also up. Unset means
+      # process_job simply falls back to AdaptiveSelector, no error.
+      EXTRACTION_ENGINE_BASE_URL: ${EXTRACTION_ENGINE_BASE_URL:-http://extraction-engine:8080}
     depends_on:
-      - postgres
-      - redis
-      - pgbouncer
-      - minio
-      - jaeger
-
-  proxy-harvester:
-    build: .
-    command: python -m scraper_engine.proxy.harvester_daemon
-    env_file: .env
-    environment:
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+asyncpg://scraper:scraper@pgbouncer:6432/scraper_engine
-    depends_on:
-      - postgres
-      - redis
-      - jaeger
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - extraction-scraper-net
 
   postgres:
+    restart: unless-stopped
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: scraper_engine
@@ -86,7 +194,32 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper -d scraper_engine"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot init service — same shape as pgbouncer-init below (short-lived,
+  # gated via `condition: service_completed_successfully`). Runs `alembic
+  # upgrade head` exactly once, before any Postgres-writing service starts,
+  # so a fresh `docker compose up` never 500s on missing tables (previously
+  # nothing ran migrations automatically; an operator had to know to run
+  # `alembic upgrade head` by hand). Talks directly to postgres:5432, never
+  # through pgbouncer:6432 — DDL needs one stable session for the whole
+  # migration run, and PgBouncer's transaction-pooling mode doesn't
+  # guarantee that (same reasoning as postgres_client.py's own
+  # BEGIN...COMMIT-per-checkout wrapper, applied there for app queries).
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scraper:scraper@postgres:5432/scraper_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   pgbouncer-init:
     image: postgres:16-alpine
@@ -106,6 +239,7 @@ services:
       - pgbouncer_config:/pgbouncer-config
 
   pgbouncer:
+    restart: unless-stopped
     image: edoburu/pgbouncer:latest
     environment:
       DB_HOST: postgres
@@ -120,7 +254,12 @@ services:
       - ./infra/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - pgbouncer_config:/etc/pgbouncer-config:ro
     ports:
-      - "6432:6432"
+      - "${PGBOUNCER_PORT:-6432}:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U scraper -d scraper_engine"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     depends_on:
       pgbouncer-init:
         condition: service_completed_successfully
@@ -131,21 +270,31 @@ services:
   # it reads real pool state via SHOW POOLS/SHOW CONFIG (stats_users, added to
   # pgbouncer.ini above) rather than anything this app process could report.
   pgbouncer_exporter:
+    restart: unless-stopped
     image: prometheuscommunity/pgbouncer-exporter:latest
     environment:
       DATA_SOURCE_NAME: "postgres://scraper:${POSTGRES_PASSWORD:-scraper}@pgbouncer:6432/pgbouncer?sslmode=disable"
     ports:
-      - "9127:9127"
+      - "${PGBOUNCER_EXPORTER_PORT:-9127}:9127"
     depends_on:
       - pgbouncer
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   minio:
-    image: minio/minio:latest
+    restart: unless-stopped
+    # Round 67 — Docker Hub's minio/minio was removed (CI: "pull access denied").
+    # Same release we ran before (identical image id), pinned on quay.io.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -153,23 +302,66 @@ services:
     volumes:
       - miniodata:/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
 
   # Real tracing backend — Jaeger's all-in-one image speaks OTLP gRPC natively
   # (no separate otel-collector needed). observability.otlp_endpoint points
   # every process here at it instead of the OTel default localhost:4317
   # (which resolves to the *calling container itself*, not this service).
   jaeger:
+    restart: unless-stopped
     image: jaegertracing/all-in-one:latest
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"  # UI
-      - "4317:4317"    # OTLP gRPC receiver
-      - "4318:4318"    # OTLP HTTP receiver
+      - "${JAEGER_UI_PORT:-16686}:16686"        # UI
+      - "${JAEGER_OTLP_GRPC_PORT:-4317}:4317"   # OTLP gRPC receiver
+      - "${JAEGER_OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP receiver
+
+  # Config already existed, git-tracked, fully written (infra/prometheus/
+  # prometheus.yml, monitoring/alerts/prometheus_rules.yml) but was never
+  # actually wired into this compose file — see .claude/knowledge/
+  # operations.md for the alert rules this scrapes and evaluates.
+  prometheus:
+    restart: unless-stopped
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts/prometheus_rules.yml:/etc/prometheus/alerts/prometheus_rules.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - api
+
+  # Same story as prometheus above — monitoring/alertmanager/alertmanager.yml
+  # (two-tier Slack routing) and its docker-entrypoint.sh (substitutes
+  # SLACK_WEBHOOK_URL into the config at container start) already existed,
+  # git-tracked, never wired in.
+  alertmanager:
+    restart: unless-stopped
+    image: prom/alertmanager:latest
+    entrypoint: ["/docker-entrypoint.sh"]
+    volumes:
+      - ./monitoring/alertmanager/docker-entrypoint.sh:/docker-entrypoint.sh:ro
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
 
 volumes:
   pgdata:
   miniodata:
   pgbouncer_config:
+
+networks:
+  # Shared with the separate extraction-engine repo's own compose project --
+  # one-time setup: `docker network create extraction-scraper-net`.
+  extraction-scraper-net:
+    external: true

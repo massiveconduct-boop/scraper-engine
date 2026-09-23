@@ -14,6 +14,7 @@ import httpx
 
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
+from scraper_engine.fetcher._failure import classify_http_status
 
 from .result import FetchResult
 
@@ -22,29 +23,26 @@ if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
     from scraper_engine.fetcher.scrapling_wrapper import ScraplingWrapper
     from scraper_engine.services.botasaurus_requests_client import BotasaurusRequestsClient
-    from scraper_engine.services.firecrawl_client import FirecrawlClient
 
 MAX_REDIRECTS = 10
 
 
 class Level1Fetcher:
-    """HTTP-level fetch using httpx with optional markdown conversion."""
+    """HTTP-level fetch using httpx. Markdown conversion happens centrally in
+    Worker.process_job, not here — see the module docstring."""
 
     TIMEOUT_SECONDS = 20
 
     def __init__(
         self,
-        firecrawl_client: FirecrawlClient | None = None,
         ssrf_guard: SSRFGuard | None = None,
         ja3_client: BotasaurusRequestsClient | None = None,
         scrapling_client: ScraplingWrapper | None = None,
     ) -> None:
-        """Level 1 fetcher. firecrawl_client is optional — the factory builds it
-        once from FIRECRAWL_API_KEY; None disables markdown conversion (fetch
-        still runs, FetchResult.markdown just stays unset). ssrf_guard defaults
-        to a fresh SSRFGuard() — a submission-time check alone leaves a
-        DNS-rebinding / redirect-to-internal-target gap between enqueue and the
-        worker actually connecting, so every hop is re-validated here too.
+        """Level 1 fetcher. ssrf_guard defaults to a fresh SSRFGuard() — a
+        submission-time check alone leaves a DNS-rebinding /
+        redirect-to-internal-target gap between enqueue and the worker
+        actually connecting, so every hop is re-validated here too.
 
         ja3_client is optional (round 26) — the factory builds it from
         config.botasaurus.l1_ja3_client_enabled (default off, brand-new code
@@ -58,8 +56,12 @@ class Level1Fetcher:
         matching this level's "HTTP/Scrapling" identity, previously never
         actually wired). Tried after the JA3 client (if configured) and
         before the plain httpx fallback — same shape, one more link in the
-        chain."""
-        self._firecrawl = firecrawl_client
+        chain.
+
+        Markdown conversion (round 29) moved out of every level fetcher and
+        into Worker.process_job, right next to the AdaptiveSelector call —
+        one place that runs regardless of which level actually succeeded,
+        rather than duplicated per level and only ever wired into L1."""
         self._ssrf_guard = ssrf_guard or SSRFGuard()
         self._ja3_client = ja3_client
         self._scrapling_client = scrapling_client
@@ -105,14 +107,11 @@ class Level1Fetcher:
                     await self._ssrf_guard.validate(next_url)
                     current_url = next_url
                     response = await client.get(current_url)
+                if response.is_redirect:
+                    return self._redirect_limit_result(url, proxy, response.status_code, start)
 
                 html = response.text
                 success = response.status_code < 400
-
-                markdown = None
-                if success and self._firecrawl is not None:
-                    markdown = await self._firecrawl.convert_to_markdown(html, url)
-
                 duration_ms = int((time.monotonic() - start) * 1000)
 
                 return FetchResult(
@@ -120,10 +119,12 @@ class Level1Fetcher:
                     success=success,
                     http_status=response.status_code,
                     html=html,
-                    markdown=markdown,
                     level_used=1,
                     proxy_used=proxy.key() if proxy else None,
                     duration_ms=duration_ms,
+                    failure_category=(
+                        None if success else classify_http_status(response.status_code)
+                    ),
                 )
         except httpx.TimeoutException:
             return FetchResult(
@@ -145,6 +146,28 @@ class Level1Fetcher:
                 failure_category=classify_fetch_exception(exc, FailureCategory.NETWORK_TIMEOUT),
                 error_message=str(exc),
             )
+
+    @staticmethod
+    def _redirect_limit_result(
+        url: str, proxy: Proxy | None, status: int, start: float
+    ) -> FetchResult:
+        """Round 64 — every engine's redirect loop used to fall out of its
+        `for _ in range(MAX_REDIRECTS)` with the last hop still a 3xx and then
+        compute `success = status < 400`: an endless redirect was reported as
+        a SUCCESSFUL fetch whose content was the redirect body. At the
+        plain-HTTP level a redirect loop is almost always a cookie or JS gate
+        that a real browser clears, so it is a DETECTION_BLOCK — the
+        category that escalates to L2 rather than landing in the DLQ."""
+        return FetchResult(
+            url=url,
+            success=False,
+            http_status=status,
+            level_used=1,
+            proxy_used=proxy.key() if proxy else None,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            error_message=f"Redirect limit ({MAX_REDIRECTS}) exceeded",
+        )
 
     async def _fetch_via_ja3(
         self, url: str, proxy: Proxy | None, timeout: int, start: float
@@ -174,21 +197,20 @@ class Level1Fetcher:
                 await self._ssrf_guard.validate(next_url)
                 current_url = next_url
                 response = await session.get(current_url, proxy=proxy_url)
+            if response.status_code in (301, 302, 303, 307, 308) and response.location:
+                return self._redirect_limit_result(url, proxy, response.status_code, start)
 
             success = response.status_code < 400
-            markdown = None
-            if success and self._firecrawl is not None:
-                markdown = await self._firecrawl.convert_to_markdown(response.text, url)
 
             return FetchResult(
                 url=url,
                 success=success,
                 http_status=response.status_code,
                 html=response.text,
-                markdown=markdown,
                 level_used=1,
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                failure_category=None if success else classify_http_status(response.status_code),
             )
         except Exception:
             return None
@@ -218,21 +240,20 @@ class Level1Fetcher:
                 response = await self._scrapling_client.fetch(current_url, timeout, proxy=proxy_url)
                 if response is None:
                     return None
+            if response.location is not None:
+                return self._redirect_limit_result(url, proxy, response.status_code, start)
 
             success = response.status_code < 400
-            markdown = None
-            if success and self._firecrawl is not None:
-                markdown = await self._firecrawl.convert_to_markdown(response.text, url)
 
             return FetchResult(
                 url=url,
                 success=success,
                 http_status=response.status_code,
                 html=response.text,
-                markdown=markdown,
                 level_used=1,
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                failure_category=None if success else classify_http_status(response.status_code),
             )
         except Exception:
             return None

@@ -58,20 +58,17 @@ def test_level3_fetcher_keeps_solver_when_enabled():
     assert fetcher._captcha_solver is solver
 
 
-def test_build_level1_fetcher_returns_configured_fetcher(monkeypatch):
-    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+def test_build_level1_fetcher_returns_configured_fetcher():
     fetcher = build_level1_fetcher(AppConfig())
 
     assert isinstance(fetcher, Level1Fetcher)
-    assert fetcher._firecrawl is None
     assert fetcher._ja3_client is None
     # Default level_1.engine is "scrapling" (base.yaml) — L1's own
     # "HTTP/Scrapling" identity, wired for real in round 28.
     assert isinstance(fetcher._scrapling_client, ScraplingWrapper)
 
 
-def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling(monkeypatch):
-    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling():
     config = AppConfig(
         levels=LevelsConfig(
             level_1=LevelConfig(engine="camoufox", proxy_tier_min_score=40.0, timeout_seconds=20)
@@ -80,3 +77,19 @@ def test_build_level1_fetcher_skips_scrapling_when_engine_is_not_scrapling(monke
     fetcher = build_level1_fetcher(config)
 
     assert fetcher._scrapling_client is None
+
+
+def test_skip_botasaurus_builds_a_camoufox_only_level2():
+    """Round 64 — level memory's Botasaurus hint reaches the fetcher as a
+    Camoufox-only L2 for that fetch (and no Botasaurus driver pool)."""
+    from unittest.mock import MagicMock
+
+    from scraper_engine.config.schema import AppConfig
+    from scraper_engine.fetcher.factory import build_level2_fetcher
+
+    config = AppConfig()
+    assert "botasaurus" in config.levels.level_2.engine
+    normal = build_level2_fetcher(config, botasaurus_pool=MagicMock())
+    skipped = build_level2_fetcher(config, botasaurus_pool=MagicMock(), skip_botasaurus=True)
+    assert normal._botasaurus is not None and normal._botasaurus_pool is not None
+    assert skipped._botasaurus is None and skipped._botasaurus_pool is None

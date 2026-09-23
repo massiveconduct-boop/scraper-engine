@@ -16,6 +16,17 @@ if TYPE_CHECKING:
     from scraper_engine.storage.redis_client import RedisClient
 
 
+def seconds_until_quota_reset() -> int:
+    """Seconds until the daily quota counter resets (next UTC midnight) —
+    used as the Retry-After value on a 429 quota-exceeded response, since
+    the quota key itself buckets by UTC day (see _quota_key below)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((tomorrow - now).total_seconds())
+
+
 class QuotaManager:
     """Per-tenant daily quota tracked via Redis counters.
 

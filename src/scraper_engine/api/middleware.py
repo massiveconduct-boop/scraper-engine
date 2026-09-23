@@ -57,6 +57,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     "detail": "Rate limit exceeded",
                     "retry_after_seconds": self._window_seconds,
                 },
+                headers={"Retry-After": str(self._window_seconds)},
             )
 
         self._store.setdefault(key, []).append(now)
@@ -64,7 +65,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add security headers to every response."""
+    """Add security headers to every response.
+
+    Does NOT touch the Server header here — uvicorn appends its own
+    `Server: uvicorn` at the HTTP protocol layer unconditionally, on top of
+    whatever the ASGI app already set, rather than replacing it (setting
+    `response.headers["Server"] = ""` here used to just add a SECOND,
+    empty `Server` header alongside uvicorn's own, producing a duplicate
+    header on every response instead of hiding anything). Suppressing it
+    is a uvicorn-launch-config concern (`--no-server-header` /
+    `server_header=False`), not something fixable from inside the app.
+    """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
@@ -73,7 +84,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Server"] = ""  # hide server identity
         return response
 
 

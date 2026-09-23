@@ -18,11 +18,15 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING
 
+from scraper_engine.proxy.harvester import _score_validation, _to_asn_class
+from scraper_engine.proxy.scoring import compute_success_rate
+
 if TYPE_CHECKING:
     import asyncpg
 
     from scraper_engine.core.models import AnonymityLevel
     from scraper_engine.core.tenant import TenantId
+    from scraper_engine.proxy.harvester import SupportsClassify
     from scraper_engine.storage.postgres_client import PostgresClient
 
 logger = logging.getLogger(__name__)
@@ -37,7 +41,7 @@ ValidateFn = Callable[
     # contract is the 3 required args; a fn with an extra defaulted param still
     # satisfies this.
     [str, int, str],
-    Coroutine[None, None, tuple[bool, "AnonymityLevel"]],
+    Coroutine[None, None, tuple[bool, "AnonymityLevel", "int | None"]],
 ]
 
 
@@ -53,19 +57,23 @@ class ProxyPromotionJob:
         pg: PostgresClient,
         http_validate_fn: ValidateFn,
         system_tenant: TenantId | None = None,
+        asn_classifier: SupportsClassify | None = None,
     ) -> None:
         from scraper_engine.core.tenant import TenantId
+        from scraper_engine.proxy.asn_classifier import NullAsnClassifier
 
         self._pg = pg
         self._http_validate = http_validate_fn
         self._tenant: TenantId = system_tenant or TenantId("system")
         self._sem = asyncio.Semaphore(PROMOTION_CONCURRENCY)
+        self._classifier: SupportsClassify = asn_classifier or NullAsnClassifier()
 
     async def run_once(self) -> dict[str, int]:
         """Execute one promotion cycle. Returns counts keyed by outcome."""
         async with self._pg.acquire(self._tenant) as conn:
             candidates = await conn.fetch(
-                """SELECT id, ip, port, protocol, promotion_attempts
+                """SELECT id, ip, port, protocol, promotion_attempts,
+                          global_success_count, global_failure_count
                    FROM proxy_pool
                    WHERE reliability_score < 40
                      AND promotion_attempts < $1
@@ -85,7 +93,7 @@ class ProxyPromotionJob:
         async def _try_one(row: asyncpg.Record) -> None:
             nonlocal promoted, failed, exhausted
             async with self._sem:
-                is_valid, anonymity = await self._http_validate(
+                is_valid, anonymity, latency_ms = await self._http_validate(
                     row["ip"],
                     row["port"],
                     row["protocol"],
@@ -93,14 +101,24 @@ class ProxyPromotionJob:
             async with self._pg.acquire(self._tenant) as conn:
                 new_attempts = row["promotion_attempts"] + 1
                 if is_valid:
+                    asn = _to_asn_class(await self._classifier.classify(row["ip"]))
+                    success_rate = compute_success_rate(
+                        row["global_success_count"], row["global_failure_count"]
+                    )
+                    score = _score_validation(latency_ms, anonymity, asn, success_rate)
                     await conn.execute(
                         """UPDATE proxy_pool
-                           SET reliability_score = 60,
-                               anonymity_level = $1,
+                           SET reliability_score = $1,
+                               anonymity_level = $2,
+                               asn_class = $3,
+                               response_time_ms = $4,
                                promotion_attempts = promotion_attempts + 1,
                                last_promotion_attempt_at = NOW()
-                           WHERE id = $2""",
+                           WHERE id = $5""",
+                        score,
                         anonymity.value,
+                        asn.value,
+                        latency_ms,
                         row["id"],
                     )
                     promoted += 1
@@ -113,8 +131,11 @@ class ProxyPromotionJob:
                         row["id"],
                     )
                     failed += 1
-                    if new_attempts >= MAX_PROMOTION_ATTEMPTS:
-                        exhausted += 1
+                    # A count, not an `if`: an `if` as the last statement of an
+                    # `async with` body records its "false" exit differently on
+                    # Python 3.11, so 3.11's branch coverage reported that path
+                    # missed although tests take it (round 67, PR #31 CI).
+                    exhausted += int(new_attempts >= MAX_PROMOTION_ATTEMPTS)
 
         if candidates:
             await asyncio.gather(*[_try_one(row) for row in candidates])

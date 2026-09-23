@@ -1,38 +1,39 @@
 # tests/integration/test_promotion.py
-"""Controlled proxy promotion integration test — validates judge-seeded proxy promotion.
+"""Controlled proxy promotion integration test — exercises ProxyPromotionJob's
+own pipeline mechanics (DB writes, scoring, concurrency, attempt tracking),
+not real-world external-proxy validation.
 
 Plan §4.4: uses ProxyPromotionJob.run_once() (not the legacy promote_tcp_only).
-Deterministic, repeatable — seeds a proxy pointing at the judge server and
-asserts promotion from score 25 → 60.
-"""
+Deterministic, repeatable — seeds a "proxy" pointing at the local judge_server.py
+stand-in and asserts promotion from score 25 → 60.
 
-import subprocess
-import sys
-import time
-from pathlib import Path
+Important scope note (round 32): this seeds ip=port=the judge's own address,
+so the "proxy" and the validation target are the same machine — a degenerate
+case real external routing never produces (a real proxy forwards a request
+made ON ITS BEHALF to a target it does NOT own). This test cannot and does
+not prove that a real third-party proxy validates successfully end to end —
+that depends on live, flaky, uncontrollable third-party network behavior and
+is checked separately (see tests/live/test_proxy_judge_reachability.py for
+the narrower, deterministic piece of that which CAN be asserted: that the
+production validation target itself is real and reachable).
+"""
 
 import pytest
 
 from scraper_engine.core.tenant import TenantId
 from scraper_engine.proxy.harvester import ProxyHarvester
+from scraper_engine.proxy.judge_server import start as start_judge_server
 from scraper_engine.proxy.promotion import ProxyPromotionJob
 from scraper_engine.storage.postgres_client import PostgresClient
-
-JUDGE_SERVER = Path(__file__).resolve().parent.parent / "fixtures" / "judge_server.py"
 
 
 @pytest.fixture(scope="module")
 def judge_server():
-    """Start the self-hosted judge server on port 8089 in the background."""
-    p = subprocess.Popen([sys.executable, str(JUDGE_SERVER)])
-    # Give the server a moment to bind and start listening
-    time.sleep(1.0)
+    """Start the real (embedded-thread) judge server on port 8089."""
+    server = start_judge_server()
     yield
-    p.terminate()
-    try:
-        p.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        p.kill()
+    server.shutdown()
+    server.server_close()
 
 
 @pytest.fixture
@@ -49,11 +50,13 @@ async def pg():
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_promote_tcp_only_promotes_seeded_proxy(pg, judge_server):
-    """Seed a proxy pointing to the judge server at score 25 and assert it promotes to 60.
+    """Seed a "proxy" pointing at the local judge stand-in at score 25 and
+    assert it promotes to 60.
 
     Plan §4.4: uses ProxyPromotionJob.run_once() (the plan's specified implementation).
-    This is a controlled, deterministic proof of proxy promotion without flaky
-    dependencies on wild proxies.
+    This is a controlled, deterministic proof of the promotion PIPELINE's
+    mechanics, without flaky dependencies on wild proxies or the real
+    internet — see the module docstring for what this does NOT prove.
     """
     tenant = TenantId("system")
     ip = "127.0.0.1"
@@ -101,7 +104,14 @@ async def test_promote_tcp_only_promotes_seeded_proxy(pg, judge_server):
     )
 
     assert len(rows) == 1
-    assert rows[0]["reliability_score"] == 60.0
+    # Round 32: score is now formula-computed via ScoringEngine (real
+    # measured latency to the local judge stand-in, ELITE anonymity since
+    # judge_server.py sets no Via/XFF/Proxy-Connection headers, UNKNOWN ASN
+    # for 127.0.0.1, success_rate=None on a first validation) instead of a
+    # flat 60 — bounds-checked rather than an exact float to tolerate
+    # latency jitter, but must clear L2's 70 threshold given near-zero
+    # loopback latency + elite anonymity.
+    assert 70.0 <= rows[0]["reliability_score"] <= 100.0
     assert rows[0]["anonymity_level"] == "elite"
 
     # Clean up database row

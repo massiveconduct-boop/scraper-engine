@@ -3,7 +3,10 @@
 
 BD-07 retention policy:
   - Failed snapshots: retain 30 days (for debugging)
-  - Successful snapshots: retain 1 day (transient, content already extracted)
+  - Successful snapshots: retain 7 days (round 29 — matches the caching
+    window in orchestrator/worker.py; a shorter retention would let the
+    html_snapshot_url pointer returned to callers go dead before the cache
+    entry it backs actually expires)
   - Automated deletion via S3 lifecycle rules
 """
 
@@ -24,7 +27,7 @@ class S3Client:
 
     # BD-07 retention
     FAILED_RETENTION_DAYS = 30
-    SUCCESS_RETENTION_DAYS = 1
+    SUCCESS_RETENTION_DAYS = 7
 
     def __init__(
         self,
