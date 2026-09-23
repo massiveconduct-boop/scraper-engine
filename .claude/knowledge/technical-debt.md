@@ -89,6 +89,27 @@ on: 982s against 528s off (round 66, separate sessions).
   Seats were back to 0 60s after every run. Round 66's 982s for light pages
   with admission on did not reproduce: without reuse it was 364s this time,
   so most of that gap was free-proxy noise.
+- **Getting it onto `main` (PR #31, first CI run since 2026-07-29).** Five
+  blockers, none in round-67 logic: (1) the lockfile drift check did a fresh
+  resolve against PyPI, so it failed on any upstream release. It now seeds
+  uv with the committed locks and fails only on real `pyproject.toml`
+  drift. (2) `pip-audit`: cryptography 49.0.0 and setuptools 80.10.2 had
+  known vulnerabilities → cryptography 50.0.1, and supervisor 4.3.0
+  (importlib, so the runtime setuptools pin is dropped; api image verified,
+  6/6 programs RUNNING). (3) Docker Hub's `minio/minio` is gone → the same
+  image (identical id), pinned on quay.io. (4) A real Python 3.11 bug: a
+  cancel landing mid-EVAL is absorbed by redis-py 8.0.1. `eval` returned
+  normally with the task still `cancelling()`, so the waiter polled until
+  its budget ran out and a cancelled renewer could hang `claim()`'s exit
+  forever. `HostAdmission._eval` re-raises it (`Task.cancelling()`). On
+  3.11 afterwards: 0 of 120 cancels lost (was 7-9). Other Redis loops in
+  the codebase stop on events, not cancellation alone, and production runs
+  3.12, so the guard stays scoped to admission. (5) 3.11 had never run
+  branch coverage on CI (switched on in round 62). It reported
+  `proxy/promotion.py` `134->exit` missed although tests take that path:
+  an `if` as the last statement of an `async with` body records its exit
+  differently on 3.11. The count is now arithmetic, with no branch. The
+  full suite under 3.11 locally: 1475 passed, 0 missed lines/branches.
 - **Still open.** Admission wait (~55s median on light pages) is now the
   largest cost per URL under admission, and the budget binds before the host
   is strained (PSI 26). Admission stays OFF by default until it is decided
