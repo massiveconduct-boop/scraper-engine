@@ -1,6 +1,6 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Currently at round 66.
+Project identity, operating rules, and navigation. Currently at round 67.
 **Never a diary.** Audits at rounds 28, 57 and 66 each removed dated
 per-round narrative from this exact spot (`decisions.md` →
 "Knowledge-Audit: Round-57 CLAUDE.md Diary Regression"); a 1800-word gate
@@ -78,7 +78,8 @@ openwolf cron        # cron task management
   after a probe succeeds), a host-admission controller that only limits a
   strained host (measured on free heavy targets, not paid Jumia runs),
   `display_lock_wait_ms`, and Botasaurus drivers closing on release under
-  admission (66).
+  admission (66), parked browsers keeping their render's host seat under
+  admission and a measured per-browser memory weight (67).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:
@@ -95,7 +96,7 @@ see `.claude/knowledge/architecture.md` (design) and
 
 | Package | Responsibility |
 |---|---|
-| `core/` | Domain models, TenantId, SSRF guard, retry, budget, quota. `periodic.py` — shared polling-loop helper (with optional Redis liveness heartbeat) reused by the webhook sweeper and DLQ reaper. `budget.py` — `XVFB_LOCK` (process-wide lock serializing headful-browser display spinup/teardown), `resolve_browser_max_total_instances()` (opt-in RAM-aware ceiling on live browser instances) and `acquire_browser_permit()` — the one way ANY engine takes a `BROWSER_SEMAPHORE` permit: reclaims parked instances via registered pools and counts waiters, so a pool hands a returning instance's permit over instead of parking it. `models.py` — `Proxy` (paid-gateway auth fields), `FetchResult` (`network_events` from Botasaurus CDP capture). `startup.py` — `wait_for_dependency()`, the unbounded-by-default dependency wait every process's startup uses instead of exiting when Postgres/Redis/S3 isn't up yet. `host_identity.py` — which physical host a process is on (`SCRAPER_HOST_ID`, else kernel `boot_id`) |
+| `core/` | Domain models, TenantId, SSRF guard, retry, budget, quota. `periodic.py` — shared polling-loop helper (with optional Redis liveness heartbeat) reused by the webhook sweeper and DLQ reaper. `budget.py` — `XVFB_LOCK` (process-wide lock serializing headful-browser display spinup/teardown), `resolve_browser_max_total_instances()` (opt-in RAM-aware ceiling on live browser instances) and `acquire_browser_permit()` — the one way ANY engine takes a `BROWSER_SEMAPHORE` permit: reclaims parked instances via registered pools and counts waiters, so a pool hands a returning instance's permit over instead of parking it. `models.py` — `Proxy` (paid-gateway auth fields), `FetchResult` (`network_events` from Botasaurus CDP capture). `startup.py` — `wait_for_dependency()`, the unbounded-by-default dependency wait every process's startup uses instead of exiting when Postgres/Redis/S3 isn't up yet. `host_identity.py` — which physical host a process is on (`SCRAPER_HOST_ID`, else kernel `boot_id`). `browser_rss.py` — what this process's live browsers weigh |
 | `proxy/` | Harvester (multi-source + broker subprocess), Manager (leasing, TCP+HTTPS-CONNECT preflight, SQL-side candidate exclusion, exhaustion wakes the harvester), `net_probe.py` (shared probe primitives), Scoring, Lease, `asn_classifier.py` (reverse-DNS ASN classification), `health_monitor.py` (rolling re-validation + rescoring), `pool_health.py` (per-tier HEALTHY/DEGRADED/CRITICAL state machine), `dlq_reaper.py` (transient-DLQ auto-retry daemon), `paid_gateway.py` (toggleable DataImpulse gateway proxy; renders the provider's username grammar — per-attempt `sessid` rotation for a fresh exit IP, optional `asn` pin, `cr` country), `retention_reaper.py` |
 | `browser/` | `CamoufoxWrapper` (geoip/humanize/headless, geoip-launch fallback, holds `XVFB_LOCK`), `pool.py::BrowserPool` (hot-browser `lease()`, one per rq job), `botasaurus_pool.py::BotasaurusPool` (up to `max_pooled_drivers` drivers per job, reused per proxy-identity+domain, navigated for real, display lock around launch/close only; `block_images`, `extensions`, `lang`/locale/timezone spoof, human-mode mouse, network-event capture — all opt-in via `BotasaurusConfig`), `_xvfb_cleanup.py`, `_botasaurus_nav_check.py` (`chrome-error://` silent-failure detection), `_botasaurus_scroll.py` (autoscroll port for Botasaurus's sync Driver API), `_botasaurus_extension.py`, `_botasaurus_network_capture.py` |
 | `fetcher/` | Level1/2/3 fetchers, `factory.py` (DI, CI-gated), `_content_utils` (shared guard/poll/scroll), `challenge_detector` (incl. Chromium net-error structural check), `_failure`, `_captcha.py` (DOM detect→solve→inject→re-poll), `botasaurus_wrapper.py` (Botasaurus first-attempt, same feature set as `botasaurus_pool`), `level_2.py` (Botasaurus→Camoufox fallback; the real `FetchResult`-construction site for L2, including `network_events`), `scrapling_wrapper.py` (L1's third engine option), `adaptive_selector.py` (structured extraction, called from `Worker`) |

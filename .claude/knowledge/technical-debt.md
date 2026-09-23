@@ -32,6 +32,69 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 67)
+
+Origin: round 66's open item. Under host admission every render paid for a
+cold browser, because both pools closed on release. Light pages, admission
+on: 982s against 528s off (round 66, separate sessions).
+
+- **A parked browser keeps its render's seat.** `SeatKeeper` in
+  `orchestrator/host_capacity.py`. A claim publishes itself in a
+  contextvar (`_ACTIVE_CLAIM`). When a pool parks the render's browser,
+  `retain()` marks the claim retained, so the claim's exit releases only the
+  politeness slot (`RELEASE_SLOT_LUA`), and the keeper renews the seat from
+  then on. `BrowserPool` queue items carry a 4th field (the seat), and
+  `_PooledDriver` has a `seat`. Reusing a parked browser hands its seat
+  back, because the new render's claim covers it. Every close path (LRU,
+  idle timeout, permit reclaim, eviction, shutdown) calls `discard()`.
+- **Give-back rules.** Someone waiting in the host's line plus a seat idle at
+  least `idle_grace_seconds` (2s): close one parked browser per waiter.
+  Idle `idle_seat_seconds` (45s) with nobody waiting: close it. Lease lost
+  on renewal: close *that* browser. `_close_parked(seat)` in both pools;
+  found in review before commit that the first draft closed the oldest
+  instead (buglog bug-062).
+- **Measured browser weight.** `core/browser_rss.py::sample_browser_rss()`
+  walks this process's `psutil` descendants named firefox/camoufox/chrome/chromium and counts
+  each browser tree's root once, with its whole tree's RSS. The keeper
+  publishes it to `hc:{host}:browser_rss` (one field per process, stale after
+  `max(3 × controller interval, 30s)`). The controller uses the mean for both the
+  memory-derived ceiling and the per-raise memory bound. It's clamped to
+  `[min_browser_memory_mb, browser_memory_mb]`, with the fallback 1200 until
+  2 browsers are reported. Live readings: 870-1200 MB, so a small loosening.
+- **Paid-gateway browsers are never parked** (`Proxy.reusable()`, found
+  after the A/B when the user asked whether paid proxies had been
+  considered). Every gateway attempt gets a fresh `sessid`, and reuse
+  matches on `identity_key()`, so a browser parked after a gateway render
+  could never be picked up again. It only held RAM, a browser permit and,
+  under admission, a host seat for up to 45s. Both pools now close it on
+  release, with admission on or off. Live, real Camoufox + Botasaurus in a
+  worker container, one free proxy labelled `pool` vs `paid_gateway`
+  (no DataImpulse traffic): pool → parked 1, gateway → parked 0 and 0
+  browsers left running. So the A/B's reuse gain applies to free-pool
+  renders only. Gateway renders behave as in round 66 (a cold browser
+  each), which is the cost of rotating the exit IP every attempt.
+- **Toggle:** `host_capacity.reuse_browsers`, env
+  `HOST_CAPACITY_REUSE_BROWSERS` (default true, passed through by all four
+  compose services).
+- **Live A/B (2026-09-23, free proxies only, gateway disabled for the run
+  and restored after):**
+
+  | Run | Wall | OK | Render med | Admission wait med | Load med | PSI med/p90 | Browsers med/max |
+  |---|---|---|---|---|---|---|---|
+  | Light, admission off | 393s | 97/97 | 28.6s | 0 | 4.6 | 18/25 | 15/18 |
+  | Light, admission + reuse | 333s | 97/97 | 23.4s | 58s | 5.9 | 26/40 | 10/16 |
+  | Light, admission, no reuse | 364s | 97/97 | 25.1s | 54s | 8.9 | 34/57 | 8/16 |
+  | Heavy, admission + reuse | 1885s | 81/97 | 221s | 51s | 32.4 | 83/91 | 17/23 |
+
+  Seats were back to 0 60s after every run. Round 66's 982s for light pages
+  with admission on did not reproduce: without reuse it was 364s this time,
+  so most of that gap was free-proxy noise.
+- **Still open.** Admission wait (~55s median on light pages) is now the
+  largest cost per URL under admission, and the budget binds before the host
+  is strained (PSI 26). Admission stays OFF by default until it is decided
+  whether that trade is wanted (it buys fairness and crash-safety, not
+  speed). `/v1/crawl` is still outside admission.
+
 ## Technical Debt / Open Threads (as of round 66)
 
 Origin: round 65's open item — with the DataImpulse plan out of traffic,

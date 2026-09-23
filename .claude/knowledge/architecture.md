@@ -679,13 +679,35 @@ sized its own semaphore as if it owned the machine.
   load shrinks our share — we yield, we cannot control them.
 - **Host id** (`core/host_identity.py`): `SCRAPER_HOST_ID`, else the kernel
   `boot_id` every container on a host shares.
-- **Around it.** BrowserPool prewarm is off under admission (and for
-  `max_level < 2`); under admission BOTH pools close on release
-  (`park_spares=False`, and round 66's `park_drivers=False` for
-  `BotasaurusPool`) so no browser runs outside a seat — measured cost: a
-  cold browser per render, which on light pages through the free pool
-  doubled render time (32s → 60s median);
-  `RQ_WORKERS_PER_CONTAINER` > 1 runs `rq worker-pool` so a small job starts
+- **Parked browsers keep their seat (round 67).** When a pool parks a
+  browser for reuse it keeps the seat of the render that launched it:
+  `SeatKeeper.retain()` reads the claim from a contextvar (`_ACTIVE_CLAIM`),
+  the claim's exit then returns only the politeness slot
+  (`RELEASE_SLOT_LUA`), and the keeper renews the seat from then on. One
+  seat is one browser: a render whose seat already went to another parked
+  instance closes its browser (round 66's behaviour). A render that reuses a
+  parked browser hands that browser's seat back, since its own claim now
+  covers it. The keeper (one per job, a task in `tasks.py::_run_scrape`)
+  gives a seat back when the pool closes that instance (`discard()`), when
+  anyone waits in the host's line and the seat has been idle
+  `idle_grace_seconds` (2s), after `idle_seat_seconds` (45s) idle with
+  nobody waiting, or when its lease is lost. The last case closes exactly
+  that browser (`_close_parked(seat)`), not the oldest one. So `in_use`
+  counts live browsers. A browser used on a paid-gateway session is never
+  parked, admission or not (`Proxy.reusable()`), because each gateway
+  attempt has a fresh `sessid` that no later request asks for.
+  `HOST_CAPACITY_REUSE_BROWSERS=false` restores
+  close-on-release. Prewarm stays off under admission (and for
+  `max_level < 2`).
+- **Measured browser weight (round 67).** Each keeper publishes what its
+  process's live browsers weigh (`core/browser_rss.py`: summed RSS per
+  browser process tree) to `hc:{host}:browser_rss`, at most once per
+  controller interval. The controller charges the mean, clamped to
+  `[min_browser_memory_mb, browser_memory_mb]` (400, 1200), and falls back
+  to 1200 until two browsers are reported. It can only loosen the constant:
+  summed RSS over-counts pages shared between processes. Live readings were
+  870-1200 MB.
+- `RQ_WORKERS_PER_CONTAINER` > 1 runs `rq worker-pool` so a small job starts
   without waiting for a big one — only with admission on. Timings gain
   `admission_wait_ms`; `level_N_ms` becomes render time only.
   `/v1/health` → `browser_capacity`; `/metrics` → `host_capacity_*`,

@@ -12,6 +12,56 @@ round it shipped in.
 
 ---
 
+## Decision: A Parked Browser Keeps the Seat of the Render That Launched It
+
+**Date:** 2026-09-23 | **Round:** 67
+
+**What:** Under host admission both browser pools may park a browser for
+reuse again, as long as the browser keeps the seat of the render that
+launched it (`orchestrator/host_capacity.py::SeatKeeper`). The seat now
+belongs to the browser, not the render. The keeper gives it back when the
+pool closes that browser, when someone waits in the host's line and the
+seat has been idle 2s, after 45s idle with nobody waiting, or when its lease
+is lost. Separately, workers publish what their browsers actually weigh
+(`core/browser_rss.py`) and the controller charges that instead of the
+fixed 1200 MB, clamped to `[400, 1200]`.
+
+**Why:** rounds 65-66 closed every browser on release under admission,
+because a parked one ran outside any seat, which is load the budget could
+not see. The cost was a cold browser for every render. Measured on free
+proxies, 97 light toscrape URLs, all runs in one session (2026-09-23):
+admission off 393s; admission + reuse 333s; admission without reuse 364s.
+Wall times are within free-proxy noise, but host cost is not. With reuse,
+median load was 5.9 and CPU PSI 26/40 (median/p90), against 8.9 and 34/57
+without reuse. Render median was 23.4s against 25.1s. Heavy pages (97
+Wikipedia articles) with reuse: 1885s, 81/97, load 32, PSI 83, the same as
+round 66's 1808s, 83/97 without reuse. Seats were back to 0 60s after every
+run.
+
+**Alternatives rejected:**
+- *Park without a seat* (pre-round-65 behaviour). Live in round 65, five
+  parked Camoufox per worker ran outside the budget and the controller cut
+  the target to about 2.4.
+- *Release the seat on park and re-claim it on reuse.* Then a parked browser
+  is invisible again between renders, which is the whole problem.
+- *Close the oldest parked browser when a lease is lost.* That leaves a
+  browser the host no longer counts, and frees a seat that was still valid.
+  Reclaimers take the lease id and close exactly that browser.
+- *Let the measured weight go above 1200 MB.* Summed RSS counts pages shared
+  between a browser's processes more than once, so it over-states the cost,
+  and real MemAvailable already gates every raise. The measurement may only
+  loosen the constant.
+
+**Paid gateway:** reuse cannot help there. Every gateway attempt uses a
+fresh `sessid` (round 62: a fresh exit IP per attempt), so a parked gateway
+browser is never asked for again. Both pools close it on release instead
+(`Proxy.reusable()`). The measured gain is for free-pool renders only. It
+was not measured on paid traffic, per the user's no-paid-traffic rule.
+
+**Rollback:** `HOST_CAPACITY_REUSE_BROWSERS=false` restores close-on-release.
+
+---
+
 ## Decision: A Limiter That Only Limits When the Host Is Actually Strained
 
 **Date:** 2026-09-22 | **Round:** 66
