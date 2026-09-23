@@ -131,8 +131,11 @@ class ProxyPromotionJob:
                         row["id"],
                     )
                     failed += 1
-                    if new_attempts >= MAX_PROMOTION_ATTEMPTS:
-                        exhausted += 1
+                    # A count, not an `if`: an `if` as the last statement of an
+                    # `async with` body records its "false" exit differently on
+                    # Python 3.11, so 3.11's branch coverage reported that path
+                    # missed although tests take it (round 67, PR #31 CI).
+                    exhausted += int(new_attempts >= MAX_PROMOTION_ATTEMPTS)
 
         if candidates:
             await asyncio.gather(*[_try_one(row) for row in candidates])
