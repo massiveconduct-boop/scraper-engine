@@ -66,8 +66,18 @@ def _admission(redis, **overrides) -> HostAdmission:
     return HostAdmission(redis, f"hctest-{uuid.uuid4().hex[:8]}", _cfg(**overrides))
 
 
-def _claim(adm, *, tenant=T1, domain="a.example", weight=1.0, cap=5, delay=0.0,
-           priority=None, budget=0.0, is_cancelled=None):
+def _claim(
+    adm,
+    *,
+    tenant=T1,
+    domain="a.example",
+    weight=1.0,
+    cap=5,
+    delay=0.0,
+    priority=None,
+    budget=0.0,
+    is_cancelled=None,
+):
     return adm.claim(
         tenant_id=tenant,
         domain=domain,
@@ -118,25 +128,48 @@ async def _holding(adm, *claims):
             await h.release()
 
 
-async def _enqueue_waiter(adm, *, waiter_id, priority, tenant=T1, domain="a.example",
-                          weight=1.0, cap=5, delay_ms=0):
+async def _enqueue_waiter(
+    adm, *, waiter_id, priority, tenant=T1, domain="a.example", weight=1.0, cap=5, delay_ms=0
+):
     """One raw CLAIM call that leaves the waiter in line when not granted —
     stands in for a live waiter that is between polls."""
-    info = json.dumps({
-        "tenant": str(tenant),
-        "slot_key": slot_key(domain, tenant),
-        "delay_key": delay_key(domain, tenant),
-        "cap": cap,
-        "delay_ms": delay_ms,
-        "weight": weight,
-    })
-    keys = [adm.seats_key, adm.seat_weight_key, adm.seat_tenant_key, adm.waiters_key,
-            adm.waiter_exp_key, adm.waiter_info_key, adm.target_key, adm.stats_key]
-    reply = await adm._eval(CLAIM_LUA, keys, [
-        waiter_id, priority, info, f"lease-{waiter_id}",
-        adm._cfg.lease_ttl_seconds * 1000, adm._cfg.waiter_ttl_seconds * 1000,
-        adm.default_target, adm._cfg.tenant_share, 3_600_000, 0, "1000",
-    ])
+    info = json.dumps(
+        {
+            "tenant": str(tenant),
+            "slot_key": slot_key(domain, tenant),
+            "delay_key": delay_key(domain, tenant),
+            "cap": cap,
+            "delay_ms": delay_ms,
+            "weight": weight,
+        }
+    )
+    keys = [
+        adm.seats_key,
+        adm.seat_weight_key,
+        adm.seat_tenant_key,
+        adm.waiters_key,
+        adm.waiter_exp_key,
+        adm.waiter_info_key,
+        adm.target_key,
+        adm.stats_key,
+    ]
+    reply = await adm._eval(
+        CLAIM_LUA,
+        keys,
+        [
+            waiter_id,
+            priority,
+            info,
+            f"lease-{waiter_id}",
+            adm._cfg.lease_ttl_seconds * 1000,
+            adm._cfg.waiter_ttl_seconds * 1000,
+            adm.default_target,
+            adm._cfg.tenant_share,
+            3_600_000,
+            0,
+            "1000",
+        ],
+    )
     return reply[0] == "1"
 
 
@@ -195,8 +228,9 @@ class TestFairness:
         adm = _admission(redis, default_units=4.0)
         async with _holding(adm, {"domain": "full.example", "cap": 1}):
             # Older waiter for the full site stays in line…
-            assert not await _enqueue_waiter(adm, waiter_id="old", priority=1,
-                                             domain="full.example", cap=1)
+            assert not await _enqueue_waiter(
+                adm, waiter_id="old", priority=1, domain="full.example", cap=1
+            )
             # …and a newer one for another site is still served.
             async with _claim(adm, domain="free.example", priority=2) as grant:
                 assert grant.in_use == 2.0
@@ -208,11 +242,20 @@ class TestFairness:
             # One seat left. An older waiter could take it right now…
             await redis.zadd(adm.waiters_key, {"old": 1})
             await redis.zadd(adm.waiter_exp_key, {"old": int(time.time() * 1000) + 60_000})
-            await redis.hset(adm.waiter_info_key, "old", json.dumps({
-                "tenant": str(T1), "slot_key": slot_key("o.example", T1),
-                "delay_key": delay_key("o.example", T1), "cap": 5, "delay_ms": 0,
-                "weight": 1.0,
-            }))
+            await redis.hset(
+                adm.waiter_info_key,
+                "old",
+                json.dumps(
+                    {
+                        "tenant": str(T1),
+                        "slot_key": slot_key("o.example", T1),
+                        "delay_key": delay_key("o.example", T1),
+                        "cap": 5,
+                        "delay_ms": 0,
+                        "weight": 1.0,
+                    }
+                ),
+            )
             # …so a newer caller is refused.
             with pytest.raises(AdmissionTimeoutError):
                 async with _claim(adm, domain="y.example", priority=2, budget=0.05):
@@ -238,18 +281,25 @@ class TestFairness:
         adm = _admission(redis, default_units=4.0, tenant_share=0.5)  # cap = 2
         # No other tenant waiting: T1 may go past its share.
         async with (
-            _holding(adm, {"tenant": T1, "domain": "a.example"},
-                     {"tenant": T1, "domain": "b.example"},
-                     {"tenant": T1, "domain": "c.example"}),
+            _holding(
+                adm,
+                {"tenant": T1, "domain": "a.example"},
+                {"tenant": T1, "domain": "b.example"},
+                {"tenant": T1, "domain": "c.example"},
+            ),
             _claim(adm, tenant=T2, domain="z.example"),
         ):
             pass
-        async with _holding(adm, {"tenant": T1, "domain": "a.example"},
-                            {"tenant": T1, "domain": "b.example"},
-                            {"tenant": T2, "domain": "t2full.example", "cap": 1}):
+        async with _holding(
+            adm,
+            {"tenant": T1, "domain": "a.example"},
+            {"tenant": T1, "domain": "b.example"},
+            {"tenant": T2, "domain": "t2full.example", "cap": 1},
+        ):
             # T2 is waiting (between polls, for a full site): T1 is capped at 2.
-            assert not await _enqueue_waiter(adm, waiter_id="t2", priority=1, tenant=T2,
-                                             domain="t2full.example", cap=1)
+            assert not await _enqueue_waiter(
+                adm, waiter_id="t2", priority=1, tenant=T2, domain="t2full.example", cap=1
+            )
             with pytest.raises(AdmissionTimeoutError):
                 async with _claim(adm, tenant=T1, domain="c.example", budget=0.05):
                     pass
@@ -274,11 +324,20 @@ class TestExpiry:
         adm = _admission(redis, default_units=1.0, waiter_ttl_seconds=1)
         await redis.zadd(adm.waiters_key, {"dead": 1})
         await redis.zadd(adm.waiter_exp_key, {"dead": int(time.time() * 1000) + 300})
-        await redis.hset(adm.waiter_info_key, "dead", json.dumps({
-            "tenant": str(T1), "slot_key": slot_key("d.example", T1),
-            "delay_key": delay_key("d.example", T1), "cap": 5, "delay_ms": 0,
-            "weight": 1.0,
-        }))
+        await redis.hset(
+            adm.waiter_info_key,
+            "dead",
+            json.dumps(
+                {
+                    "tenant": str(T1),
+                    "slot_key": slot_key("d.example", T1),
+                    "delay_key": delay_key("d.example", T1),
+                    "cap": 5,
+                    "delay_ms": 0,
+                    "weight": 1.0,
+                }
+            ),
+        )
         with pytest.raises(AdmissionTimeoutError):
             async with _claim(adm, priority=2, budget=0.05):
                 pass
@@ -306,8 +365,7 @@ class TestLifecycle:
         async with _holding(adm, {}):
             cancelled = AsyncMock(side_effect=[False, True])
             with pytest.raises(AdmissionCancelledError):
-                async with _claim(adm, domain="b.example", budget=5.0,
-                                  is_cancelled=cancelled):
+                async with _claim(adm, domain="b.example", budget=5.0, is_cancelled=cancelled):
                     pass
         assert await redis.zcard(adm.waiters_key) == 0
 
@@ -327,6 +385,48 @@ class TestLifecycle:
                 await task
         assert await redis.zcard(adm.waiters_key) == 0
 
+    @staticmethod
+    def _swallow_cancels(redis):
+        """Make every EVAL absorb a cancellation that lands mid-call and return
+        normally — what redis-py 8.0.1 was measured doing on Python 3.11 (round
+        67: 7-9 of 120 waiter cancels lost, `eval` returned 2196 times with the
+        task still `cancelling()`). Reproduces it on any Python version."""
+        orig = redis.eval
+
+        async def swallowing_eval(*args, **kwargs):
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.05)
+            return await orig(*args, **kwargs)
+
+        redis.eval = swallowing_eval
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_swallowed_by_the_redis_client_still_ends_the_wait(self, redis):
+        adm = _admission(redis, default_units=1.0)
+        async with _holding(adm, {}):
+            self._swallow_cancels(redis)
+
+            async def wait_forever():
+                async with _claim(adm, domain="b.example", budget=30.0):
+                    pass
+
+            task = asyncio.create_task(wait_forever())
+            await asyncio.sleep(0.02)  # inside a (slowed) EVAL
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+        assert await redis.zcard(adm.waiters_key) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_swallowed_during_renewal_does_not_hang_the_release(self, redis):
+        """claim()'s exit cancels its renewer and awaits it: a renewer that
+        lost that cancel inside EVAL would keep renewing forever."""
+        adm = _admission(redis, renew_interval_seconds=0.0)
+        async with _claim(adm):
+            self._swallow_cancels(redis)
+            await asyncio.sleep(0.12)  # the renewer is mid-EVAL most of the time
+        assert (await adm.snapshot()).in_use == 0
+
     @pytest.mark.asyncio
     async def test_renewal_keeps_a_long_hold_alive(self, redis):
         adm = _admission(redis, lease_ttl_seconds=1, renew_interval_seconds=0.2)
@@ -337,8 +437,9 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_renewal_stops_at_the_hold_cap_without_cancelling_work(self, redis, caplog):
-        adm = _admission(redis, lease_ttl_seconds=1, renew_interval_seconds=0.2,
-                         max_hold_seconds=0.3)
+        adm = _admission(
+            redis, lease_ttl_seconds=1, renew_interval_seconds=0.2, max_hold_seconds=0.3
+        )
         async with _claim(adm) as grant:
             await asyncio.sleep(1.6)
             # The block is still running; only the lease lapsed (expired

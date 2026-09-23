@@ -313,6 +313,22 @@ _ACTIVE_CLAIM: contextvars.ContextVar[_ActiveClaim | None] = contextvars.Context
 )
 
 
+def _raise_if_cancel_was_swallowed() -> None:
+    """Re-raise a cancellation the Redis client absorbed.
+
+    Round 67, found on CI: on Python 3.11, redis-py 8.0.1 sometimes returns
+    from a command normally although the calling task was cancelled
+    mid-command (the task stays `cancelling()`, but no CancelledError comes
+    out). A waiter then kept polling until its whole wait budget ran out, and
+    a renewer cancelled by claim()'s exit kept renewing forever, hanging that
+    exit. `cancelling()` still counts the request, so honour it here, after
+    every admission call. Python 3.12 was never seen to lose one.
+    """
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
+
+
 class AdmissionError(Exception):
     """Base for every way a claim can end without a grant."""
 
@@ -394,9 +410,11 @@ class HostAdmission:
 
     async def _eval(self, script: str, keys: list[str], args: list[Any]) -> Any:
         try:
-            return await self._redis.eval(script, len(keys), *keys, *args)
+            reply = await self._redis.eval(script, len(keys), *keys, *args)
         except Exception as exc:  # CancelledError is BaseException: never caught here
             raise AdmissionUnavailableError(f"host admission unavailable: {exc}") from exc
+        _raise_if_cancel_was_swallowed()
+        return reply
 
     @contextlib.asynccontextmanager
     async def claim(
@@ -605,9 +623,7 @@ class HostAdmission:
         """Publish what this process's live browsers weigh (round 67). Best
         effort: a host that reports nothing falls back to the configured
         `browser_memory_mb`, which is what round 66 always used."""
-        payload = json.dumps(
-            {"count": sample.count, "mean_mb": sample.mean_mb, "at": time.time()}
-        )
+        payload = json.dumps({"count": sample.count, "mean_mb": sample.mean_mb, "at": time.time()})
         with contextlib.suppress(Exception):
             await self._redis.hset(self.browser_rss_key, reporter_id, payload)
             await self._redis.pexpire(self.browser_rss_key, _HOST_KEY_TTL_MS)
