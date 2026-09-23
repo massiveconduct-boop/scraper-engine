@@ -52,13 +52,11 @@ dependencies = [
     "scrapy==2.17.0",
     # Runs api + the 3 self-healing daemons (harvester, dlq-reaper,
     # webhook-sweeper) as one supervised container — see docker/supervisord.conf.
-    # supervisor still imports pkg_resources internally, which python:3.12-slim
-    # no longer bundles by default -- setuptools has to be an explicit runtime
-    # dependency, not just a [build-system] one, or supervisord crashloops.
-    # Pinned <81: setuptools removed the pkg_resources module entirely in
-    # that release, which supervisor (last released 2022) never adapted to.
-    "supervisor==4.2.5",
-    "setuptools>=68,<81",
+    # Round 67 — 4.3.0 loads its entry points and resources through importlib
+    # on Python 3.8+, so the runtime setuptools pin (<81, for 4.2.5's
+    # pkg_resources import) is gone with it: that pin held setuptools on a
+    # release with a known vulnerability (PYSEC-2026-3447, fixed in 83.0.0).
+    "supervisor==4.3.0",
     # Round 33: local HTML->markdown fallback (services/markdown_fallback.py)
     # so FetchResult.markdown is populated even when Firecrawl isn't
     # configured (FIRECRAWL_API_KEY/FIRECRAWL_BASE_URL both unset) — see
