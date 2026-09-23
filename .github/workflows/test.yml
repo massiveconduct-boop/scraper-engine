@@ -28,6 +28,15 @@ jobs:
           # run a 3.11+3.12 matrix) — without it, uv resolves against whatever
           # interpreter compiled the lockfile and can pick a package version that
           # doesn't support the floor (numpy==2.5.1 requires >=3.12, broke the 3.11 job).
+          # Round 67 — start from the committed locks: uv keeps every pin already
+          # in the output file unless pyproject.toml forces a change, so this
+          # fails when a dependency changed without relocking, not whenever a
+          # newer release appears on PyPI (a fresh resolve made the check fail
+          # on its own over time: PR #31, ~40 packages "drifted" in two months
+          # with pyproject untouched). Upgrading pins stays deliberate
+          # (Dependabot / a manual `uv pip compile --upgrade`).
+          cp requirements-lock.txt /tmp/check-lock.txt
+          cp requirements-dev-lock.txt /tmp/check-dev-lock.txt
           uv pip compile pyproject.toml --python-version 3.11 --emit-index-url --no-header -o /tmp/check-lock.txt
           uv pip compile pyproject.toml --extra dev --python-version 3.11 --emit-index-url --no-header -o /tmp/check-dev-lock.txt
           diff requirements-lock.txt /tmp/check-lock.txt
