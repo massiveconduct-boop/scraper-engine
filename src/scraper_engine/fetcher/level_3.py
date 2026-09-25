@@ -15,6 +15,7 @@ from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
 from scraper_engine.fetcher._content_utils import (
+    MainDocumentAnswer,
     SSRFRouteGuard,
     autoscroll,
     poll_until_solved,
@@ -103,13 +104,30 @@ class Level3Fetcher:
                 page = await browser_context.new_page()
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
+                answer = MainDocumentAnswer(page)
                 try:
                     nav_response = await page.goto(
                         url, wait_until=self._goto_wait_until, timeout=timeout * 1000
                     )
                 except Exception:
                     route_guard.raise_if_blocked()
-                    raise
+                    verdict = answer.site_verdict()
+                    if verdict is None:
+                        raise
+                    # Round 70 — the site answered (e.g. an empty-bodied
+                    # 429) and the browser failed on the answer, not the
+                    # other way round: report the answer, like any other
+                    # rendered status, for worker.py to classify.
+                    return FetchResult(
+                        url=url,
+                        success=True,
+                        http_status=verdict.status,
+                        html="",
+                        level_used=3,
+                        proxy_used=proxy.key() if proxy else "none",
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                        retry_after_seconds=retry_after_for(verdict.status, verdict.headers),
+                    )
                 nav_status = nav_response.status if nav_response is not None else 200
                 # CPU-bound client-side JS (e.g. PoW solvers) cannot be detected
                 # by networkidle — the browser is computing, not fetching. Use a

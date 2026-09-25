@@ -30,6 +30,7 @@ class FakePage:
         trigger_route_block=False,
         nav_status=200,
         nav_headers=None,
+        answered=None,
     ):
         self._html = html
         self.goto_exc = goto_exc
@@ -39,6 +40,14 @@ class FakePage:
         self.evaluate_calls = 0
         self.nav_status = nav_status
         self.nav_headers = nav_headers or {}
+        # Round 70 — a main-document Response the site sent before goto()
+        # raised (Firefox's NS_ERROR_NET_EMPTY_RESPONSE on an empty 429).
+        self.answered = answered
+        self._response_handlers = []
+
+    def on(self, event, handler):
+        assert event == "response"
+        self._response_handlers.append(handler)
 
     async def route(self, pattern, handler):
         self._route_handler = handler
@@ -51,6 +60,9 @@ class FakePage:
                 continue_=AsyncMock(),
             )
             await self._route_handler(fake_route)
+        if self.answered is not None:
+            for handler in self._response_handlers:
+                handler(self.answered)
         if self.goto_exc:
             raise self.goto_exc
         # Real Playwright Response, not None (round 33 — see test_level_2.py's
@@ -175,6 +187,56 @@ class TestFetch:
 
         assert result.success is True
         assert page.evaluate_calls > 0
+
+    @staticmethod
+    def _answer(status, headers=None, *, navigation=True, main_frame=True):
+        """Round 70 — a Playwright Response as the `response` event hands it."""
+        return SimpleNamespace(
+            status=status,
+            headers=headers or {},
+            request=SimpleNamespace(is_navigation_request=lambda: navigation),
+            frame=SimpleNamespace(parent_frame=None if main_frame else object()),
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_429_that_fails_navigation_reports_the_sites_answer(self, monkeypatch):
+        """Round 70 — live: httpbin's empty-bodied 429 makes Firefox raise
+        NS_ERROR_NET_EMPTY_RESPONSE after the site answered; it ended as
+        browser_crash instead of rate_limited."""
+        page = FakePage(
+            goto_exc=RuntimeError("Page.goto: NS_ERROR_NET_EMPTY_RESPONSE"),
+            answered=self._answer(429, {"retry-after": "90"}),
+        )
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+
+        result = await Level3Fetcher().fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is True
+        assert result.http_status == 429
+        assert result.html == ""
+        assert result.level_used == 3
+        assert result.retry_after_seconds == 90
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _answer.__func__(502),
+            _answer.__func__(429, navigation=False),
+            _answer.__func__(429, main_frame=False),
+        ],
+        ids=["5xx-stays-a-crash", "not-a-navigation", "iframe"],
+    )
+    async def test_other_answers_keep_the_navigation_error(self, monkeypatch, answer):
+        page = FakePage(goto_exc=RuntimeError("NS_ERROR_NET_EMPTY_RESPONSE"), answered=answer)
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_3.CamoufoxWrapper", fake_wrapper_cls)
+
+        result = await Level3Fetcher().fetch("http://example.com", TenantId("system"), _proxy())
+
+        assert result.success is False
+        assert result.error_message == "NS_ERROR_NET_EMPTY_RESPONSE"
 
     @pytest.mark.asyncio
     async def test_goto_exception_without_ssrf_block_reraises_original(self, monkeypatch):
