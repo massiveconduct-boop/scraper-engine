@@ -197,6 +197,17 @@ class FetchResult(BaseModel):
     # "failure:<category>". A live job escalated every URL past L2 and
     # nothing anywhere could say why.
     escalations: list[dict[str, Any]] | None = None
+    # Round 69 — True when this URL's path wanted the paid gateway (block
+    # retry, pool-block hint, open circuit, exhausted pool, paid_only) while
+    # it was refusing our credentials (proxy/gateway_health.py). Without it a
+    # free-proxy refusal read as "this site blocks scrapers" when the route
+    # that usually works was out of service.
+    paid_gateway_skipped: bool | None = None
+    # Round 69 — on a terminal DETECTION_BLOCK, which check said "blocked",
+    # in escalations' `reason` vocabulary ("status:429", "signature:cf-chl",
+    # "js_gated", ...). One category covers 401/403/404/405/410/429 and
+    # challenge pages; this says which one it was.
+    block_reason: str | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

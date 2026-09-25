@@ -32,6 +32,50 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 69)
+
+Origin: research_agent brief `to-scraper-engine-2026-09-25-failure-labels.md`
+(follow-up to PR #32). With the gateway refused and free proxies serving
+L2/L3, failures misled readers.
+
+- **Evidence.** `research_agent.scrape_results` since 2026-09-23: all 48
+  `detection_block` rows had `http_status` NULL, while their message said
+  `(http_status=403)` / `401` / `200`. The for/else terminal branch rebuilt
+  the result without it (its own round-49 comment admitted "drops
+  http_status"). 51 `circuit_open` rows (reuters.com) gave no sign that
+  `free_first`'s gateway, which normally handles an open circuit, was
+  refused.
+- **Fix.** For/else result keeps `http_status`/`is_challenge_page`.
+  `_describe_block` prefixes a terminal `detection_block` message with
+  `<what> at L<n> via <route>` and sets `block_reason`. A per-URL
+  `gateway_skipped` flag is set at the pool-block hint, the open circuit and
+  the block retry (`_gateway_block_retry_usable`), and from
+  `_fetch_with_proxy`'s `gateway_bypassed` stamp (forced/exhausted/paid_only
+  while refused). `_note_gateway_skipped` flags the terminal result and
+  appends the refusal note once. New fields ride in the `timings` JSONB.
+- **Docs.** `api-reference.md` → "Reading a failed result" and "Failure
+  categories" (one line each, whose doing it is, auto-retry). Found while
+  writing it: `captcha_triggered` is defined but never assigned; an unsolved
+  CAPTCHA ends as `detection_block` with a `signature:` reason.
+- **False success on 401, found by the live check.** africabusinesscommunities.com
+  answered 401 at L3 through a free proxy and was stored as a success whose
+  markdown was the 93-character page title: `ChallengeDetector.
+  CHALLENGE_STATUS_CODES` lacks 401/405/410, while `fetcher/_failure.py`
+  classes them as blocks. Fixed in the worker's still-blocked check
+  (`classify_http_status(...) == DETECTION_BLOCK`), not in the detector list,
+  which would also make L2/L3 wait for a solve. `_check_cache` now also
+  skips a stored "success" with status ≥400 (such a row would otherwise be
+  served for the 7-day TTL; the live re-run hit exactly that).
+  `tests/integration/test_worker_cache.py`, negative-controlled.
+- **Live (stub 407 proxy, no paid traffic):** deviantart.com
+  `27577981-0ff9-4a53-8588-24fba4a8012e` and africabusinesscommunities.com
+  `6af89c30-513b-41be-ade4-fd4b29231634` → `detection_block`,
+  `http_status 403`, `block_reason status:403`, `paid_gateway_skipped true`,
+  `HTTP 403 (refused) at L3 via pool — … (paid gateway is refusing our
+  credentials …)`.
+- **Proposed, not shipped:** `rate_limited` for 429 (a user decision:
+  research_agent reads `failure_category`).
+
 ## Technical Debt / Open Threads (as of round 68)
 
 Origin: research_agent brief 2026-09-25 (`research_agent/docs/inbox/

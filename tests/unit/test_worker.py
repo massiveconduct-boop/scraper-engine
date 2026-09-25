@@ -2922,6 +2922,7 @@ class TestGatewayRefusalFallsBackToPool:
         assert fetcher.fetch.await_count == 1
         assert fetcher.fetch.await_args.kwargs["proxy"] is self._pool_proxy
         assert result.proxy_source == "pool"
+        assert result.paid_gateway_skipped is True  # round 69
 
     @pytest.mark.asyncio
     async def test_paid_only_with_a_known_refusal_fails_without_a_render(
@@ -2936,6 +2937,7 @@ class TestGatewayRefusalFallsBackToPool:
         fetcher.fetch.assert_not_awaited()
         assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
         assert result.proxy_source == "paid_gateway"
+        assert result.paid_gateway_skipped is True  # round 69
         assert "refusing our credentials" in (result.error_message or "")
 
     @pytest.mark.asyncio
@@ -2966,6 +2968,7 @@ class TestGatewayRefusalFallsBackToPool:
         fetcher.fetch.assert_not_awaited()
         assert result.failure_category == FailureCategory.PROXY_EXHAUSTED
         assert "refusing our credentials" in (result.error_message or "")
+        assert result.paid_gateway_skipped is True  # round 69
 
     @pytest.mark.asyncio
     async def test_refused_then_exhausted_pool_is_proxy_exhausted(
@@ -2991,10 +2994,11 @@ class TestGatewayRefusalFallsBackToPool:
         self._wire_pm(monkeypatch, tenant)
         self._wire_fetcher(monkeypatch, self._ok())
 
-        await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
 
         health.clear.assert_awaited_once()
         health.mark_refused.assert_not_awaited()
+        assert result.paid_gateway_skipped is None  # the gateway was used
 
     @pytest.mark.asyncio
     async def test_other_gateway_failures_leave_the_verdict_alone(
@@ -3099,6 +3103,257 @@ class TestGatewayRefusalFallsBackToPool:
 
         assert worker._fetch_url.await_args_list[1].kwargs["force_gateway"] is True
         worker._level_memory.record_pool_blocked.assert_not_awaited()
+
+
+class TestFailureLabels:
+    """Round 69 — research_agent brief: a failure must say what happened.
+    Live, terminal blocks were stored with a NULL http_status (the for/else
+    branch rebuilt the result without it), one label covered 403/429/404 and
+    challenge pages, and a refused paid gateway was invisible unless the pool
+    ran dry."""
+
+    _configure = staticmethod(TestGatewayRefusalFallsBackToPool._configure)
+
+    @staticmethod
+    def _blocked(status, level, source="pool"):
+        return FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=level,
+            http_status=status,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            duration_ms=1,
+            proxy_source=source,
+        )
+
+    async def _run(self, worker, tenant, side_effect, job="job-labels"):
+        worker._fetch_url = AsyncMock(side_effect=side_effect)
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")], config_overrides=ConfigOverrides(min_level=2)
+        )
+        response = await worker.process_job(tenant, job, request)
+        assert response.results is not None
+        return response.results[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "prefix"),
+        [
+            (403, "HTTP 403 (refused) at L3 via pool"),
+            (429, "HTTP 429 (rate limited) at L3 via pool"),
+            (404, "HTTP 404 (not found, or a block shaped like one) at L3 via pool"),
+        ],
+    )
+    async def test_a_terminal_status_block_names_status_level_and_route(
+        self, tenant, worker, status, prefix
+    ):
+        result = await self._run(
+            worker, tenant, [self._blocked(status, 2), self._blocked(status, 3)]
+        )
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.http_status == status  # was NULL before round 69
+        assert result.block_reason == f"status:{status}"
+        assert result.error_message.startswith(prefix)
+        assert result.paid_gateway_skipped is None
+        assert worker._dlq.enqueue.await_args.args[4] == result.error_message
+
+    @pytest.mark.asyncio
+    async def test_a_final_level_challenge_page_names_the_signature(self, tenant, worker):
+        page = FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=3,
+            http_status=200,
+            html="<html><body><div id='cf-browser-verification'>checking</div></body></html>",
+            duration_ms=1,
+            proxy_source="pool",
+        )
+        result = await self._run(worker, tenant, [self._blocked(403, 2), page])
+        assert result.block_reason == "signature:cf-browser-verification"
+        assert result.http_status == 200
+        assert result.is_challenge_page is True
+        assert result.error_message.startswith(
+            "challenge page (signature 'cf-browser-verification') at L3 via pool — "
+        )
+
+    @staticmethod
+    def _unlisted_status_page(status, level):
+        """A browser-level "success" whose status the challenge detector does
+        not list (401/405/410). Live: a 401 at L3 was stored as a success
+        whose content was the page title."""
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=level,
+            http_status=status,
+            html="<html><head><title>Airtel Money gains ground</title></head><body>"
+            + "subscribe to read " * 20
+            + "</body></html>",
+            duration_ms=1,
+            proxy_source="pool",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "prefix"),
+        [
+            (401, "HTTP 401 (unauthorized) at L3 via pool"),
+            (405, "HTTP 405 (method refused) at L3 via pool"),
+            (410, "HTTP 410 (gone, or a block shaped like it) at L3 via pool"),
+        ],
+    )
+    async def test_an_unlisted_block_status_is_not_accepted_as_content(
+        self, tenant, worker, status, prefix
+    ):
+        result = await self._run(
+            worker,
+            tenant,
+            [self._unlisted_status_page(status, 2), self._unlisted_status_page(status, 3)],
+        )
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.block_reason == f"status:{status}"
+        assert result.error_message.startswith(prefix)
+        # L2's copy was rejected and escalated, not accepted either.
+        assert [e["reason"] for e in result.escalations] == [f"status:{status}"] * 2
+
+    @pytest.mark.asyncio
+    async def test_a_refused_gateway_on_the_path_is_named_on_the_failure(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_pool=True))
+        result = await self._run(worker, tenant, [self._blocked(403, 2), self._blocked(403, 3)])
+        assert result.paid_gateway_skipped is True
+        assert result.error_message.startswith("HTTP 403 (refused) at L3 via pool")
+        assert result.error_message.count("paid gateway is refusing our credentials") == 1
+        assert "paid gateway is refusing our credentials" in worker._dlq.enqueue.await_args.args[4]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_block_retry_is_named_on_the_failure(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2))
+        result = await self._run(worker, tenant, [self._blocked(403, 2), self._blocked(403, 3)])
+        forced = [c.kwargs["force_gateway"] for c in worker._fetch_url.await_args_list]
+        assert forced == [False, False]
+        assert result.paid_gateway_skipped is True
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_with_a_refused_gateway_says_so(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._circuit_breaker.allow_request.return_value = False
+        result = await self._run(worker, tenant, [])
+        assert result.failure_category == FailureCategory.CIRCUIT_OPEN
+        assert result.paid_gateway_skipped is True
+        assert result.error_message.startswith("Circuit open for example.com (paid gateway")
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_without_a_gateway_stays_plain(self, tenant, worker):
+        worker._circuit_breaker.allow_request.return_value = False
+        result = await self._run(worker, tenant, [])
+        assert result.error_message == "Circuit open for example.com"
+        assert result.paid_gateway_skipped is None
+
+    @pytest.mark.asyncio
+    async def test_a_skip_reported_by_the_fetch_reaches_a_dlq_eligible_failure(
+        self, tenant, worker, monkeypatch
+    ):
+        """_fetch_with_proxy's own stamp, on a DLQ-eligible category whose
+        message already carries the note: flagged, not repeated."""
+        self._configure(worker, monkeypatch, refused=True)
+        exhausted = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            duration_ms=0,
+            failure_category=FailureCategory.PROXY_EXHAUSTED,
+            error_message="Proxy pool exhausted (paid gateway is refusing our credentials ...)",
+            paid_gateway_skipped=True,
+        )
+        result = await self._run(worker, tenant, [exhausted])
+        assert result.paid_gateway_skipped is True
+        assert result.error_message.count("paid gateway is refusing our credentials") == 1
+
+
+class TestFailureLabelHelpers:
+    """Round 69 — the pure helpers behind the labels."""
+
+    @staticmethod
+    def _terminal(message="still blocked"):
+        return FetchResult(
+            url="http://x", success=False, level_used=3, duration_ms=0, error_message=message
+        )
+
+    @pytest.mark.parametrize(
+        ("last_kw", "prefix", "reason"),
+        [
+            ({"http_status": None}, "blocked at L2 via direct", None),
+            ({"http_status": 418}, "HTTP 418 at L2 via direct", "status:418"),
+            (
+                {"block_reason": "gateway_error"},
+                "blocked page (gateway_error) at L2",
+                "gateway_error",
+            ),
+            (
+                {"block_reason": "js_gated"},
+                "JavaScript-gated page (no content rendered) at L2",
+                "js_gated",
+            ),
+        ],
+    )
+    def test_describe_block(self, last_kw, prefix, reason):
+        from scraper_engine.orchestrator.worker import _describe_block
+
+        last = FetchResult(url="http://x", success=False, level_used=2, duration_ms=0, **last_kw)
+        terminal = self._terminal()
+        _describe_block(terminal, last)
+        assert terminal.error_message.startswith(prefix)
+        assert terminal.error_message.endswith(" — still blocked")
+        assert terminal.block_reason == reason
+
+    def test_describe_block_without_a_message(self):
+        from scraper_engine.orchestrator.worker import _describe_block
+
+        last = FetchResult(
+            url="http://x", success=False, level_used=2, duration_ms=0, http_status=403
+        )
+        terminal = self._terminal(message=None)
+        _describe_block(terminal, last)
+        assert terminal.error_message == "HTTP 403 (refused) at L2 via direct"
+
+    def test_note_gateway_skipped(self):
+        from scraper_engine.orchestrator.worker import (
+            _GATEWAY_REFUSED_MESSAGE,
+            _note_gateway_skipped,
+        )
+
+        untouched = self._terminal()
+        _note_gateway_skipped(untouched, False)
+        assert untouched.paid_gateway_skipped is None
+        assert untouched.error_message == "still blocked"
+
+        empty = self._terminal(message=None)
+        _note_gateway_skipped(empty, True)
+        assert empty.error_message == _GATEWAY_REFUSED_MESSAGE
+
+        once = self._terminal()
+        _note_gateway_skipped(once, True)
+        _note_gateway_skipped(once, True)
+        assert once.error_message == f"still blocked ({_GATEWAY_REFUSED_MESSAGE})"
+        assert once.paid_gateway_skipped is True
+
+    def test_the_marker_research_agent_greps_for_is_stable(self):
+        from scraper_engine.orchestrator.worker import (
+            _GATEWAY_REFUSED_MARKER,
+            _GATEWAY_REFUSED_MESSAGE,
+        )
+
+        assert _GATEWAY_REFUSED_MARKER == "paid gateway is refusing our credentials"
+        assert _GATEWAY_REFUSED_MESSAGE.startswith(_GATEWAY_REFUSED_MARKER)
 
 
 class TestDisplayLockWait:

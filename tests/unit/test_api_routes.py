@@ -1537,6 +1537,25 @@ async def test_get_job_splits_escalations_out_of_the_timings_column(wired_deps):
 
 
 @pytest.mark.asyncio
+async def test_get_job_splits_failure_labels_out_of_the_timings_column(wired_deps):
+    """Round 69 — paid_gateway_skipped / block_reason come back as fields."""
+    jid = uuid.uuid4()
+    now = datetime.now(UTC)
+    stored = {"total_ms": 9, "paid_gateway_skipped": True, "block_reason": "status:403"}
+    wired_deps.fetch.side_effect = [
+        [_job_row(jid, "COMPLETED", ["https://a.example"])],
+        [{"n": 1}],
+        [_result_row("https://a.example", now, timings=json.dumps(stored))],
+    ]
+
+    resp = await get_job(str(jid), x_api_key="sk-admin")
+
+    assert resp.results[0].timings == {"total_ms": 9}
+    assert resp.results[0].paid_gateway_skipped is True
+    assert resp.results[0].block_reason == "status:403"
+
+
+@pytest.mark.asyncio
 async def test_get_job_reports_queue_wait_and_runtime(wired_deps):
     jid = uuid.uuid4()
     created = datetime.now(UTC)

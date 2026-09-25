@@ -701,7 +701,10 @@ escalation ladder.
 ## Why Did This URL Climb to L3? (Round 64)
 
 Read the result's `escalations` list (`GET /v1/jobs/{id}`, or the
-`level_rejected` worker log line). Each entry names the level, the exact
+`level_rejected` worker log line). For the URL's final verdict, read
+`block_reason` and the start of `error_message` (`HTTP 403 (refused) at L3
+via pool — …`); `paid_gateway_skipped: true` means the gateway route that
+usually gets through was down, so the block may be the free pool's only. Each entry names the level, the exact
 check (`reason`), the HTTP status, the L2 engine, and the proxy source.
 
 - `proxy_source: "pool"` with `status:403` (or `failure:detection_block`)
