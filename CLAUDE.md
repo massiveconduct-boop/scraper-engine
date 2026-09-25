@@ -74,14 +74,10 @@ openwolf cron        # cron task management
   per-domain skip hints, 0-branch gate over 10 packages (64), host-wide
   browser admission — seat + politeness slot claimed together,
   pressure-sized, off by default (65), a proxy's 407 as its own
-  `proxy_auth_failed` category (terminal on the gateway, re-driven only
-  after a probe succeeds), a host-admission controller that only limits a
-  strained host (measured on free heavy targets, not paid Jumia runs),
-  `display_lock_wait_ms`, and Botasaurus drivers closing on release under
-  admission (66), parked browsers keeping their render's host seat under
-  admission and a measured per-browser memory weight (67), a refused paid
-  gateway taken out of use for every worker with `free_first` falling back
-  to the free pool, shown on `/v1/health` (68).
+  `proxy_auth_failed` category, a controller that only limits a strained
+  host, `display_lock_wait_ms` (66), parked browsers keeping their host
+  seat, measured browser weight (67), a refused gateway out of use for
+  every worker, `free_first` falling back to the pool (68).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:
