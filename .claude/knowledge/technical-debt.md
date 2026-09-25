@@ -81,6 +81,23 @@ africabusinesscommunities.com the day before.
   `proxy_auth_failed` entries onto the pool, 20 per cycle (~500 in the first
   hour, tapering). Expected, but it occupies the workers for a while after
   deploy.
+- **Slack alerts traced (same day).** Prometheus
+  `max_over_time(ALERTS{alertstate="firing"}[2d])`: `DeadLetterQueueGrowing`
+  on 09-23/24 (the refusals above filling the DLQ); `HighJobFailureRate` +
+  `DeadLetterQueueGrowing` 12:53-14:03 on 09-25 (this round's reaper change
+  re-driving the backlog, plus the faulty stub run); `ProxySourceWentDark`
+  for geonode and shiftytr_https since 09-24 03:43.
+- **geonode dark since round 6's URL.** `protocols=http%%2Chttps` in a plain
+  (never %-formatted) string; geonode answered `{"data":[],"total":0}`. With
+  `%2C`: 100 proxies. A test now rejects `%%` in any source URL.
+- **ShiftyTR removed.** `ShiftyTR/Proxy-List` frozen since 2023-08-11; https
+  list validated 0 per cycle, http 4, and all 43 entries of both lists were
+  also in other sources. `SOURCES` is now 10 URLs / 8 operators.
+- **CI: MinIO image.** quay.io started refusing anonymous pulls
+  ("unauthorized"); compose now defaults to Chainguard's rebuild pinned by
+  digest, this host pins the cached quay image via `MINIO_IMAGE` (decisions.md
+  → "MinIO From Chainguard's Rebuild…"). Also CI's `wc -w` counts ~38 more
+  words than local on CLAUDE.md, which failed the 1800 gate at 1788 local.
 - **Open:** the account itself. After a top-up the first gateway use clears
   the verdict (or it expires in 10 min); nothing to re-drive by hand under
   `free_first`.
