@@ -170,6 +170,10 @@ dataimpulse:
   # (see proxy/paid_gateway.py): unpinned 1-of-12, asn=29465 (MTN Nigeria)
   # 6-of-6, asn=36873 (Airtel Nigeria) 6-of-6.
   asn: "${DATAIMPULSE_ASN:}"
+  # Round 68 — how long one refusal of our credentials (HTTP 407) takes the
+  # gateway out of use for every worker (proxy/gateway_health.py). A refused
+  # attempt carries no traffic, so the re-test after expiry costs nothing.
+  refused_ttl_seconds: "${DATAIMPULSE_REFUSED_TTL_SECONDS:600}"
 
 politeness:
   default_concurrency: 2

@@ -254,6 +254,18 @@ not `url()`: without credentials every answer is `407 NO_USER`, which proves
 nothing. A 407 with `TRAFFIC_EXHAUSTED` is the account, not the code. Fix:
 top up the plan.
 
+**Since round 68:** check `/v1/health` → `paid_gateway` first. `status:
+refused` (with `since` and the first error) means some worker saw a 407 in the
+last `dataimpulse.refused_ttl_seconds`; it needs no probe. Under `free_first`
+URLs then go through the free pool and fail, if at all, with their real
+outcome (`detection_block`, `proxy_exhausted`, …), never `proxy_auth_failed`.
+Only `paid_only` still returns `proxy_auth_failed`, without a render. A
+`levelhint:poolblock:*` key written before round 68 while the gateway was
+refusing may be wrong (a 407 used to count as "the gateway got through");
+delete it: `redis-cli --scan --pattern 'levelhint:poolblock:*' | xargs
+redis-cli del`. Hints come back on their own when the gateway really does
+get through.
+
 ## Host Admission On but Load Still High (Round 65)
 
 **Check live browsers against seats:** `/v1/health` → `browser_capacity.

@@ -100,8 +100,9 @@ _TRANSIENT_CATEGORIES = [
     # browser capacity ran out, or our own Redis failed. See _is_eligible.
     FailureCategory.CAPACITY_TIMEOUT,
     FailureCategory.DEPENDENCY_UNAVAILABLE,
-    # Round 66 — a proxy refused our credentials; with the gateway in play,
-    # eligible only once a probe through it succeeds again. See _is_eligible.
+    # Round 66 — a proxy refused our credentials; under paid_only, eligible
+    # only once a probe through the gateway succeeds again (round 68: under
+    # free_first, on pool health). See _is_eligible.
     FailureCategory.PROXY_AUTH_FAILED,
 ]
 
@@ -202,12 +203,17 @@ async def _is_eligible(
     if (
         entry.failure_category == FailureCategory.PROXY_AUTH_FAILED
         and di_cfg.enabled
-        and di_cfg.strategy != "free_only"
+        and di_cfg.strategy == "paid_only"
     ):
         # Round 66 — the gateway refusing our credentials is the account
         # (plan out of traffic). Re-driving before it accepts them again only
         # repeats the refusal on every URL. Under free_only the entry can only
         # be a free proxy's refusal, which the tier check below covers.
+        #
+        # Round 68 — under free_first too: a re-driven URL no longer needs
+        # the gateway (orchestrator/worker.py goes back to the pool while it
+        # is refusing), so pool health is what decides whether it can work —
+        # and deciding that spends no plan traffic.
         return await _gateway_ok()
     if entry.failure_category in (
         FailureCategory.PROXY_EXHAUSTED,

@@ -2846,6 +2846,261 @@ class TestProxyAuthFailed:
         worker._circuit_breaker.record_failure.assert_not_awaited()
 
 
+class TestGatewayRefusalFallsBackToPool:
+    """Round 68 — live, research_agent: 171 of 171 gateway renders refused
+    over two days (plan out of traffic) while the free pool served the same
+    levels fine. Under free_first the gateway is a fallback, so a refusal
+    must send the URL back to the pool, be remembered by every worker, and
+    never teach level memory that the domain refuses the pool."""
+
+    _refused = staticmethod(TestProxyAuthFailed._refused)
+    _wire_fetcher = staticmethod(TestProxyAuthFailed._wire_fetcher)
+    _wire_pm = staticmethod(TestProxyAuthFailed._wire_pm)
+    _pool_proxy = Proxy(id=7, ip="1.2.3.4", port=8080, protocol=ProxyProtocol.HTTP)
+
+    @staticmethod
+    def _configure(worker, monkeypatch, *, strategy="free_first", refused=False):
+        from scraper_engine.config.schema import DataImpulseConfig
+        from scraper_engine.proxy.gateway_health import GatewayRefusal
+
+        worker._config.dataimpulse = DataImpulseConfig(
+            enabled=True, strategy=strategy, rotate_on_block_retries=0
+        )
+        monkeypatch.setattr(
+            "scraper_engine.proxy.paid_gateway.build_gateway_proxy",
+            MagicMock(return_value=TestGatewayFallbackOnFailure._gateway_proxy()),
+        )
+        health = MagicMock()
+        health.refusal = AsyncMock(
+            return_value=GatewayRefusal(since="2026-09-25T11:20:00+00:00", error="407")
+            if refused
+            else None
+        )
+        health.mark_refused = AsyncMock()
+        health.clear = AsyncMock()
+        worker._gateway_health = health
+        return health
+
+    @staticmethod
+    def _ok(source=None):
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=2,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=5,
+            proxy_source=source,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_gateway_attempt_is_made_again_on_the_pool(
+        self, tenant, worker, monkeypatch
+    ):
+        health = self._configure(worker, monkeypatch)
+        self._wire_pm(monkeypatch, tenant, self._pool_proxy)
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None), self._ok())
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        assert fetcher.fetch.await_count == 2
+        assert fetcher.fetch.await_args_list[1].kwargs["proxy"] is self._pool_proxy
+        assert result.success is True
+        assert result.proxy_source == "pool"
+        health.mark_refused.assert_awaited_once_with(
+            "Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_known_refusal_skips_the_gateway_entirely(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch, refused=True)
+        self._wire_pm(monkeypatch, tenant, self._pool_proxy)
+        fetcher = self._wire_fetcher(monkeypatch, self._ok())
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        assert fetcher.fetch.await_count == 1
+        assert fetcher.fetch.await_args.kwargs["proxy"] is self._pool_proxy
+        assert result.proxy_source == "pool"
+
+    @pytest.mark.asyncio
+    async def test_paid_only_with_a_known_refusal_fails_without_a_render(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, strategy="paid_only", refused=True)
+        self._wire_pm(monkeypatch, tenant)
+        fetcher = self._wire_fetcher(monkeypatch)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        fetcher.fetch.assert_not_awaited()
+        assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        assert result.proxy_source == "paid_gateway"
+        assert "refusing our credentials" in (result.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_paid_only_marks_the_refusal_and_returns_it(self, tenant, worker, monkeypatch):
+        health = self._configure(worker, monkeypatch, strategy="paid_only")
+        self._wire_pm(monkeypatch, tenant)
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None))
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        health.mark_refused.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_pool_does_not_fall_back_to_a_refused_gateway(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        pm = self._wire_pm(monkeypatch, tenant)
+        pm.get_proxy.side_effect = ProxyPoolExhaustedError(
+            domain="example.com", level=2, attempts=5
+        )
+        fetcher = self._wire_fetcher(monkeypatch)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        fetcher.fetch.assert_not_awaited()
+        assert result.failure_category == FailureCategory.PROXY_EXHAUSTED
+        assert "refusing our credentials" in (result.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_refused_then_exhausted_pool_is_proxy_exhausted(
+        self, tenant, worker, monkeypatch
+    ):
+        health = self._configure(worker, monkeypatch)
+        pm = self._wire_pm(monkeypatch, tenant)
+        pm.get_proxy.side_effect = ProxyPoolExhaustedError(
+            domain="example.com", level=2, attempts=5
+        )
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None))
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        assert fetcher.fetch.await_count == 1
+        assert result.failure_category == FailureCategory.PROXY_EXHAUSTED
+        # The 407 this call saw is enough; no second read of the verdict.
+        assert health.refusal.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_success_clears_the_verdict(self, tenant, worker, monkeypatch):
+        health = self._configure(worker, monkeypatch)
+        self._wire_pm(monkeypatch, tenant)
+        self._wire_fetcher(monkeypatch, self._ok())
+
+        await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        health.clear.assert_awaited_once()
+        health.mark_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_gateway_failures_leave_the_verdict_alone(
+        self, tenant, worker, monkeypatch
+    ):
+        health = self._configure(worker, monkeypatch)
+        self._wire_pm(monkeypatch, tenant)
+        timeout = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            duration_ms=5,
+            failure_category=FailureCategory.NETWORK_TIMEOUT,
+        )
+        fetcher = self._wire_fetcher(monkeypatch, timeout, timeout)
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2, force_gateway=True)
+
+        assert fetcher.fetch.await_count == 2  # round 37's one same-level retry
+
+        assert result.failure_category == FailureCategory.NETWORK_TIMEOUT
+        health.clear.assert_not_awaited()
+        health.mark_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_with_a_refused_gateway_is_circuit_open(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._circuit_breaker.allow_request.return_value = False
+        worker._fetch_url = AsyncMock()
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        response = await worker.process_job(tenant, "job-circuit-refused", request)
+
+        worker._fetch_url.assert_not_awaited()
+        assert response.results is not None
+        assert response.results[0].failure_category == FailureCategory.CIRCUIT_OPEN
+
+    @pytest.mark.asyncio
+    async def test_a_pool_block_hint_is_ignored_while_refused(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2, skip_pool=True))
+        worker._fetch_url = AsyncMock(return_value=self._ok("pool"))
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-hint-refused", request)
+
+        assert worker._fetch_url.await_args.kwargs["force_gateway"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_gateway_block_retry_while_refused(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(2))
+        worker._level_memory.record_pool_blocked = AsyncMock()
+        blocked = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=2,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            duration_ms=1,
+            proxy_source="pool",
+        )
+        worker._fetch_url = AsyncMock(return_value=blocked)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-no-retry-refused", request)
+
+        forced = [c.kwargs["force_gateway"] for c in worker._fetch_url.await_args_list]
+        assert forced == [False, False]  # L2 and L3 on the pool, no gateway retry
+        worker._level_memory.record_pool_blocked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("retry_source", ["paid_gateway", "pool"])
+    async def test_a_refused_or_pool_served_retry_never_records_a_pool_block(
+        self, tenant, worker, monkeypatch, retry_source
+    ):
+        """The level-memory poisoning: a 407 is "not blocked", so a refused
+        gateway retry used to record that the domain refuses the pool."""
+        self._configure(worker, monkeypatch)
+        worker._level_memory.plan = AsyncMock(return_value=DomainPlan(3))
+        worker._level_memory.record_pool_blocked = AsyncMock()
+        blocked = FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=3,
+            http_status=403,
+            failure_category=FailureCategory.DETECTION_BLOCK,
+            duration_ms=1,
+            proxy_source="pool",
+        )
+        retry = (
+            self._refused("paid_gateway", level=3)
+            if retry_source == "paid_gateway"
+            else self._ok("pool")
+        )
+        worker._fetch_url = AsyncMock(side_effect=[blocked, retry])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+
+        await worker.process_job(tenant, "job-no-poison", request)
+
+        assert worker._fetch_url.await_args_list[1].kwargs["force_gateway"] is True
+        worker._level_memory.record_pool_blocked.assert_not_awaited()
+
+
 class TestDisplayLockWait:
     """Round 66 — a URL's time queued for XVFB_LOCK is reported in timings."""
 

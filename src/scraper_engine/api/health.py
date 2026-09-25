@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from scraper_engine.core.periodic import heartbeat_key
 
 if TYPE_CHECKING:
-    from scraper_engine.config.schema import HostCapacityConfig
+    from scraper_engine.config.schema import DataImpulseConfig, HostCapacityConfig
     from scraper_engine.storage.postgres_client import PostgresClient
     from scraper_engine.storage.redis_client import RedisClient
     from scraper_engine.storage.s3_client import S3Client
@@ -43,6 +43,10 @@ class HealthStatus:
     # Round 65 — host-wide browser admission, when enabled. Informational
     # only, like `daemons`: never affects `healthy`.
     browser_capacity: dict[str, object] | None = None
+    # Round 68 — whether the paid gateway is refusing our credentials
+    # (proxy/gateway_health.py). Informational too: a refused gateway is an
+    # account to top up, not a broken api, and free_first keeps working.
+    paid_gateway: dict[str, object] | None = None
 
 
 async def _check_daemon_liveness(redis: RedisClient) -> dict[str, str]:
@@ -74,11 +78,13 @@ class HealthChecker:
         redis: RedisClient,
         s3: S3Client | None = None,
         host_capacity: HostCapacityConfig | None = None,
+        dataimpulse: DataImpulseConfig | None = None,
     ) -> None:
         self._pg = pg
         self._redis = redis
         self._s3 = s3
         self._host_capacity = host_capacity
+        self._dataimpulse = dataimpulse
 
     async def check(self) -> HealthStatus:
         """Run all health checks and return composite status."""
@@ -142,6 +148,14 @@ class HealthChecker:
         if self._host_capacity is not None and self._host_capacity.enabled:
             status.browser_capacity = await _browser_capacity(self._redis, self._host_capacity)
 
+        if self._dataimpulse is not None:
+            status.paid_gateway = await _paid_gateway(self._redis, self._dataimpulse)
+            if status.paid_gateway["status"] == "refused":
+                status.checks["paid_gateway"] = (
+                    "provider is refusing our credentials (plan out of traffic or bad "
+                    "login) — top up the DataImpulse plan or fix DATAIMPULSE_*"
+                )
+
         status.healthy = healthy
         return status
 
@@ -163,11 +177,31 @@ async def _browser_capacity(redis: RedisClient, cfg: HostCapacityConfig) -> dict
     }
 
 
+async def _paid_gateway(redis: RedisClient, cfg: DataImpulseConfig) -> dict[str, object]:
+    """The gateway's configured strategy and whether it is refusing our
+    credentials. Reads the shared verdict only — never probes the gateway,
+    since a probe that succeeds spends plan traffic."""
+    if not cfg.enabled:
+        return {"status": "disabled"}
+    from scraper_engine.proxy.gateway_health import GatewayHealth
+
+    refusal = await GatewayHealth(redis, cfg.refused_ttl_seconds).refusal()
+    if refusal is None:
+        return {"status": "ok", "strategy": cfg.strategy}
+    return {
+        "status": "refused",
+        "strategy": cfg.strategy,
+        "since": refusal.since,
+        "error": refusal.error,
+    }
+
+
 async def check_health(
     pg: PostgresClient,
     redis: RedisClient,
     s3: S3Client | None = None,
     host_capacity: HostCapacityConfig | None = None,
+    dataimpulse: DataImpulseConfig | None = None,
 ) -> HealthStatus:
     """Convenience function for FastAPI/CLI — runs the real composite health check."""
-    return await HealthChecker(pg, redis, s3, host_capacity).check()
+    return await HealthChecker(pg, redis, s3, host_capacity, dataimpulse).check()

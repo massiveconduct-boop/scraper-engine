@@ -615,6 +615,12 @@ class DataImpulseConfig(BaseModel):
     # `noasn` exclusion parameter is deliberately NOT modelled here — it is
     # accepted by the gateway and then ignored, verified live.
     asn: int | None = None
+    # Round 68 — after the gateway refuses our credentials once (a 407: plan
+    # out of traffic, bad login), every worker stops routing through it for
+    # this long (proxy/gateway_health.py) instead of repeating the refusal on
+    # every URL. The first gateway use after expiry re-tests it; a refused
+    # attempt carries no traffic, so the re-test is free.
+    refused_ttl_seconds: int = Field(default=600, ge=10, le=86400)
 
     @field_validator("asn", mode="before")
     @classmethod

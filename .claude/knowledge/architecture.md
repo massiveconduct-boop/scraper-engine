@@ -341,6 +341,15 @@ Worker._fetch_with_proxy()            [orchestrator/worker.py]
   └─ free_only  → pm.get_proxy() as today, unchanged (default)
 ```
 
+- **Refusal verdict (round 68).** `proxy/gateway_health.py::GatewayHealth` —
+  one account-wide Redis key, `paid_gateway:refused` (JSON `since`/`error`,
+  TTL `dataimpulse.refused_ttl_seconds`, 600s default). Written by
+  `_fetch_with_proxy` on a gateway `PROXY_AUTH_FAILED`, cleared on a gateway
+  success, read before every gateway use (`Worker._gateway_fallback_usable`).
+  While set: `free_first` = `free_only` (the refused attempt itself is made
+  again on the pool), `paid_only` fails fast without a render, `/v1/health`
+  shows `paid_gateway.status: refused`. Redis errors count as "not refused".
+
 - **`proxy/paid_gateway.py::build_gateway_proxy()`** — pure function, 4 env
   vars (`DATAIMPULSE_PROXY_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`,
   `DATAIMPULSE_PASSWORD`; note the host/port names are the user's own

@@ -841,6 +841,22 @@ async def test_health_route_includes_browser_capacity_when_present(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_route_includes_paid_gateway_when_present(monkeypatch):
+    """Round 68 — whether the gateway is refusing our credentials."""
+    from scraper_engine.api.health import HealthStatus
+
+    monkeypatch.setattr(deps, "_storage_pg", AsyncMock())
+    monkeypatch.setattr(deps, "_storage_redis", AsyncMock())
+    block = {"status": "refused", "strategy": "free_first", "since": "t", "error": "407"}
+    monkeypatch.setattr(
+        "scraper_engine.api.health.check_health",
+        AsyncMock(return_value=HealthStatus(healthy=True, paid_gateway=block)),
+    )
+    payload = await health()
+    assert payload["paid_gateway"] == block
+
+
+@pytest.mark.asyncio
 async def test_health_route_unhealthy_returns_503_with_degraded_payload(monkeypatch):
     from scraper_engine.api.health import HealthStatus
 
@@ -1635,6 +1651,14 @@ def test_metrics_endpoint_refreshes_host_capacity_when_enabled(monkeypatch, fail
     resp = TestClient(_metrics_app()).get("/metrics")
     assert resp.status_code == 200
     refresh.assert_awaited_once()
+
+
+def test_dataimpulse_config_is_loaded_once():
+    from scraper_engine.api import routes as routes_module
+
+    routes_module._dataimpulse_config.cache_clear()
+    first = routes_module._dataimpulse_config()
+    assert routes_module._dataimpulse_config() is first
 
 
 def test_host_capacity_config_is_loaded_once():

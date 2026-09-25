@@ -25,7 +25,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
-from scraper_engine.config.schema import AppConfig, HostCapacityConfig
+from scraper_engine.config.schema import AppConfig, DataImpulseConfig, HostCapacityConfig
 from scraper_engine.core.models import (
     CrawlRequest,
     DeadLetterEntryResponse,
@@ -882,6 +882,14 @@ def _host_capacity_config() -> HostCapacityConfig:
     return load_config().host_capacity
 
 
+@functools.cache
+def _dataimpulse_config() -> DataImpulseConfig:
+    """Loaded once, same reason as _host_capacity_config."""
+    from scraper_engine.config.loader import load_config
+
+    return load_config().dataimpulse
+
+
 @router.get("/health")
 async def health() -> dict[str, object]:
     """Composite health check — pg/redis/s3 reachability + daemon liveness + proxy pool size."""
@@ -892,7 +900,7 @@ async def health() -> dict[str, object]:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     status = await check_health(
-        _storage_pg, _storage_redis, _storage_s3, _host_capacity_config()
+        _storage_pg, _storage_redis, _storage_s3, _host_capacity_config(), _dataimpulse_config()
     )
     payload: dict[str, object] = {
         "status": "ok" if status.healthy else "degraded",
@@ -905,6 +913,8 @@ async def health() -> dict[str, object]:
     }
     if status.browser_capacity is not None:
         payload["browser_capacity"] = status.browser_capacity
+    if status.paid_gateway is not None:
+        payload["paid_gateway"] = status.paid_gateway
     if not status.healthy:
         raise HTTPException(status_code=503, detail=payload)
     return payload
