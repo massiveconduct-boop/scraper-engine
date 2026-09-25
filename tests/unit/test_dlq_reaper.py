@@ -330,15 +330,16 @@ class TestIsEligible:
 
 
 class TestProxyAuthFailed:
-    """Round 66 — a proxy refused our credentials. With the gateway in play
-    that is the account (plan out of traffic): re-drive only once a probe
-    through the gateway succeeds, and probe once for many entries."""
+    """Round 66 — a proxy refused our credentials. Under paid_only that is
+    the account (plan out of traffic): re-drive only once a probe through the
+    gateway succeeds, and probe once for many entries. Round 68 — under
+    free_first a re-drive goes back to the pool, so pool health decides."""
 
     @pytest.fixture(autouse=True)
     def _reset_probe(self, monkeypatch):
         monkeypatch.setattr(dlq_reaper, "_gateway_probe", None)
 
-    def _gateway(self, monkeypatch, *, enabled=True, strategy="free_first", ok=True):
+    def _gateway(self, monkeypatch, *, enabled=True, strategy="paid_only", ok=True):
         from scraper_engine.config.schema import DataImpulseConfig
 
         cfg = DataImpulseConfig(enabled=enabled, strategy=strategy, country="ng", asn=29465)
@@ -376,9 +377,10 @@ class TestProxyAuthFailed:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("enabled", "strategy"), [(False, "free_first"), (True, "free_only")]
+        ("enabled", "strategy"),
+        [(False, "paid_only"), (True, "free_only"), (True, "free_first")],
     )
-    async def test_without_the_gateway_it_is_a_free_proxy_and_checks_tier_health(
+    async def test_without_a_gateway_only_path_it_checks_tier_health(
         self, monkeypatch, enabled, strategy
     ):
         probe = self._gateway(monkeypatch, enabled=enabled, strategy=strategy)

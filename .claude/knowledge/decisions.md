@@ -12,6 +12,46 @@ round it shipped in.
 
 ---
 
+## Decision: A Refused Gateway Is Out of Use for Everyone, and free_first Falls Back to the Pool
+
+**Date:** 2026-09-25 | **Round:** 68
+
+**What:** One 407 from the paid gateway writes a shared Redis verdict
+(`paid_gateway:refused`, `proxy/gateway_health.py`, TTL
+`dataimpulse.refused_ttl_seconds`, default 600s). While it exists, `free_first`
+behaves exactly like `free_only`: no forced gateway attempt on an open
+circuit, on a pool-blocked domain or as a block retry, and an exhausted pool is
+`proxy_exhausted`. The attempt that got the 407 is made again on the free pool
+in the same call. `paid_only` fails fast as `proxy_auth_failed` without a
+render. A gateway success clears the verdict; expiry re-tests it. `/v1/health`
+reports it as `paid_gateway.status: refused` plus a `checks` line, without
+flipping `healthy`. A pool-blocked hint is recorded only on a real gateway
+success.
+
+**Why:** research_agent, 2026-09-23 to 09-25: 171 of 171 gateway renders
+refused (plan out of traffic) while free-pool L2 renders kept succeeding. Under
+round 66 every refused URL went to the DLQ, even though the gateway was only a
+fallback and the pool could still produce a real outcome. Worse, a 407 counts
+as "not blocked", so a refused block retry recorded that the domain refuses the
+pool, and every later URL of that domain went gateway-first into the same
+refusal (10 domains poisoned live).
+
+**Tradeoffs:** supersedes round 66's "a gateway refusal ends the URL" for
+`free_first` only. The first refused URL pays one extra render (the pool
+attempt). While refused, a domain the pool cannot reach fails with its real
+block instead of waiting in the DLQ for a top-up; the reaper now re-drives
+`free_first` `proxy_auth_failed` entries on pool health, so none of this spends
+plan traffic. A refused attempt carries no traffic, so re-testing on expiry is
+free.
+
+**Alternatives rejected:** probe the gateway from the health endpoint (a
+successful probe spends plan traffic every 10s); a per-process flag (every
+worker and every forked rq job would learn the refusal again); flip `healthy`
+to false (a 503 on an account problem would make the compose healthcheck treat
+a working api as down, same reasoning as daemon liveness).
+
+---
+
 ## Decision: A Parked Browser Keeps the Seat of the Render That Launched It
 
 **Date:** 2026-09-23 | **Round:** 67
@@ -110,6 +150,8 @@ parked browser hold its seat and be evicted when someone waits.
 ---
 
 ## Decision: A Gateway Credential Refusal Ends the URL; a Probe Gates the Re-drive
+
+**Superseded for `free_first` by round 68** ("A Refused Gateway Is Out of Use for Everyone…" above); still how `paid_only` works.
 
 **Date:** 2026-09-22 | **Round:** 66
 

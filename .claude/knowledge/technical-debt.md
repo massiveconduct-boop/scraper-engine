@@ -32,6 +32,59 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 68)
+
+Origin: research_agent brief 2026-09-25 (`research_agent/docs/inbox/
+to-scraper-engine-2026-09-25-proxy-auth-failed.md`). Its live run 3 lost every
+Reuters URL to `proxy_auth_failed` at L2 (job `572722d9-…`), and
+africabusinesscommunities.com the day before.
+
+- **Cause, account side.** `research_agent.scrape_results` since 2026-09-23
+  10:47 UTC: 171 of 171 `proxy_source=paid_gateway` rows are
+  `proxy_auth_failed`, zero gateway successes; 63 free-pool L2 rows succeeded,
+  434 L1 rows (no proxy) succeeded. Same signature as round 66's `407
+  TRAFFIC_EXHAUSTED`. Credentials reach Camoufox as separate
+  `username`/`password` fields (`browser/camoufox_wrapper.py`), so it is not
+  the Firefox-ignores-URL-credentials bug. Not re-probed: the user allowed no
+  paid traffic. User action: top up the DataImpulse plan.
+- **Engine bug 1 — a fallback's refusal ended the URL.** Under `free_first`
+  the gateway only stands in for the pool (open circuit, pool-block hint,
+  block retry, exhausted pool), but round 66 sent every gateway 407 to the
+  DLQ, and every URL re-tried the dead account. Fix: the shared verdict in
+  `proxy/gateway_health.py`; `_fetch_with_proxy` makes the refused attempt
+  again on the pool; decision points use `_gateway_fallback_usable()`.
+- **Engine bug 2 — refusals poisoned level memory.** `_looks_blocked()` is
+  False for a 407, so a refused block retry called `record_pool_blocked`, and
+  the domain went gateway-first into the refusal for every later URL. 10
+  `levelhint:poolblock:research_agent:*` keys were live; deleted by hand. Now
+  recorded only on a real gateway success.
+- **Surfacing.** `/v1/health` → `paid_gateway` (`disabled` / `ok` /
+  `refused` + `since`, `error`, `strategy`), plus `checks.paid_gateway` when
+  refused. Informational only. `paid_only` + refused → `proxy_auth_failed`
+  without a render. DLQ reaper: `free_first` refusals re-drive on pool
+  health, the gateway probe stays for `paid_only`.
+- **Live check without paid traffic.** A stub proxy on the compose network
+  answering every request `407 TRAFFIC_EXHAUSTED`, with the workers'
+  `DATAIMPULSE_PROXY_HOST/PORT` pointed at it (kit: scratchpad
+  `compose.stub.yml` + `stub_407_proxy.py`, rebuild from this note). The
+  stub must NOT send `Proxy-Authenticate`: with the challenge Camoufox reports
+  `NS_ERROR_PROXY_CONNECTION_REFUSED` (→ `browser_crash`), without it the live
+  `NS_ERROR_PROXY_AUTHENTICATION_FAILED`. The first run had the challenge; the
+  reaper's re-drives went through the stub as `browser_crash` and tripped
+  reuters.com's circuit (reset by hand). Probe a stub with one Camoufox launch
+  before pointing workers at it.
+- **Real-gateway confirmation, zero traffic.** With the workers back on the
+  real gateway, a reaper re-drive hit DataImpulse and wrote the verdict
+  (`NS_ERROR_PROXY_AUTHENTICATION_FAILED`, 2026-09-25 12:51 UTC): the account
+  still refuses.
+- **Backlog drain.** The reaper change re-drove the two days of `free_first`
+  `proxy_auth_failed` entries onto the pool, 20 per cycle (~500 in the first
+  hour, tapering). Expected, but it occupies the workers for a while after
+  deploy.
+- **Open:** the account itself. After a top-up the first gateway use clears
+  the verdict (or it expires in 10 min); nothing to re-drive by hand under
+  `free_first`.
+
 ## Technical Debt / Open Threads (as of round 67)
 
 Origin: round 66's open item. Under host admission every render paid for a

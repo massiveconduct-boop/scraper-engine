@@ -206,3 +206,43 @@ async def test_browser_capacity_block_only_when_host_admission_is_enabled(monkey
     status = await check_health(pg, redis, AsyncMock(), HostCapacityConfig(enabled=True))
     assert status.browser_capacity["status"].startswith("unknown:")
     assert status.healthy is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "stored", "expected_status"),
+    [
+        (False, None, "disabled"),
+        (True, None, "ok"),
+        (True, '{"since": "2026-09-25T11:20:00+00:00", "error": "407"}', "refused"),
+    ],
+)
+async def test_paid_gateway_block_reports_the_shared_refusal(enabled, stored, expected_status):
+    """Round 68 — read from the shared verdict only; never a probe, which
+    would spend plan traffic whenever the gateway works."""
+    from scraper_engine.config.schema import DataImpulseConfig
+
+    pg = AsyncMock()
+    redis = AsyncMock()
+    redis.get.return_value = "5"
+    redis.raw.get.side_effect = lambda key: stored if key == "paid_gateway:refused" else "1"
+    cfg = DataImpulseConfig(enabled=enabled, strategy="free_first")
+
+    status = await check_health(pg, redis, None, None, cfg)
+
+    assert status.paid_gateway is not None
+    assert status.paid_gateway["status"] == expected_status
+    assert ("paid_gateway" in status.checks) is (expected_status == "refused")
+    # Informational: a refused gateway is an account to top up, not a broken api.
+    assert status.healthy is True
+    if expected_status == "refused":
+        assert status.paid_gateway["since"] == "2026-09-25T11:20:00+00:00"
+        assert status.paid_gateway["strategy"] == "free_first"
+
+
+@pytest.mark.asyncio
+async def test_no_paid_gateway_block_without_its_config():
+    redis = AsyncMock()
+    redis.get.return_value = "5"
+    status = await check_health(AsyncMock(), redis)
+    assert status.paid_gateway is None

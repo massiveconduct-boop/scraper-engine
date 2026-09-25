@@ -341,6 +341,15 @@ Worker._fetch_with_proxy()            [orchestrator/worker.py]
   └─ free_only  → pm.get_proxy() as today, unchanged (default)
 ```
 
+- **Refusal verdict (round 68).** `proxy/gateway_health.py::GatewayHealth` —
+  one account-wide Redis key, `paid_gateway:refused` (JSON `since`/`error`,
+  TTL `dataimpulse.refused_ttl_seconds`, 600s default). Written by
+  `_fetch_with_proxy` on a gateway `PROXY_AUTH_FAILED`, cleared on a gateway
+  success, read before every gateway use (`Worker._gateway_fallback_usable`).
+  While set: `free_first` = `free_only` (the refused attempt itself is made
+  again on the pool), `paid_only` fails fast without a render, `/v1/health`
+  shows `paid_gateway.status: refused`. Redis errors count as "not refused".
+
 - **`proxy/paid_gateway.py::build_gateway_proxy()`** — pure function, 4 env
   vars (`DATAIMPULSE_PROXY_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`,
   `DATAIMPULSE_PASSWORD`; note the host/port names are the user's own
@@ -383,13 +392,18 @@ Worker._fetch_with_proxy()            [orchestrator/worker.py]
   the root cause and fix. `paid_only`/`free_first` are now live-verified
   reliable for L2 (4 rounds of increasingly concurrent real jobs, zero
   crash-attributable job failures).
-- **Credential refusal (round 66).** A proxy's 407 is `PROXY_AUTH_FAILED`
-  (`fetcher/_failure.py`). From the gateway it means the account (plan out of
-  traffic): no new-session retry, no later level, URL DLQ'd at once, circuit
-  untouched. The DLQ reaper re-drives those entries only once
-  `paid_gateway.gateway_accepts_credentials()` gets a 200 through the gateway
-  (answer cached 120s). From a free proxy it is that proxy: `mark_failure`
-  and one fresh-lease retry, then normal escalation.
+- **Credential refusal (rounds 66, 68).** A proxy's 407 is
+  `PROXY_AUTH_FAILED` (`fetcher/_failure.py`); never counted against the
+  domain's circuit. From a free proxy it is that proxy: `mark_failure` and one
+  fresh-lease retry, then normal escalation. From the gateway it is the
+  account (plan out of traffic, bad login): it sets the refusal verdict above,
+  never gets a new-session retry, and then
+  - `free_first`: the same attempt is made again on the free pool, and the
+    URL carries on as under `free_only` until the verdict expires;
+  - `paid_only`: the URL is DLQ'd at once, and the DLQ reaper re-drives it
+    only once `paid_gateway.gateway_accepts_credentials()` gets a 200 through
+    the gateway (answer cached 120s). `free_first` entries re-drive on pool
+    health instead, with no gateway probe.
 
 ---
 

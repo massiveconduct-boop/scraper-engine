@@ -331,7 +331,7 @@ condition that caused them clears, up to a configured cap tracked in
 |---|---|
 | `proxy_exhausted`, `browser_crash`, `network_timeout` | the proxy pool tier for that level is healthy again |
 | `circuit_open` | the domain's circuit breaker has closed |
-| `proxy_auth_failed` | a test request through the paid gateway succeeds again (the gateway refused the engine's credentials, e.g. plan out of traffic); without the gateway, as `browser_crash` |
+| `proxy_auth_failed` | a proxy refused the engine's credentials. With `strategy: paid_only`, once a test request through the paid gateway succeeds again (e.g. after a plan top-up). Otherwise the retry goes through the free pool, so once that level's pool tier is healthy |
 | `politeness_timeout` | nothing holds a politeness slot on that domain any more |
 | `capacity_timeout` | the host has spare browser capacity (nobody waiting, seats free) |
 | `dependency_unavailable` | the engine's own Redis answers again |
@@ -442,6 +442,15 @@ Composite health check. No authentication required.
 `degraded`). With host-wide browser admission enabled, a
 `browser_capacity` block is added — `in_use_units`, `target_units`,
 `waiters`, `status` — also informational.
+
+A `paid_gateway` block reports the paid proxy gateway: `{"status":
+"disabled"}`, `{"status": "ok", "strategy": …}`, or `{"status":
+"refused", "strategy": …, "since": …, "error": …}` when the provider has
+refused the engine's credentials (plan out of traffic, bad login) within
+the last `dataimpulse.refused_ttl_seconds` (600s by default). While refused,
+`checks.paid_gateway` says what to do, and `free_first` fetches go through
+the free proxy pool instead. Informational: it never turns the status to
+`degraded`, and reading it never sends traffic through the gateway.
 
 ---
 

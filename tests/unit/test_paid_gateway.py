@@ -218,6 +218,30 @@ class TestAsnRequiresCountry:
         assert cfg.country == ""
 
 
+class TestRefusedTtl:
+    """Round 68 — how long one 407 takes the gateway out of use."""
+
+    def test_default_is_ten_minutes(self):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        assert DataImpulseConfig().refused_ttl_seconds == 600
+
+    @pytest.mark.parametrize("value", [0, 9, 86401])
+    def test_out_of_range_is_rejected(self, value):
+        from pydantic import ValidationError
+
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        with pytest.raises(ValidationError):
+            DataImpulseConfig(refused_ttl_seconds=value)
+
+    def test_base_yaml_renders_the_default(self, monkeypatch):
+        from scraper_engine.config.loader import load_config
+
+        monkeypatch.delenv("DATAIMPULSE_REFUSED_TTL_SECONDS", raising=False)
+        assert load_config().dataimpulse.refused_ttl_seconds == 600
+
+
 class TestGatewayAcceptsCredentials:
     """Round 66 — the probe proxy/dlq_reaper.py runs before re-driving a URL
     the gateway refused. True only on a real 200 through the gateway."""

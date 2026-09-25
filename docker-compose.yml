@@ -292,9 +292,13 @@ services:
 
   minio:
     restart: unless-stopped
-    # Round 67 — Docker Hub's minio/minio was removed (CI: "pull access denied").
-    # Same release we ran before (identical image id), pinned on quay.io.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # Round 68 — MinIO no longer publishes community images: Docker Hub's
+    # minio/minio went first (round 67), then quay.io/minio/minio (CI:
+    # "unauthorized"). Chainguard rebuilds it from source; pinned by digest.
+    # It runs as uid 65532, so a volume created by the old root-run image
+    # needs MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # (while it is still cached locally) or a chown of the volume.
+    image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1}
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -305,7 +309,9 @@ services:
       - "${MINIO_API_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # Pure bash (/dev/tcp + [[ ]]): the Chainguard image has no curl or
+      # wget, and the quay image has no grep.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
       interval: 3s
       timeout: 5s
       retries: 30

@@ -86,6 +86,14 @@ _SAME_LEVEL_PROXY_RETRIES = 1  # one retry with a fresh proxy before giving up o
 # because nothing in the system could ask it to.
 _GATEWAY_ROTATE_CATEGORIES = frozenset({FailureCategory.DETECTION_BLOCK})
 
+# Round 68 — why a URL did not go out through the paid gateway while it is
+# refusing our credentials (proxy/gateway_health.py). Ends up in the result's
+# and DLQ entry's error_message, so it says what the operator must do.
+_GATEWAY_REFUSED_MESSAGE = (
+    "paid gateway is refusing our credentials (plan out of traffic or bad login) "
+    "— not attempted; top up or fix DATAIMPULSE_* and it is re-tested automatically"
+)
+
 # round 29 — how long a successful scrape_results row is considered a valid
 # cache hit before it must be re-scraped. Sliding: a hit refreshes freshness
 # by inserting a new row with a fresh extracted_at (see _persist_one_result
@@ -257,6 +265,12 @@ class Worker:
         from .level_memory import LevelMemory
 
         self._level_memory = LevelMemory(redis, self._config.escalation)
+        # Round 68 — the shared "gateway is refusing our credentials" verdict
+        # (proxy/gateway_health.py). One 407 takes the gateway out of use for
+        # every worker until the verdict expires.
+        from scraper_engine.proxy.gateway_health import GatewayHealth
+
+        self._gateway_health = GatewayHealth(redis, self._config.dataimpulse.refused_ttl_seconds)
 
     def _resolve_levels(self, overrides: ConfigOverrides | None) -> list[int]:
         """The escalation ladder for this request, narrowed by min/max_level.
@@ -328,6 +342,15 @@ class Worker:
         guarantees it's configured whenever enabled is True."""
         return (
             self._config.dataimpulse.enabled and self._config.dataimpulse.strategy == "free_first"
+        )
+
+    async def _gateway_fallback_usable(self) -> bool:
+        """Round 68 — _gateway_fallback_eligible, and the gateway is not
+        currently refusing our credentials. A refused gateway makes free_first
+        behave exactly like free_only: no forced gateway attempt on an open
+        circuit, a pool-blocked domain or a block retry."""
+        return (
+            self._gateway_fallback_eligible and await self._gateway_health.refusal() is None
         )
 
     async def process_job(
@@ -482,7 +505,10 @@ class Worker:
             # Round 64 — a domain known to refuse the free pool goes straight
             # to the gateway (see LevelMemory.plan). Only where the gateway
             # fallback exists at all: under free_only there is nowhere to go.
-            gateway_first = plan.skip_pool and self._gateway_fallback_eligible
+            # Round 68 — nor while the gateway is refusing our credentials:
+            # the pool may be blocked here, but it is the only path that can
+            # still produce a real outcome for this URL.
+            gateway_first = plan.skip_pool and await self._gateway_fallback_usable()
             skip_botasaurus = plan.skip_botasaurus
             if gateway_first:
                 logger.info(
@@ -536,8 +562,9 @@ class Worker:
                     # nothing about, and it's available right now, not after
                     # a cooldown. free_only/paid_only/gateway-not-configured
                     # keep the exact prior behavior: immediate CIRCUIT_OPEN
-                    # DLQ, no attempt made.
-                    if circuit_open and not self._gateway_fallback_eligible:
+                    # DLQ, no attempt made. Round 68 — so does free_first
+                    # while the gateway is refusing our credentials.
+                    if circuit_open and not await self._gateway_fallback_usable():
                         circuit_result = FetchResult(
                             url=url_str,
                             success=False,
@@ -700,6 +727,9 @@ class Worker:
                                 )
                             )
                         )
+                        # Round 68 — checked last: it is the only clause that
+                        # reads Redis, and only a blocked result gets here.
+                        and await self._gateway_fallback_usable()
                     ):
                         # Round 64 — the attempt being retried is a rejection
                         # like any other, and the retry is a phase like any
@@ -735,10 +765,24 @@ class Worker:
                         if gateway_result is not None:
                             result = gateway_result
                             last_level_result = result
-                            if not self._looks_blocked(gateway_result):
+                            if (
+                                gateway_result.proxy_source == "paid_gateway"
+                                and gateway_result.success
+                                and not self._looks_blocked(gateway_result)
+                            ):
                                 # The pool was blocked, the gateway at the
-                                # same level was not: the domain refuses the
-                                # pool, not this level.
+                                # same level got real content: the domain
+                                # refuses the pool, not this level.
+                                #
+                                # Round 68 — only on a real gateway success.
+                                # "Not blocked" alone also held for a 407: with
+                                # the plan out of traffic every refused retry
+                                # taught level memory the domain refuses the
+                                # pool, and each later URL of it went
+                                # gateway-first into the same refusal (10
+                                # domains live, research_agent). The retry may
+                                # also have come back from the pool, once
+                                # _fetch_with_proxy fell back on a refusal.
                                 await self._level_memory.record_pool_blocked(tenant_id, domain)
 
                     if result.success:
@@ -922,6 +966,11 @@ class Worker:
                         # retry would go out through the same refused
                         # account. The DLQ reaper re-drives it once a probe
                         # through the gateway succeeds again.
+                        #
+                        # Round 68 — only paid_only still gets here with a
+                        # gateway refusal. Under free_first the gateway is a
+                        # fallback, and _fetch_with_proxy retries a refused
+                        # attempt on the free pool before it returns.
                         category = result.failure_category
                         auth_failed = category == FailureCategory.PROXY_AUTH_FAILED
                         gateway_refused = auth_failed and result.proxy_source == "paid_gateway"
@@ -1332,11 +1381,28 @@ class Worker:
         # and silently leave the real failure unretried.
         pool_retries_left = _SAME_LEVEL_PROXY_RETRIES
         block_rotations_left = di_cfg.rotate_on_block_retries if di_cfg.enabled else 0
+        # Round 68 — the gateway is refusing our credentials (shared verdict,
+        # proxy/gateway_health.py, or a 407 seen by this very call). Under
+        # free_first the pool is then the only path; under paid_only there is
+        # no path at all, and the URL fails without a render.
+        gateway_refused = False
 
         while True:
+            if (force_gateway or strategy == "paid_only") and not gateway_refused:
+                gateway_refused = await self._gateway_health.refusal() is not None
+            if gateway_refused and strategy == "paid_only":
+                return FetchResult(
+                    url=url,
+                    success=False,
+                    level_used=level,
+                    duration_ms=0,
+                    failure_category=FailureCategory.PROXY_AUTH_FAILED,
+                    error_message=_GATEWAY_REFUSED_MESSAGE,
+                    proxy_source="paid_gateway",
+                )
             async with self._render_claim(admission, weight):
                 lease: ProxyLease
-                if force_gateway:
+                if force_gateway and not gateway_refused:
                     gateway_proxy = self._new_gateway_proxy()
                     if gateway_proxy is None:
                         raise RuntimeError(
@@ -1359,7 +1425,9 @@ class Worker:
                     try:
                         lease = await pm.get_proxy(tenant_id, level=level, domain=domain)
                     except ProxyPoolExhaustedError:
-                        if strategy == "free_first":
+                        if strategy == "free_first" and not gateway_refused:
+                            gateway_refused = await self._gateway_health.refusal() is not None
+                        if strategy == "free_first" and not gateway_refused:
                             gateway_proxy = self._new_gateway_proxy()
                             if gateway_proxy is None:
                                 raise RuntimeError(
@@ -1373,7 +1441,8 @@ class Worker:
                                 level_used=level,
                                 duration_ms=0,
                                 failure_category=FailureCategory.PROXY_EXHAUSTED,
-                                error_message="Proxy pool exhausted",
+                                error_message="Proxy pool exhausted"
+                                + (f" ({_GATEWAY_REFUSED_MESSAGE})" if gateway_refused else ""),
                             )
                 async with lease:
                     fetcher = build_fetcher()
@@ -1381,6 +1450,19 @@ class Worker:
                         url, tenant_id, proxy=lease.proxy, overrides=overrides
                     )
                     result.proxy_source = lease.proxy.source
+                    if lease.proxy.source == "paid_gateway":
+                        if result.failure_category == FailureCategory.PROXY_AUTH_FAILED:
+                            # Round 68 — the account, not the URL: tell every
+                            # worker, then (free_first) make this same attempt
+                            # on the free pool instead of ending the URL.
+                            await self._gateway_health.mark_refused(
+                                result.error_message or "proxy authentication failed"
+                            )
+                            gateway_refused = True
+                            if strategy == "free_first":
+                                continue
+                        elif result.success:
+                            await self._gateway_health.clear()
                     # A paid-gateway lease has no proxy_pool row (see
                     # proxy/paid_gateway.py) — mark_success/mark_failure would be
                     # a harmless no-op UPDATE either way, but gating on source
@@ -1412,6 +1494,8 @@ class Worker:
                     # proxy's fault, so a fresh lease can help. The gateway
                     # refusing them is the account's: every new session gets
                     # the same 407, so it returns at once (see process_job).
+                    # Round 68 — only under paid_only; free_first already went
+                    # back to the pool above.
                     retryable = result.failure_category in _PROXY_RETRYABLE_CATEGORIES or (
                         result.failure_category == FailureCategory.PROXY_AUTH_FAILED
                         and lease.proxy.source == "pool"
