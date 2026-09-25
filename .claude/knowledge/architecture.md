@@ -49,7 +49,8 @@ Levels: L1 (httpx/Scrapling, timeout 20s, any proxy), L2 (Botasaurus+Camoufox, t
 **What a terminal failure carries (round 69).** Built once, in
 `process_job`'s for/else branch (plus the circuit-open and DLQ-eligible
 breaks): the last attempt's `http_status`/`is_challenge_page`/`proxy_source`;
-for `detection_block` a `block_reason` and a message prefix
+for `detection_block` and `rate_limited` (round 70: a terminal 429) a
+`block_reason` and a message prefix
 `<what> at L<n> via <route>` (`_describe_block`); and, when an eligible
 `free_first` gateway use was refused anywhere on the URL's path, the
 `paid_gateway_skipped` flag plus the refusal note (`_note_gateway_skipped`;

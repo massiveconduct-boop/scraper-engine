@@ -16,6 +16,8 @@ class ScraplingResponse(NamedTuple):
     status_code: int
     text: str
     location: str | None
+    # Round 70 — raw Retry-After header (fetcher/_failure.py::retry_after_for).
+    retry_after: str | None = None
 
 
 class ScraplingWrapper:
@@ -55,5 +57,8 @@ class ScraplingWrapper:
             return None
         location = page.headers.get("location") if 300 <= page.status < 400 else None
         return ScraplingResponse(
-            status_code=page.status, text=str(page.html_content), location=location
+            status_code=page.status,
+            text=str(page.html_content),
+            location=location,
+            retry_after=page.headers.get("retry-after"),
         )

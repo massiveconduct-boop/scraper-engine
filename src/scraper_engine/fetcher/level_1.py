@@ -14,7 +14,7 @@ import httpx
 
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
-from scraper_engine.fetcher._failure import classify_http_status
+from scraper_engine.fetcher._failure import classify_http_status, retry_after_for
 
 from .result import FetchResult
 
@@ -125,6 +125,7 @@ class Level1Fetcher:
                     failure_category=(
                         None if success else classify_http_status(response.status_code)
                     ),
+                    retry_after_seconds=retry_after_for(response.status_code, response.headers),
                 )
         except httpx.TimeoutException:
             return FetchResult(
@@ -211,6 +212,9 @@ class Level1Fetcher:
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 failure_category=None if success else classify_http_status(response.status_code),
+                retry_after_seconds=retry_after_for(
+                    response.status_code, {"retry-after": response.retry_after}
+                ),
             )
         except Exception:
             return None
@@ -254,6 +258,9 @@ class Level1Fetcher:
                 proxy_used=proxy.key() if proxy else None,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 failure_category=None if success else classify_http_status(response.status_code),
+                retry_after_seconds=retry_after_for(
+                    response.status_code, {"retry-after": response.retry_after}
+                ),
             )
         except Exception:
             return None

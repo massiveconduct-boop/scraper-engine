@@ -24,9 +24,11 @@ def make_entry(
     job_id="job-1",
     auto_retry_count=0,
     dead_at=None,
+    retry_not_before=None,
 ):
     now = datetime.now(UTC)
     return DeadLetterEntry(
+        retry_not_before=retry_not_before,
         id=1,
         job_id=job_id,
         tenant_id="test",
@@ -398,6 +400,64 @@ class TestProxyAuthFailed:
     def test_dataimpulse_config_is_loaded_once(self):
         dlq_reaper._dataimpulse_config.cache_clear()
         assert dlq_reaper._dataimpulse_config() is dlq_reaper._dataimpulse_config()
+
+
+class TestRateLimited:
+    """Round 70 — a URL the site answered 429 at every level is re-driven,
+    but late: after the contention backoff (60s * 2**n from dead_at), after
+    the site's own Retry-After (retry_not_before), and never into a circuit
+    that is open for the domain."""
+
+    @staticmethod
+    def _entry(*, dead_ago, not_before_in=None, url="http://slow.example/p"):
+        now = datetime.now(UTC)
+        return make_entry(
+            category=FailureCategory.RATE_LIMITED,
+            url=url,
+            dead_at=now - timedelta(seconds=dead_ago),
+            retry_not_before=(
+                now + timedelta(seconds=not_before_in) if not_before_in is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _breaker(state=CircuitState.CLOSED):
+        cb = AsyncMock()
+        cb.state.return_value = state
+        return cb
+
+    def test_is_a_reaped_contention_category(self):
+        assert FailureCategory.RATE_LIMITED in dlq_reaper._TRANSIENT_CATEGORIES
+        assert FailureCategory.RATE_LIMITED in dlq_reaper._CONTENTION_CATEGORIES
+
+    @pytest.mark.asyncio
+    async def test_ineligible_before_the_backoff(self):
+        cb = self._breaker()
+        entry = self._entry(dead_ago=30)
+        assert await dlq_reaper._is_eligible(entry, MagicMock(), cb, ProxyTierConfig()) is False
+        cb.state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ineligible_before_retry_not_before_even_after_the_backoff(self):
+        cb = self._breaker()
+        entry = self._entry(dead_ago=3600, not_before_in=600)
+        assert await dlq_reaper._is_eligible(entry, MagicMock(), cb, ProxyTierConfig()) is False
+        cb.state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", [CircuitState.CLOSED, CircuitState.HALF_OPEN])
+    @pytest.mark.parametrize("not_before_in", [None, -60])
+    async def test_eligible_after_both_unless_the_circuit_is_open(self, state, not_before_in):
+        cb = self._breaker(state)
+        entry = self._entry(dead_ago=3600, not_before_in=not_before_in)
+        assert await dlq_reaper._is_eligible(entry, MagicMock(), cb, ProxyTierConfig()) is True
+        cb.state.assert_awaited_once_with("slow.example")
+
+    @pytest.mark.asyncio
+    async def test_ineligible_while_the_circuit_is_open(self):
+        cb = self._breaker(CircuitState.OPEN)
+        entry = self._entry(dead_ago=3600, not_before_in=-60)
+        assert await dlq_reaper._is_eligible(entry, MagicMock(), cb, ProxyTierConfig()) is False
 
 
 class TestRetryEntry:

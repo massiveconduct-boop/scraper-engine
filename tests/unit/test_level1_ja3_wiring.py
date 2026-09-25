@@ -18,6 +18,7 @@ class _FakeResponse:
     status_code = 200
     text = "<html>httpx fallback</html>"
     is_redirect = False
+    headers: dict[str, str] = {}
 
 
 class _FakeAsyncClient:
@@ -69,6 +70,35 @@ async def test_ja3_404_classified_as_detection_block(monkeypatch):
 
     assert result.success is False
     assert result.failure_category == FailureCategory.DETECTION_BLOCK
+
+
+@pytest.mark.asyncio
+async def test_ja3_429_is_rate_limited_and_reads_retry_after(monkeypatch):
+    """Round 70 — the JA3 path's 429 carries the site's Retry-After."""
+    session = AsyncMock()
+    session.get.return_value = Ja3Response(
+        status_code=429, text="<html>slow down</html>", location=None, retry_after="45"
+    )
+    fetcher = Level1Fetcher(ja3_client=_fake_ja3_client(session))
+
+    result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+    assert result.success is False
+    assert result.failure_category == FailureCategory.RATE_LIMITED
+    assert result.retry_after_seconds == 45
+
+
+@pytest.mark.asyncio
+async def test_ja3_non_429_ignores_retry_after(monkeypatch):
+    session = AsyncMock()
+    session.get.return_value = Ja3Response(
+        status_code=503, text="<html>down</html>", location=None, retry_after="45"
+    )
+    fetcher = Level1Fetcher(ja3_client=_fake_ja3_client(session))
+
+    result = await fetcher.fetch("http://example.com", TenantId("system"))
+
+    assert result.retry_after_seconds is None
 
 
 @pytest.mark.asyncio

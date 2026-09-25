@@ -25,7 +25,14 @@ def _proxy() -> Proxy:
 
 
 class FakePage:
-    def __init__(self, html=_REAL_HTML, goto_exc=None, trigger_route_block=False, nav_status=200):
+    def __init__(
+        self,
+        html=_REAL_HTML,
+        goto_exc=None,
+        trigger_route_block=False,
+        nav_status=200,
+        nav_headers=None,
+    ):
         self._html = html
         self.goto_exc = goto_exc
         self.trigger_route_block = trigger_route_block
@@ -33,6 +40,7 @@ class FakePage:
         self.wait_calls = 0
         self.evaluate_calls = 0
         self.nav_status = nav_status
+        self.nav_headers = nav_headers or {}
 
     async def route(self, pattern, handler):
         self._route_handler = handler
@@ -50,7 +58,7 @@ class FakePage:
         # A real Playwright Response, not None — mirrors what page.goto()
         # actually returns on a normal http(s) navigation (round 33: the
         # production code used to discard this entirely and hardcode 200).
-        return SimpleNamespace(status=self.nav_status)
+        return SimpleNamespace(status=self.nav_status, headers=self.nav_headers)
 
     async def wait_for_load_state(self, state, timeout):
         return None
@@ -272,6 +280,22 @@ class TestFetchViaCamoufox:
 
         assert result.success is True
         assert result.http_status == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "expected"), [(429, 90), (403, None), (200, None)])
+    async def test_retry_after_is_read_only_from_a_429(self, monkeypatch, status, expected):
+        """Round 70 — the navigation response's Retry-After becomes
+        retry_after_seconds on a 429 only."""
+        page = FakePage(nav_status=status, nav_headers={"retry-after": "90"})
+        fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
+        monkeypatch.setattr("scraper_engine.fetcher.level_2.CamoufoxWrapper", fake_wrapper_cls)
+
+        result = await Level2Fetcher().fetch(
+            "http://example.com", TenantId("system"), proxy=_proxy()
+        )
+
+        assert result.http_status == status
+        assert result.retry_after_seconds == expected
 
     @pytest.mark.asyncio
     async def test_pool_lease_used_when_pool_configured(self):

@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -3140,7 +3141,7 @@ class TestFailureLabels:
         ("status", "prefix"),
         [
             (403, "HTTP 403 (refused) at L3 via pool"),
-            (429, "HTTP 429 (rate limited) at L3 via pool"),
+            # Round 70 — 429 is RATE_LIMITED now; see TestRateLimited.
             (404, "HTTP 404 (not found, or a block shaped like one) at L3 via pool"),
         ],
     )
@@ -3277,6 +3278,173 @@ class TestFailureLabels:
         result = await self._run(worker, tenant, [exhausted])
         assert result.paid_gateway_skipped is True
         assert result.error_message.count("paid gateway is refusing our credentials") == 1
+
+
+class TestRateLimited:
+    """Round 70 — HTTP 429 is RATE_LIMITED, not DETECTION_BLOCK. It still
+    escalates, rotates the gateway exit IP and gets the gateway block retry
+    exactly like a block (worker.py::_BLOCK_CATEGORIES); only the terminal
+    label differs, and the site's Retry-After holds the DLQ reaper back."""
+
+    _wire = TestGatewayExitIpRotation._wire
+    _fetcher_returning = staticmethod(TestGatewayExitIpRotation._fetcher_returning)
+    _usernames = staticmethod(TestGatewayExitIpRotation._usernames)
+
+    @staticmethod
+    def _limited(level, source="pool", retry_after=None):
+        return FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=level,
+            http_status=429,
+            failure_category=FailureCategory.RATE_LIMITED,
+            error_message="rate limited",
+            duration_ms=1,
+            proxy_source=source,
+            retry_after_seconds=retry_after,
+        )
+
+    @staticmethod
+    def _ok(level, source="pool"):
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=level,
+            http_status=200,
+            html="<html><body>" + "<p>Real article text. </p>" * 30 + "</body></html>",
+            duration_ms=1,
+            proxy_source=source,
+        )
+
+    async def _run(self, worker, tenant, side_effect, job="job-429"):
+        worker._fetch_url = AsyncMock(side_effect=side_effect)
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        response = await worker.process_job(tenant, job, request)
+        assert response.results is not None
+        return response.results[0]
+
+    @pytest.mark.asyncio
+    async def test_a_429_at_every_level_ends_rate_limited(self, tenant, worker):
+        result = await self._run(
+            worker, tenant, [self._limited(1), self._limited(2), self._limited(3)]
+        )
+
+        assert worker._fetch_url.await_count == 3  # escalated through every level
+        assert result.success is False
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.http_status == 429
+        assert result.block_reason == "status:429"
+        assert result.error_message.startswith("HTTP 429 (rate limited) at L3 via pool")
+        args = worker._dlq.enqueue.await_args.args
+        assert args[3] == FailureCategory.RATE_LIMITED
+        assert args[4] == result.error_message
+        # Still counts toward the circuit breaker.
+        worker._circuit_breaker.record_failure.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_becomes_the_dlq_retry_not_before(self, tenant, worker):
+        before = datetime.now(UTC)
+        await self._run(
+            worker,
+            tenant,
+            [self._limited(1), self._limited(2), self._limited(3, retry_after=120)],
+        )
+        after = datetime.now(UTC)
+
+        not_before = worker._dlq.enqueue.await_args.kwargs["retry_not_before"]
+        assert before + timedelta(seconds=120) <= not_before <= after + timedelta(seconds=120)
+
+    @pytest.mark.asyncio
+    async def test_no_retry_after_on_the_last_result_means_no_retry_not_before(
+        self, tenant, worker
+    ):
+        """Only the last level's answer counts: an earlier level's
+        Retry-After describes an attempt that is already over."""
+        await self._run(
+            worker,
+            tenant,
+            [self._limited(1, retry_after=300), self._limited(2), self._limited(3)],
+        )
+
+        assert worker._dlq.enqueue.await_args.kwargs["retry_not_before"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_detection_block_never_gets_a_retry_not_before(self, tenant, worker):
+        blocked = [
+            self._limited(level, retry_after=60).model_copy(
+                update={"http_status": 403, "failure_category": FailureCategory.DETECTION_BLOCK}
+            )
+            for level in (1, 2, 3)
+        ]
+        result = await self._run(worker, tenant, blocked)
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert worker._dlq.enqueue.await_args.kwargs["retry_not_before"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_final_level_success_shaped_429_is_rate_limited(self, tenant, worker):
+        """The L3 shape: the browser reports success with the real 429
+        status and the worker downgrades it at the final level."""
+        page = self._ok(3).model_copy(update={"http_status": 429, "retry_after_seconds": 30})
+        result = await self._run(worker, tenant, [self._limited(1), self._limited(2), page])
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.http_status == 429
+        assert worker._dlq.enqueue.await_args.args[3] == FailureCategory.RATE_LIMITED
+        assert worker._dlq.enqueue.await_args.kwargs["retry_not_before"] is not None
+
+    @pytest.mark.asyncio
+    async def test_an_l1_429_still_escalates_and_l2_succeeds(self, tenant, worker):
+        result = await self._run(worker, tenant, [self._limited(1), self._ok(2)])
+
+        assert result.success is True
+        assert result.level_used == 2
+        assert worker._fetch_url.await_count == 2
+        assert result.escalations[0]["level"] == 1
+        assert result.escalations[0]["reason"] == "failure:rate_limited"
+        worker._dlq.enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_free_pool_429_gets_the_gateway_block_retry(self, tenant, worker):
+        from scraper_engine.config.schema import DataImpulseConfig
+
+        worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
+        result = await self._run(
+            worker, tenant, [self._limited(1, "pool"), self._ok(1, "paid_gateway")]
+        )
+
+        assert result.success is True
+        assert result.proxy_source == "paid_gateway"
+        assert [c.kwargs["force_gateway"] for c in worker._fetch_url.await_args_list] == [
+            False,
+            True,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_paid_gateway_429_spends_a_block_rotation(self, tenant, worker, monkeypatch):
+        fetcher = self._wire(
+            worker, monkeypatch, self._limited(2, source=None), self._ok(2, source=None)
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result.success is True
+        assert fetcher.fetch.await_count == 2
+        first, second = self._usernames(fetcher)
+        assert first != second  # a new exit IP for the retry
+        self._pm.get_proxy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_rotation_budget_bounds_a_429_too(self, tenant, worker, monkeypatch):
+        fetcher = self._wire(
+            worker, monkeypatch, *[self._limited(2, source=None) for _ in range(4)], rotations=2
+        )
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert fetcher.fetch.await_count == 3
+        assert result.failure_category == FailureCategory.RATE_LIMITED
 
 
 class TestFailureLabelHelpers:

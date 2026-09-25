@@ -264,10 +264,10 @@ here with `proxy_source: "pool"`.
 
 **Reading a failed result.** A failed URL's `error_message` says what
 happened. Two more fields help:
-- **`block_reason`** is set on a `detection_block`. It names which check
-  fired, in the same vocabulary as `escalations[].reason`: `status:403`,
-  `status:429`, `signature:<text>`, `js_gated`, … For a `detection_block`
-  the message starts with a plain summary of what, where and through which
+- **`block_reason`** is set on a `detection_block` or `rate_limited`. It
+  names which check fired, in the same vocabulary as
+  `escalations[].reason`: `status:403`, `status:429`, `signature:<text>`,
+  `js_gated`, … For either category the message starts with a plain summary of what, where and through which
   route: `HTTP 403 (refused) at L3 via pool — …`, `HTTP 429 (rate limited)
   at L2 via pool — …`, `challenge page (signature 'cf-browser-verification')
   at L3 via pool — …`. The route is `pool` (free proxy), `paid_gateway`, or
@@ -289,7 +289,8 @@ doing it is, and whether the engine re-drives it by itself (see `GET
 
 | `failure_category` | Meaning | Whose doing | Auto-retried |
 |---|---|---|---|
-| `detection_block` | The site answered 401/403/404/405/410/429, or served a challenge / JavaScript-gated page, at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
+| `detection_block` | The site answered 401/403/404/405/410, or served a challenge / JavaScript-gated page, at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
+| `rate_limited` | The site answered 429 ("too many requests") at every level and route tried. `block_reason` is `status:429` | Target site, asking us to slow down (maybe per exit IP) | Yes, after a wait, and not before the site's `Retry-After` (capped at one hour) |
 | `circuit_open` | Too many recent failures on this domain; the engine is pausing it | Target site, by history | Yes, once the circuit closes |
 | `proxy_exhausted` | No usable proxy was available for the level | Ours (proxy supply) | Yes, when that pool tier is healthy |
 | `proxy_auth_failed` | A proxy refused the engine's credentials. From the paid gateway, that means the account (plan out of traffic, bad login) | Proxy provider / account | Yes: `paid_only` after a gateway probe succeeds, otherwise on pool health |
@@ -378,8 +379,9 @@ condition that caused them clears, up to a configured cap tracked in
 | `politeness_timeout` | nothing holds a politeness slot on that domain any more |
 | `capacity_timeout` | the host has spare browser capacity (nobody waiting, seats free) |
 | `dependency_unavailable` | the engine's own Redis answers again |
+| `rate_limited` | the domain's circuit breaker is not open, and the time the site's `Retry-After` header asked for (capped at one hour) has passed, if it sent one |
 
-The last three also wait 60s × 2^`auto_retry_count` after their most
+The last four also wait 60s × 2^`auto_retry_count` after their most
 recent failure. A retried job keeps its original `job_id`, and only its
 not-yet-successful URLs are fetched again; poll `GET /v1/jobs/{job_id}` to
 see it move through `PENDING`/`PROCESSING` again. Every other

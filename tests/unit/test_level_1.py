@@ -137,6 +137,70 @@ class TestPlainHttpxStatusClassification:
         assert result.failure_category is None
 
 
+class _HeadersStatusClient(_StatusClient):
+    """A _StatusClient whose response carries real httpx.Headers."""
+
+    def __init__(self, status_code, headers):
+        super().__init__(status_code)
+        self._headers = headers
+
+    async def get(self, url):
+        response = _FakeResponse(self._status_code, text="<html>slow down</html>")
+        response.headers = httpx.Headers(self._headers)
+        return response
+
+
+class TestRetryAfter:
+    """Round 70 — a 429 is RATE_LIMITED and carries the site's Retry-After
+    (fetcher/_failure.py::retry_after_for); any other status leaves it None."""
+
+    @pytest.mark.asyncio
+    async def test_httpx_429_reads_retry_after(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _HeadersStatusClient(429, {"Retry-After": "120"}))
+
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+
+        assert result.success is False
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.retry_after_seconds == 120
+
+    @pytest.mark.asyncio
+    async def test_httpx_non_429_ignores_retry_after(self, monkeypatch):
+        monkeypatch.setattr(httpx, "AsyncClient", _HeadersStatusClient(503, {"Retry-After": "120"}))
+
+        result = await Level1Fetcher().fetch("http://example.com", TenantId("system"))
+
+        assert result.retry_after_seconds is None
+
+    @pytest.mark.asyncio
+    async def test_scrapling_429_reads_retry_after(self):
+        scrapling = AsyncMock()
+        scrapling.fetch.return_value = ScraplingResponse(
+            status_code=429, text="<html>slow down</html>", location=None, retry_after="30"
+        )
+
+        result = await Level1Fetcher(scrapling_client=scrapling).fetch(
+            "http://example.com", TenantId("system")
+        )
+
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.retry_after_seconds == 30
+
+    @pytest.mark.asyncio
+    async def test_scrapling_non_429_ignores_retry_after(self):
+        scrapling = AsyncMock()
+        scrapling.fetch.return_value = ScraplingResponse(
+            status_code=403, text="<html>no</html>", location=None, retry_after="30"
+        )
+
+        result = await Level1Fetcher(scrapling_client=scrapling).fetch(
+            "http://example.com", TenantId("system")
+        )
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.retry_after_seconds is None
+
+
 class TestPlainHttpxExceptions:
     @pytest.mark.asyncio
     async def test_timeout_returns_network_timeout_failure(self, monkeypatch):

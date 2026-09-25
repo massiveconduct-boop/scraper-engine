@@ -20,7 +20,7 @@ from scraper_engine.fetcher._content_utils import (
     poll_until_solved,
     safe_content,
 )
-from scraper_engine.fetcher._failure import classify_fetch_exception
+from scraper_engine.fetcher._failure import classify_fetch_exception, retry_after_for
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
@@ -174,6 +174,11 @@ class Level3Fetcher:
                     http_status=nav_status,
                     html=html,
                     level_used=3,
+                    retry_after_seconds=(
+                        retry_after_for(nav_status, nav_response.headers)
+                        if nav_response is not None
+                        else None
+                    ),
                     proxy_used=proxy.key() if proxy else "none",
                     duration_ms=duration_ms,
                 )
