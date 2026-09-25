@@ -776,6 +776,20 @@ class TestParseIpPort:
         assert result == []
 
 
+class TestSourceUrls:
+    """Round 68 — geonode's URL carried `%%2C` for two months: a plain
+    string, never %-formatted, so geonode received a malformed parameter and
+    answered an empty list every cycle (ProxySourceWentDark)."""
+
+    def test_no_source_url_carries_a_doubled_percent(self):
+        for name, url, _fmt in ProxyHarvester.SOURCES:
+            assert "%%" not in url, name
+
+    def test_source_names_are_unique(self):
+        names = [name for name, _url, _fmt in ProxyHarvester.SOURCES]
+        assert len(names) == len(set(names))
+
+
 class TestParseGeonode:
     """Lines 231-239: _parse_geonode static parser — pure function, no mocking needed."""
 
