@@ -355,7 +355,9 @@ class TestFetchViaCamoufox:
         fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
         monkeypatch.setattr("scraper_engine.fetcher.level_2.CamoufoxWrapper", fake_wrapper_cls)
 
-        result = await Level2Fetcher().fetch("http://example.com", TenantId("system"), proxy=_proxy())
+        result = await Level2Fetcher().fetch(
+            "http://example.com", TenantId("system"), proxy=_proxy()
+        )
 
         assert result.success is True
         assert result.http_status == 429
@@ -378,7 +380,9 @@ class TestFetchViaCamoufox:
         fake_wrapper_cls = MagicMock(return_value=FakeAsyncCtxMgr(FakeBrowserContext(page)))
         monkeypatch.setattr("scraper_engine.fetcher.level_2.CamoufoxWrapper", fake_wrapper_cls)
 
-        result = await Level2Fetcher().fetch("http://example.com", TenantId("system"), proxy=_proxy())
+        result = await Level2Fetcher().fetch(
+            "http://example.com", TenantId("system"), proxy=_proxy()
+        )
 
         assert result.success is False
         assert result.error_message == "NS_ERROR_NET_EMPTY_RESPONSE"
