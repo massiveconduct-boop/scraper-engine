@@ -392,13 +392,18 @@ Worker._fetch_with_proxy()            [orchestrator/worker.py]
   the root cause and fix. `paid_only`/`free_first` are now live-verified
   reliable for L2 (4 rounds of increasingly concurrent real jobs, zero
   crash-attributable job failures).
-- **Credential refusal (round 66).** A proxy's 407 is `PROXY_AUTH_FAILED`
-  (`fetcher/_failure.py`). From the gateway it means the account (plan out of
-  traffic): no new-session retry, no later level, URL DLQ'd at once, circuit
-  untouched. The DLQ reaper re-drives those entries only once
-  `paid_gateway.gateway_accepts_credentials()` gets a 200 through the gateway
-  (answer cached 120s). From a free proxy it is that proxy: `mark_failure`
-  and one fresh-lease retry, then normal escalation.
+- **Credential refusal (rounds 66, 68).** A proxy's 407 is
+  `PROXY_AUTH_FAILED` (`fetcher/_failure.py`); never counted against the
+  domain's circuit. From a free proxy it is that proxy: `mark_failure` and one
+  fresh-lease retry, then normal escalation. From the gateway it is the
+  account (plan out of traffic, bad login): it sets the refusal verdict above,
+  never gets a new-session retry, and then
+  - `free_first`: the same attempt is made again on the free pool, and the
+    URL carries on as under `free_only` until the verdict expires;
+  - `paid_only`: the URL is DLQ'd at once, and the DLQ reaper re-drives it
+    only once `paid_gateway.gateway_accepts_credentials()` gets a 200 through
+    the gateway (answer cached 120s). `free_first` entries re-drive on pool
+    health instead, with no gateway probe.
 
 ---
 

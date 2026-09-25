@@ -231,36 +231,38 @@ convention only needed two call sites fixed.
 
 ---
 
-## Every Jumia URL Suddenly Fails as `proxy_auth_failed` (Round 65, relabelled Round 66)
+## Paid Gateway Refusing Our Credentials (`proxy_auth_failed`, Rounds 65-68)
 
-**Symptom:** a run that was working starts failing every URL, all
-`failure_category: proxy_auth_failed`, `proxy_source: paid_gateway`, error
-`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`, each after one ~5s
-attempt. Before round 66 the same thing was labelled `browser_crash`,
-retried, escalated through every level and re-driven by the DLQ reaper.
+**Symptom (since round 68):** `/v1/health` → `paid_gateway.status: refused`
+plus a `checks.paid_gateway` line. Under `free_first`, sites the free pool
+can reach keep working, and sites it cannot fail with their real outcome
+(`detection_block`, `circuit_open`, `proxy_exhausted`), never
+`proxy_auth_failed`. Under `paid_only`, every browser-level URL fails
+`proxy_auth_failed` at once, without a render. The Camoufox error is
+`Page.goto: NS_ERROR_PROXY_AUTHENTICATION_FAILED`. Rounds 66-67 DLQ'd every
+refused URL even under `free_first`, and before round 66 it was labelled
+`browser_crash`; old DLQ rows may carry either shape.
 
-**Cause:** the paid gateway (DataImpulse) refuses our credentials — seen
-live as `407 TRAFFIC_EXHAUSTED` when the plan ran out of traffic. Level
-memory sends Jumia straight to the gateway (`levelhint:poolblock:*`) and the
-free pool is refused there, so nothing gets through. Since round 66 the
-refusal is terminal for the URL, and the DLQ reaper holds these entries
-until its gateway probe (`paid_gateway.gateway_accepts_credentials`, cached
-120s) gets a 200 — after a top-up they re-drive on their own.
+**Cause:** the paid gateway (DataImpulse) refuses our credentials. Seen live
+as `407 TRAFFIC_EXHAUSTED` when the plan ran out of traffic (2026-09-22), and
+again from 2026-09-23 (171 of 171 gateway renders refused). A refused
+attempt carries no plan traffic.
 
-**Check:** one direct request through the gateway from inside a worker:
+**Fix:** top up the plan, or fix `DATAIMPULSE_*` if the login changed.
+Nothing to re-drive by hand: the first gateway success clears the verdict
+(or it expires after `dataimpulse.refused_ttl_seconds`); `free_first` DLQ
+entries re-drive on pool health, `paid_only` ones after the reaper's gateway
+probe (cached 120s) gets a 200.
+
+**Confirming the provider's wording (needs the user's permission — a probe
+that succeeds spends plan traffic):** one direct request through the gateway
+from inside a worker:
 `docker compose exec -T worker-l1 python -c "…build_gateway_proxy(…)…
 httpx.get('https://api.ipify.org', proxy=p.auth_url())"` — use `auth_url()`,
 not `url()`: without credentials every answer is `407 NO_USER`, which proves
-nothing. A 407 with `TRAFFIC_EXHAUSTED` is the account, not the code. Fix:
-top up the plan.
+nothing. A 407 with `TRAFFIC_EXHAUSTED` is the account, not the code.
 
-**Since round 68:** check `/v1/health` → `paid_gateway` first. `status:
-refused` (with `since` and the first error) means some worker saw a 407 in the
-last `dataimpulse.refused_ttl_seconds`; it needs no probe. Under `free_first`
-URLs then go through the free pool and fail, if at all, with their real
-outcome (`detection_block`, `proxy_exhausted`, …), never `proxy_auth_failed`.
-Only `paid_only` still returns `proxy_auth_failed`, without a render. A
-`levelhint:poolblock:*` key written before round 68 while the gateway was
+**Stale hints:** a `levelhint:poolblock:*` key written before round 68 while the gateway was
 refusing may be wrong (a 407 used to count as "the gateway got through");
 delete it: `redis-cli --scan --pattern 'levelhint:poolblock:*' | xargs
 redis-cli del`. Hints come back on their own when the gateway really does
