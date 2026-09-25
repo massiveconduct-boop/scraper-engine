@@ -520,12 +520,24 @@ def _timings_column(result: FetchResult) -> str | None:
     back by the same endpoint, and a column would have meant another full
     `create_tenant_schema()` re-emit for one list. api/routes.py::get_job
     splits it back out onto `FetchResult.escalations`.
+
+    Round 69 — `paid_gateway_skipped` and `block_reason` ride along the same
+    way, for the same reason.
     """
-    if result.timings is None and not result.escalations:
+    if (
+        result.timings is None
+        and not result.escalations
+        and not result.paid_gateway_skipped
+        and not result.block_reason
+    ):
         return None
     payload: dict[str, Any] = dict(result.timings or {})
     if result.escalations:
         payload["escalations"] = result.escalations
+    if result.paid_gateway_skipped:
+        payload["paid_gateway_skipped"] = True
+    if result.block_reason:
+        payload["block_reason"] = result.block_reason
     return json.dumps(payload)
 
 

@@ -93,6 +93,64 @@ _GATEWAY_REFUSED_MESSAGE = (
     "paid gateway is refusing our credentials (plan out of traffic or bad login) "
     "— not attempted; top up or fix DATAIMPULSE_* and it is re-tested automatically"
 )
+# Round 69 — research_agent detects the gateway note by this text; keep it
+# stable (and a prefix of _GATEWAY_REFUSED_MESSAGE) or tell them the new one.
+_GATEWAY_REFUSED_MARKER = "paid gateway is refusing our credentials"
+
+
+def _note_gateway_skipped(result: FetchResult, skipped: bool) -> None:
+    """Round 69 — on a URL's terminal failure, say that the paid gateway was
+    wanted on its path and skipped because it is refusing our credentials:
+    flag the result and append the refusal note to its message, once."""
+    if not skipped:
+        return
+    result.paid_gateway_skipped = True
+    message = result.error_message or ""
+    if _GATEWAY_REFUSED_MARKER in message:
+        return
+    result.error_message = (
+        f"{message} ({_GATEWAY_REFUSED_MESSAGE})" if message else _GATEWAY_REFUSED_MESSAGE
+    )
+
+
+# Round 69 — what each "blocked" status means to a reader. DETECTION_BLOCK
+# covers all of them (fetcher/_failure.py::_DETECTION_BLOCK_STATUSES).
+_BLOCK_STATUS_MEANING = {
+    401: "unauthorized",
+    403: "refused",
+    404: "not found, or a block shaped like one",
+    405: "method refused",
+    410: "gone, or a block shaped like it",
+    429: "rate limited",
+}
+
+
+def _describe_block(terminal: FetchResult, last: FetchResult) -> None:
+    """Round 69 — start a terminal DETECTION_BLOCK's message with what the
+    block was, where and through which route: `HTTP 403 (refused) at L3 via
+    pool — <original message>`, and set `block_reason` in escalations'
+    vocabulary. One category covers 401/403/404/405/410/429 and challenge
+    pages; a reader could not tell a rate limit from a bot check."""
+    reason = last.block_reason or (f"status:{last.http_status}" if last.http_status else None)
+    terminal.block_reason = reason
+    if reason is None:
+        what = "blocked"
+    elif reason.startswith("status:"):
+        status = int(reason.removeprefix("status:"))
+        meaning = _BLOCK_STATUS_MEANING.get(status)
+        what = f"HTTP {status} ({meaning})" if meaning else f"HTTP {status}"
+    elif reason.startswith("signature:"):
+        what = f"challenge page (signature '{reason.removeprefix('signature:')}')"
+    elif reason == "js_gated":
+        what = "JavaScript-gated page (no content rendered)"
+    else:
+        what = f"blocked page ({reason})"
+    route = last.proxy_source or "direct"
+    summary = f"{what} at L{last.level_used} via {route}"
+    terminal.error_message = (
+        f"{summary} — {terminal.error_message}" if terminal.error_message else summary
+    )
+
 
 # round 29 — how long a successful scrape_results row is considered a valid
 # cache hit before it must be re-scraped. Sliding: a hit refreshes freshness
@@ -171,6 +229,8 @@ class _RenderAdmission:
 
     def wait_budget(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
+
+
 DLQ_ELIGIBLE_CATEGORIES = PERMANENT_FAILURE_CATEGORIES | TRANSIENT_FAILURE_CATEGORIES
 
 
@@ -349,9 +409,17 @@ class Worker:
         currently refusing our credentials. A refused gateway makes free_first
         behave exactly like free_only: no forced gateway attempt on an open
         circuit, a pool-blocked domain or a block retry."""
-        return (
-            self._gateway_fallback_eligible and await self._gateway_health.refusal() is None
-        )
+        return self._gateway_fallback_eligible and await self._gateway_health.refusal() is None
+
+    async def _gateway_block_retry_usable(self, result: FetchResult) -> bool:
+        """Round 69 — _gateway_fallback_usable() for the block retry, which
+        only asks once the pool attempt was blocked. A refusal there marks the
+        blocked result, so the URL's terminal failure can say the retry that
+        usually gets through was skipped."""
+        if await self._gateway_fallback_usable():
+            return True
+        result.paid_gateway_skipped = True
+        return False
 
     async def process_job(
         self,
@@ -509,6 +577,13 @@ class Worker:
             # the pool may be blocked here, but it is the only path that can
             # still produce a real outcome for this URL.
             gateway_first = plan.skip_pool and await self._gateway_fallback_usable()
+            # Round 69 — the gateway was wanted on this URL's path but refused
+            # (here, or at the circuit/block-retry points below, or inside
+            # _fetch_with_proxy). A failure then says so, instead of reading as
+            # "this site blocks scrapers" when the usual route was down.
+            gateway_skipped = (
+                plan.skip_pool and self._gateway_fallback_eligible and not gateway_first
+            )
             skip_botasaurus = plan.skip_botasaurus
             if gateway_first:
                 logger.info(
@@ -565,6 +640,8 @@ class Worker:
                     # DLQ, no attempt made. Round 68 — so does free_first
                     # while the gateway is refusing our credentials.
                     if circuit_open and not await self._gateway_fallback_usable():
+                        if self._gateway_fallback_eligible:
+                            gateway_skipped = True
                         circuit_result = FetchResult(
                             url=url_str,
                             success=False,
@@ -573,15 +650,16 @@ class Worker:
                             failure_category=FailureCategory.CIRCUIT_OPEN,
                             error_message=f"Circuit open for {domain}",
                         )
+                        _note_gateway_skipped(circuit_result, gateway_skipped)
                         await self._dlq.enqueue(
                             tenant_id,
                             job_id,
                             url_str,
                             FailureCategory.CIRCUIT_OPEN,
-                            f"Circuit open for {domain}",
+                            circuit_result.error_message or "",
                             level,
                         )
-                        errors.append(f"Circuit open for {domain}")
+                        errors.append(circuit_result.error_message or "")
                         results[index] = _finish(circuit_result)
                         if on_result is not None:
                             await on_result(circuit_result)
@@ -602,9 +680,7 @@ class Worker:
                     # it through an untimed browser wait and starve its
                     # same-site siblings into the 300s slot timeout.
                     claims_per_render = admission is not None and level >= 2
-                    held: contextlib.AbstractAsyncContextManager[None] = (
-                        contextlib.nullcontext()
-                    )
+                    held: contextlib.AbstractAsyncContextManager[None] = contextlib.nullcontext()
                     if not claims_per_render:
                         # Round 63 — the inter-fetch delay is served BEFORE taking
                         # a slot, not while holding one. Sleeping inside the slot
@@ -682,6 +758,8 @@ class Worker:
                         continue
 
                     last_level_result = result
+                    if result.paid_gateway_skipped:
+                        gateway_skipped = True
 
                     # Round 49 — one gateway retry before conceding a
                     # final-level block, evaluated BEFORE branching on
@@ -729,7 +807,9 @@ class Worker:
                         )
                         # Round 68 — checked last: it is the only clause that
                         # reads Redis, and only a blocked result gets here.
-                        and await self._gateway_fallback_usable()
+                        # Round 69 — a refusal here is remembered for the
+                        # terminal result (_gateway_block_retry_usable).
+                        and await self._gateway_block_retry_usable(result)
                     ):
                         # Round 64 — the attempt being retried is a rejection
                         # like any other, and the retry is a phase like any
@@ -785,6 +865,11 @@ class Worker:
                                 # _fetch_with_proxy fell back on a refusal.
                                 await self._level_memory.record_pool_blocked(tenant_id, domain)
 
+                    # Round 69 — a refused block retry, or a gateway retry that
+                    # _fetch_with_proxy served from the pool instead.
+                    if result.paid_gateway_skipped:
+                        gateway_skipped = True
+
                     if result.success:
                         await self._circuit_breaker.record_success(domain)
                         # `FetchResult.is_challenge_page` was declared on the model,
@@ -815,20 +900,29 @@ class Worker:
                         # challenge-page half). Browser levels render JS and already
                         # loop internally until solved or exhausted, so a genuine L2/
                         # L3 success usually won't trip this.
-                        still_looks_blocked = result.is_challenge_page or (
-                            self._challenge_detector.looks_javascript_gated(result.html or "")
+                        # Round 69 — a block status the challenge detector
+                        # does not list (401, 405, 410) is a block too:
+                        # fetcher/_failure.py already classes all six as
+                        # DETECTION_BLOCK. Live, a 401 at L3 was stored as a
+                        # success whose "content" was the page title.
+                        # Checked here, not in CHALLENGE_STATUS_CODES, which
+                        # also makes L2/L3 wait for a solve that never comes.
+                        blocked_status = (
+                            classify_http_status(result.http_status or 200)
+                            == FailureCategory.DETECTION_BLOCK
+                        )
+                        still_looks_blocked = (
+                            result.is_challenge_page
+                            or blocked_status
+                            or self._challenge_detector.looks_javascript_gated(result.html or "")
                         )
                         if still_looks_blocked:
-                            _reject(
-                                level,
-                                result,
-                                self._challenge_detector.challenge_reason(
-                                    result.html or "",
-                                    result.http_status or 200,
-                                    short_page_is_suspect=False,
-                                )
-                                or "js_gated",
-                            )
+                            block_reason = self._challenge_detector.challenge_reason(
+                                result.html or "",
+                                result.http_status or 200,
+                                short_page_is_suspect=False,
+                            ) or (f"status:{result.http_status}" if blocked_status else "js_gated")
+                            _reject(level, result, block_reason)
                         if level < url_levels[-1] and still_looks_blocked:
                             continue
                         # Round 45 — the final level used to unconditionally accept
@@ -855,9 +949,9 @@ class Worker:
                                 classify_http_status(result.http_status or 0)
                                 or FailureCategory.DETECTION_BLOCK
                             )
+                            result.block_reason = block_reason
                             result.error_message = result.error_message or (
-                                f"Still blocked/not-found after final level "
-                                f"(http_status={result.http_status})"
+                                "still blocked/not-found after final level"
                             )
                             continue
                         # Round 63 — this is the real "this level produced
@@ -873,9 +967,7 @@ class Worker:
                             if result.engine == "botasaurus":
                                 await self._level_memory.record_botasaurus_ok(tenant_id, domain)
                             elif result.engine == "camoufox":
-                                await self._level_memory.record_botasaurus_failed(
-                                    tenant_id, domain
-                                )
+                                await self._level_memory.record_botasaurus_failed(tenant_id, domain)
                         if result.html:
                             extract_start = time.monotonic()
                             # FetchResult.extracted was declared on the model and
@@ -920,9 +1012,7 @@ class Worker:
                                     max_links=self._config.extraction.max_links
                                 ).extract(result.html, schema=schema, base_url=url_str)
                             result.extracted = extracted
-                            timings["extract_ms"] = int(
-                                (time.monotonic() - extract_start) * 1000
-                            )
+                            timings["extract_ms"] = int((time.monotonic() - extract_start) * 1000)
                             markdown_start = time.monotonic()
                             # Markdown conversion (round 29) — same "wired once,
                             # applies regardless of level" rationale as
@@ -952,9 +1042,7 @@ class Worker:
                                 )
 
                                 result.markdown = html_to_markdown(result.html)
-                            timings["markdown_ms"] = int(
-                                (time.monotonic() - markdown_start) * 1000
-                            )
+                            timings["markdown_ms"] = int((time.monotonic() - markdown_start) * 1000)
                         results[index] = _finish(result)
                         if on_result is not None:
                             await on_result(result)
@@ -986,6 +1074,7 @@ class Worker:
                         if category is not None and (
                             category in DLQ_ELIGIBLE_CATEGORIES or gateway_refused
                         ):
+                            _note_gateway_skipped(result, gateway_skipped)
                             await self._dlq.enqueue(
                                 tenant_id,
                                 job_id,
@@ -1048,12 +1137,25 @@ class Worker:
                         # Round 49 — carried forward so a DLQ'd/exhausted
                         # result stays traceable to whether the last real
                         # attempt went through the free pool or the paid
-                        # gateway, instead of silently dropping it the way
-                        # this branch already drops http_status/proxy_used.
+                        # gateway. Round 69 — http_status and
+                        # is_challenge_page too: this branch dropped them, so
+                        # every terminal block was stored with a NULL status
+                        # and only its message said "http_status=403".
                         proxy_source=(
                             last_level_result.proxy_source if last_level_result else None
                         ),
+                        http_status=(last_level_result.http_status if last_level_result else None),
+                        is_challenge_page=(
+                            last_level_result.is_challenge_page if last_level_result else False
+                        ),
                     )
+                    if (
+                        last_level_result is not None
+                        and real_category == FailureCategory.DETECTION_BLOCK
+                    ):
+                        _describe_block(exhausted_result, last_level_result)
+                    _note_gateway_skipped(exhausted_result, gateway_skipped)
+                    real_message = exhausted_result.error_message or real_message
                     await self._dlq.enqueue(
                         tenant_id,
                         job_id,
@@ -1222,6 +1324,9 @@ class Worker:
             FROM scrape_results
             WHERE url = $1 AND success = true
               AND extracted_at > NOW() - INTERVAL '{CACHE_TTL_DAYS} days'
+              -- Round 69: a "success" stored with a block status (a 401 at
+              -- L3, before process_job treated it as blocked) is not content.
+              AND COALESCE(http_status, 200) < 400
             ORDER BY extracted_at DESC
             LIMIT 1
             """,
@@ -1386,6 +1491,10 @@ class Worker:
         # free_first the pool is then the only path; under paid_only there is
         # no path at all, and the URL fails without a render.
         gateway_refused = False
+        # Round 69 — this call wanted the gateway (forced, or as the
+        # exhausted pool's fallback) and went without it; stamped on the
+        # result as `paid_gateway_skipped`.
+        gateway_bypassed = False
 
         while True:
             if (force_gateway or strategy == "paid_only") and not gateway_refused:
@@ -1399,7 +1508,10 @@ class Worker:
                     failure_category=FailureCategory.PROXY_AUTH_FAILED,
                     error_message=_GATEWAY_REFUSED_MESSAGE,
                     proxy_source="paid_gateway",
+                    paid_gateway_skipped=True,
                 )
+            if force_gateway and gateway_refused:
+                gateway_bypassed = True
             async with self._render_claim(admission, weight):
                 lease: ProxyLease
                 if force_gateway and not gateway_refused:
@@ -1427,6 +1539,8 @@ class Worker:
                     except ProxyPoolExhaustedError:
                         if strategy == "free_first" and not gateway_refused:
                             gateway_refused = await self._gateway_health.refusal() is not None
+                        if strategy == "free_first" and gateway_refused:
+                            gateway_bypassed = True
                         if strategy == "free_first" and not gateway_refused:
                             gateway_proxy = self._new_gateway_proxy()
                             if gateway_proxy is None:
@@ -1443,6 +1557,7 @@ class Worker:
                                 failure_category=FailureCategory.PROXY_EXHAUSTED,
                                 error_message="Proxy pool exhausted"
                                 + (f" ({_GATEWAY_REFUSED_MESSAGE})" if gateway_refused else ""),
+                                paid_gateway_skipped=gateway_bypassed or None,
                             )
                 async with lease:
                     fetcher = build_fetcher()
@@ -1450,6 +1565,8 @@ class Worker:
                         url, tenant_id, proxy=lease.proxy, overrides=overrides
                     )
                     result.proxy_source = lease.proxy.source
+                    if gateway_bypassed:
+                        result.paid_gateway_skipped = True
                     if lease.proxy.source == "paid_gateway":
                         if result.failure_category == FailureCategory.PROXY_AUTH_FAILED:
                             # Round 68 — the account, not the URL: tell every

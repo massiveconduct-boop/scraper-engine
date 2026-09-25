@@ -21,7 +21,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Response
 
@@ -516,16 +516,26 @@ async def list_jobs(
     return {"jobs": jobs, "limit": limit, "offset": offset, "count": len(jobs)}
 
 
-def _split_timings_column(
-    raw: str | None,
-) -> tuple[dict[str, int] | None, list[dict[str, Any]] | None]:
+class _StoredDiagnostics(NamedTuple):
+    """The per-URL diagnostics that share the `scrape_results.timings` column."""
+
+    timings: dict[str, int] | None = None
+    escalations: list[dict[str, Any]] | None = None
+    paid_gateway_skipped: bool | None = None
+    block_reason: str | None = None
+
+
+def _split_timings_column(raw: str | None) -> _StoredDiagnostics:
     """Undo orchestrator/tasks.py::_timings_column — the stored JSONB holds the
-    integer phase timings plus an optional `escalations` list (round 64)."""
+    integer phase timings plus an optional `escalations` list (round 64) and,
+    since round 69, `paid_gateway_skipped` / `block_reason`."""
     if not raw:
-        return None, None
+        return _StoredDiagnostics()
     payload = json.loads(raw)
     escalations = payload.pop("escalations", None)
-    return (payload or None), escalations
+    skipped = payload.pop("paid_gateway_skipped", None)
+    block_reason = payload.pop("block_reason", None)
+    return _StoredDiagnostics(payload or None, escalations, skipped, block_reason)
 
 
 @router.get("/jobs/{job_id}")
@@ -618,11 +628,13 @@ async def get_job(
             # way back out, so a caller could not see which proxy path served
             # a URL or where its time went (round 63).
             proxy_source=r["proxy_source"],
-            timings=timings,
-            escalations=escalations,
+            timings=stored.timings,
+            escalations=stored.escalations,
+            paid_gateway_skipped=stored.paid_gateway_skipped,
+            block_reason=stored.block_reason,
         )
         for r in result_rows
-        for timings, escalations in [_split_timings_column(r["timings"])]
+        for stored in [_split_timings_column(r["timings"])]
     ]
     errors = [r.error_message for r in results if not r.success and r.error_message]
 

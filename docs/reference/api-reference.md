@@ -262,6 +262,49 @@ through the paid gateway (if enabled) before moving up; that retry's time
 is `level_N_gateway_retry_ms` in `timings`, and the blocked attempt appears
 here with `proxy_source: "pool"`.
 
+**Reading a failed result.** A failed URL's `error_message` says what
+happened. Two more fields help:
+- **`block_reason`** is set on a `detection_block`. It names which check
+  fired, in the same vocabulary as `escalations[].reason`: `status:403`,
+  `status:429`, `signature:<text>`, `js_gated`, … For a `detection_block`
+  the message starts with a plain summary of what, where and through which
+  route: `HTTP 403 (refused) at L3 via pool — …`, `HTTP 429 (rate limited)
+  at L2 via pool — …`, `challenge page (signature 'cf-browser-verification')
+  at L3 via pool — …`. The route is `pool` (free proxy), `paid_gateway`, or
+  `direct` (L1, no proxy).
+- **`paid_gateway_skipped: true`** means the engine would normally have
+  sent this URL through the paid gateway, but the gateway was refusing the
+  engine's credentials. That covers the block retry, a site known to refuse
+  free proxies, an open circuit and an exhausted pool. The failure then
+  reflects the free route only, not the site's full answer. The message also
+  ends with `(paid gateway is refusing our credentials …)`, and callers may
+  match on that exact text.
+
+Both fields are `null` when they don't apply. `http_status` is the last
+attempt's real status, including on terminal blocks.
+
+**Failure categories.** One line each on what the category means, whose
+doing it is, and whether the engine re-drives it by itself (see `GET
+/v1/jobs/{job_id}/dlq`):
+
+| `failure_category` | Meaning | Whose doing | Auto-retried |
+|---|---|---|---|
+| `detection_block` | The site answered 401/403/404/405/410/429, or served a challenge / JavaScript-gated page, at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
+| `circuit_open` | Too many recent failures on this domain; the engine is pausing it | Target site, by history | Yes, once the circuit closes |
+| `proxy_exhausted` | No usable proxy was available for the level | Ours (proxy supply) | Yes, when that pool tier is healthy |
+| `proxy_auth_failed` | A proxy refused the engine's credentials. From the paid gateway, that means the account (plan out of traffic, bad login) | Proxy provider / account | Yes: `paid_only` after a gateway probe succeeds, otherwise on pool health |
+| `browser_crash` | The browser or the page load failed without a site verdict (includes proxy connection errors) | Ours or the proxy | Yes, on pool health |
+| `network_timeout` | The request failed or timed out at the network level (L1's default for any fetch error) | The proxy or the site, undetermined | Yes, on pool health |
+| `host_unreachable` | The domain does not resolve (checked directly, without a proxy) | Target (dead domain) | No |
+| `ssrf_blocked` | The URL resolves to a private or denied network | Caller's input | No |
+| `quota_exceeded` | The tenant's quota ran out | Caller's account | No |
+| `politeness_timeout` | No politeness slot for this site came free in time (other URLs of the same site were busy) | Ours (contention) | Yes, with backoff |
+| `capacity_timeout` | No browser capacity on this host came free in time | Ours (capacity) | Yes, with backoff |
+| `dependency_unavailable` | The engine's own Redis failed during the fetch | Ours (infrastructure) | Yes, with backoff |
+| `parse_error` | Anything unexpected inside the engine while handling this URL | Ours (a bug) | No |
+| `captcha_triggered` | Defined but never assigned today: an unsolved CAPTCHA ends as `detection_block` (`block_reason` `signature:h-captcha`, …) | — | No |
+| `not_found` | Historical rows only (rounds 43-44); nothing assigns it now | — | No |
+
 **`partial_failure`:** `true` when `status` is `COMPLETED` but at least
 one URL in this job landed in the dead-letter queue alongside a
 succeeded one — `COMPLETED` alone only ever meant "at least one URL

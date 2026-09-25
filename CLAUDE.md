@@ -1,6 +1,6 @@
 # Scraper Engine — CLAUDE.md
 
-Project identity, operating rules, and navigation. Currently at round 68.
+Project identity, operating rules, and navigation. Currently at round 69.
 **Never a diary.** Audits at rounds 28, 57 and 66 each removed dated
 per-round narrative from this exact spot (`decisions.md` →
 "Knowledge-Audit: Round-57 CLAUDE.md Diary Regression"); a 1800-word gate
@@ -77,7 +77,8 @@ openwolf cron        # cron task management
   `proxy_auth_failed` category, a controller that only limits a strained
   host, `display_lock_wait_ms` (66), parked browsers keeping their host
   seat, measured browser weight (67), a refused gateway out of use for
-  every worker, `free_first` falling back to the pool (68).
+  every worker, `free_first` falling back to the pool (68),
+  self-describing failures (69).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:

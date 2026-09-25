@@ -609,6 +609,13 @@ class TestTimingsColumn:
         )
         assert json.loads(stored) == {"total_ms": 5, "escalations": esc}
 
+    def test_failure_labels_ride_along_even_without_timings(self):
+        """Round 69 — paid_gateway_skipped / block_reason share the column too."""
+        stored = tasks_module._timings_column(
+            self._result(paid_gateway_skipped=True, block_reason="status:429")
+        )
+        assert json.loads(stored) == {"paid_gateway_skipped": True, "block_reason": "status:429"}
+
 
 # --- Round 64: crawl proxy leasing -------------------------------------------
 

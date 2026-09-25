@@ -12,6 +12,38 @@ round it shipped in.
 
 ---
 
+## Decision: Failure Results Explain Themselves Additively, Inside the Existing Contract
+
+**Date:** 2026-09-25 | **Round:** 69
+
+**What:** Terminal failures gain two optional fields: `paid_gateway_skipped`
+and `block_reason` (in `escalations[].reason`'s vocabulary). A
+`detection_block` message starts with `<what> at L<n> via <route>`. A
+refused gateway on the URL's path appends the existing
+`_GATEWAY_REFUSED_MESSAGE`, at most once. The for/else result keeps
+`http_status`. No new category, no column, and no DLQ shape change: both
+fields ride in the `timings` JSONB like `escalations`.
+
+**Why:** research_agent asked (brief `to-scraper-engine-2026-09-25-failure-
+labels.md`) because failures misled readers. all 48 terminal blocks since
+2026-09-23 had a NULL `http_status` (the for/else branch rebuilt the result without it),
+`(http_status=200)` rows never said which challenge, and 51 `circuit_open`
+rows didn't show that the gateway route that normally handles an open circuit
+was down.
+
+**Tradeoffs:** a message prefix is text, so callers should read
+`block_reason` for logic. `level_used` stays `url_levels[-1]` (a contract
+field); the real last level is in the prefix and in `escalations`.
+
+**Alternatives rejected:**
+- A `rate_limited` category for 429. Proposed to the user instead, because
+  research_agent reads `failure_category` and a new value is a contract
+  change.
+- New DB columns (a schema re-emit for two diagnostics).
+- Rewording `_GATEWAY_REFUSED_MESSAGE` (research_agent greps it).
+
+---
+
 ## Decision: MinIO From Chainguard's Rebuild, Pinned by Digest; Existing Volumes Keep Their Image
 
 **Date:** 2026-09-25 | **Round:** 68

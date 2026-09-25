@@ -46,6 +46,18 @@ Cancellation (round 29): checked once per URL, before escalation starts
 
 Levels: L1 (httpx/Scrapling, timeout 20s, any proxy), L2 (Botasaurus+Camoufox, timeout 40s, anonymous+ proxy), L3 (Camoufox-only, timeout 60s, elite proxy).
 
+**What a terminal failure carries (round 69).** Built once, in
+`process_job`'s for/else branch (plus the circuit-open and DLQ-eligible
+breaks): the last attempt's `http_status`/`is_challenge_page`/`proxy_source`;
+for `detection_block` a `block_reason` and a message prefix
+`<what> at L<n> via <route>` (`_describe_block`); and, when an eligible
+`free_first` gateway use was refused anywhere on the URL's path, the
+`paid_gateway_skipped` flag plus the refusal note (`_note_gateway_skipped`;
+research_agent matches `_GATEWAY_REFUSED_MARKER`). Both new fields are stored
+inside the `timings` JSONB beside `escalations`, no column of their own. The
+one-line meaning of every `failure_category`, for outside readers:
+`docs/reference/api-reference.md` → "Failure categories".
+
 **Note on `DEAD_LETTER` (corrected round 29):** `JobStatus.DEAD_LETTER` is a
 valid enum value and DB CHECK-constraint entry, but no code path has ever
 set a job's *status* to it — "dead-lettered" above means the per-URL entry
