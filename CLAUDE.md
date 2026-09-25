@@ -42,15 +42,15 @@ openwolf cron        # cron task management
 
 `openwolf scan` regenerates `.wolf/anatomy.md` from `.wolf/anatomy-index.json`. Descriptions in `anatomy.md` may be edited (they are absorbed on the next scan) but never reorder or reformat the file.
 
-**`cerebrum.md`'s Decision Log vs `.claude/knowledge/decisions.md` (round 34):** these overlap in purpose and already drifted once (see `decisions.md` → "OpenWolf ↔ `.claude/knowledge/` Division of Labor"). `cerebrum.md` stays OpenWolf's fast session-local capture — don't hand-edit it. Any decision logged there with real lasting architectural consequence must also be written to `.claude/knowledge/decisions.md` in the same session — that file is what `CLAUDE.md`'s Navigation section actually sends readers to.
+**`cerebrum.md`'s Decision Log vs `.claude/knowledge/decisions.md` (round 34):** these overlap in purpose and already drifted once (see `decisions.md` → "OpenWolf ↔ `.claude/knowledge/` Division of Labor"). `cerebrum.md` stays OpenWolf's fast session-local capture, updated per the protocol above. Any decision logged there with real lasting architectural consequence must also be written to `.claude/knowledge/decisions.md` in the same session — that file is what `CLAUDE.md`'s Navigation section actually sends readers to.
 
 ## Architecture
 
 - **Runtime:** Python 3.12, asyncio, FastAPI, uvicorn
 - **Browser:** Camoufox v0.5.4 (Firefox 152), semaphore-gated pool with `lease()` context manager
-- **Proxy:** 8-URL sources across 6 operators, TCP probe + HTTP validation, two-tier scoring
+- **Proxy:** 10 source URLs across 8 operators, TCP probe + HTTP validation, two-tier scoring
 - **Storage:** PostgreSQL 16 (PgBouncer transaction-pooling), Redis 7, S3/MinIO
-- **Testing:** pytest 9.1.1, unit+integration+chaos suite + 18 live + load suite (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate: the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES plus an absolute missed-BRANCH budget that may only shrink, at 0 since round 64; `--cov-fail-under=100` is a backstop.** It covers 10 packages (core, proxy, orchestrator, fetcher, services, storage, api, scrapy_project, cli, observability); `browser/` is measured-but-ungated (needs a real Firefox) and `config/` is outside it. Chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. History of the gate's exclusions, regressions and audits (rounds 34, 35, 62, 64): `.claude/knowledge/technical-debt.md`.
+- **Testing:** pytest 9.1.1, unit+integration+chaos suite + live + load suites (counts: see CI, not hardcoded here per operating rule #4). Captcha/Camoufox live tests skipped in CI (no Camoufox binary there). **Coverage gate: the real gate is `tools/check_coverage_ratchet.py` — zero missed LINES plus an absolute missed-BRANCH budget that may only shrink, at 0 since round 64; `--cov-fail-under=100` is a backstop.** It covers 10 packages (core, proxy, orchestrator, fetcher, services, storage, api, scrapy_project, cli, observability); `browser/` is measured-but-ungated (needs a real Firefox) and `config/` is outside it. Chaos tests also need `tests/fixtures/challenge_mirror`'s server running locally (`python -m app.server`, port 8090), which isn't started automatically. History of the gate's exclusions, regressions and audits (rounds 34, 35, 62, 64): `.claude/knowledge/technical-debt.md`.
 - **Linting:** ruff (clean), mypy `--strict` clean (baseline retired round 18)
 - **Evolution history (one clause per round; a round-28 audit moved the
   full narrative out of this file, round-57 and round-66 audits re-trimmed

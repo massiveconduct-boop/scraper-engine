@@ -57,14 +57,17 @@ docker compose up -d
 ```
 
 Services started:
-- `api` — FastAPI on port 8000
+- `api` — FastAPI on port 8000, plus the background daemons as supervisord
+  programs in the same container (`docker/supervisord.conf`): proxy harvester,
+  DLQ reaper, webhook sweeper, capacity controller, stuck-job reaper
 - `worker-l1`, `worker-l2`, `worker-l3` — RQ workers per escalation level
-- `proxy-harvester` — background proxy discovery
 - `postgres` — primary database
-- `pgbouncer` — connection pooler (transaction mode, max 500 clients)
+- `pgbouncer` (+ `pgbouncer_exporter`) — connection pooler (transaction mode, max 500 clients)
 - `redis` — queue + cache
-- `minio` — S3-compatible snapshot storage
-- `prometheus`, `alertmanager` — metrics + alert routing
+- `minio` — S3-compatible snapshot storage (image overridable with
+  `MINIO_IMAGE`; see the comment in `docker-compose.yml`)
+- `prometheus`, `alertmanager` — metrics + alert routing (Slack)
+- `jaeger` — distributed tracing
 - `migrate` — one-shot, applies migrations then exits; every service above
   that writes to Postgres waits on it via `depends_on: condition:
   service_completed_successfully`

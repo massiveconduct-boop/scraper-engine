@@ -12,6 +12,37 @@ round it shipped in.
 
 ---
 
+## Decision: MinIO From Chainguard's Rebuild, Pinned by Digest; Existing Volumes Keep Their Image
+
+**Date:** 2026-09-25 | **Round:** 68
+
+**What:** `docker-compose.yml`'s minio image is
+`${MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:…}`. This host's `.env` sets
+`MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (cached
+locally). The healthcheck is pure bash (`/dev/tcp`, `read`, `[[ ]]`, with a
+`Host` header).
+
+**Why:** MinIO stopped publishing community images. Docker Hub's
+`minio/minio` disappeared in round 67 (moved to quay.io then), and on
+2026-09-25 quay.io answered CI's anonymous pull with "unauthorized", failing
+every integration and chaos job. Chainguard rebuilds MinIO from source and
+serves it anonymously. The digest pin keeps CI reproducible.
+
+**Tradeoffs:** Chainguard's free tier only guarantees `latest`, so the pinned
+digest may be garbage-collected someday; the fix then is re-pinning to a new
+`latest` digest, not a code change. Chainguard runs as uid 65532 while the
+old image ran as root, so an existing volume would hit permission errors;
+hence the per-host `MINIO_IMAGE` override rather than switching this host. The
+healthcheck cannot use `curl`/`wget` (absent in Chainguard) or `grep` (absent
+in the quay image), and the older server answers 400 without `Host`.
+
+**Alternatives rejected:** mirror the old image to our own GHCR (publishing a
+third-party image from the user's account, not asked for); swap MinIO for
+another S3 server (behaviour differences in tests that exercise S3Client);
+build MinIO from source in CI (slow, and moves the pin to a Go toolchain).
+
+---
+
 ## Decision: A Refused Gateway Is Out of Use for Everyone, and free_first Falls Back to the Pool
 
 **Date:** 2026-09-25 | **Round:** 68

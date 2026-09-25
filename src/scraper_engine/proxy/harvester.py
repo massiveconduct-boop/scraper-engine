@@ -2,10 +2,9 @@
 # proxy/harvester.py
 """Proxy harvester — multi-source discovery with HTTP validation.
 
-6+ independent upstream sources per round-6 directive:
-  proxyscrape (HTTP+HTTPS), geonode, openproxylist.xyz,
-  TheSpeedX (GitHub), monosans (GitHub)
-HTTP round-trip validation via judge endpoint. Two-tier scoring.
+Independent upstream sources (SOURCES below), one health signal each
+(proxy/source_health.py, ProxySourceWentDark alert). HTTP round-trip
+validation via judge endpoint. Two-tier scoring.
 """
 
 from __future__ import annotations
@@ -197,7 +196,10 @@ class ProxyHarvester:
         ),
         (
             "geonode",
-            "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%%2Chttps",
+            # Round 68 — `%2C`, not `%%2C`: this is a plain string, never
+            # %-formatted, so the doubled `%` reached geonode literally and it
+            # answered every cycle with an empty list (ProxySourceWentDark).
+            "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
             "geonode_json",
         ),
         ("openproxylist", "https://api.openproxylist.xyz/http.txt", "ip_port"),
@@ -217,16 +219,9 @@ class ProxyHarvester:
             "https://api.proxyscrape.com/?request=getproxies&proxytype=http",
             "ip_port",
         ),
-        (
-            "shiftytr_http",
-            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-            "ip_port",
-        ),
-        (
-            "shiftytr_https",
-            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
-            "ip_port",
-        ),
+        # Round 68 — ShiftyTR/Proxy-List removed: frozen since 2023-08-11, its
+        # https list validated 0 proxies per cycle (ProxySourceWentDark) and
+        # all 43 entries of both its lists were also in the sources here.
         (
             "clarketm_github",
             "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",

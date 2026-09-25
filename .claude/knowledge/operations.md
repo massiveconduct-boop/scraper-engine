@@ -24,12 +24,14 @@ directly if this doc and reality ever disagree.
 | PgBouncer | edoburu/pgbouncer:latest | 6432 | `PGBOUNCER_PORT` | Connection pooler (transaction mode) |
 | PgBouncer exporter | prometheuscommunity/pgbouncer-exporter | 9127 | `PGBOUNCER_EXPORTER_PORT` | Real pool-state metrics for Prometheus |
 | Redis | 7-alpine | 6379 | `REDIS_PORT` | Queue + cache |
-| MinIO | minio/minio:latest | 9000 (API), 9001 (console) | `MINIO_API_PORT`, `MINIO_CONSOLE_PORT` | S3-compatible storage |
-| API | uvicorn | 8000 | `API_PORT` | FastAPI server |
+| MinIO | `${MINIO_IMAGE}`, default Chainguard's source rebuild pinned by digest (MinIO stopped publishing images; see the compose comment) | 9000 (API), 9001 (console) | `MINIO_API_PORT`, `MINIO_CONSOLE_PORT`, `MINIO_IMAGE` | S3-compatible storage. This host's `.env` pins the old `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (cached locally) because its volume was created by that root-run image |
+| API | this repo's image, supervisord | 8000 | `API_PORT` | FastAPI server, plus the daemons below as supervisord programs in the SAME container (`docker/supervisord.conf`; architecture.md → "Container Topology (Round 35)") |
 | Workers L1/L2/L3 | RQ | — | — | Escalation-level queue workers |
-| Proxy harvester | standalone Python | — | — | Background proxy collection + self-healing (round 34 — reacts to a Redis kick signal from exhausted requests, not just its own timer; also runs the per-tier pool-health cycle) |
-| Webhook sweeper | standalone Python | — | — | Round 34 — drains `webhook_outbox` (retries failed/crashed deliveries with backoff; the rq work-horse that made the original attempt is too short-lived to own retry state) |
-| DLQ reaper | standalone Python | — | — | Round 34 — auto-retries `dead_letter_queue` entries in the transient category (`PROXY_EXHAUSTED`, `CIRCUIT_OPEN`) once the condition that caused them clears |
+| Proxy harvester | in `api` (supervisord) | — | — | Background proxy collection + self-healing (reacts to a Redis kick signal from exhausted requests, not just its own timer; also runs the per-tier pool-health cycle) |
+| Webhook sweeper | in `api` (supervisord) | — | — | Drains `webhook_outbox` (retries failed/crashed deliveries with backoff; the rq work-horse that made the original attempt is too short-lived to own retry state) |
+| DLQ reaper | in `api` (supervisord) | — | — | Auto-retries `dead_letter_queue` entries in the transient categories once the condition that caused them clears — the per-category rules are `proxy/dlq_reaper.py::_is_eligible` and `docs/reference/api-reference.md` → "Auto-retry" |
+| Capacity controller | in `api` (supervisord) | — | — | Sizes the host-wide browser budget from CPU PSI / MemAvailable; ticks whether or not host admission is enabled |
+| Stuck-job reaper | in `api` (supervisord) | — | — | Reconciles PENDING/PROCESSING job rows against rq's own registries |
 | `migrate` | same image as `api` | — | — | One-shot `alembic upgrade head`, gates every Postgres-writing service via `depends_on: condition: service_completed_successfully` — see Migrations below |
 | Prometheus | prom/prometheus:latest | 9090 | `PROMETHEUS_PORT` | Metrics collection + alert evaluation. Live `docker-compose.yml` service (previously config-only — `infra/prometheus/prometheus.yml` existed, git-tracked, but was never wired in) |
 | Alertmanager | prom/alertmanager:latest | 9093 | `ALERTMANAGER_PORT` | Alert routing to Slack (two-tier: default + paging-channel). Live `docker-compose.yml` service — same "config existed, never wired" story as Prometheus |
@@ -143,8 +145,8 @@ Prometheus + Alertmanager are live `docker-compose.yml` services (round-N fix �
   `ops_webhook_url` at a different Slack channel than `SLACK_WEBHOOK_URL`
   so the two don't read as a confusing double-alert. Full reasoning:
   `.claude/knowledge/decisions.md` → "Keep Both Pool-Health Alert Paths".
-- `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate`, `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable` — all defined and all now backed by real metrics (round 25 — see below).
-- Rules in `monitoring/alerts/prometheus_rules.yml`. 11 rules as of round 25 (was 12 — `BrowserPoolExhausted` removed, see below), `promtool check rules` validated against a real Prometheus container.
+- The other rules: `CircuitBreakerFrequentTrips`, `DeadLetterQueueGrowing`, `DeadLetterQueuePileLarge`, `CapSolverBudgetExhausted`, `ProxyExhaustionRateHigh`, `HighJobFailureRate` (critical), `HighAPIErrorRate`, `PgBouncerPoolNearLimit`, `RedisUnreachable`, `SafeContentGuardFiringFrequently`, `ProxySourceWentDark` (one per free proxy source, zero proxies for 6h). The list in `monitoring/alerts/prometheus_rules.yml` is authoritative; `promtool check rules` validates it.
+- **Which alert reached Slack, and when.** Alertmanager logs nothing on a successful send, so ask Prometheus: `max_over_time(ALERTS{alertstate="firing"}[2d])` lists what fired, and a `query_range` on `ALERTS{alertname="X",alertstate="firing"}` gives the periods (`localhost:9090`). A `for:` timer restarts when the api container restarts (the gauges come from it), so a long-running alert shows as `pending` for its `for:` window after every deploy and then fires again: it has not cleared. A burst of `HighJobFailureRate` + `DeadLetterQueueGrowing` right after a deploy that changes DLQ eligibility is the reaper re-driving a backlog (round 68: ~500 re-drives in the first hour).
 - **`BrowserPoolExhausted` REMOVED (round 25), not fixed.** Its expr was
   `browser_pool_size{status="idle"} == 0`, but `BrowserPool` now lives inside
   the rq work-horse process for one job's lifetime (see

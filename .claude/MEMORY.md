@@ -23,7 +23,7 @@ Both halves are listed here now; the division of labour is in
 | `.wolf/STATUS.md` | Rolling CURRENT-state handoff: concluded work, next quest, live runtime config, useful commands. Deliberately NOT a history — only the last ~3 rounds carry detail, older ones are one clause pointing at `technical-debt.md` | FIRST file of every resumed session |
 | `.wolf/cerebrum.md` | Session-local capture: User Preferences, Key Learnings, Do-Not-Repeat (dated gotchas), Decision Log | Before generating code; before repeating a past approach |
 | `.wolf/buglog.json` | Structured bug memory — error message, root cause, fix, tags | Before debugging anything; the fix may already be recorded |
-| `.wolf/anatomy.md` | Token-efficient file index (~310 files) with per-file descriptions and token estimates. Regenerate with `openwolf scan`; exclusions live in `.wolf/config.json` | Before opening any file, to avoid a full read |
+| `.wolf/anatomy.md` | Token-efficient file index of every tracked file, with per-file descriptions and token estimates. Regenerate with `openwolf scan`; exclusions live in `.wolf/config.json` | Before opening any file, to avoid a full read |
 
 ## Architecture & Design
 

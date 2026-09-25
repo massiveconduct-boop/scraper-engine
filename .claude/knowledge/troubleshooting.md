@@ -273,8 +273,10 @@ get through.
 **Check live browsers against seats:** `/v1/health` → `browser_capacity.
 in_use_units` vs. `ps -eo args | grep camoufox-bin | grep -v contentproc`
 in each worker. Browsers far above seats means something launches or keeps
-browsers outside a claim. The one found live was parked BrowserPool spares
-(fixed: `park_spares=False` under admission). A low `target_units` with high
+browsers outside a claim. The one found live (round 65) was parked
+BrowserPool spares; since round 67 a parked browser keeps its render's seat
+(`SeatKeeper`), so parked browsers ARE counted — a gap now means a launch
+path that bypasses the claim. A low `target_units` with high
 load is the controller reacting to that outside load, not the cause.
 
 Round 66 found the second cause of "limited but still slow": the controller
@@ -320,10 +322,10 @@ owner and the one-command way to check.
 ### PgBouncer Connection Refused (Port 6432)
 **Symptom:** `ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 6432)`.
 **Fix:** `docker compose up -d pgbouncer`. PgBouncer must be explicitly started — it's not started by `docker compose up -d postgres redis` alone.
-**Impact:** G-05 test errors, suite drops from 170 to 165.
+**Impact:** G-05 test errors; the suite silently collects fewer tests.
 
-### Suite Regression (165 instead of 170)
-**Symptom:** Test count drops 5 from expected 170.
+### Suite Regression (fewer tests collected than CI reports)
+**Symptom:** the local collected/passed count is below the count CI reports for the same commit.
 **Diagnosis:** Check which tests ERROR (not FAIL). Errors during collection (PgBouncer down, Redis down) cause test files to silently drop.
 **Fix:** Ensure all three infrastructure services are running: `docker compose up -d postgres redis pgbouncer`.
 
@@ -340,7 +342,7 @@ owner and the one-command way to check.
 **Symptom:** Command returns exit code 144.
 **Meaning:** 128+16 = signal 16. The Bash tool in this session sends signal 16 when its 120s timeout expires. This is NOT a kernel OOM (137), NOT SIGTERM (143), NOT a subprocess crash.
 **Fix:** Split long commands (>120s cumulative) into separate Bash invocations. Use `ctx_execute` for commands needing >120s.
-**Production impact:** None. Docker containers have no execution deadline. The harvester runs as a standalone process with no timeout wrapper.
+**Production impact:** None. Docker containers have no execution deadline. The harvester runs as a supervisord program inside the `api` container, with no timeout wrapper.
 
 ### Broker Subprocess "Hangs"
 **Symptom:** Exit 144 during harvest, no proxy output.

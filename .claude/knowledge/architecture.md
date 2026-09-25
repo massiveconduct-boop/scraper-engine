@@ -262,10 +262,10 @@ Redis heartbeats rather than querying supervisord's own RPC socket).
 ```
 harvest_once()
   ├─ _direct_scrape()        [PRIMARY — 5-10 proxies in ~5s]
-  │   ├─ 8 source URLs → _scrape_one() per source
+  │   ├─ ProxyHarvester.SOURCES (10 URLs) → _scrape_one() per source
   │   │   ├─ _parse_ip_port() / _parse_geonode()
-  │   │   ├─ _tcp_probe() (2s timeout)
-  │   │   └─ _http_validate() through self-hosted judge (:8089)
+  │   │   ├─ tcp_probe() (2s timeout)
+  │   │   └─ _http_validate() through JUDGE_URLS (public IP-echo judges)
   │   │       └─ Score: TCP-only=25 (below L1), validated=60 (above L1)
   │   └─ Persist to proxy_pool with anonymity_level + reliability_score
   │
@@ -294,7 +294,7 @@ stand-in for tests only (`tests/unit/test_judge_server.py`,
 `.claude/knowledge/decisions.md` for the full decision record and
 `.claude/knowledge/troubleshooting.md` → "All Pool Proxies Score 25".
 
-**Source diversity:** 8 URLs across 6 operators (proxyscrape.com, openproxylist.xyz, TheSpeedX/GitHub, monosans/GitHub, pubproxy.com, geonode.com). 5 real failure domains (GitHub CDN shared by two repos).
+**Source diversity:** 10 URLs across 8 operators (proxyscrape.com ×3, geonode.com, openproxylist.xyz, pubproxy.com, and four GitHub repos: TheSpeedX, monosans, clarketm, sunny9577). 5 real failure domains (the four repos share GitHub's CDN). `ProxyHarvester.SOURCES` is the list; each source has its own health signal (`ProxySourceWentDark` after 6h of zero). Round 68 dropped ShiftyTR (frozen since 2023) and fixed geonode's URL.
 
 **Scoring:** Two-tier. TCP-only=25 (below L1 threshold 40 — cannot be selected). HTTP-validated=60. `promote_tcp_only()` background job re-validates TCP-only proxies.
 
@@ -584,12 +584,15 @@ every detail: `.claude/knowledge/technical-debt.md`'s round-42 entry.
 **Design:** Hot-browser pool with real reuse. `pool.start(N)` launches N Camoufox instances and stores live contexts in an asyncio.Queue. `pool.lease(proxy, domain)` is the async context manager — returns a live context, guarantees release (structural cleanup per invariant §1.1.6).
 
 **Key methods:**
-- **Round 65:** with host admission on (`host_capacity.enabled`),
-  `orchestrator/tasks.py` builds the pool with `prewarm_count=0` and
-  `park_spares=False` — every healthy instance is closed on release instead
-  of parked, because a parked spare runs outside any host seat and, with a
-  rotated gateway session per attempt, is never reused. The parking rules
-  below apply only with admission off.
+- **Parking under host admission (rounds 65, 67).** `orchestrator/tasks.py`
+  sets `park_spares = not host_capacity.enabled or
+  host_capacity.reuse_browsers`. With admission on and reuse on (the
+  default), a parked browser keeps the host seat of the render that launched
+  it (`SeatKeeper`, see "Host-Wide Browser Admission"), so parking no longer
+  runs a browser outside the budget. Only `HOST_CAPACITY_REUSE_BROWSERS=false`
+  closes every healthy instance on release (round 65's behaviour). A browser
+  used on a paid-gateway session is never parked (fresh `sessid` per attempt,
+  so it can't be reused).
 - `start()` — launches prewarm_count browsers, stores (context, wrapper, idle_since)
 - `acquire(domain)` — classifies drained items as selected/keep/teardown per idle timeout + domain matching
 - `release(ctx, healthy)` — healthy returns to pool, unhealthy tears down
