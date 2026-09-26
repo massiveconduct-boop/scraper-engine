@@ -104,6 +104,11 @@ _TRANSIENT_CATEGORIES = [
     # only once a probe through the gateway succeeds again (round 68: under
     # free_first, on pool health). See _is_eligible.
     FailureCategory.PROXY_AUTH_FAILED,
+    # Round 70 — the site answered 429 at every level. Reaper-only, like
+    # BROWSER_CRASH/NETWORK_TIMEOUT above: in worker.py's TRANSIENT set it
+    # would stop a 429 escalating, and a new exit IP can clear one. See
+    # _is_eligible.
+    FailureCategory.RATE_LIMITED,
 ]
 
 # Round 65 — contention categories wait base * 2**auto_retry_count after
@@ -115,6 +120,9 @@ _CONTENTION_CATEGORIES = frozenset(
         FailureCategory.POLITENESS_TIMEOUT,
         FailureCategory.CAPACITY_TIMEOUT,
         FailureCategory.DEPENDENCY_UNAVAILABLE,
+        # Round 70 — not contention on our side, but the same answer: a URL
+        # the site rate-limited must not come back the moment it failed.
+        FailureCategory.RATE_LIMITED,
     }
 )
 _CONTENTION_BACKOFF_BASE_SECONDS = 60.0
@@ -250,6 +258,15 @@ async def _is_eligible(
     if entry.failure_category == FailureCategory.DEPENDENCY_UNAVAILABLE:
         # The reaper reaching this point means Redis answers again.
         return True
+    if entry.failure_category == FailureCategory.RATE_LIMITED:
+        # Round 70 — past the backoff above, also past the site's own
+        # Retry-After (worker.py stores it capped), and never into a circuit
+        # that is open for the domain: it opened because the domain keeps
+        # refusing us, which is the slowing down a 429 asks for.
+        if entry.retry_not_before is not None and datetime.now(UTC) < entry.retry_not_before:
+            return False
+        circuit_state = await circuit_breaker.state(_domain(entry.url))
+        return circuit_state != CircuitState.OPEN
     if entry.failure_category == FailureCategory.POLITENESS_TIMEOUT:
         politeness = PolitenessController(redis.raw)
         active = await politeness.active_slots(_domain(entry.url), TenantId(entry.tenant_id))

@@ -38,6 +38,9 @@ class DeadLetterEntry:
     auto_retry_count: int
     enqueued_at: datetime
     dead_at: datetime
+    # Round 70 — not re-driven before this (a 429's Retry-After). None when
+    # the site sent none, or for any other category.
+    retry_not_before: datetime | None = None
 
 
 class DeadLetterQueue:
@@ -54,25 +57,30 @@ class DeadLetterQueue:
         category: FailureCategory,
         error: str,
         level: int,
+        retry_not_before: datetime | None = None,
     ) -> None:
         """Write a permanently (or transiently, pending auto-retry) failed
         URL to the DLQ. UPSERTs on (job_id, url) (round 34) — a URL that
         proxy/dlq_reaper.py auto-retried and that failed again lands back on
         the *same* row (auto_retry_count carried forward via the DO UPDATE's
         implicit no-op on that column), instead of a fresh INSERT resetting
-        the count and defeating the reaper's retry cap."""
+        the count and defeating the reaper's retry cap.
+
+        Round 70 — `retry_not_before` is replaced on every upsert: it
+        describes this failure, not an earlier one."""
         now = datetime.now(UTC)
         await self._pg.execute(
             tenant_id,
             """
             INSERT INTO dead_letter_queue (job_id, url, failure_category, error_message,
-                                           level_attempted, dead_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                                           level_attempted, dead_at, retry_not_before)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (job_id, url) DO UPDATE SET
                 failure_category = EXCLUDED.failure_category,
                 error_message = EXCLUDED.error_message,
                 level_attempted = EXCLUDED.level_attempted,
-                dead_at = EXCLUDED.dead_at
+                dead_at = EXCLUDED.dead_at,
+                retry_not_before = EXCLUDED.retry_not_before
             """,
             job_id,
             url,
@@ -80,11 +88,12 @@ class DeadLetterQueue:
             error,
             level,
             now,
+            retry_not_before,
         )
 
     _SELECT_COLUMNS = (
         "id, job_id, url, failure_category, error_message, level_attempted, "
-        "auto_retry_count, enqueued_at, dead_at"
+        "auto_retry_count, enqueued_at, dead_at, retry_not_before"
     )
 
     async def list_for_tenant(
@@ -204,6 +213,7 @@ class DeadLetterQueue:
                 auto_retry_count=r["auto_retry_count"],
                 enqueued_at=r["enqueued_at"],
                 dead_at=r["dead_at"],
+                retry_not_before=r.get("retry_not_before"),
             )
             for r in rows
         ]

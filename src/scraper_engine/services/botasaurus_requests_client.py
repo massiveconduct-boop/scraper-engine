@@ -26,6 +26,8 @@ class Ja3Response(NamedTuple):
     status_code: int
     text: str
     location: str | None
+    # Round 70 — raw Retry-After header (fetcher/_failure.py::retry_after_for).
+    retry_after: str | None = None
 
 
 class Ja3Session:
@@ -57,6 +59,7 @@ class Ja3Session:
             status_code=response.status_code,
             text=response.text,
             location=response.headers.get("location"),
+            retry_after=response.headers.get("retry-after"),
         )
 
 

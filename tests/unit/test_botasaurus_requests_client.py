@@ -32,13 +32,18 @@ from scraper_engine.services.botasaurus_requests_client import (
 
 
 def _fake_session(
-    status_code: int = 200, text: str = "<html>ok</html>", location: str | None = None
+    status_code: int = 200,
+    text: str = "<html>ok</html>",
+    location: str | None = None,
+    retry_after: str | None = None,
 ):
     session = MagicMock()
     response = MagicMock()
     response.status_code = status_code
     response.text = text
     response.headers = {"location": location} if location else {}
+    if retry_after is not None:
+        response.headers["retry-after"] = retry_after
     session.get.return_value = response
     return session
 
@@ -106,6 +111,17 @@ class TestBotasaurusRequestsClient:
         result = await client.get("https://target.example/page")
         assert result.status_code == 302
         assert result.location == "https://target.example/next"
+        assert result.retry_after is None
+
+    @pytest.mark.asyncio
+    async def test_get_surfaces_the_retry_after_header(self, fake_firefox: MagicMock):
+        """Round 70 — the raw header; Level1Fetcher parses it."""
+        client = BotasaurusRequestsClient()
+        session = _fake_session(status_code=429, retry_after="45")
+        fake_firefox.Session.return_value = session
+        result = await client.get("https://target.example/page")
+        assert result.status_code == 429
+        assert result.retry_after == "45"
 
 
 class TestJa3Session:

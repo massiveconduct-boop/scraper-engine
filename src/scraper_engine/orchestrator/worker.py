@@ -16,6 +16,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -84,7 +85,14 @@ _SAME_LEVEL_PROXY_RETRIES = 1  # one retry with a fresh proxy before giving up o
 # fixed username — even process_job's gateway-fallback re-attempt went out
 # over the same, already-flagged exit identity. The pool never changed IP
 # because nothing in the system could ask it to.
-_GATEWAY_ROTATE_CATEGORIES = frozenset({FailureCategory.DETECTION_BLOCK})
+#
+# Round 70 — a 429 (RATE_LIMITED) is a block for every purpose here: a new
+# exit IP is exactly what can clear a per-IP rate limit. _BLOCK_CATEGORIES
+# is every category that means "the site refused this attempt": each one
+# escalates, rotates the gateway exit IP and gets the gateway block retry
+# the same way; only the terminal label (and the DLQ reaper) tell them apart.
+_BLOCK_CATEGORIES = frozenset({FailureCategory.DETECTION_BLOCK, FailureCategory.RATE_LIMITED})
+_GATEWAY_ROTATE_CATEGORIES = _BLOCK_CATEGORIES
 
 # Round 68 — why a URL did not go out through the paid gateway while it is
 # refusing our credentials (proxy/gateway_health.py). Ends up in the result's
@@ -114,7 +122,8 @@ def _note_gateway_skipped(result: FetchResult, skipped: bool) -> None:
 
 
 # Round 69 — what each "blocked" status means to a reader. DETECTION_BLOCK
-# covers all of them (fetcher/_failure.py::_DETECTION_BLOCK_STATUSES).
+# covers all but 429, which is RATE_LIMITED since round 70
+# (fetcher/_failure.py::classify_http_status).
 _BLOCK_STATUS_MEANING = {
     401: "unauthorized",
     403: "refused",
@@ -126,11 +135,11 @@ _BLOCK_STATUS_MEANING = {
 
 
 def _describe_block(terminal: FetchResult, last: FetchResult) -> None:
-    """Round 69 — start a terminal DETECTION_BLOCK's message with what the
-    block was, where and through which route: `HTTP 403 (refused) at L3 via
-    pool — <original message>`, and set `block_reason` in escalations'
-    vocabulary. One category covers 401/403/404/405/410/429 and challenge
-    pages; a reader could not tell a rate limit from a bot check."""
+    """Round 69 — start a terminal DETECTION_BLOCK's (round 70: or
+    RATE_LIMITED's) message with what the block was, where and through
+    which route: `HTTP 403 (refused) at L3 via pool — <original message>`,
+    and set `block_reason` in escalations' vocabulary. One category covers
+    401/403/404/405/410 and challenge pages; this says which it was."""
     reason = last.block_reason or (f"status:{last.http_status}" if last.http_status else None)
     terminal.block_reason = reason
     if reason is None:
@@ -795,7 +804,7 @@ class Worker:
                         self._gateway_fallback_eligible
                         and result.proxy_source != "paid_gateway"
                         and (
-                            result.failure_category == FailureCategory.DETECTION_BLOCK
+                            result.failure_category in _BLOCK_CATEGORIES
                             or (
                                 result.success
                                 and self._challenge_detector.is_challenge_page(
@@ -907,9 +916,9 @@ class Worker:
                         # success whose "content" was the page title.
                         # Checked here, not in CHALLENGE_STATUS_CODES, which
                         # also makes L2/L3 wait for a solve that never comes.
+                        # Round 70 — and 429, now RATE_LIMITED.
                         blocked_status = (
-                            classify_http_status(result.http_status or 200)
-                            == FailureCategory.DETECTION_BLOCK
+                            classify_http_status(result.http_status or 200) in _BLOCK_CATEGORIES
                         )
                         still_looks_blocked = (
                             result.is_challenge_page
@@ -1151,11 +1160,19 @@ class Worker:
                     )
                     if (
                         last_level_result is not None
-                        and real_category == FailureCategory.DETECTION_BLOCK
+                        and real_category in _BLOCK_CATEGORIES
                     ):
                         _describe_block(exhausted_result, last_level_result)
                     _note_gateway_skipped(exhausted_result, gateway_skipped)
                     real_message = exhausted_result.error_message or real_message
+                    # Round 70 — a 429's Retry-After, if the site sent one,
+                    # holds the DLQ reaper's re-drive back until then.
+                    retry_after = (
+                        last_level_result.retry_after_seconds
+                        if last_level_result is not None
+                        and real_category == FailureCategory.RATE_LIMITED
+                        else None
+                    )
                     await self._dlq.enqueue(
                         tenant_id,
                         job_id,
@@ -1163,6 +1180,11 @@ class Worker:
                         real_category,
                         real_message,
                         url_levels[-1],
+                        retry_not_before=(
+                            datetime.now(UTC) + timedelta(seconds=retry_after)
+                            if retry_after is not None
+                            else None
+                        ),
                     )
                     errors.append(real_message)
                     results[index] = _finish(exhausted_result)

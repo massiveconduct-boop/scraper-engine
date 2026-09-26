@@ -82,6 +82,12 @@ RETRY_MATRIX: dict[FailureCategory, RetryStrategy] = {
     FailureCategory.PROXY_AUTH_FAILED: RetryStrategy(
         max_attempts=0, base_delay_seconds=0, max_delay_seconds=0, retryable=False
     ),
+    # Round 70 — the site said "slow down" (HTTP 429). Retry, but late: the
+    # DLQ reaper waits 60s * 2**n and any Retry-After the site sent, capped
+    # at an hour (fetcher/_failure.py::RETRY_AFTER_CAP_SECONDS).
+    FailureCategory.RATE_LIMITED: RetryStrategy(
+        max_attempts=3, base_delay_seconds=60.0, max_delay_seconds=3600.0, retryable=True
+    ),
 }
 
 

@@ -3705,3 +3705,38 @@ one. With both hints the same 10 Jumia URLs took 115.8s.
 **Invariant kept:** like the level hint, these only SKIP work that recently
 failed for the domain, and the re-probe retries it; they can make a job
 faster, never turn a fetch that would have succeeded into a failure.
+
+## A 429 Is Rate Limiting, Not a Bot Verdict (Round 70, user decision)
+
+**Decision:** a URL whose last answer is HTTP 429 ends as `rate_limited`,
+not `detection_block`. Up to the terminal label nothing changes: a 429
+escalates, rotates the gateway exit IP and gets the gateway block retry
+exactly like a 403 (`worker.py::_BLOCK_CATEGORIES`), because a new exit IP is
+what clears a per-IP limit. After it, the DLQ reaper re-drives it: no sooner
+than 60s × 2^n after it failed, no sooner than the site's `Retry-After`
+(parsed at L1 and Camoufox L2/L3, capped at an hour, stored as
+`dead_letter_queue.retry_not_before`), and never into an open circuit.
+
+**Why:** research_agent could not tell "slow down" from "you're a bot", and
+a 429 got the same never-retried treatment as a 403, although waiting is
+what fixes it.
+
+**Circuit breaker — still counts.** A 429 is the target's doing and is
+recorded like any block. An open circuit is the engine backing off the
+domain, which is what a 429 asks for; the breaker only trips at 95% failure
+over 20+ attempts, so exempting 429 would keep us hammering a site that
+told us to stop.
+
+**Level memory — unchanged.** It learns only from successes (which level got
+content), never from the failure below. If L2 succeeds where L1 got a 429,
+starting at L2 avoids that 429 whatever caused it (some WAFs answer bots with
+429), and the every-20th-URL re-probe corrects a stale hint. `skip_pool` is
+still set only by a real gateway success after a pool block.
+
+**Rejected:** putting `rate_limited` in `worker.py`'s
+`TRANSIENT_FAILURE_CATEGORIES` — that set also triggers the early DLQ write
+and break, which would stop a 429 from escalating to a new IP. It is
+reaper-only, like `browser_crash`/`network_timeout` (round 42). Also
+rejected: a per-category Prometheus label; no metric is labelled by
+category today.
+

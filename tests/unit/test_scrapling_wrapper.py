@@ -75,6 +75,7 @@ class TestFetch:
         assert result.status_code == 200
         assert result.text == "<html>scrapling</html>"
         assert result.location is None
+        assert result.retry_after is None
         get_mock.assert_awaited_once_with(
             "http://example.com", timeout=5, proxy="http://p:1", follow_redirects=False
         )
@@ -97,6 +98,27 @@ class TestFetch:
         assert result is not None
         assert result.status_code == 302
         assert result.location == "/next"
+
+    @pytest.mark.asyncio
+    async def test_surfaces_the_retry_after_header(self, monkeypatch):
+        """Round 70 — the raw header; Level1Fetcher parses it."""
+        wrapper = ScraplingWrapper()
+        wrapper._available = True
+
+        fake_page = MagicMock()
+        fake_page.html_content = "<html>slow down</html>"
+        fake_page.status = 429
+        fake_page.headers = {"retry-after": "30"}
+
+        get_mock = AsyncMock(return_value=fake_page)
+        monkeypatch.setitem(sys.modules, "scrapling.fetchers", _fake_fetchers_module(get_mock))
+
+        result = await wrapper.fetch("http://example.com", timeout=5)
+
+        assert result is not None
+        assert result.status_code == 429
+        assert result.retry_after == "30"
+        assert result.location is None
 
     @pytest.mark.asyncio
     async def test_returns_none_on_fetch_exception(self, monkeypatch):

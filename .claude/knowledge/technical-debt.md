@@ -32,6 +32,54 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 70)
+
+Origin: research_agent brief `to-scraper-engine-2026-09-25-rate-limited.md`
+(user decision on round 69's proposal). PR #35.
+
+- **Change.** A terminal HTTP 429 ends as `rate_limited` instead of
+  `detection_block` (`fetcher/_failure.py::classify_http_status`). Up to the
+  terminal label a 429 is treated as a block exactly as before: escalation,
+  gateway exit-IP rotation, gateway block retry (`worker.py::
+  _BLOCK_CATEGORIES`). `block_reason` stays `status:429` and the message
+  prefix stays `HTTP 429 (rate limited) at L<n> via <route>`.
+- **Re-drive.** Reaper-only transient (`dlq_reaper._TRANSIENT_CATEGORIES`
+  and `_CONTENTION_CATEGORIES`, not `worker.TRANSIENT_FAILURE_CATEGORIES`,
+  which would stop the escalation). Eligible once 60s × 2^n has passed,
+  after `dead_letter_queue.retry_not_before` (migration 012: the site's
+  `Retry-After`, parsed by `parse_retry_after`, capped at 3600s), and while
+  the domain's circuit is not OPEN. Retry-After is read at L1 (httpx, JA3,
+  Scrapling) and at Camoufox L2/L3, but not from Botasaurus, which exposes
+  no response headers.
+- **Breaker and level memory.** A 429 still counts toward the breaker, and
+  level memory is unchanged. Reasons in decisions.md → "A 429 Is Rate
+  Limiting, Not a Bot Verdict". Live, repeated 429 tests opened
+  httpbin.org's circuit, and the reaper held the `rate_limited` entry back
+  until it closed.
+- **Found by the live check: an empty-bodied error killed the navigation.**
+  httpbin's 429 has no body, and Firefox raises `NS_ERROR_NET_EMPTY_RESPONSE`
+  from `page.goto()`, even without a proxy, so the URL ended as
+  `browser_crash` at L2/L3. Playwright's `response` event still delivers the
+  main document (status and headers) first.
+  `_content_utils.MainDocumentAnswer` records it, and L2-Camoufox and L3
+  return that answer (empty html) when `goto()` raises after a main-frame
+  answer that `classify_http_status` reads as the site's verdict. A 5xx
+  stays `browser_crash`, since through a free proxy it is often the proxy.
+- **Live (free pool, workers with `DATAIMPULSE_ENABLED=false`):**
+  - `75f9732d-0586-4833-adf2-bb15942ffb3b` (L1 only): `rate_limited`,
+    `status:429`, `HTTP 429 (rate limited) at L1 via direct`. The reaper
+    re-drove it to its cap (attempt 3), and it ended `rate_limited` each time.
+  - `b39fecf6-13d4-4417-ae5b-cf9e25f0b694`: at first `circuit_open`. After a
+    re-drive, L2-Camoufox and L3 via pool both got 429, and it ended
+    `rate_limited`, `http_status 429`, `HTTP 429 (rate limited) at L3 via pool`.
+  - L1 against a local 429 + `Retry-After: 120` stub in worker-l1:
+    `retry_after_seconds 120`. L3 Camoufox against the same stub in
+    worker-l3: 429, `retry_after_seconds 120`.
+  - Free-proxy noise made two other full-ladder runs end `browser_crash` /
+    `proxy_exhausted`: the last level's category wins, as designed.
+- **Open.** A 429 via Botasaurus (L2's first engine) carries no Retry-After,
+  so it relies on the backoff. No metric is labelled by failure category.
+
 ## Technical Debt / Open Threads (as of round 69)
 
 Origin: research_agent brief `to-scraper-engine-2026-09-25-failure-labels.md`

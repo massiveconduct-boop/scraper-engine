@@ -18,12 +18,13 @@ from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
 from scraper_engine.fetcher._content_utils import (
+    MainDocumentAnswer,
     SSRFRouteGuard,
     autoscroll,
     poll_until_solved,
     safe_content,
 )
-from scraper_engine.fetcher._failure import classify_fetch_exception
+from scraper_engine.fetcher._failure import classify_fetch_exception, retry_after_for
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
@@ -235,13 +236,31 @@ class Level2Fetcher:
                 page = await browser_context.new_page()
                 route_guard = SSRFRouteGuard(self._ssrf_guard)
                 await route_guard.install(page)
+                answer = MainDocumentAnswer(page)
                 try:
                     nav_response = await page.goto(
                         url, wait_until=self._goto_wait_until, timeout=timeout * 1000
                     )
                 except Exception:
                     route_guard.raise_if_blocked()
-                    raise
+                    verdict = answer.site_verdict()
+                    if verdict is None:
+                        raise
+                    # Round 70 — the site answered (e.g. an empty-bodied
+                    # 429) and the browser failed on the answer, not the
+                    # other way round: report the answer, like any other
+                    # rendered status, for worker.py to classify.
+                    return FetchResult(
+                        engine="camoufox",
+                        url=url,
+                        success=True,
+                        http_status=verdict.status,
+                        html="",
+                        level_used=2,
+                        proxy_used=proxy.key() if proxy else "none",
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                        retry_after_seconds=retry_after_for(verdict.status, verdict.headers),
+                    )
                 with contextlib.suppress(Exception):
                     await page.wait_for_load_state(
                         "networkidle", timeout=self._networkidle_timeout_ms
@@ -303,6 +322,11 @@ class Level2Fetcher:
                     http_status=nav_status,
                     html=html,
                     level_used=2,
+                    retry_after_seconds=(
+                        retry_after_for(nav_status, nav_response.headers)
+                        if nav_response is not None
+                        else None
+                    ),
                     proxy_used=proxy.key() if proxy else "none",
                     duration_ms=duration_ms,
                 )

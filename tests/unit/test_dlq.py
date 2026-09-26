@@ -59,6 +59,59 @@ class TestDeadLetterQueue:
         assert args[4] == 2
         assert isinstance(args[5], datetime)
         assert args[5].tzinfo is UTC
+        # Round 70 — no site-requested wait unless the caller passes one.
+        assert args[6] is None
+
+    @pytest.mark.asyncio
+    async def test_enqueue_passes_retry_not_before_through(self, dlq, pg) -> None:
+        """Round 70 — a 429's Retry-After reaches the row, and is replaced
+        (not kept from an earlier failure) on the upsert."""
+        from scraper_engine.core.models import FailureCategory
+        from scraper_engine.core.tenant import TenantId
+
+        not_before = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
+        await dlq.enqueue(
+            TenantId("test"),
+            job_id="job-1",
+            url="http://example.com/slow",
+            category=FailureCategory.RATE_LIMITED,
+            error="HTTP 429 (rate limited) at L3 via pool",
+            level=3,
+            retry_not_before=not_before,
+        )
+
+        _, query, args = pg.executed[0]
+        assert args[2] == "rate_limited"
+        assert args[6] == not_before
+        assert "retry_not_before = EXCLUDED.retry_not_before" in query
+
+    @pytest.mark.asyncio
+    async def test_list_maps_retry_not_before(self, dlq, pg) -> None:
+        from scraper_engine.core.models import FailureCategory
+        from scraper_engine.core.tenant import TenantId
+
+        now = datetime.now(UTC)
+        pg.fetch_rows = [
+            {
+                "id": 8,
+                "job_id": "job-1",
+                "url": "http://example.com/slow",
+                "failure_category": "rate_limited",
+                "error_message": "HTTP 429",
+                "level_attempted": 3,
+                "auto_retry_count": 0,
+                "enqueued_at": now,
+                "dead_at": now,
+                "retry_not_before": now,
+            }
+        ]
+
+        entries = await dlq.list_for_tenant(TenantId("test"))
+
+        assert entries[0].failure_category == FailureCategory.RATE_LIMITED
+        assert entries[0].retry_not_before == now
+        _, query, _ = pg.fetch_calls
+        assert "retry_not_before" in query
 
     @pytest.mark.asyncio
     async def test_list_for_tenant_maps_rows(self, dlq, pg) -> None:
@@ -95,6 +148,8 @@ class TestDeadLetterQueue:
         assert entry.auto_retry_count == 1
         assert entry.enqueued_at == now
         assert entry.dead_at == now
+        # Round 70 — a row without the column (pre-012 shape) reads as None.
+        assert entry.retry_not_before is None
         _, _, call_args = pg.fetch_calls
         assert call_args == (50, 10)
 

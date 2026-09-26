@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from scraper_engine.core.exceptions import SSRFBlockedError
+from scraper_engine.fetcher._failure import classify_http_status
 
 if TYPE_CHECKING:
     from scraper_engine.core.ssrf_guard import SSRFGuard
@@ -64,6 +65,39 @@ class SSRFRouteGuard:
         rejection in place of whatever generic error Playwright reported."""
         if self.blocked is not None:
             raise self.blocked
+
+
+class MainDocumentAnswer:
+    """Round 70 — remembers the HTTP answer the site gave for the page's
+    main document, so a navigation that fails AFTER the site answered can
+    still report that answer.
+
+    Live-caught: httpbin's 429 has an empty body, and Firefox (so Camoufox,
+    with or without a proxy) turns an empty error response into
+    `NS_ERROR_NET_EMPTY_RESPONSE`, which `page.goto()` raises. The site had
+    said "rate limited", with its Retry-After, and the URL ended as
+    `browser_crash` at L2/L3. Playwright's `response` event still fires for
+    that document (status and headers intact) before the request fails.
+    """
+
+    def __init__(self, page: Any) -> None:
+        self._response: Any = None
+        page.on("response", self._record)
+
+    def _record(self, response: Any) -> None:
+        if response.request.is_navigation_request() and response.frame.parent_frame is None:
+            self._response = response
+
+    def site_verdict(self) -> Any:
+        """The main document's response when its status is one the engine
+        reads as the site's verdict (fetcher/_failure.py::classify_http_status:
+        401/403/404/405/410/429), else None. A 5xx is left out on purpose:
+        through a free proxy it is as often the proxy's own failure, which
+        stays a retryable BROWSER_CRASH."""
+        response = self._response
+        if response is None or classify_http_status(response.status) is None:
+            return None
+        return response
 
 
 # `page` is a Playwright/Camoufox Page — duck-typed as Any here so these shared

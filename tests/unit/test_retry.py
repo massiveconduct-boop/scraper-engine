@@ -38,6 +38,8 @@ class TestRetryMatrix:
             FailureCategory.NETWORK_TIMEOUT,
             FailureCategory.PARSE_ERROR,
             FailureCategory.BROWSER_CRASH,
+            # Round 70 — a 429 is worth a later retry.
+            FailureCategory.RATE_LIMITED,
         }
         for cat in retryable:
             assert RETRY_MATRIX[cat].retryable is True, f"{cat} should be retryable"

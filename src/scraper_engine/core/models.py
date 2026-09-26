@@ -148,6 +148,14 @@ class FailureCategory(str, Enum):
     # BROWSER_CRASH and be retried and re-driven. Never the target's fault:
     # exempt from the circuit breaker and level memory.
     PROXY_AUTH_FAILED = "proxy_auth_failed"
+    # Round 70 — the site answered HTTP 429 at every level and route tried.
+    # It used to end as DETECTION_BLOCK and was never retried, but a 429
+    # says "slow down", not "you're a bot". Escalation is unchanged (a new
+    # exit IP can clear it). Transient: the DLQ reaper re-drives it after a
+    # backoff and after the site's own Retry-After, if one was sent. It
+    # still counts toward the circuit breaker, whose opening is the backing
+    # off a 429 asks for.
+    RATE_LIMITED = "rate_limited"
 
 
 class FetchResult(BaseModel):
@@ -203,11 +211,17 @@ class FetchResult(BaseModel):
     # free-proxy refusal read as "this site blocks scrapers" when the route
     # that usually works was out of service.
     paid_gateway_skipped: bool | None = None
-    # Round 69 — on a terminal DETECTION_BLOCK, which check said "blocked",
-    # in escalations' `reason` vocabulary ("status:429", "signature:cf-chl",
-    # "js_gated", ...). One category covers 401/403/404/405/410/429 and
-    # challenge pages; this says which one it was.
+    # Round 69 — on a terminal DETECTION_BLOCK or RATE_LIMITED, which check
+    # said "blocked", in escalations' `reason` vocabulary ("status:403",
+    # "status:429", "signature:cf-chl", "js_gated", ...). DETECTION_BLOCK
+    # covers 401/403/404/405/410 and challenge pages; this says which one.
     block_reason: str | None = None
+    # Round 70 — the delay a 429's Retry-After header asked for, in seconds,
+    # parsed and capped by fetcher/_failure.py::parse_retry_after. Internal:
+    # it becomes the DLQ entry's retry_not_before and is not persisted with
+    # the result. None when there was no 429, no header, or no way to read
+    # it (Botasaurus exposes no response headers).
+    retry_after_seconds: int | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
