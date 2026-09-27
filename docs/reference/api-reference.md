@@ -290,7 +290,7 @@ doing it is, and whether the engine re-drives it by itself (see `GET
 | `failure_category` | Meaning | Whose doing | Auto-retried |
 |---|---|---|---|
 | `detection_block` | The site answered 401/403/404/405/410, or served a challenge / JavaScript-gated page, at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
-| `rate_limited` | The site answered 429 ("too many requests") at every level and route tried. `block_reason` is `status:429` | Target site, asking us to slow down (maybe per exit IP) | Yes, after a wait, and not before the site's `Retry-After` (capped at one hour) |
+| `rate_limited` | The site answered 429 ("too many requests"), and nothing later changed its answer: every later level either got 429 too or failed without hearing from the site (a proxy, network or browser failure; the message then ends `— later levels got no answer from the site: L<n> <category>: …`). `block_reason` is `status:429` | Target site, asking us to slow down (maybe per exit IP) | Yes, after a wait, and not before the site's `Retry-After` (capped at one hour) |
 | `circuit_open` | Too many recent failures on this domain; the engine is pausing it | Target site, by history | Yes, once the circuit closes |
 | `proxy_exhausted` | No usable proxy was available for the level | Ours (proxy supply) | Yes, when that pool tier is healthy |
 | `proxy_auth_failed` | A proxy refused the engine's credentials. From the paid gateway, that means the account (plan out of traffic, bad login) | Proxy provider / account | Yes: `paid_only` after a gateway probe succeeds, otherwise on pool health |

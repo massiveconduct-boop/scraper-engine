@@ -3740,3 +3740,36 @@ reaper-only, like `browser_crash`/`network_timeout` (round 42). Also
 rejected: a per-category Prometheus label; no metric is labelled by
 category today.
 
+## The Site's Last Answer Outranks a Later Non-Answer; Botasaurus Keeps a 429 (Round 71)
+
+**Decision 1 — terminal precedence.** A URL's terminal category is normally
+its last level's. When that last level failed without an answer from the site
+(`browser_crash`, `network_timeout`, `proxy_exhausted`, `proxy_auth_failed`)
+and the last answer the site did give was a 429, the URL ends `rate_limited`
+with that 429's status, route and Retry-After, and the message names the later
+failure. `worker.py::_terminal_rate_limit`, called from both exits (end of
+ladder and the mid-ladder DLQ break).
+
+**Why:** live, L1 got 429 and L2/L3 died on free proxies, so the URL read as
+`browser_crash`/`proxy_exhausted` — a proxy problem — while the site had said
+"slow down". Both outcomes are re-driven, but only `rate_limited` waits for
+the site's Retry-After and tells research_agent what happened.
+
+**Not extended to `detection_block`:** a 403 followed by a proxy failure stays
+`browser_crash`, which the reaper re-drives on pool health; relabelling it
+`detection_block` would turn a retried URL into a never-retried one on the
+strength of one level's answer.
+
+**Decision 2 — Botasaurus reports the real status, and keeps a 429.** The main
+document's status and headers are always captured through Botasaurus's CDP
+response hook (`browser/_botasaurus_main_document.py`). On a 429, L2 returns
+Botasaurus's answer (with Retry-After) instead of falling back to Camoufox;
+any other block status still falls back, now with its real status.
+
+**Why:** every Botasaurus result was built with a hardcoded 200, so a 403 or
+429 page whose text did not read as a challenge passed as a success. A 429
+limits the exit IP, and Camoufox at the same level goes out through the same
+proxy — a second browser launch to be told the same thing; escalation and the
+gateway rotation are what change the IP. A 403 can be about the fingerprint,
+where Camoufox (Firefox) is a genuinely different second opinion.
+
