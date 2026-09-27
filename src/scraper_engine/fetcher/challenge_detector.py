@@ -82,10 +82,11 @@ class ChallengeDetector:
     # A gateway/proxy failure page (the proxy's own upstream connection
     # died — not the target blocking us) is not real content, same problem
     # class as an unsolved anti-bot challenge. It also can't always be
-    # caught via CHALLENGE_STATUS_CODES above: the browser-level fetchers
-    # (Level2Fetcher's Botasaurus path, and any path that can't expose the
-    # real navigation status) report a fixed 200 regardless of what the
-    # page's actual content is. Real examples captured live (round 33) from
+    # caught via CHALLENGE_STATUS_CODES above: a path that can't see the
+    # real navigation status reports 200 regardless of the page's content
+    # (every Botasaurus result did until round 71; it now falls back to 200
+    # only when browser/_botasaurus_main_document.py saw no main document).
+    # Real examples captured live (round 33) from
     # 3 unrelated free proxies share no vendor string in common — nginx/
     # openresty's stock error_page ("500 Internal Server Error ...
     # openresty"), Squid's ("500 Internal Server Error

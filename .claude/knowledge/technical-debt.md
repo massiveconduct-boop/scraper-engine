@@ -97,7 +97,8 @@ Origin: research_agent brief `to-scraper-engine-2026-09-25-rate-limited.md`
   `Retry-After`, parsed by `parse_retry_after`, capped at 3600s), and while
   the domain's circuit is not OPEN. Retry-After is read at L1 (httpx, JA3,
   Scrapling) and at Camoufox L2/L3, but not from Botasaurus, which exposes
-  no response headers.
+  no response headers (superseded round 71 — Botasaurus now reads it, see
+  above).
 - **Breaker and level memory.** A 429 still counts toward the breaker, and
   level memory is unchanged. Reasons in decisions.md → "A 429 Is Rate
   Limiting, Not a Bot Verdict". Live, repeated 429 tests opened
@@ -125,7 +126,8 @@ Origin: research_agent brief `to-scraper-engine-2026-09-25-rate-limited.md`
   - Free-proxy noise made two other full-ladder runs end `browser_crash` /
     `proxy_exhausted`: the last level's category wins, as designed.
 - **Open.** A 429 via Botasaurus (L2's first engine) carries no Retry-After,
-  so it relies on the backoff. No metric is labelled by failure category.
+  so it relies on the backoff (closed round 71, see above). No metric is
+  labelled by failure category.
 
 ## Technical Debt / Open Threads (as of round 69)
 
@@ -169,7 +171,7 @@ L2/L3, failures misled readers.
   `HTTP 403 (refused) at L3 via pool — … (paid gateway is refusing our
   credentials …)`.
 - **Proposed, not shipped:** `rate_limited` for 429 (a user decision:
-  research_agent reads `failure_category`).
+  research_agent reads `failure_category`). (Shipped round 70, see above.)
 
 ## Technical Debt / Open Threads (as of round 68)
 
@@ -1717,7 +1719,7 @@ completed".
   `level_2.py::_fetch_via_botasaurus`'s only check,
   `ChallengeDetector.is_challenge_page()`, is called with `status_code`
   hardcoded to `200` (Botasaurus's API exposes no real navigation status
-  at all) and `short_page_is_suspect=False`. `CHALLENGE_STATUS_CODES` is
+  at all — superseded round 71: captured via CDP, see the round-71 entry) and `short_page_is_suspect=False`. `CHALLENGE_STATUS_CODES` is
   moot (status hardcoded). `CHALLENGE_SIGNATURES` (cf-*, datadome, akamai,
   h-captcha, etc.) has nothing to do with Chromium's own UI chrome.
   `_looks_like_gateway_error` (round 33) requires a literal 3-digit `5xx`
