@@ -3341,6 +3341,121 @@ class TestRateLimited:
         # Still counts toward the circuit breaker.
         worker._circuit_breaker.record_failure.assert_awaited()
 
+    @staticmethod
+    def _no_answer(level, category, source="pool"):
+        """Round 71 — an attempt that failed before the site said anything."""
+        return FetchResult(
+            url="http://example.com",
+            success=False,
+            level_used=level,
+            failure_category=category,
+            error_message=f"{category.value} at L{level}",
+            duration_ms=1,
+            proxy_source=source,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "category",
+        [
+            FailureCategory.BROWSER_CRASH,
+            FailureCategory.NETWORK_TIMEOUT,
+            FailureCategory.PROXY_EXHAUSTED,
+            FailureCategory.PROXY_AUTH_FAILED,
+        ],
+    )
+    async def test_a_429_followed_only_by_no_answer_failures_ends_rate_limited(
+        self, tenant, worker, category
+    ):
+        """Round 71 — live: L1 got 429, L2/L3 died on free proxies, and the
+        URL ended browser_crash. The site's last word was the 429."""
+        before = datetime.now(UTC)
+        result = await self._run(
+            worker,
+            tenant,
+            [
+                self._limited(1, source=None, retry_after=45),
+                self._no_answer(2, FailureCategory.BROWSER_CRASH),
+                self._no_answer(3, category),
+            ],
+        )
+        after = datetime.now(UTC)
+
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.http_status == 429
+        assert result.block_reason == "status:429"
+        assert result.error_message == (
+            "HTTP 429 (rate limited) at L1 via direct — later levels got no answer "
+            f"from the site: L3 {category.value}: {category.value} at L3"
+        )
+        args = worker._dlq.enqueue.await_args.args
+        assert args[3] == FailureCategory.RATE_LIMITED
+        not_before = worker._dlq.enqueue.await_args.kwargs["retry_not_before"]
+        assert before + timedelta(seconds=45) <= not_before <= after + timedelta(seconds=45)
+
+    @pytest.mark.asyncio
+    async def test_a_success_shaped_429_at_a_middle_level_counts_as_the_answer(
+        self, tenant, worker
+    ):
+        """The L2 browser shape: success=True with the real 429 status."""
+        page = self._ok(2).model_copy(update={"http_status": 429, "html": ""})
+        result = await self._run(
+            worker,
+            tenant,
+            [
+                self._no_answer(1, FailureCategory.NETWORK_TIMEOUT),
+                page,
+                self._no_answer(3, FailureCategory.PROXY_EXHAUSTED),
+            ],
+        )
+
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        assert result.error_message.startswith("HTTP 429 (rate limited) at L2 via pool")
+
+    @pytest.mark.asyncio
+    async def test_a_no_answer_failure_without_a_message(self, tenant, worker):
+        crashed = self._no_answer(3, FailureCategory.BROWSER_CRASH).model_copy(
+            update={"error_message": None}
+        )
+        result = await self._run(
+            worker,
+            tenant,
+            [self._limited(1), self._no_answer(2, FailureCategory.NETWORK_TIMEOUT), crashed],
+        )
+
+        assert result.error_message == (
+            "HTTP 429 (rate limited) at L1 via pool — later levels got no answer "
+            "from the site: L3 browser_crash"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_later_site_answer_replaces_the_429(self, tenant, worker):
+        """L2 heard a 403 after L1's 429: the 429 is no longer the site's
+        last word, so the last level's own failure stands."""
+        refused = self._limited(2).model_copy(
+            update={"http_status": 403, "failure_category": FailureCategory.DETECTION_BLOCK}
+        )
+        result = await self._run(
+            worker,
+            tenant,
+            [self._limited(1), refused, self._no_answer(3, FailureCategory.BROWSER_CRASH)],
+        )
+
+        assert result.failure_category == FailureCategory.BROWSER_CRASH
+        assert result.http_status is None
+        assert worker._dlq.enqueue.await_args.kwargs["retry_not_before"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_answer_failures_without_a_429_are_unchanged(self, tenant, worker):
+        result = await self._run(
+            worker,
+            tenant,
+            [self._no_answer(level, FailureCategory.BROWSER_CRASH) for level in (1, 2, 3)],
+        )
+
+        assert result.failure_category == FailureCategory.BROWSER_CRASH
+        assert result.error_message == "browser_crash at L3"
+
     @pytest.mark.asyncio
     async def test_retry_after_becomes_the_dlq_retry_not_before(self, tenant, worker):
         before = datetime.now(UTC)

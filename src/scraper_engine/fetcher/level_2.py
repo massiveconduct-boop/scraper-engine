@@ -14,6 +14,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
+from scraper_engine.browser._botasaurus_main_document import DocumentAnswer
 from scraper_engine.browser.camoufox_wrapper import CamoufoxWrapper
 from scraper_engine.core.models import FailureCategory
 from scraper_engine.core.ssrf_guard import SSRFGuard
@@ -24,7 +25,11 @@ from scraper_engine.fetcher._content_utils import (
     poll_until_solved,
     safe_content,
 )
-from scraper_engine.fetcher._failure import classify_fetch_exception, retry_after_for
+from scraper_engine.fetcher._failure import (
+    classify_fetch_exception,
+    classify_http_status,
+    retry_after_for,
+)
 from scraper_engine.fetcher.challenge_detector import ChallengeDetector
 
 from .result import FetchResult
@@ -142,6 +147,35 @@ class Level2Fetcher:
         # network_events below stays None) when that toggle is off, so this
         # is a harmless no-op pass-through by default.
         network_events: list[dict[str, object]] = []
+        # Round 71 — the main document's real status and headers, always
+        # captured (browser/_botasaurus_main_document.py). None = not seen.
+        answer = DocumentAnswer()
+
+        def _rate_limited(html: str) -> FetchResult | None:
+            """A 429 is the site limiting this exit IP: Camoufox on the same
+            proxy would only ask again. Report it (with its Retry-After) for
+            worker.py to escalate or rotate, instead of falling back."""
+            if classify_http_status(answer.status or 200) != FailureCategory.RATE_LIMITED:
+                return None
+            assert answer.status is not None
+            logger.warning(
+                "l2_botasaurus_rate_limited elapsed_ms=%d url=%s",
+                int((time.monotonic() - start) * 1000),
+                url,
+            )
+            return FetchResult(
+                engine="botasaurus",
+                url=url,
+                success=True,
+                http_status=answer.status,
+                html=html,
+                level_used=2,
+                proxy_used=proxy.key(),
+                duration_ms=int((time.monotonic() - start) * 1000),
+                network_events=network_events or None,
+                retry_after_seconds=retry_after_for(answer.status, answer.headers),
+            )
+
         try:
             if self._botasaurus_pool is not None:
                 html = await self._botasaurus_pool.fetch(
@@ -152,6 +186,7 @@ class Level2Fetcher:
                     scroll_passes=self._scroll_passes,
                     scroll_wait_ms=self._scroll_wait_ms,
                     events_sink=network_events,
+                    answer=answer,
                 )
             else:
                 html = await self._botasaurus.fetch_html(
@@ -162,6 +197,7 @@ class Level2Fetcher:
                     scroll_passes=self._scroll_passes,
                     scroll_wait_ms=self._scroll_wait_ms,
                     events_sink=network_events,
+                    answer=answer,
                 )
         except (Exception, SystemExit) as exc:
             # Round 40 — live-caught: botasaurus_driver's own proxy-auth
@@ -180,6 +216,11 @@ class Level2Fetcher:
             # Round 64 — logged. This fallback was silent: a live Jumia run
             # spent 80-360s per URL at L2 and nothing said whether Botasaurus
             # was failing, how, or how long it took before Camoufox ran.
+            # Round 71 — an empty-bodied 429 leaves Chrome on chrome-error://
+            # (BotasaurusNavigationError) after the site answered.
+            limited = _rate_limited("")
+            if limited is not None:
+                return limited
             logger.warning(
                 "l2_botasaurus_fallback reason=exception:%s elapsed_ms=%d url=%s",
                 type(exc).__name__,
@@ -187,7 +228,15 @@ class Level2Fetcher:
                 url,
             )
             return None
-        reason = self._challenge_detector.challenge_reason(html, 200, short_page_is_suspect=False)
+        limited = _rate_limited(html)
+        if limited is not None:
+            return limited
+        # Round 71 — the real status, not a hardcoded 200: a 403 page with a
+        # body that did not read as a challenge was accepted as a success.
+        status = answer.status or 200
+        reason = self._challenge_detector.challenge_reason(
+            html, status, short_page_is_suspect=False
+        )
         if reason is not None:
             logger.warning(
                 "l2_botasaurus_fallback reason=%s elapsed_ms=%d url=%s",
@@ -200,7 +249,7 @@ class Level2Fetcher:
             engine="botasaurus",
             url=url,
             success=True,
-            http_status=200,
+            http_status=status,
             html=html,
             level_used=2,
             proxy_used=proxy.key(),

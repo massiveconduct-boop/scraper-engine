@@ -6,7 +6,7 @@ nothing exercised _fetch_via_camoufox, _fetch_via_raw_playwright, or the
 pool branch of _fetch_via_botasaurus."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -142,6 +142,92 @@ class TestFetchViaBotasaurus:
         assert result.html == _REAL_HTML
         botasaurus_pool.fetch.assert_awaited_once()
 
+    @staticmethod
+    def _pool_answering(status, headers=None, html=_REAL_HTML, exc=None):
+        """Round 71 — a Botasaurus pool whose fetch saw the main document
+        answer `status` (as the CDP hook records it) before returning."""
+        pool = AsyncMock()
+
+        async def fetch(*_a, answer=None, **_k):
+            if status is not None:
+                answer.status = status
+                answer.headers = headers or {}
+            if exc is not None:
+                raise exc
+            return html
+
+        pool.fetch.side_effect = fetch
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_a_429_page_is_reported_not_retried_in_camoufox(self):
+        """Round 71 — a 429 with a body used to come back as a 200 success
+        (hardcoded status) or fall back to Camoufox on the same exit IP."""
+        pool = self._pool_answering(429, {"retry-after": "33"})
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is not None
+        assert result.engine == "botasaurus"
+        assert result.http_status == 429
+        assert result.html == _REAL_HTML
+        assert result.retry_after_seconds == 33
+
+    @pytest.mark.asyncio
+    async def test_an_empty_429_that_fails_navigation_is_reported(self):
+        """Live: an empty-bodied 429 leaves Chrome on chrome-error://."""
+        pool = self._pool_answering(429, exc=RuntimeError("chrome-error://chromewebdata/"))
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is not None
+        assert result.http_status == 429
+        assert result.html == ""
+        assert result.retry_after_seconds is None
+
+    @pytest.mark.asyncio
+    async def test_a_403_page_falls_back_with_its_real_status(self):
+        """Round 71 — a 403 whose body did not read as a challenge was
+        accepted as a 200 success. With the real status it is a block, and
+        Camoufox (a different fingerprint) gets its chance as before."""
+        pool = self._pool_answering(403)
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_other_failures_still_fall_back(self):
+        pool = self._pool_answering(None, exc=RuntimeError("net::ERR_PROXY_CONNECTION_FAILED"))
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_a_real_status_is_reported(self):
+        pool = self._pool_answering(203)
+        fetcher = Level2Fetcher(botasaurus=MagicMock(), botasaurus_pool=pool)
+
+        result = await fetcher._fetch_via_botasaurus(
+            "http://example.com", TenantId("system"), _proxy()
+        )
+
+        assert result is not None
+        assert result.http_status == 203
+
     @pytest.mark.asyncio
     async def test_system_exit_from_botasaurus_falls_back_to_camoufox(self):
         """Round 40 — live-caught: botasaurus_driver's proxy-auth helper
@@ -185,6 +271,7 @@ class TestFetchViaBotasaurus:
             scroll_passes=4,
             scroll_wait_ms=750,
             events_sink=[],
+            answer=ANY,
         )
 
     @pytest.mark.asyncio
@@ -204,6 +291,7 @@ class TestFetchViaBotasaurus:
             scroll_passes=4,
             scroll_wait_ms=750,
             events_sink=[],
+            answer=ANY,
         )
 
     @pytest.mark.asyncio

@@ -32,6 +32,53 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 71)
+
+Origin: user, closing round 70's two open threads. Test tenant `ratelimit70`
+dropped (no drop-tenant command exists: schema + `public.api_keys` +
+`public.tenants` + Redis `quota:daily:*:<slug>`).
+
+- **A 429 outranks a later no-answer failure.** Round 70 live runs ended
+  `browser_crash` / `proxy_exhausted` after L1 got 429. `_terminal_rate_limit`
+  (worker.py) now makes such a URL `rate_limited` with the 429's status,
+  route and Retry-After, and the message says
+  `— later levels got no answer from the site: L<n> <category>: …`. It is
+  called from both exits. The first version sat only in the for/else branch
+  and missed `proxy_exhausted`, which leaves through the mid-ladder DLQ break.
+  A later site answer (e.g. 403) replaces the 429.
+- **Botasaurus had no real status at all.** `http_status=200` was hardcoded,
+  because the sync Driver API returns HTML only. Live in worker-l2 (local
+  stub, no proxy):
+  - a 429 with a body rendered normally, so it would have been a 200 success;
+  - an empty 429 left Chrome on `chrome-error://`, which triggered a Camoufox
+    relaunch.
+
+  `_botasaurus_main_document.register_main_document_capture` records the main
+  document's response (CDP `Network.responseReceived`, `type_` Document,
+  `frame_id` == `driver._tab.target.target_id`; an iframe's Document has its
+  own frame id, verified live). It is always on, in both the pool and the
+  wrapper.
+
+  L2 now returns a Botasaurus 429 directly, with Retry-After and without
+  Camoufox. Other statuses are reported as they really are, so a 403 page
+  falls back as a block.
+
+  Live via `Level2Fetcher._fetch_via_botasaurus`: body 429 →
+  `status=429 retry_after=33`; empty 429 → `status=429 retry_after=77`;
+  body 403 → Camoufox fallback.
+- **Live jobs** (free pool, workers `DATAIMPULSE_ENABLED=false`, temp tenant
+  `ratelimit71`, since dropped):
+  - `4a0e5db9-d6bf-4782-b69b-feb6f8c076ad` and
+    `535b1e41-d081-4607-88c8-d37d07949a7e`: all 7 httpbin 429 URLs ended
+    `rate_limited`, with L2 escalations
+    `engine=botasaurus, reason=status:429, http_status=429`.
+  - `?b=3` hit the new rule: `HTTP 429 (rate limited) at L2 via pool — later
+    levels got no answer from the site: L3 browser_crash: Page.goto:
+    NS_ERROR_PROXY_TOO_MANY_REQUESTS …` (the proxy's own refusal, not the site's).
+- **Open:** none from round 70. `driver._tab` is a private Botasaurus
+  attribute; if an upgrade renames it, capture silently records nothing and
+  L2 falls back to its old 200 default (the hook swallows errors).
+
 ## Technical Debt / Open Threads (as of round 70)
 
 Origin: research_agent brief `to-scraper-engine-2026-09-25-rate-limited.md`

@@ -491,7 +491,8 @@ class TestBotasaurusPool:
                 events_sink=events_sink,
             )
         driver.before_request_sent.assert_called_once()
-        driver.after_response_received.assert_called_once()
+        # Round 71 — plus the always-on main-document hook.
+        assert driver.after_response_received.call_count == 2
 
     @pytest.mark.asyncio
     async def test_network_capture_not_registered_by_default(self):
@@ -507,7 +508,8 @@ class TestBotasaurusPool:
                 events_sink=events_sink,
             )
         driver.before_request_sent.assert_not_called()
-        driver.after_response_received.assert_not_called()
+        # Round 71 — only the always-on main-document hook.
+        driver.after_response_received.assert_called_once()
 
 
 class TestMultiDriverPool:

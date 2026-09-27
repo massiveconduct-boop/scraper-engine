@@ -34,7 +34,7 @@ class TestBotasaurusWrapper:
             assert budget.BROWSER_SEMAPHORE.locked() is False
             html = await wrapper.fetch_html(URL, proxy=_proxy(), tenant_id=TENANT)
         assert html == "<html>ok</html>"
-        fetch.assert_called_once_with(URL, _proxy().auth_url(), None, 0, 1500, None)
+        fetch.assert_called_once_with(URL, _proxy().auth_url(), None, 0, 1500, None, None)
         # Released after the call, not held open
         assert budget.BROWSER_SEMAPHORE.locked() is False
 
@@ -56,7 +56,7 @@ class TestBotasaurusWrapper:
         with patch.object(wrapper, "_botasaurus_fetch", return_value="<html>ok</html>") as fetch:
             await wrapper.fetch_html(URL, proxy=gateway_proxy, tenant_id=TENANT)
         fetch.assert_called_once_with(
-            URL, "http://user123:pass456@gw.dataimpulse.com:823", None, 0, 1500, None
+            URL, "http://user123:pass456@gw.dataimpulse.com:823", None, 0, 1500, None, None
         )
 
     def test_parallel_always_forced_to_one(self):
@@ -252,6 +252,16 @@ class TestBotasaurusWrapper:
         assert any(name == "before_request_sent" for name, _args in calls)
         assert any(name == "after_response_received" for name, _args in calls)
 
+    def test_main_document_capture_registered_when_an_answer_is_given(self):
+        """Round 71 — always on: the real status of Botasaurus's page."""
+        from scraper_engine.browser._botasaurus_main_document import DocumentAnswer
+
+        wrapper = BotasaurusWrapper()
+        _captured, calls, fake_browser = self._fake_browser_harness()
+        with patch("botasaurus.browser.browser", side_effect=fake_browser):
+            wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None, answer=DocumentAnswer())
+        assert [name for name, _ in calls].count("after_response_received") == 1
+
     def test_network_capture_not_registered_by_default(self):
         wrapper = BotasaurusWrapper()
         _captured, calls, fake_browser = self._fake_browser_harness()
@@ -337,9 +347,7 @@ class TestBotasaurusWrapper:
         captured, _calls, fake_browser = self._fake_browser_harness()
         with (
             patch("botasaurus.browser.browser", side_effect=fake_browser),
-            patch(
-                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
-            ) as autoscroll,
+            patch("scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll") as autoscroll,
         ):
             wrapper._botasaurus_fetch(
                 URL, "http://1.2.3.4:8080", None, scroll_passes=3, scroll_wait_ms=250
@@ -356,9 +364,7 @@ class TestBotasaurusWrapper:
         captured, _calls, fake_browser = self._fake_browser_harness()
         with (
             patch("botasaurus.browser.browser", side_effect=fake_browser),
-            patch(
-                "scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll"
-            ) as autoscroll,
+            patch("scraper_engine.browser._botasaurus_scroll.botasaurus_autoscroll") as autoscroll,
         ):
             wrapper._botasaurus_fetch(URL, "http://1.2.3.4:8080", None)
         autoscroll.assert_not_called()
