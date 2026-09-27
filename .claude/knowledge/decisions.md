@@ -38,7 +38,8 @@ field); the real last level is in the prefix and in `escalations`.
 **Alternatives rejected:**
 - A `rate_limited` category for 429. Proposed to the user instead, because
   research_agent reads `failure_category` and a new value is a contract
-  change.
+  change. (Adopted round 70 — see "A 429 Is Rate Limiting, Not a Bot
+  Verdict".)
 - New DB columns (a schema re-emit for two diagnostics).
 - Rewording `_GATEWAY_REFUSED_MESSAGE` (research_agent greps it).
 
@@ -3714,7 +3715,8 @@ escalates, rotates the gateway exit IP and gets the gateway block retry
 exactly like a 403 (`worker.py::_BLOCK_CATEGORIES`), because a new exit IP is
 what clears a per-IP limit. After it, the DLQ reaper re-drives it: no sooner
 than 60s × 2^n after it failed, no sooner than the site's `Retry-After`
-(parsed at L1 and Camoufox L2/L3, capped at an hour, stored as
+(parsed at L1 and Camoufox L2/L3 — and Botasaurus L2 since round 71 —
+capped at an hour, stored as
 `dead_letter_queue.retry_not_before`), and never into an open circuit.
 
 **Why:** research_agent could not tell "slow down" from "you're a bot", and

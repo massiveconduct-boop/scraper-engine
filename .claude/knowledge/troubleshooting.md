@@ -718,6 +718,12 @@ check (`reason`), the HTTP status, the L2 engine, and the proxy source.
   `access denied`) matched the site's own markup — a detector false
   positive to fix there, with the captured HTML as the regression test.
 - `js_gated`: an SPA shell; escalation to a browser is correct.
+- `status:429`: rate limiting, not a bot verdict (round 70). It escalates
+  like a block but ends `rate_limited`, which the DLQ reaper re-drives after
+  the site's `Retry-After`. A message ending `— later levels got no answer
+  from the site: L<n> <category>: …` means L<n> failed on its own (proxy,
+  network, browser) after an earlier 429 (round 71). Botasaurus 429s show as
+  `engine=botasaurus, reason=status:429` with no Camoufox attempt after.
 
 - A slow L2 with no rejection at all: grep the worker log for
   `l2_botasaurus_fallback` — Botasaurus failing inside L2 (e.g.

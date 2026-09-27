@@ -54,7 +54,11 @@ for `detection_block` and `rate_limited` (round 70: a terminal 429) a
 `<what> at L<n> via <route>` (`_describe_block`); and, when an eligible
 `free_first` gateway use was refused anywhere on the URL's path, the
 `paid_gateway_skipped` flag plus the refusal note (`_note_gateway_skipped`;
-research_agent matches `_GATEWAY_REFUSED_MARKER`). Both new fields are stored
+research_agent matches `_GATEWAY_REFUSED_MARKER`). Round 71: when the last
+level fails without hearing from the site (`browser_crash`/`network_timeout`/
+`proxy_exhausted`/`proxy_auth_failed`) and the site's last answer was a 429,
+`_terminal_rate_limit` makes the URL `rate_limited` instead, at both exits
+(for/else and the mid-ladder DLQ break). Both new fields are stored
 inside the `timings` JSONB beside `escalations`, no column of their own. The
 one-line meaning of every `failure_category`, for outside readers:
 `docs/reference/api-reference.md` → "Failure categories".
@@ -220,7 +224,11 @@ thread" paragraph, before extending either one.
 
 **Transient DLQ auto-retry.** `proxy/dlq_reaper.py` (own daemon, same
 shape) polls `DeadLetterQueue.list_retryable()` per tenant every 60s for
-`TRANSIENT_FAILURE_CATEGORIES` entries under their retry cap, checks
+entries in its own `_TRANSIENT_CATEGORIES` (broader than `worker.py`'s
+`TRANSIENT_FAILURE_CATEGORIES`; since round 70 incl. `RATE_LIMITED`, which
+also waits `dead_letter_queue.retry_not_before` — the site's capped
+`Retry-After`, migration 012 — and never re-drives into an OPEN circuit)
+under their retry cap, checks
 eligibility by reading current state (never mutating it — see
 `decisions.md` for why `CircuitBreaker.state()` not `allow_request()`),
 and re-enqueues the *same* `job_id` via the rq producer
@@ -1167,6 +1175,16 @@ returning the new `network_events` column, and reused-driver fetches
 silently dropping network-event capture into a dead first-call list
 (CDP hooks are tab-scoped, registered once at launch — fixed with a
 redirect indirection).
+
+**Real main-document status (Round 71).**
+`browser/_botasaurus_main_document.py::register_main_document_capture`
+(always on, pool and wrapper) records the main document's status and headers
+from CDP `Network.responseReceived` (type Document, `frame_id` ==
+`driver._tab.target.target_id`), so Botasaurus results carry the real
+`http_status` instead of a hardcoded 200. A Botasaurus 429 is returned
+directly with its Retry-After (no Camoufox fallback); other block statuses
+fall back to Camoufox with the real status. If an upgrade renames the private
+`driver._tab`, capture silently records nothing and the old 200 default returns.
 
 Full detail for rounds 57-60: `.claude/knowledge/technical-debt.md`'s
 per-round entries.
