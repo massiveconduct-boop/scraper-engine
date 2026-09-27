@@ -78,8 +78,8 @@ openwolf cron        # cron task management
   host, `display_lock_wait_ms` (66), parked browsers keeping their host
   seat, measured browser weight (67), a refused gateway out of use for
   every worker, `free_first` falling back to the pool (68),
-  self-describing failures (69), `rate_limited` for a 429 (70), a 429 outranking later no-answer
-  failures and Botasaurus reporting real status (71).
+  self-describing failures (69), `rate_limited` for a 429 (70),
+  Botasaurus status (71).
   Current design, topic-organized: `.claude/knowledge/architecture.md`.
   Full chronological history, every bug, every root cause:
   `.claude/knowledge/technical-debt.md`. WHY each call was made:
