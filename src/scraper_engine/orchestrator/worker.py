@@ -92,6 +92,18 @@ _SAME_LEVEL_PROXY_RETRIES = 1  # one retry with a fresh proxy before giving up o
 # escalates, rotates the gateway exit IP and gets the gateway block retry
 # the same way; only the terminal label (and the DLQ reaper) tell them apart.
 _BLOCK_CATEGORIES = frozenset({FailureCategory.DETECTION_BLOCK, FailureCategory.RATE_LIMITED})
+# Round 71 — failures that carry no answer from the site: the browser, the
+# network or the proxy failed before the site said anything. When a URL's
+# last level ends this way after an earlier level was rate-limited, the
+# site's last word was the 429, and that is the URL's terminal answer.
+_NO_SITE_ANSWER_CATEGORIES = frozenset(
+    {
+        FailureCategory.BROWSER_CRASH,
+        FailureCategory.NETWORK_TIMEOUT,
+        FailureCategory.PROXY_EXHAUSTED,
+        FailureCategory.PROXY_AUTH_FAILED,
+    }
+)
 _GATEWAY_ROTATE_CATEGORIES = _BLOCK_CATEGORIES
 
 # Round 68 — why a URL did not go out through the paid gateway while it is
@@ -132,6 +144,17 @@ _BLOCK_STATUS_MEANING = {
     410: "gone, or a block shaped like it",
     429: "rate limited",
 }
+
+
+def _retry_not_before(terminal: FetchResult) -> datetime | None:
+    """Round 70 — a terminal 429's Retry-After, if the site sent one, holds
+    the DLQ reaper's re-drive back until then. None for anything else."""
+    if (
+        terminal.failure_category != FailureCategory.RATE_LIMITED
+        or terminal.retry_after_seconds is None
+    ):
+        return None
+    return datetime.now(UTC) + timedelta(seconds=terminal.retry_after_seconds)
 
 
 def _describe_block(terminal: FetchResult, last: FetchResult) -> None:
@@ -504,6 +527,9 @@ class Worker:
             display_wait = start_display_wait_meter()
 
             escalations: list[dict[str, Any]] = []
+            # Round 71 — the most recent rejected attempt the site answered
+            # (any HTTP status). See _NO_SITE_ANSWER_CATEGORIES.
+            last_site_answer: list[FetchResult] = []
 
             def _finish(result: FetchResult) -> FetchResult:
                 """Stamp the accumulated timings onto a terminal result."""
@@ -516,8 +542,41 @@ class Worker:
                 result.escalations = list(escalations) or None
                 return result
 
+            def _terminal_rate_limit(failed: FetchResult, level: int) -> FetchResult | None:
+                """Round 71 — the URL's terminal result when `failed` carries no
+                answer from the site (_NO_SITE_ANSWER_CATEGORIES) and the last
+                answer the site did give was a 429; else None. Live: L1 got
+                429, L2/L3 died on free proxies, and the URL ended
+                browser_crash / proxy_exhausted, hiding the rate limit."""
+                category = failed.failure_category
+                if category not in _NO_SITE_ANSWER_CATEGORIES or not last_site_answer:
+                    return None
+                answer = last_site_answer[0]
+                if classify_http_status(answer.http_status or 0) != FailureCategory.RATE_LIMITED:
+                    return None
+                terminal = FetchResult(
+                    url=url_str,
+                    success=False,
+                    level_used=level,
+                    duration_ms=0,
+                    failure_category=FailureCategory.RATE_LIMITED,
+                    error_message=(
+                        f"later levels got no answer from the site: "
+                        f"L{failed.level_used} {category.value}"
+                        + (f": {failed.error_message}" if failed.error_message else "")
+                    ),
+                    proxy_source=answer.proxy_source,
+                    http_status=answer.http_status,
+                    is_challenge_page=answer.is_challenge_page,
+                    retry_after_seconds=answer.retry_after_seconds,
+                )
+                _describe_block(terminal, answer)
+                return terminal
+
             def _reject(level: int, result: FetchResult, reason: str) -> None:
                 """Record why `level` did not produce this URL's answer (round 64)."""
+                if result.http_status is not None:
+                    last_site_answer[:] = [result]
                 entry = {
                     "level": level,
                     "reason": reason,
@@ -1083,6 +1142,11 @@ class Worker:
                         if category is not None and (
                             category in DLQ_ELIGIBLE_CATEGORIES or gateway_refused
                         ):
+                            # Round 71 — e.g. an exhausted pool at L3 after a
+                            # 429 at L1: the 429 is the URL's answer.
+                            limited = _terminal_rate_limit(result, level)
+                            if limited is not None:
+                                result, category = limited, FailureCategory.RATE_LIMITED
                             _note_gateway_skipped(result, gateway_skipped)
                             await self._dlq.enqueue(
                                 tenant_id,
@@ -1091,6 +1155,7 @@ class Worker:
                                 category,
                                 result.error_message or "",
                                 level,
+                                retry_not_before=_retry_not_before(result),
                             )
                             errors.append(result.error_message or "DLQ")
                             results[index] = _finish(result)
@@ -1157,22 +1222,19 @@ class Worker:
                         is_challenge_page=(
                             last_level_result.is_challenge_page if last_level_result else False
                         ),
+                        retry_after_seconds=(
+                            last_level_result.retry_after_seconds if last_level_result else None
+                        ),
                     )
-                    if (
-                        last_level_result is not None
-                        and real_category in _BLOCK_CATEGORIES
-                    ):
+                    if last_level_result is not None and real_category in _BLOCK_CATEGORIES:
                         _describe_block(exhausted_result, last_level_result)
+                    elif last_level_result is not None:
+                        limited = _terminal_rate_limit(last_level_result, url_levels[-1])
+                        if limited is not None:
+                            exhausted_result = limited
+                            real_category = FailureCategory.RATE_LIMITED
                     _note_gateway_skipped(exhausted_result, gateway_skipped)
                     real_message = exhausted_result.error_message or real_message
-                    # Round 70 — a 429's Retry-After, if the site sent one,
-                    # holds the DLQ reaper's re-drive back until then.
-                    retry_after = (
-                        last_level_result.retry_after_seconds
-                        if last_level_result is not None
-                        and real_category == FailureCategory.RATE_LIMITED
-                        else None
-                    )
                     await self._dlq.enqueue(
                         tenant_id,
                         job_id,
@@ -1180,11 +1242,7 @@ class Worker:
                         real_category,
                         real_message,
                         url_levels[-1],
-                        retry_not_before=(
-                            datetime.now(UTC) + timedelta(seconds=retry_after)
-                            if retry_after is not None
-                            else None
-                        ),
+                        retry_not_before=_retry_not_before(exhausted_result),
                     )
                     errors.append(real_message)
                     results[index] = _finish(exhausted_result)

@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING
 from scraper_engine.core import budget
 
 if TYPE_CHECKING:
+    from scraper_engine.browser._botasaurus_main_document import DocumentAnswer
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
 
@@ -122,6 +123,7 @@ class BotasaurusWrapper:
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
         events_sink: list[dict[str, object]] | None = None,
+        answer: DocumentAnswer | None = None,
     ) -> str:
         """Fetch HTML via Botasaurus, gated by the same global semaphore as Camoufox.
 
@@ -154,6 +156,7 @@ class BotasaurusWrapper:
                     scroll_passes,
                     scroll_wait_ms,
                     events_sink,
+                    answer,
                 )
         finally:
             budget.BROWSER_SEMAPHORE.release()
@@ -166,6 +169,7 @@ class BotasaurusWrapper:
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
         events_sink: list[dict[str, object]] | None = None,
+        answer: DocumentAnswer | None = None,
     ) -> str:
         """Synchronous Botasaurus fetch, run in executor — Botasaurus's driver
         management is Selenium-based (no native asyncio API to await on)."""
@@ -174,6 +178,9 @@ class BotasaurusWrapper:
         from botasaurus.window_size import WindowSize
 
         from scraper_engine.browser._botasaurus_extension import LocalExtension
+        from scraper_engine.browser._botasaurus_main_document import (
+            register_main_document_capture,
+        )
         from scraper_engine.browser._botasaurus_nav_check import raise_if_navigation_failed
         from scraper_engine.browser._botasaurus_network_capture import register_network_capture
         from scraper_engine.browser._botasaurus_scroll import botasaurus_autoscroll
@@ -229,6 +236,9 @@ class BotasaurusWrapper:
             captured_driver.append(driver)
             if capture_network_events and events_sink is not None:
                 register_network_capture(driver, events_sink)
+            # Round 71 — the main document's real status and headers.
+            if answer is not None:
+                register_main_document_capture(driver, answer)
             if humanize_mouse:
                 driver.enable_human_mode()
             # botasaurus's own decorator always calls the wrapped function as

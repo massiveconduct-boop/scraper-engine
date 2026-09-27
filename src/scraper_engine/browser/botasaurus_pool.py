@@ -47,6 +47,7 @@ from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
 from scraper_engine.core import budget
 
 if TYPE_CHECKING:
+    from scraper_engine.browser._botasaurus_main_document import DocumentAnswer
     from scraper_engine.config.schema import BotasaurusConfig
     from scraper_engine.core.models import Proxy
     from scraper_engine.core.tenant import TenantId
@@ -54,7 +55,16 @@ if TYPE_CHECKING:
 
 
 class _PooledDriver:
-    __slots__ = ("driver", "proxy_key", "domain", "busy", "last_used", "events_sink", "seat")
+    __slots__ = (
+        "driver",
+        "proxy_key",
+        "domain",
+        "busy",
+        "last_used",
+        "events_sink",
+        "answer",
+        "seat",
+    )
 
     def __init__(self, proxy_key: str, domain: str) -> None:
         # Round 67 — the host seat this driver holds while parked, or None
@@ -74,6 +84,9 @@ class _PooledDriver:
         # The hook reads this attribute at event time, so each fetch's events
         # land in that fetch's own list.
         self.events_sink: list[dict[str, object]] | None = None
+        # Round 71 — same per-fetch pattern for the main document's status
+        # and headers (browser/_botasaurus_main_document.py), always on.
+        self.answer: DocumentAnswer | None = None
 
 
 class BotasaurusPool:
@@ -120,6 +133,7 @@ class BotasaurusPool:
         scroll_passes: int = 0,
         scroll_wait_ms: int = 1500,
         events_sink: list[dict[str, object]] | None = None,
+        answer: DocumentAnswer | None = None,
     ) -> str:
         """Fetch `url` with a driver belonging to this exact (proxy identity,
         domain) pair — an idle pooled one if there is one, else a fresh launch.
@@ -135,6 +149,7 @@ class BotasaurusPool:
         loop = asyncio.get_running_loop()
         entry = await self._checkout(proxy.identity_key(), domain)
         entry.events_sink = events_sink
+        entry.answer = answer
         try:
             await budget.acquire_browser_permit()
             try:
@@ -264,6 +279,9 @@ class BotasaurusPool:
         from botasaurus.window_size import WindowSize
 
         from scraper_engine.browser._botasaurus_extension import LocalExtension
+        from scraper_engine.browser._botasaurus_main_document import (
+            register_main_document_capture,
+        )
         from scraper_engine.browser._botasaurus_network_capture import register_network_capture
 
         cfg = self._config
@@ -300,6 +318,7 @@ class BotasaurusPool:
             # inside so any failure here is caught by the except below.
             if cfg.capture_network_events:
                 register_network_capture(driver, lambda: entry.events_sink)
+            register_main_document_capture(driver, lambda: entry.answer)
             if cfg.humanize_mouse:
                 driver.enable_human_mode()
             if cfg.locale or cfg.timezone:
