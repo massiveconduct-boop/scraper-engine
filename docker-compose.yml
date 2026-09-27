@@ -55,6 +55,12 @@ services:
   worker-l1:
     restart: unless-stopped
     build: .
+    # A small init (tini) as PID 1 reaps processes whose parent is gone —
+    # rq itself does not, so each dead Chrome a job left became a permanent
+    # zombie. The hostname labels this worker in the worker_browser_processes
+    # gauge (core/leftover_processes.py).
+    init: true
+    hostname: worker-l1
     # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
     # this container (rq worker-pool), so a small job no longer waits for a
     # big one to finish before it can start. Only raise it together with
@@ -99,6 +105,8 @@ services:
   worker-l2:
     restart: unless-stopped
     build: .
+    init: true  # see worker-l1
+    hostname: worker-l2
     # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
     # this container (rq worker-pool), so a small job no longer waits for a
     # big one to finish before it can start. Only raise it together with
@@ -143,6 +151,8 @@ services:
   worker-l3:
     restart: unless-stopped
     build: .
+    init: true  # see worker-l1
+    hostname: worker-l3
     # Round 65 — RQ_WORKERS_PER_CONTAINER > 1 runs that many rq workers in
     # this container (rq worker-pool), so a small job no longer waits for a
     # big one to finish before it can start. Only raise it together with
@@ -320,11 +330,21 @@ services:
   # (no separate otel-collector needed). observability.otlp_endpoint points
   # every process here at it instead of the OTel default localhost:4317
   # (which resolves to the *calling container itself*, not this service).
+  # In-memory storage keeps every trace until restart unless capped: it
+  # reached 10.1 GB RSS + 1.5 GB swap in 4 days (2026-09-27). MEMORY_MAX_TRACES
+  # drops the oldest traces past the cap; mem_limit is the backstop. Measured
+  # ~70 KB of RSS per stored trace (491 traces = 36 MiB, the largest 1107
+  # spans), so 5000 traces is ~350 MB, about 10 hours of history. Pinned to
+  # the v1 release that was running (v1 is end-of-life; v2 is a different image
+  # and config format).
   jaeger:
     restart: unless-stopped
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/all-in-one:1.76.0
+    mem_limit: ${JAEGER_MEM_LIMIT:-1g}
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: ${JAEGER_MEMORY_MAX_TRACES:-5000}
     ports:
       - "${JAEGER_UI_PORT:-16686}:16686"        # UI
       - "${JAEGER_OTLP_GRPC_PORT:-4317}:4317"   # OTLP gRPC receiver

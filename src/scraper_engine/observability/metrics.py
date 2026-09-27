@@ -211,6 +211,23 @@ host_admission_wait_sum = Gauge(
     registry=REGISTRY,
 )
 
+# Written to Redis by core/leftover_processes.py at every job's start and end
+# (worker processes exit after each job), read here at scrape time.
+worker_browser_processes = Gauge(
+    "worker_browser_processes",
+    "Live browser processes in a worker container at its last job start or end "
+    "(chromium counts every Chrome process, renderers included)",
+    ["worker", "kind"],
+    registry=REGISTRY,
+)
+browser_processes_reaped_total = Gauge(
+    "browser_processes_reaped_total",
+    "Cumulative processes a job left running that the job-end or job-start "
+    "sweep had to kill (Redis-backed counter; should stay flat)",
+    ["kind"],
+    registry=REGISTRY,
+)
+
 job_duration_seconds_count = Gauge(
     "job_duration_seconds_count",
     "Cumulative count of completed scrape jobs per status (Redis-backed counter)",
@@ -315,6 +332,24 @@ async def refresh_redis_backed_counters(redis: RedisClient) -> None:
     # every other counter in this function, for the same reason: an
     # in-process Gauge in either of those processes would never reach this
     # one's REGISTRY.
+    # Leftover browser processes (core/leftover_processes.py). The gauge is
+    # rebuilt from the keys that still exist, so a worker whose key expired
+    # drops out instead of keeping its last count.
+    from scraper_engine.core.leftover_processes import (
+        GAUGE_KEY_PREFIX,
+        KINDS,
+        REAPED_KEY_PREFIX,
+    )
+
+    for kind in KINDS:
+        raw = await redis.raw.get(f"{REAPED_KEY_PREFIX}{kind}")
+        browser_processes_reaped_total.labels(kind=kind).set(float(raw) if raw else 0.0)
+    worker_browser_processes.clear()
+    async for key in redis.raw.scan_iter(match=f"{GAUGE_KEY_PREFIX}*"):
+        worker = key.removeprefix(GAUGE_KEY_PREFIX)
+        for proc_kind, count in (await redis.raw.hgetall(key)).items():
+            worker_browser_processes.labels(worker=worker, kind=proc_kind).set(float(count))
+
     pending_raw = await redis.raw.get("metrics:webhook_outbox_pending")
     webhook_outbox_pending.set(float(pending_raw) if pending_raw else 0.0)
     failures_raw = await redis.raw.get("metrics:webhook_delivery_failures_total")

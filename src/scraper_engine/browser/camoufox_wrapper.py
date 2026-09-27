@@ -297,12 +297,12 @@ class CamoufoxWrapper:
         instances, an idle event loop, zero log output, the job stalled
         mid-run until RQ's job timeout killed the work-horse.
 
-        A timeout here can leak an OS process. That is strictly the better
-        failure: a leaked browser costs memory on one worker until the
-        container recycles, while an unbounded wait costs every remaining URL
-        of every job that worker would ever run. The permit is released by
-        the caller's `finally` either way, which is what lets the job carry
-        on.
+        A timeout here leaves the browser process running until the job
+        ends, when orchestrator/tasks.py::run_scrape_job kills everything the
+        job left (core/leftover_processes.py). That is strictly the better
+        failure: an unbounded wait costs every remaining URL of the job. The
+        permit is released by the caller's `finally` either way, which is
+        what lets the job carry on.
         """
         try:
             async with asyncio.timeout(_BROWSER_TEARDOWN_TIMEOUT_SECONDS):
@@ -314,8 +314,8 @@ class CamoufoxWrapper:
             # would silently no-op on a Camoufox browser. Camoufox owns its own
             # virtual display (camoufox/virtdisplay.py), and a teardown we just
             # gave up on is exactly the case where we cannot reach into it
-            # safely. Leaking the display is the accepted cost; the log is the
-            # signal that it happened.
+            # safely. The job-end sweep kills the browser and its display; the
+            # log is the signal that it happened.
             logger.error(
                 "camoufox_teardown_timed_out_after_%ss proxy=%s — abandoning the browser "
                 "process and releasing its budget so the worker can keep running",

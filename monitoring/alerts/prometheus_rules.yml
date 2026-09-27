@@ -194,3 +194,30 @@ groups:
           description: "One of the (already small) pool of independent proxy sources appears to
             be dead. Check if it needs replacing per the round-6/6.1 diversity work — this is
             exactly the class of silent single-source failure that motivated that work."
+
+      # ── Leftover browser processes (core/leftover_processes.py) ──
+      # A job-end or job-start sweep had to kill processes a job did not
+      # close. The sweep stops the memory build-up, but each kill is a close
+      # path that still leaks — the worker log line
+      # `leftover_processes_killed` names the counts.
+      - alert: BrowserProcessesLeaked
+        expr: increase(browser_processes_reaped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jobs left {{ $value }} {{ $labels.kind }} processes running in the last hour"
+          description: "The sweep killed them, but some close path still leaks. Check worker
+            logs for leftover_processes_killed and botasaurus_close_failed."
+
+      # Counted at every job start and end. With one rq worker per container
+      # nothing should be left between jobs; a high count that stays means
+      # browsers are building up faster than jobs end.
+      - alert: WorkerBrowserProcessesHigh
+        expr: worker_browser_processes > 300
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.worker }} has {{ $value }} {{ $labels.kind }} processes"
+          description: "Browser processes are building up in this worker container. Compare
+            with its in-flight jobs; see core/leftover_processes.py."

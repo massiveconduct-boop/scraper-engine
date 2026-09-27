@@ -307,6 +307,7 @@ psutil==7.2.2
     # via
     #   botasaurus
     #   botasaurus-driver
+    #   scraper-engine (pyproject.toml)
 pycares==4.11.0
     # via aiodns
 pycparser==3.0

@@ -117,8 +117,33 @@ def _job_deadline() -> float | None:
 
 
 def run_scrape_job(tenant_id: str, job_id: str) -> None:
-    """Sync entry point rq calls. Runs the async pipeline to completion."""
-    asyncio.run(_run_scrape_job(tenant_id, job_id))
+    """Sync entry point rq calls. Runs the async pipeline to completion.
+
+    Inside an rq work-horse (one forked process per job) it also kills any
+    browser process a job left behind: orphans of earlier horses before the
+    job, everything still under this horse after it (see
+    core/leftover_processes.py). The job-end sweep sits in a `finally` so a
+    failed or timed-out job (rq's JobTimeoutException) is swept too.
+    """
+    from rq import get_current_job
+
+    from scraper_engine.core.leftover_processes import (
+        reap_descendants,
+        reap_orphaned_browsers,
+        sweep,
+    )
+
+    job = get_current_job()
+    if job is None:
+        # Not in a work-horse (tests, direct calls): this process's children
+        # are not the job's to kill.
+        asyncio.run(_run_scrape_job(tenant_id, job_id))
+        return
+    sweep(reap_orphaned_browsers, job.connection)
+    try:
+        asyncio.run(_run_scrape_job(tenant_id, job_id))
+    finally:
+        sweep(reap_descendants, job.connection)
 
 
 async def _run_scrape_job(tenant_id_raw: str, job_id: str) -> None:

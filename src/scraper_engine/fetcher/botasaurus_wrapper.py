@@ -276,9 +276,9 @@ class BotasaurusWrapper:
             return str(_fetch())
         finally:
             if captured_driver:
-                import contextlib
+                from scraper_engine.browser._botasaurus_close import finish_close
 
-                from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
-
-                with contextlib.suppress(Exception):
-                    cleanup_stale_display(captured_driver[0])
+                # The decorator's own close can fail partway (a dead Chrome
+                # makes tiny_profile's save_cookies raise first) and leave
+                # Chrome and Xvfb running; finish_close kills what is left.
+                finish_close(captured_driver[0])
