@@ -44,6 +44,10 @@ dependencies = [
     # Same "config exists, nothing enforces it" bug class as the rest of
     # this round; see .claude/knowledge/operations.md #12.
     "proxybroker2==2.0.0a4",
+    # Imported directly by core/leftover_processes.py (the job-end sweep of
+    # browser processes a job left running); was already a transitive dep
+    # of botasaurus. Same reasoning as botasaurus-requests above.
+    "psutil==7.2.2",
     "structlog==26.1.0",
     "prometheus-client==0.25.0",
     "pyyaml==6.0.3",

@@ -36,7 +36,7 @@ directly if this doc and reality ever disagree.
 | Prometheus | prom/prometheus:latest | 9090 | `PROMETHEUS_PORT` | Metrics collection + alert evaluation. Live `docker-compose.yml` service (previously config-only — `infra/prometheus/prometheus.yml` existed, git-tracked, but was never wired in) |
 | Alertmanager | prom/alertmanager:latest | 9093 | `ALERTMANAGER_PORT` | Alert routing to Slack (two-tier: default + paging-channel). Live `docker-compose.yml` service — same "config existed, never wired" story as Prometheus |
 | PgBouncer init | postgres:16-alpine | — | — | SCRAM userlist auto-regeneration |
-| Jaeger | jaegertracing/all-in-one:latest | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | `JAEGER_UI_PORT`, `JAEGER_OTLP_GRPC_PORT`, `JAEGER_OTLP_HTTP_PORT` | Distributed tracing backend — round 24 |
+| Jaeger | jaegertracing/all-in-one:1.76.0 (in-memory, capped — round 72) | 16686 (UI), 4317 (OTLP gRPC), 4318 (OTLP HTTP) | `JAEGER_UI_PORT`, `JAEGER_OTLP_GRPC_PORT`, `JAEGER_OTLP_HTTP_PORT` | Distributed tracing backend — round 24 |
 
 Every host-side port above is overridable via its env var (e.g. `API_PORT=8010 docker compose up -d`) or by setting it in `.env` — container-to-container traffic is unaffected since services address each other by service name, not host port. Ports shown are the defaults, unchanged from before this was made overridable.
 
@@ -195,6 +195,21 @@ Prometheus + Alertmanager are live `docker-compose.yml` services (round-N fix �
   "BatchSpanProcessor + fork()") rather than failing the job. Structured
   JSON logs (`observability.logging_level`) are independent of tracing and
   keep working even if Jaeger is down.
+- **Memory cap (round 72):** in-memory storage keeps at most
+  `MEMORY_MAX_TRACES` traces (default 5000, ~350 MB at a measured ~70 KB per
+  trace), with `mem_limit: 1g` as the backstop. Uncapped, it reached 10.1 GB
+  in 4 days. Only about the last 10 hours of traces are kept, so look up a
+  job's trace soon after it runs.
+
+### Browser processes in workers (round 72)
+- `worker_browser_processes{worker,kind}` is the count of live
+  chromium/Xvfb/camoufox/node processes in each worker container at its last
+  job start or end. With one rq worker per container it should be 0 between
+  jobs. `browser_processes_reaped_total{kind}` counts processes the job-end or
+  job-start sweep (`core/leftover_processes.py`) had to kill. It should stay
+  flat: each increase is a close path that still leaks. Look in the worker log
+  for `leftover_processes_killed` and `botasaurus_close_failed`.
+- By hand: `docker compose exec worker-l2 ps -eo pid,ppid,etimes,stat,comm | grep -Ei 'chrom|xvfb|camoufox'`.
 
 ---
 

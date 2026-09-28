@@ -32,6 +32,64 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 72)
+
+Origin: research_agent brief `to-scraper-engine-2026-09-28-memory-leaks.md`.
+Its live run was killed by the host's memory reaper (swap 8186/8191 MB).
+Two scraper_engine leaks held ~12.4 GB of the 24 GB host.
+
+- **Jaeger kept every trace in memory.** `all-in-one:latest` (v1.76.0) with
+  default in-memory storage and no cap reached 10.1 GB RSS + 1.5 GB swap in
+  4 days. Measured on the live instance: 491 traces = 36 MiB (~70 KB each,
+  largest 1107 spans). Compose now pins `1.76.0` and sets
+  `SPAN_STORAGE_TYPE=memory`, `MEMORY_MAX_TRACES=5000` (~350 MB, ~10 h of
+  history; `JAEGER_MEMORY_MAX_TRACES`) and `mem_limit: 1g`
+  (`JAEGER_MEM_LIMIT`). The startup log confirms `"MaxTraces":5000`. v1 is
+  end-of-life; moving to v2 (`jaegertracing/jaeger`, YAML config) is a
+  separate job.
+- **Workers kept browsers after jobs: 547 chromium + 120 Xvfb** across
+  three workers over 36 h, built up steadily. Old logs were gone (the
+  containers had been recreated). The rq failed registry had nothing recent.
+  Found live instead, in a throwaway worker container: with `tiny_profile`
+  (our default), `Driver.close()` calls `save_cookies()` over CDP BEFORE it
+  closes anything. When Chrome has died, that raises `[Errno 111] Connection
+  refused`, and the browser, the Xvfb display and the local auth proxy are
+  never closed. `BotasaurusPool._close_driver` suppressed the error, so this
+  failed silently. After a failed close, one live `Xvfb` and 9 zombie
+  `chromium` + 2 zombie `chrome_crashpad` processes were left. rq (PID 1 in
+  the container) never reaps an orphan, so each zombie stayed for good.
+  Fixes:
+  - `browser/_botasaurus_close.py`: `close_driver()` tries the normal close,
+    then `finish_close()` kills Chrome (SIGKILL + bounded wait), runs
+    `config.close()` (display + local proxy) if the close never got that far,
+    stops a display that is still up, and removes lock files. The pool uses
+    `close_driver`. The @browser decorator path
+    (`fetcher/botasaurus_wrapper.py`) uses `finish_close` in its `finally`.
+  - `core/leftover_processes.py`, called by `tasks.run_scrape_job` only inside
+    an rq work-horse. At job end, in a `finally` (so failed and timed-out jobs
+    are swept too), it kills every live process still under the horse. At job
+    start it kills this user's browser processes whose parent is PID 1. That
+    covers rq's group kill of an overrunning horse, because Camoufox's Xvfb
+    uses `start_new_session`. `chrome_crashpad_handler` is skipped: Chrome
+    double-forks it, so its parent is PID 1 while its browser is alive, and it
+    exits with that browser (seen live). The job-end sweep also bounds
+    Camoufox's timed-out teardown (`_shutdown_browser_bounded`), which used to
+    be an "accepted leak until the container recycles".
+  - Compose workers: `init: true` (tini reaps zombies), `hostname: worker-lN`.
+  - Metrics: `worker_browser_processes{worker,kind}` (published to Redis at
+    every job start and end, 1-day TTL) and
+    `browser_processes_reaped_total{kind}`. Alerts: `BrowserProcessesLeaked`
+    and `WorkerBrowserProcessesHigh` (>300 for 30m).
+  - Verified live. `tests/live/test_botasaurus_close_live.py` passes with the
+    new close and fails with the old one (`assert {'xvfb': 1} == {}`). An
+    end-to-end rq job on a private queue leaked a real Driver on purpose:
+    the job-end sweep killed `{'xvfb': 1, 'chromium': 9}`, and 0 browser
+    processes were left in the container.
+- **Open:** a Botasaurus launch still running in an executor thread when its
+  fetch is cancelled has no owner until job end. The sweep bounds it to the
+  job's lifetime. Deploying this change (rebuild the 3 workers, recreate
+  Jaeger) waits for the user's go.
+
 ## Technical Debt / Open Threads (as of round 71)
 
 Origin: user, closing round 70's two open threads. Test tenant `ratelimit70`

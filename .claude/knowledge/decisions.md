@@ -3775,3 +3775,34 @@ proxy — a second browser launch to be told the same thing; escalation and the
 gateway rotation are what change the IP. A 403 can be about the fingerprint,
 where Camoufox (Firefox) is a genuinely different second opinion.
 
+
+## A Finished Job Owns No Processes; Jaeger Gets a Trace Cap (Round 72)
+
+**Decision 1 — close what botasaurus leaves, and also sweep at the job
+boundary.** A Botasaurus close that fails partway is now finished by hand
+(`browser/_botasaurus_close.py`). On top of that, the rq entry point kills
+every process still under the work-horse when the job ends, and orphaned
+browsers (parent PID 1) when a job starts (`core/leftover_processes.py`).
+
+**Why both:** the per-driver fix removes the leak that was found live (dead
+Chrome → `save_cookies` raises → nothing closed). But there are at least two
+other known ways a browser outlives its owner: a Camoufox teardown that times
+out (deliberately abandoned since round 63), and a launch still in an executor
+thread when its fetch is cancelled. More will come with library upgrades. rq
+forks one process per job, so "nothing under the horse after the job" is a
+rule that needs no knowledge of how a leak happened. The sweep logs and counts
+every kill, so a leak shows up as `browser_processes_reaped_total` going up
+instead of hiding behind the fix.
+
+**Rejected:** a timer that kills old browser processes by age (it cannot tell
+a leak from a long render), and restarting workers on a schedule (loses
+in-flight jobs and hides the cause).
+
+**Decision 2 — `init: true` on workers.** rq, as PID 1, never reaps an
+orphaned process, so every dead Chrome stayed as a zombie. tini reaps them.
+
+**Decision 3 — keep Jaeger v1 in-memory, capped.** Pin `1.76.0`,
+`MEMORY_MAX_TRACES=5000` (measured ~70 KB per trace), and `mem_limit: 1g` as
+the backstop. Badger with a TTL would keep more history on disk, but nothing
+reads old traces. v2 is a different image and config format, so moving to it
+is its own change.

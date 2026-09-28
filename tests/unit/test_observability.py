@@ -21,9 +21,18 @@ def _gauge(gauge, **labels):
     return (gauge.labels(**labels) if labels else gauge)._value.get()
 
 
-def _redis(values):
+def _redis(values, hashes=None):
+    hashes = hashes or {}
     redis = MagicMock()
     redis.raw.get = AsyncMock(side_effect=lambda key: values.get(key))
+
+    async def scan_iter(match):
+        for key in hashes:
+            if key.startswith(match.rstrip("*")):
+                yield key
+
+    redis.raw.scan_iter = scan_iter
+    redis.raw.hgetall = AsyncMock(side_effect=lambda key: hashes[key])
     return redis
 
 
@@ -111,6 +120,23 @@ class TestRefreshRedisBackedCounters:
         assert _gauge(metrics.job_duration_seconds_count, status="failed") == 0.0
         assert _gauge(metrics.webhook_outbox_pending) == 1.0
         assert _gauge(metrics.webhook_delivery_failures_total) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_browser_process_counts_are_copied_per_worker(self):
+        redis = _redis(
+            {"metrics:browser_processes_reaped_total:xvfb": "3"},
+            {"metrics:worker_browser_processes:worker-l2": {"chromium": "11", "xvfb": "1"}},
+        )
+        metrics.worker_browser_processes.labels(worker="gone-worker", kind="xvfb").set(9)
+        await metrics.refresh_redis_backed_counters(redis)
+        assert _gauge(metrics.browser_processes_reaped_total, kind="xvfb") == 3.0
+        assert _gauge(metrics.browser_processes_reaped_total, kind="chromium") == 0.0
+        assert _gauge(metrics.worker_browser_processes, worker="worker-l2", kind="chromium") == 11
+        assert _gauge(metrics.worker_browser_processes, worker="worker-l2", kind="xvfb") == 1
+        # A worker whose key expired is no longer reported.
+        samples = [s for m in metrics.worker_browser_processes.collect() for s in m.samples]
+        workers = {s.labels["worker"] for s in samples}
+        assert workers == {"worker-l2"}
 
 
 def test_get_logger_defaults_to_the_engine_name():

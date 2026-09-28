@@ -39,11 +39,10 @@ L2). Two more corrections in the same pass:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
-from scraper_engine.browser._xvfb_cleanup import cleanup_stale_display
+from scraper_engine.browser._botasaurus_close import close_driver
 from scraper_engine.core import budget
 
 if TYPE_CHECKING:
@@ -378,13 +377,10 @@ class BotasaurusPool:
         return True
 
     def _close_driver(self, driver: Any) -> None:
-        with contextlib.suppress(Exception):
-            driver.close()
-        # Round 41 — driver.close() SIGKILLs the Xvfb display without
-        # unlinking its lock/socket files (see browser/_xvfb_cleanup.py).
-        # Best-effort, never lets cleanup failure mask the real close above.
-        with contextlib.suppress(Exception):
-            cleanup_stale_display(driver)
+        # Driver.close() can fail partway and leave Chrome and its Xvfb
+        # display running; close_driver() kills what it left (see
+        # browser/_botasaurus_close.py), then removes the display's lock files.
+        close_driver(driver)
 
     async def shutdown(self) -> None:
         """Close every held driver — called once at job end, same bracket

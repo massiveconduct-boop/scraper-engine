@@ -367,6 +367,62 @@ def test_run_scrape_job_sync_wrapper_runs_the_coroutine(monkeypatch):
     assert called["args"] == ("system", "job-x")
 
 
+def _sweeps(monkeypatch, job):
+    """Record which sweeps run_scrape_job runs, with which Redis connection."""
+    from scraper_engine.core import leftover_processes
+
+    calls = []
+    monkeypatch.setattr("rq.get_current_job", lambda: job)
+    monkeypatch.setattr(
+        leftover_processes, "sweep", lambda reaper, redis: calls.append((reaper.__name__, redis))
+    )
+    return calls
+
+
+def test_run_scrape_job_in_a_work_horse_sweeps_before_and_after(monkeypatch):
+    """Browsers a job leaves running are killed when it ends (2026-09-28:
+    547 chromium + 120 Xvfb had built up across three workers)."""
+    job = MagicMock()
+    calls = _sweeps(monkeypatch, job)
+
+    async def fake_run_scrape_job(tenant_id, job_id):
+        calls.append(("job", None))
+
+    monkeypatch.setattr(tasks_module, "_run_scrape_job", fake_run_scrape_job)
+    tasks_module.run_scrape_job("system", "job-x")
+    assert calls == [
+        ("reap_orphaned_browsers", job.connection),
+        ("job", None),
+        ("reap_descendants", job.connection),
+    ]
+
+
+def test_run_scrape_job_sweeps_after_a_failed_or_timed_out_job(monkeypatch):
+    from rq.timeouts import JobTimeoutException
+
+    job = MagicMock()
+    calls = _sweeps(monkeypatch, job)
+
+    async def timed_out(tenant_id, job_id):
+        raise JobTimeoutException("Task exceeded maximum timeout value (600 seconds)")
+
+    monkeypatch.setattr(tasks_module, "_run_scrape_job", timed_out)
+    with pytest.raises(JobTimeoutException):
+        tasks_module.run_scrape_job("system", "job-x")
+    assert calls[-1] == ("reap_descendants", job.connection)
+
+
+def test_run_scrape_job_outside_a_work_horse_does_not_sweep(monkeypatch):
+    calls = _sweeps(monkeypatch, None)
+
+    async def fake_run_scrape_job(tenant_id, job_id):
+        return None
+
+    monkeypatch.setattr(tasks_module, "_run_scrape_job", fake_run_scrape_job)
+    tasks_module.run_scrape_job("system", "job-x")
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_run_scrape_job_metrics_update_failure_is_swallowed(fake_clients, monkeypatch):
     """The Redis-backed job_duration counter update is best-effort — a Redis
