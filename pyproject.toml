@@ -49,7 +49,7 @@ dependencies = [
     # of botasaurus. Same reasoning as botasaurus-requests above.
     "psutil==7.2.2",
     "structlog==26.1.0",
-    "prometheus-client==0.25.0",
+    "prometheus-client==0.26.0",
     "pyyaml==6.0.3",
     "boto3==1.43.52",
     "python-dotenv==1.2.2",
