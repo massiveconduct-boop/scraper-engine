@@ -547,12 +547,13 @@ def _timings_column(result: FetchResult) -> str | None:
     splits it back out onto `FetchResult.escalations`.
 
     Round 69 — `paid_gateway_skipped` and `block_reason` ride along the same
-    way, for the same reason.
+    way, for the same reason. Round 73 — so does `site_refused_recently`.
     """
     if (
         result.timings is None
         and not result.escalations
         and not result.paid_gateway_skipped
+        and not result.site_refused_recently
         and not result.block_reason
     ):
         return None
@@ -561,6 +562,8 @@ def _timings_column(result: FetchResult) -> str | None:
         payload["escalations"] = result.escalations
     if result.paid_gateway_skipped:
         payload["paid_gateway_skipped"] = True
+    if result.site_refused_recently:
+        payload["site_refused_recently"] = True
     if result.block_reason:
         payload["block_reason"] = result.block_reason
     return json.dumps(payload)

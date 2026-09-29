@@ -210,6 +210,18 @@ class ChallengeDetector:
 
         return None
 
+    def content_reason(self, html: str) -> str | None:
+        """challenge_reason() for the page alone — the HTTP status says nothing.
+
+        Round 73 — a 404/410 is final unless its BODY looks like a block. The
+        status check in challenge_reason() would answer `status:404` for every
+        404, which is the very question being asked. 200 is not a challenge
+        status, and the short-page check is off, so only the body's signatures
+        (challenge vendors, gateway-error pages, browser net-error pages) can
+        answer.
+        """
+        return self.challenge_reason(html, 200, short_page_is_suspect=False)
+
     # Markers that a page's real content is rendered client-side (JS-gated).
     _JS_REQUIRED_MARKERS: tuple[str, ...] = (
         "you need to enable javascript",

@@ -339,3 +339,17 @@ class TestChallengeReason:
             assert detector.is_challenge_page(html, status) == (
                 detector.challenge_reason(html, status) is not None
             )
+
+
+class TestContentReason:
+    """Round 73 — content_reason() judges the page alone, ignoring its status."""
+
+    def test_a_plain_page_has_no_reason(self):
+        assert ChallengeDetector().content_reason("<html>" + "Not here. " * 40 + "</html>") is None
+
+    def test_a_challenge_signature_is_named(self):
+        html = "<html>" + "please verify you are a human " * 5 + "</html>"
+        assert ChallengeDetector().content_reason(html).startswith("signature:")
+
+    def test_a_short_page_is_not_suspect_by_length(self):
+        assert ChallengeDetector().content_reason("<html>404</html>") is None

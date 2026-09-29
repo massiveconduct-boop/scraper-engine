@@ -672,6 +672,11 @@ class TestTimingsColumn:
         )
         assert json.loads(stored) == {"paid_gateway_skipped": True, "block_reason": "status:429"}
 
+    def test_site_refused_recently_rides_along(self):
+        """Round 73 — a site-memory failure carries its flag the same way."""
+        stored = tasks_module._timings_column(self._result(site_refused_recently=True))
+        assert json.loads(stored) == {"site_refused_recently": True}
+
 
 # --- Round 64: crawl proxy leasing -------------------------------------------
 

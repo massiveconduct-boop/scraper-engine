@@ -211,6 +211,11 @@ class FetchResult(BaseModel):
     # free-proxy refusal read as "this site blocks scrapers" when the route
     # that usually works was out of service.
     paid_gateway_skipped: bool | None = None
+    # Round 73 — True when this URL failed at once, without a fetch, because
+    # its site (registrable domain) refused every level a few minutes ago while
+    # the paid gateway was unavailable (orchestrator/level_memory.py). The
+    # other failure fields are the earlier refusal's, unchanged.
+    site_refused_recently: bool | None = None
     # Round 69 — on a terminal DETECTION_BLOCK or RATE_LIMITED, which check
     # said "blocked", in escalations' `reason` vocabulary ("status:403",
     # "status:429", "signature:cf-chl", "js_gated", ...). DETECTION_BLOCK

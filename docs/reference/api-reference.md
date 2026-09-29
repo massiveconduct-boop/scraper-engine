@@ -255,12 +255,17 @@ entry per level (or per same-level attempt) the engine rejected before the
 result you got, in order; `null` when the first attempt succeeded.
 `reason` is the exact check that fired — `status:403`,
 `signature:<text>` (a known challenge-page marker), `gateway_error`,
-`chromium_net_error`, `js_gated`, or `failure:<category>` — and `engine`
-names what produced it inside a level (`botasaurus` or `camoufox` at L2).
-When a free-pool proxy is blocked the engine retries that same level once
-through the paid gateway (if enabled) before moving up; that retry's time
-is `level_N_gateway_retry_ms` in `timings`, and the blocked attempt appears
-here with `proxy_source: "pool"`.
+`chromium_net_error`, `js_gated`, `site_refused_recently`, or
+`failure:<category>` — and `engine` names what produced it inside a level
+(`botasaurus` or `camoufox` at L2).
+When a free-pool proxy is blocked at L2 or L3 the engine retries that same
+level once through the paid gateway (if enabled and not refusing our
+credentials) before moving up; that retry's time is
+`level_N_gateway_retry_ms` in `timings`, and the blocked attempt appears
+here with `proxy_source: "pool"`. There is no such retry at L1 (it has no
+proxy path), and none when the gateway refuses the engine's login: the
+blocked attempt stands and the URL is flagged `paid_gateway_skipped`.
+A plain 404/410 page ends the URL at once (see `not_found` below).
 
 **Reading a failed result.** A failed URL's `error_message` says what
 happened. Two more fields help:
@@ -280,7 +285,20 @@ happened. Two more fields help:
   ends with `(paid gateway is refusing our credentials …)`, and callers may
   match on that exact text.
 
-Both fields are `null` when they don't apply. `http_status` is the last
+- **`site_refused_recently: true`** means the engine did not fetch this URL
+  at all: its site (registrable domain, so `www.nejm.org` and `nejm.org`
+  are one) refused every level for an earlier URL within the last 30
+  minutes (`escalation.site_refusal_ttl_seconds`), and the paid gateway
+  could not have changed that (it is disabled, or it was refusing the
+  engine's credentials). `failure_category`, `http_status`, `block_reason`
+  and `proxy_source` are the earlier refusal's, `escalations` holds one
+  `site_refused_recently` entry, and the message starts `<site> refused
+  every level recently — not retried: …`. Only a final-level
+  401/403/405 or bot-check page is remembered (never a 429, a 404, or
+  a failure that carried no site answer). The memory ends when the paid
+  gateway serves a URL again, or when a URL of the site succeeds.
+
+All three fields are `null` when they don't apply. `http_status` is the last
 attempt's real status, including on terminal blocks.
 
 **Failure categories.** One line each on what the category means, whose
@@ -289,7 +307,7 @@ doing it is, and whether the engine re-drives it by itself (see `GET
 
 | `failure_category` | Meaning | Whose doing | Auto-retried |
 |---|---|---|---|
-| `detection_block` | The site answered 401/403/404/405/410, or served a challenge / JavaScript-gated page, at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
+| `detection_block` | The site answered 401/403/405, or served a challenge / JavaScript-gated page (or a 404/410 shaped like a block: a stub body or a challenge signature), at every level tried (a page that renders with one of those statuses counts too). `block_reason` says which. With `site_refused_recently: true` it is an earlier URL's refusal, replayed without a fetch | Target site (maybe only towards free proxies: check `paid_gateway_skipped`) | No |
 | `rate_limited` | The site answered 429 ("too many requests"), and nothing later changed its answer: every later level either got 429 too or failed without hearing from the site (a proxy, network or browser failure; the message then ends `— later levels got no answer from the site: L<n> <category>: …`). `block_reason` is `status:429` | Target site, asking us to slow down (maybe per exit IP) | Yes, after a wait, and not before the site's `Retry-After` (capped at one hour) |
 | `circuit_open` | Too many recent failures on this domain; the engine is pausing it | Target site, by history | Yes, once the circuit closes |
 | `proxy_exhausted` | No usable proxy was available for the level | Ours (proxy supply) | Yes, when that pool tier is healthy |
@@ -304,7 +322,7 @@ doing it is, and whether the engine re-drives it by itself (see `GET
 | `dependency_unavailable` | The engine's own Redis failed during the fetch | Ours (infrastructure) | Yes, with backoff |
 | `parse_error` | Anything unexpected inside the engine while handling this URL | Ours (a bug) | No |
 | `captcha_triggered` | Defined but never assigned today: an unsolved CAPTCHA ends as `detection_block` (`block_reason` `signature:h-captcha`, …) | — | No |
-| `not_found` | Historical rows only (rounds 43-44); nothing assigns it now | — | No |
+| `not_found` | The site answered 404/410 with an ordinary error page (no challenge signature, at least 200 characters of body). Final at the level that saw it: no escalation, no gateway retry, no circuit failure. `block_reason` is `status:404` / `status:410`. Stub-bodied or challenge-looking 404s stay `detection_block` and still climb | Caller's URL (or a removed page) | No |
 
 **`partial_failure`:** `true` when `status` is `COMPLETED` but at least
 one URL in this job landed in the dead-letter queue alongside a
@@ -386,7 +404,7 @@ recent failure. A retried job keeps its original `job_id`, and only its
 not-yet-successful URLs are fetched again; poll `GET /v1/jobs/{job_id}` to
 see it move through `PENDING`/`PROCESSING` again. Every other
 `failure_category` (`ssrf_blocked`, `quota_exceeded`, `host_unreachable`,
-`detection_block`, `parse_error`, …) is never auto-retried.
+`detection_block`, `not_found`, `parse_error`, …) is never auto-retried.
 
 ---
 

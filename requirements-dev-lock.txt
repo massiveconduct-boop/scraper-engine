@@ -555,7 +555,9 @@ supervisor==4.3.0
 tld==0.13.2
     # via scrapling
 tldextract==5.3.1
-    # via scrapy
+    # via
+    #   scraper-engine (pyproject.toml)
+    #   scrapy
 tomli==2.4.1
     # via
     #   coverage

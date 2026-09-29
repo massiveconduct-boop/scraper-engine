@@ -234,3 +234,102 @@ class TestBotasaurusHint:
         )
         await memory.record_botasaurus_ok(TENANT, "a.example")
         redis.raw.delete.assert_awaited_once_with("levelhint:botafail:levelmem:a.example")
+
+
+class TestSiteRefusal:
+    """Round 73 — a site that refused every level, remembered briefly."""
+
+    @staticmethod
+    def _store(config: EscalationConfig | None = None):
+        memory, _ = _memory(config)
+        data: dict[str, str] = {}
+
+        async def _set(key, value, ex=None):
+            data[key] = value
+
+        async def _get(key):
+            return data.get(key)
+
+        async def _delete(key):
+            data.pop(key, None)
+
+        async def _incr(key):
+            data[key] = str(int(data.get(key, 0)) + 1)
+            return int(data[key])
+
+        memory._redis.raw.set = AsyncMock(side_effect=_set)
+        memory._redis.raw.get = AsyncMock(side_effect=_get)
+        memory._redis.raw.delete = AsyncMock(side_effect=_delete)
+        memory._redis.raw.incr = AsyncMock(side_effect=_incr)
+        return memory
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_refusal_reads_back_for_its_site_only(self):
+        memory = self._store()
+        await memory.record_site_refused(TENANT, "nejm.org", {"http_status": 403})
+
+        assert await memory.site_refusal(TENANT, "nejm.org") == {"http_status": 403}
+        assert await memory.site_refusal(TENANT, "other.org") is None
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_expires_after_its_ttl(self):
+        memory = self._store(EscalationConfig(site_refusal_ttl_seconds=90))
+        await memory.record_site_refused(TENANT, "nejm.org", {"http_status": 403})
+
+        assert memory._redis.raw.set.await_args.kwargs["ex"] == 90
+
+    @pytest.mark.asyncio
+    async def test_clear_forgets_it(self):
+        memory = self._store()
+        await memory.record_site_refused(TENANT, "nejm.org", {"http_status": 403})
+        await memory.clear_site_refusal(TENANT, "nejm.org")
+
+        assert await memory.site_refusal(TENANT, "nejm.org") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "config",
+        [
+            EscalationConfig(site_refusal_ttl_seconds=0),
+            EscalationConfig(level_memory_enabled=False),
+        ],
+    )
+    async def test_a_disabled_memory_does_nothing(self, config):
+        memory = self._store(config)
+        await memory.record_site_refused(TENANT, "nejm.org", {"http_status": 403})
+        await memory.clear_site_refusal(TENANT, "nejm.org")
+        await memory.bump_gateway_epoch()
+
+        assert await memory.site_refusal(TENANT, "nejm.org") is None
+        memory._redis.raw.set.assert_not_awaited()
+        memory._redis.raw.delete.assert_not_awaited()
+        memory._redis.raw.incr.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_redis_failures_are_swallowed(self):
+        memory = self._store()
+        boom = AsyncMock(side_effect=OSError("redis down"))
+        memory._redis.raw.set = boom
+        memory._redis.raw.get = boom
+        memory._redis.raw.incr = boom
+
+        await memory.record_site_refused(TENANT, "nejm.org", {})
+        await memory.bump_gateway_epoch()
+        assert await memory.site_refusal(TENANT, "nejm.org") is None
+        assert await memory.gateway_epoch() == "?"
+
+    @pytest.mark.asyncio
+    async def test_a_payload_that_is_not_a_refusal_is_ignored(self):
+        memory = self._store()
+        memory._redis.raw.get = AsyncMock(return_value="[1, 2]")
+
+        assert await memory.site_refusal(TENANT, "nejm.org") is None
+
+    @pytest.mark.asyncio
+    async def test_the_gateway_epoch_counts_gateway_successes(self):
+        memory = self._store()
+
+        assert await memory.gateway_epoch() == "0"
+        await memory.bump_gateway_epoch()
+        await memory.bump_gateway_epoch()
+        assert await memory.gateway_epoch() == "2"

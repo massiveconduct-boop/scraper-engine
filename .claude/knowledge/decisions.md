@@ -3806,3 +3806,30 @@ orphaned process, so every dead Chrome stayed as a zombie. tini reaps them.
 the backstop. Badger with a TTL would keep more history on disk, but nothing
 reads old traces. v2 is a different image and config format, so moving to it
 is its own change.
+
+## Round 73 — Fail Fast on Definitive Refusals
+
+Origin: research_agent brief `to-scraper-engine-2026-09-29-fail-fast.md`.
+
+**Decision 1 — a plain 404/410 is `not_found`, not `detection_block`.** The
+brief asked for it to stop escalating and stop being called a challenge page.
+`FailureCategory.NOT_FOUND` already existed (permanent DLQ), so no new enum
+value. "Plain" is judged on the body (>= 200 characters, no challenge
+signature) because round 45 found sites that answer a WAF block with a 404:
+those keep the climb. research_agent groups by `failure_category`; they were
+told the value changes for this case.
+
+**Decision 2 — the same-level "retry" is removed where it could not help.**
+It was the gateway block retry: identical request at L1, a second free-pool
+render at L2/L3 when the gateway login was refused. It stays at L2/L3 for a
+gateway that can answer (Jumia is why it exists, rounds 62-64).
+
+**Decision 3 — site memory ends on a gateway SUCCESS, not on a clock.** A
+refusal recorded while the gateway was out carries `gateway_epoch`; any
+gateway success moves the epoch. The 10-minute refusal verdict cannot be the
+key: it expires while the account is still empty, which would let every site
+climb again every 10 minutes.
+
+**Rejected:** a per-URL "same URL twice" cache (the site key covers it), and
+skipping L3 after an L2 403 with no memory of the site (no evidence a free
+L3 never wins, and it would cost real successes).

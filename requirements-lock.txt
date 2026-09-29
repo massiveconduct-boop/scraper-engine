@@ -402,7 +402,9 @@ supervisor==4.3.0
 tld==0.13.2
     # via scrapling
 tldextract==5.3.1
-    # via scrapy
+    # via
+    #   scraper-engine (pyproject.toml)
+    #   scrapy
 twisted==26.4.0
     # via scrapy
 typing-extensions==4.16.0
