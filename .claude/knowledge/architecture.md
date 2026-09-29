@@ -8,7 +8,7 @@ pool, PgBouncer, API routing, SSRF enforcement, fetcher construction,
 CAPTCHA solving, observability, tracing, botasaurus, metrics, data flow,
 repository layout, src layout, webhook outbox, webhook sweeper, Slack
 notifications, proxy pool health, proxy self-healing, DLQ auto-retry,
-partial_failure.
+partial_failure, leftover browser processes, Xvfb, zombies, process sweep.
 **Dependencies:** none — describes the system as built; cross-references
 `decisions.md` for WHY and `technical-debt.md` for full round history.
 **Related:** `.local/specs/scraper-engine-blueprint-v2.md` (local-only, not tracked in git), `.claude/knowledge/decisions.md`, `.claude/knowledge/technical-debt.md`
@@ -482,10 +482,11 @@ teardown across both engines:
 best-effort proactive removal of a just-closed Botasaurus driver's
 `/tmp/.X<N>-lock`/`/tmp/.X11-unix/X<N>` files (reaches into
 botasaurus_driver's private `Config._display` attribute; no public API
-exists). Wired into `botasaurus_pool.py::_close_driver()` and
-`botasaurus_wrapper.py::_botasaurus_fetch()`'s `finally` block (captured
-via closure, since the `@browser` decorator never exposes the `Driver`
-back to the caller after its own internal close).
+exists). Since round 72 it is called from `browser/_botasaurus_close.py`
+(`close_driver()` for the pool, `finish_close()` in
+`botasaurus_wrapper.py::_botasaurus_fetch()`'s `finally`, where the driver is
+captured via closure because the `@browser` decorator never hands it back).
+See "Browser Process Ownership (Round 72)" below for what else that close now guarantees.
 
 **What this does and doesn't guarantee:** live verification (4 rounds of
 concurrent real jobs against nairametrics.com, up to 4 simultaneous
@@ -500,6 +501,36 @@ CDP/websocket connection, `"Connection to remote host was lost -
 goodbye"`, no way to clean up the orphaned Xvfb process). This is a
 concurrency-race fix, not a guarantee the warning line disappears
 entirely — the warning is now cosmetic noise, not a failure mode.
+
+---
+
+## Browser Process Ownership (Round 72)
+
+A finished rq job owns no processes. Two layers enforce it:
+
+1. **Per driver** — `browser/_botasaurus_close.py`. With `tiny_profile`,
+   botasaurus `Driver.close()` saves cookies over CDP first, and a dead Chrome
+   makes that raise before anything is closed. `close_driver()` runs the
+   normal close, then `finish_close()` kills whatever is left: it SIGKILLs
+   Chrome, runs `config.close()` (Xvfb display + local auth proxy) if the
+   close never got that far, stops a live display, and removes lock files.
+2. **Per job** — `core/leftover_processes.py`, run by
+   `orchestrator/tasks.py::run_scrape_job` only inside an rq work-horse:
+   - At job end, in a `finally`, it kills every live process under the horse.
+     This covers Camoufox's abandoned teardown (`_shutdown_browser_bounded`,
+     60s) and a Botasaurus launch cancelled mid-flight.
+   - At job start, it kills this user's browser processes whose parent is
+     PID 1: leftovers of a horse rq force-killed (Camoufox's Xvfb uses
+     `start_new_session`, so it escapes rq's group kill).
+     `chrome_crashpad_handler` is exempt: its parent is PID 1 even while its
+     browser runs.
+
+Worker containers run with `init: true`, so tini as PID 1 reaps zombies; rq
+itself never did. Visibility comes from `worker_browser_processes{worker,kind}`
+(published at each job start and end) and `browser_processes_reaped_total{kind}`,
+plus the alerts `BrowserProcessesLeaked` and `WorkerBrowserProcessesHigh`.
+Operations: `operations.md` → "Browser processes in workers". Why two layers:
+`decisions.md` → "A Finished Job Owns No Processes".
 
 ---
 

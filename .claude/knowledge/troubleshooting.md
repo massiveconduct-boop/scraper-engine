@@ -411,6 +411,26 @@ proxy source for a higher base rate.
 
 ---
 
+### Chromium / Xvfb processes piling up in workers (round 72)
+
+**Symptom:** `ps` in a worker shows chromium, Xvfb or camoufox processes with
+no job running, or `worker_browser_processes` is above 0 between jobs, or
+`browser_processes_reaped_total` goes up.
+**Check:** worker logs for `leftover_processes_killed` (the job sweep killed
+something: which kind, and which sweep) and `botasaurus_close_failed` (a
+driver's own close raised, usually because Chrome had died).
+**Known causes, all handled since round 72** (`architecture.md` → "Browser
+Process Ownership"):
+- a failed botasaurus close;
+- a timed-out Camoufox teardown;
+- a cancelled launch;
+- an rq force-kill of a horse.
+
+A rising reaped counter means a NEW close path leaks. The sweep contains it,
+but find the path; don't just accept the kills.
+**Not a leak:** `chrome_crashpad_handler` with parent PID 1 while its
+browser runs.
+
 ## Force-Push Recovery Patterns (Round 11)
 
 ### Test Files Silently Not Collected (Untracked in Git)
