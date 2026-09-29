@@ -85,10 +85,14 @@ Two scraper_engine leaks held ~12.4 GB of the 24 GB host.
     end-to-end rq job on a private queue leaked a real Driver on purpose:
     the job-end sweep killed `{'xvfb': 1, 'chromium': 9}`, and 0 browser
     processes were left in the container.
+- **Deployed 2026-09-28** (PR #38): api and the 3 workers rebuilt, Jaeger
+  recreated (startup log `"MaxTraces":5000`), Prometheus rules reloaded.
+  Workers run with `init=true`, and `worker_browser_processes` read 0 for all
+  three workers after one no-op job each. The api had to be rebuilt too:
+  `/metrics` is served there.
 - **Open:** a Botasaurus launch still running in an executor thread when its
   fetch is cancelled has no owner until job end. The sweep bounds it to the
-  job's lifetime. Deploying this change (rebuild the 3 workers, recreate
-  Jaeger) waits for the user's go.
+  job's lifetime.
 
 ## Technical Debt / Open Threads (as of round 71)
 
