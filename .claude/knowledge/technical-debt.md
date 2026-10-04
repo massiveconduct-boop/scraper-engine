@@ -32,6 +32,59 @@ true, cheap-to-read catalog and this stays fully discoverable (indexed in
 
 ---
 
+## Technical Debt / Open Threads (as of round 73)
+
+Origin: research_agent brief `to-scraper-engine-2026-09-29-fail-fast.md`.
+Its researchers waited 15-23 min per task; part of it was scrapes that end
+in failure only after a full climb (80-113 s each, e.g. pulse.ng 404 =
+L1 x2, L2 x2, L3).
+
+- **Where the "x2" came from.** Not a retry setting. The round-49/64 gateway
+  block retry (`worker.py`, after each level) ran at EVERY level. At L1 it
+  re-sent the identical HTTP request (`force_gateway` is ignored there). At
+  L2/L3 a refused gateway login made `_fetch_with_proxy` fall back to the
+  free pool and render the same page again. The refusal verdict lives 10
+  min, so every URL after its expiry paid both.
+- **Fixes.** (1) No gateway retry at L1. The retry passes `gateway_only`:
+  a refused login is returned as `proxy_auth_failed`, the pool attempt's
+  result stands (rejected once) and the URL gets `paid_gateway_skipped`.
+  (2) A 404/410 whose body is an ordinary error page (no challenge
+  signature, >= 200 characters) is final: `not_found`, permanent DLQ, no
+  circuit failure, no gateway retry (`_is_final_not_found`,
+  `ChallengeDetector.content_reason`). Stub or challenge-shaped 404s keep
+  the round-45 climb, since some sites answer a WAF block with a 404.
+  (3) A site (registrable domain, `core/domain.py`, offline `tldextract`)
+  that refused every level with a 401/403/405 or a bot-check page is
+  remembered `escalation.site_refusal_ttl_seconds` (1800) when the gateway
+  cannot change the answer (disabled/`free_only`, or it was skipped because
+  refusing). Its next URLs fail at once with `site_refused_recently: true`
+  and the earlier refusal's fields. The memory ends when the gateway serves
+  a URL again (`levelhint:gateway_epoch` moves) or a URL of the site
+  succeeds. Never written for 429, 404, `paid_only`, a capped ladder, or a
+  refusal the gateway also got.
+- **Measured** (live, free pool; a local stub answering 407 stood in for the
+  refusing gateway, no paid traffic; wall time from submit to terminal state
+  incl. ~5 s queue/poll latency; engine `total_ms` in brackets):
+
+  | URL (representative, the brief gave sites only) | before | after |
+  |---|---|---|
+  | pulse.ng missing story (404) | 91.5 s (136 s gateway off) | 7.2 s (0.7 s) |
+  | nejm.org 1st / 2nd URL | 56.0 / 55.9 s | 63.2 / 6.1 s (0.05 s) |
+  | namu.wiki 1st / same URL again | 52.9 / 52.9 s | 52.8 / 6.1 s |
+  | jamanetwork.com | 56.0 s | 54.8 s, then 6.1 s |
+  | sciencedirect.com | 92.5 s | 87.3 s, then 6.1 s |
+  | medpagetoday / healio / acc (controls) | 6.1 / 8.2 / 7.3 s ok | 6.2 / 7.2 / 7.2 s ok |
+
+  The FIRST URL of a refusing site still climbs (45-90 s: two browser
+  levels). Only what follows it is fast.
+- **Open.** Not measured live: the paid route itself (no paid traffic);
+  unit tests cover the gateway paths. L2's Botasaurus-then-Camoufox
+  fallback still renders twice on a Botasaurus-seen 403 (not changed: a
+  different engine can pass). First-URL cost could drop further only with
+  evidence L3 on a free proxy never beats an L2 403.
+
+---
+
 ## Technical Debt / Open Threads (as of round 72)
 
 Origin: research_agent brief `to-scraper-engine-2026-09-28-memory-leaks.md`.

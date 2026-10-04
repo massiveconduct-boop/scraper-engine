@@ -26,6 +26,7 @@ Two invariants keep this safe to have on by default:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from scraper_engine.core.tenant import TenantId
 
 logger = logging.getLogger(__name__)
+
+_GATEWAY_EPOCH_KEY = "levelhint:gateway_epoch"
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,76 @@ class LevelMemory:
     async def record_botasaurus_ok(self, tenant_id: TenantId, domain: str) -> None:
         """Botasaurus produced the accepted L2 result — drop the hint."""
         await self._clear_flag(self._botasaurus_fails_key(tenant_id, domain), domain)
+
+    @staticmethod
+    def _site_refusal_key(tenant_id: TenantId, site: str) -> str:
+        return f"levelhint:refused:{tenant_id}:{site}"
+
+    @property
+    def _site_refusal_on(self) -> bool:
+        return (
+            self._config.level_memory_enabled and self._config.site_refusal_ttl_seconds > 0
+        )
+
+    async def record_site_refused(
+        self, tenant_id: TenantId, site: str, refusal: dict[str, Any]
+    ) -> None:
+        """Round 73 — `site` (a registrable domain) refused every level.
+
+        `refusal` is what the next URL of the site is told instead of a fetch
+        (level, http_status, failure_category, block_reason, message). It lives
+        `site_refusal_ttl_seconds`, then the site is tried again.
+        """
+        if not self._site_refusal_on:
+            return
+        try:
+            await self._raw.set(
+                self._site_refusal_key(tenant_id, site),
+                json.dumps(refusal),
+                ex=self._config.site_refusal_ttl_seconds,
+            )
+        except Exception:
+            logger.warning("level_memory_write_failed site=%s", site, exc_info=True)
+
+    async def site_refusal(self, tenant_id: TenantId, site: str) -> dict[str, Any] | None:
+        """The remembered refusal for `site`, or None (none, expired, disabled,
+        unreadable). The caller decides whether it still applies — it depends
+        on the paid gateway, which this class knows nothing about."""
+        if not self._site_refusal_on:
+            return None
+        try:
+            raw = await self._raw.get(self._site_refusal_key(tenant_id, site))
+            refusal = json.loads(raw) if raw is not None else None
+        except Exception:
+            logger.warning("level_memory_read_failed site=%s", site, exc_info=True)
+            return None
+        return refusal if isinstance(refusal, dict) else None
+
+    async def gateway_epoch(self) -> str:
+        """Counts gateway successes (bump_gateway_epoch). A site refusal
+        recorded while the gateway was out stops applying once this moves: the
+        gateway is back, and the route that could reach the site works again."""
+        try:
+            raw = await self._raw.get(_GATEWAY_EPOCH_KEY)
+        except Exception:
+            logger.warning("level_memory_read_failed gateway_epoch", exc_info=True)
+            return "?"
+        return "0" if raw is None else str(raw)
+
+    async def bump_gateway_epoch(self) -> None:
+        """The paid gateway just served a URL."""
+        if not self._site_refusal_on:
+            return
+        try:
+            await self._raw.incr(_GATEWAY_EPOCH_KEY)
+        except Exception:
+            logger.warning("level_memory_write_failed gateway_epoch", exc_info=True)
+
+    async def clear_site_refusal(self, tenant_id: TenantId, site: str) -> None:
+        """A URL of `site` produced usable content — forget the refusal."""
+        if not self._site_refusal_on:
+            return
+        await self._clear_flag(self._site_refusal_key(tenant_id, site), site)
 
     async def _set_flag(self, key: str, domain: str) -> None:
         if not self._config.level_memory_enabled:

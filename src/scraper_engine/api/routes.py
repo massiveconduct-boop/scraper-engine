@@ -523,19 +523,22 @@ class _StoredDiagnostics(NamedTuple):
     escalations: list[dict[str, Any]] | None = None
     paid_gateway_skipped: bool | None = None
     block_reason: str | None = None
+    site_refused_recently: bool | None = None
 
 
 def _split_timings_column(raw: str | None) -> _StoredDiagnostics:
     """Undo orchestrator/tasks.py::_timings_column — the stored JSONB holds the
     integer phase timings plus an optional `escalations` list (round 64) and,
-    since round 69, `paid_gateway_skipped` / `block_reason`."""
+    since round 69, `paid_gateway_skipped` / `block_reason` (round 73:
+    `site_refused_recently`)."""
     if not raw:
         return _StoredDiagnostics()
     payload = json.loads(raw)
     escalations = payload.pop("escalations", None)
     skipped = payload.pop("paid_gateway_skipped", None)
     block_reason = payload.pop("block_reason", None)
-    return _StoredDiagnostics(payload or None, escalations, skipped, block_reason)
+    refused_recently = payload.pop("site_refused_recently", None)
+    return _StoredDiagnostics(payload or None, escalations, skipped, block_reason, refused_recently)
 
 
 @router.get("/jobs/{job_id}")
@@ -631,6 +634,7 @@ async def get_job(
             timings=stored.timings,
             escalations=stored.escalations,
             paid_gateway_skipped=stored.paid_gateway_skipped,
+            site_refused_recently=stored.site_refused_recently,
             block_reason=stored.block_reason,
         )
         for r in result_rows

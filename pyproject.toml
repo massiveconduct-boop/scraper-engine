@@ -48,6 +48,10 @@ dependencies = [
     # browser processes a job left running); was already a transitive dep
     # of botasaurus. Same reasoning as botasaurus-requests above.
     "psutil==7.2.2",
+    # Imported directly by core/domain.py (registrable domain for the per-site
+    # refusal memory, round 73); was already a transitive dep. Same reasoning
+    # as psutil above.
+    "tldextract==5.3.1",
     "structlog==26.1.0",
     "prometheus-client==0.25.0",
     "pyyaml==6.0.3",

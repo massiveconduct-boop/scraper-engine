@@ -1372,10 +1372,13 @@ class TestGatewayFallbackOnFailure:
             proxy_source="paid_gateway",
         )
         # Round 64 — the gateway retry fires at the level that was blocked
-        # (here L1), not only at the final level, so the rescue comes on the
-        # second call instead of after climbing the whole ladder.
+        # (here L2), not only at the final level, so the rescue comes on the
+        # second call instead of after climbing the whole ladder. Round 73 —
+        # never at L1: it has no gateway path, the retry was the same request.
         worker._fetch_url = AsyncMock(side_effect=[direct_block, rescued])
-        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")], config_overrides=ConfigOverrides(min_level=2)
+        )
 
         response = await worker.process_job(tenant, "job-direct-block-rescue", request)
 
@@ -1390,14 +1393,14 @@ class TestGatewayFallbackOnFailure:
         # and a total_ms nothing else accounted for.
         assert response.results[0].escalations == [
             {
-                "level": 1,
+                "level": 2,
                 "reason": "failure:detection_block",
                 "http_status": 403,
                 "engine": None,
                 "proxy_source": "pool",
             }
         ]
-        assert "level_1_gateway_retry_ms" in response.results[0].timings
+        assert "level_2_gateway_retry_ms" in response.results[0].timings
         assert worker._fetch_url.await_count == 2
 
     @pytest.mark.asyncio
@@ -1430,8 +1433,9 @@ class TestGatewayFallbackOnFailure:
             proxy_source="paid_gateway",
         )
         worker._fetch_url = AsyncMock(
-            # pool attempt + one gateway retry, at each of the three levels
-            side_effect=[direct_block_pool, direct_block_gateway] * 3
+            # L1: one attempt (round 73: no retry there); L2 and L3: the pool
+            # attempt + one gateway retry each
+            side_effect=[direct_block_pool] + [direct_block_pool, direct_block_gateway] * 2
         )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
@@ -1444,13 +1448,16 @@ class TestGatewayFallbackOnFailure:
         # proxy_source carried forward from last_level_result into the
         # for/else branch's constructed exhausted_result, not dropped.
         assert response.results[0].proxy_source == "paid_gateway"
-        # exactly one gateway retry per level — the gateway-sourced failure
-        # must not trigger a second one.
-        assert worker._fetch_url.await_count == 6
+        # exactly one gateway retry per browser level — the gateway-sourced
+        # failure must not trigger a second one.
+        assert worker._fetch_url.await_count == 5
         assert [c.kwargs.get("force_gateway") for c in worker._fetch_url.await_args_list] == [
             False,
+            False,
             True,
-        ] * 3
+            False,
+            True,
+        ]
 
     @pytest.mark.asyncio
     async def test_still_blocked_gateway_retry_itself_fails(self, tenant, worker):
@@ -1566,11 +1573,11 @@ class TestGatewayFallbackOnFailure:
             http_status=200,
             proxy_source="paid_gateway",
         )
-        # Level 1, level 2 both non-final and blocked -> escalate. Level 3
-        # (final) is attempted twice: the normal initial call (still
-        # blocked), then the forced-gateway retry (rescued).
+        # Level 1 (no retry there) and level 2 (its gateway retry is blocked
+        # too) escalate. Level 3 (final) is attempted twice: the normal
+        # initial call (still blocked), then the forced-gateway retry (rescued).
         worker._fetch_url = AsyncMock(
-            side_effect=[blocked_result, blocked_result, blocked_result, rescued_result]
+            side_effect=[blocked_result] * 4 + [rescued_result]
         )
         request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
 
@@ -3200,7 +3207,6 @@ class TestFailureLabels:
         [
             (401, "HTTP 401 (unauthorized) at L3 via pool"),
             (405, "HTTP 405 (method refused) at L3 via pool"),
-            (410, "HTTP 410 (gone, or a block shaped like it) at L3 via pool"),
         ],
     )
     async def test_an_unlisted_block_status_is_not_accepted_as_content(
@@ -3316,9 +3322,12 @@ class TestRateLimited:
             proxy_source=source,
         )
 
-    async def _run(self, worker, tenant, side_effect, job="job-429"):
+    async def _run(self, worker, tenant, side_effect, job="job-429", min_level=None):
         worker._fetch_url = AsyncMock(side_effect=side_effect)
-        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        request = ScrapeRequest(
+            urls=[HttpUrl("http://example.com")],
+            config_overrides=ConfigOverrides(min_level=min_level) if min_level else None,
+        )
         response = await worker.process_job(tenant, job, request)
         assert response.results is not None
         return response.results[0]
@@ -3526,7 +3535,7 @@ class TestRateLimited:
 
         worker._config.dataimpulse = DataImpulseConfig(enabled=True, strategy="free_first")
         result = await self._run(
-            worker, tenant, [self._limited(1, "pool"), self._ok(1, "paid_gateway")]
+            worker, tenant, [self._limited(2, "pool"), self._ok(2, "paid_gateway")], min_level=2
         )
 
         assert result.success is True
@@ -3682,3 +3691,398 @@ class TestDisplayLockWait:
         response = await worker.process_job(tenant, "job-no-display-wait", request)
 
         assert "display_lock_wait_ms" not in response.results[0].timings
+
+
+class TestFailFast:
+    """Round 73 — definitive refusals fail fast (research_agent brief): a
+    plain 404/410 page is final, L1 never gets a "gateway retry", a refused
+    gateway login does not buy a second free render, and a site that refused
+    every level is remembered while the paid gateway cannot change the answer."""
+
+    _refused = staticmethod(TestProxyAuthFailed._refused)
+    _wire_fetcher = staticmethod(TestProxyAuthFailed._wire_fetcher)
+    _wire_pm = staticmethod(TestProxyAuthFailed._wire_pm)
+    _configure = staticmethod(TestGatewayRefusalFallsBackToPool._configure)
+    _CLEAN_404 = "<html><body>" + "Sorry, we could not find that page. " * 12 + "</body></html>"
+
+    @staticmethod
+    def _page(status, level=1, *, body=None, source="pool", success=None):
+        from scraper_engine.fetcher._failure import classify_http_status
+
+        success = status < 400 if success is None else success
+        return FetchResult(
+            url="http://example.com",
+            success=success,
+            level_used=level,
+            http_status=status,
+            html=TestFailFast._CLEAN_404 if body is None else body,
+            duration_ms=1,
+            proxy_source=source,
+            failure_category=None if success else classify_http_status(status),
+        )
+
+    @staticmethod
+    def _ok(level=2, source="pool"):
+        return FetchResult(
+            url="http://example.com",
+            success=True,
+            level_used=level,
+            http_status=200,
+            html="<html><body>" + "real content " * 80 + "</body></html>",
+            duration_ms=1,
+            proxy_source=source,
+        )
+
+    async def _run(self, worker, tenant, side_effect, min_level=None, max_level=None):
+        worker._fetch_url = AsyncMock(side_effect=side_effect)
+        overrides = (
+            ConfigOverrides(min_level=min_level, max_level=max_level)
+            if min_level or max_level
+            else None
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")], config_overrides=overrides)
+        response = await worker.process_job(tenant, "job-73", request)
+        assert response.results is not None
+        return response.results[0]
+
+    # -- rule 1: a plain 404/410 is final ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_plain_404_ends_at_the_first_level_as_not_found(self, tenant, worker):
+        result = await self._run(worker, tenant, [self._page(404)])
+
+        assert worker._fetch_url.await_count == 1
+        assert result.success is False
+        assert result.failure_category == FailureCategory.NOT_FOUND
+        assert result.block_reason == "status:404"
+        assert result.is_challenge_page is False
+        assert result.error_message.startswith("HTTP 404 (not found) at L1 via pool")
+        assert [e["reason"] for e in result.escalations] == ["status:404"]
+        assert worker._dlq.enqueue.await_args.args[3] == FailureCategory.NOT_FOUND
+        worker._circuit_breaker.record_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_plain_410_from_a_browser_level_is_final_too(self, tenant, worker):
+        page = self._page(410, 2, success=True)
+        result = await self._run(worker, tenant, [page], min_level=2)
+
+        assert worker._fetch_url.await_count == 1
+        assert result.failure_category == FailureCategory.NOT_FOUND
+        assert result.error_message.startswith("HTTP 410 (gone) at L2 via pool")
+
+    @pytest.mark.asyncio
+    async def test_a_404_that_gets_the_gateway_retry_no_more(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch)
+        result = await self._run(worker, tenant, [self._page(404, 2)], min_level=2)
+
+        assert worker._fetch_url.await_count == 1
+        assert result.failure_category == FailureCategory.NOT_FOUND
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "<html><body>404</body></html>",  # a stub, not a page
+            "<html><body>" + "please verify you are a human " * 12 + "</body></html>",
+        ],
+    )
+    async def test_a_404_shaped_like_a_block_still_escalates(self, tenant, worker, body):
+        # Round 45: some sites answer a WAF block with a 404.
+        ambiguous = self._page(404, 1, body=body)
+        result = await self._run(worker, tenant, [ambiguous, self._ok(2)])
+
+        assert worker._fetch_url.await_count == 2
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_a_shaped_404_that_a_browser_shows_plainly_is_final_there(self, tenant, worker):
+        result = await self._run(
+            worker, tenant, [self._page(404, 1, body="<html>404</html>"), self._page(404, 2)]
+        )
+
+        assert worker._fetch_url.await_count == 2
+        assert result.failure_category == FailureCategory.NOT_FOUND
+        assert [e["level"] for e in result.escalations] == [1, 2]
+
+    # -- rule 3: no repeat on a definitive status --------------------------
+
+    @pytest.mark.asyncio
+    async def test_l1_never_gets_a_gateway_retry(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch)
+        result = await self._run(worker, tenant, [self._page(403, 1), self._ok(2)])
+
+        assert result.success is True
+        assert [c.kwargs["force_gateway"] for c in worker._fetch_url.await_args_list] == [
+            False,
+            False,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_gateway_retry_leaves_the_pool_result_standing(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch)
+        effects = [
+            self._page(403, 2),
+            self._refused("paid_gateway", level=2),
+            self._page(403, 3),
+            self._refused("paid_gateway", level=3),
+        ]
+        result = await self._run(worker, tenant, effects, min_level=2)
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.http_status == 403
+        assert result.proxy_source == "pool"
+        assert result.paid_gateway_skipped is True
+        # Each pool rejection is recorded once, not once per attempt.
+        assert [(e["level"], e["reason"]) for e in result.escalations] == [
+            (2, "failure:detection_block"),
+            (3, "failure:detection_block"),
+        ]
+        assert all(
+            c.kwargs.get("gateway_only") is True
+            for c in worker._fetch_url.await_args_list
+            if c.kwargs["force_gateway"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_gateway_only_returns_a_refusal_instead_of_rendering_on_the_pool(
+        self, tenant, worker, monkeypatch
+    ):
+        health = self._configure(worker, monkeypatch)
+        self._wire_pm(monkeypatch, tenant)
+        fetcher = self._wire_fetcher(monkeypatch, self._refused(None))
+
+        result = await worker._fetch_url(
+            tenant, "http://example.com", 2, force_gateway=True, gateway_only=True
+        )
+
+        assert fetcher.fetch.await_count == 1
+        assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        assert result.proxy_source == "paid_gateway"
+        health.mark_refused.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_only_with_a_known_refusal_makes_no_render(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        self._wire_pm(monkeypatch, tenant)
+        fetcher = self._wire_fetcher(monkeypatch)
+
+        result = await worker._fetch_url(
+            tenant, "http://example.com", 2, force_gateway=True, gateway_only=True
+        )
+
+        fetcher.fetch.assert_not_awaited()
+        assert result.failure_category == FailureCategory.PROXY_AUTH_FAILED
+        assert result.paid_gateway_skipped is True
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_success_moves_the_gateway_epoch(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch)
+        pm = self._wire_pm(monkeypatch, tenant)
+        pm.get_proxy.side_effect = ProxyPoolExhaustedError(
+            domain="example.com", level=2, attempts=5
+        )
+        self._wire_fetcher(monkeypatch, self._ok(2, "paid_gateway"))
+        worker._level_memory.bump_gateway_epoch = AsyncMock()
+
+        result = await worker._fetch_url(tenant, "http://example.com", 2)
+
+        assert result.success is True
+        worker._level_memory.bump_gateway_epoch.assert_awaited_once()
+
+    # -- rule 2: a refusing site is remembered ------------------------------
+
+    @staticmethod
+    def _refusal(epoch="0", **over):
+        return {
+            "level": 3,
+            "http_status": 403,
+            "block_reason": "status:403",
+            "message": "HTTP 403 (refused) at L3 via pool",
+            "proxy_source": "pool",
+            "paid_gateway_skipped": False,
+            "gateway_epoch": epoch,
+        } | over
+
+    @pytest.mark.asyncio
+    async def test_a_remembered_refusal_fails_the_next_url_without_a_fetch(self, tenant, worker):
+        worker._level_memory.site_refusal = AsyncMock(return_value=self._refusal())
+
+        result = await self._run(worker, tenant, [])
+
+        worker._fetch_url.assert_not_awaited()
+        assert result.success is False
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        assert result.site_refused_recently is True
+        assert result.http_status == 403
+        assert result.block_reason == "status:403"
+        assert result.proxy_source == "pool"
+        assert result.error_message.startswith("example.com refused every level recently")
+        assert "HTTP 403 (refused) at L3 via pool" in result.error_message
+        assert [e["reason"] for e in result.escalations] == ["site_refused_recently"]
+        assert worker._dlq.enqueue.await_args.args[3] == FailureCategory.DETECTION_BLOCK
+        worker._circuit_breaker.record_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_remembered_refusal_keeps_the_gateway_note(self, tenant, worker):
+        worker._level_memory.site_refusal = AsyncMock(
+            return_value=self._refusal(paid_gateway_skipped=True, level=None, message=None)
+        )
+
+        result = await self._run(worker, tenant, [])
+
+        assert result.paid_gateway_skipped is True
+        assert result.level_used == 3  # the top of the ladder when none was stored
+        assert "blocked" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_no_remembered_refusal_means_a_normal_fetch(self, tenant, worker):
+        worker._level_memory.site_refusal = AsyncMock(return_value=None)
+
+        result = await self._run(worker, tenant, [self._ok(1)])
+
+        assert result.success is True
+        assert result.site_refused_recently is None
+
+    @pytest.mark.asyncio
+    async def test_the_gateway_coming_back_ends_a_remembered_refusal(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch)
+        worker._level_memory.site_refusal = AsyncMock(return_value=self._refusal(epoch="1"))
+        worker._level_memory.gateway_epoch = AsyncMock(return_value="2")
+
+        result = await self._run(worker, tenant, [self._ok(1)])
+
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_holds_while_the_gateway_has_not_worked_since(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch)
+        worker._level_memory.site_refusal = AsyncMock(return_value=self._refusal(epoch="1"))
+        worker._level_memory.gateway_epoch = AsyncMock(return_value="1")
+
+        result = await self._run(worker, tenant, [])
+
+        assert result.site_refused_recently is True
+
+    @pytest.mark.asyncio
+    async def test_paid_only_ignores_the_memory(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch, strategy="paid_only")
+        worker._level_memory.site_refusal = AsyncMock(return_value=self._refusal())
+
+        result = await self._run(worker, tenant, [self._ok(1)])
+
+        assert result.success is True
+        worker._level_memory.site_refusal.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_site_that_refuses_every_level_is_remembered(self, tenant, worker):
+        worker._level_memory.record_site_refused = AsyncMock()
+        result = await self._run(
+            worker, tenant, [self._page(403, 1), self._page(403, 2), self._page(403, 3)]
+        )
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        worker._level_memory.record_site_refused.assert_awaited_once()
+        args = worker._level_memory.record_site_refused.await_args.args
+        assert args[1] == "example.com"
+        assert args[2]["http_status"] == 403
+        assert args[2]["level"] == 3
+        assert args[2]["block_reason"] == "status:403"
+        assert args[2]["paid_gateway_skipped"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_bot_check_page_is_remembered_like_a_403(self, tenant, worker):
+        worker._level_memory.record_site_refused = AsyncMock()
+        bot_check = "<html><body>" + "please verify you are a human " * 12 + "</body></html>"
+        pages = [self._page(200, lvl, body=bot_check) for lvl in (1, 2, 3)]
+        result = await self._run(worker, tenant, pages)
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        worker._level_memory.record_site_refused.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_gateway_makes_the_refusal_worth_remembering(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch, refused=True)
+        worker._level_memory.record_site_refused = AsyncMock()
+        pages = [self._page(403, lvl) for lvl in (1, 2, 3)]
+        await self._run(worker, tenant, pages)
+
+        payload = worker._level_memory.record_site_refused.await_args.args[2]
+        assert payload["paid_gateway_skipped"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_the_gateway_also_got_is_not_remembered(
+        self, tenant, worker, monkeypatch
+    ):
+        self._configure(worker, monkeypatch)
+        worker._level_memory.record_site_refused = AsyncMock()
+        effects = [
+            self._page(403, 1),
+            self._page(403, 2),
+            self._page(403, 2, source="paid_gateway"),
+            self._page(403, 3),
+            self._page(403, 3, source="paid_gateway"),
+        ]
+        result = await self._run(worker, tenant, effects)
+
+        assert result.failure_category == FailureCategory.DETECTION_BLOCK
+        worker._level_memory.record_site_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_429_is_not_remembered(self, tenant, worker):
+        worker._level_memory.record_site_refused = AsyncMock()
+        pages = [self._page(429, lvl) for lvl in (1, 2, 3)]
+        result = await self._run(worker, tenant, pages)
+
+        assert result.failure_category == FailureCategory.RATE_LIMITED
+        worker._level_memory.record_site_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_ladder_the_caller_capped_is_not_remembered(self, tenant, worker):
+        worker._level_memory.record_site_refused = AsyncMock()
+        pages = [self._page(403, 1), self._page(403, 2)]
+        await self._run(worker, tenant, pages, max_level=2)
+
+        worker._level_memory.record_site_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_paid_only_never_remembers(self, tenant, worker, monkeypatch):
+        self._configure(worker, monkeypatch, strategy="paid_only")
+        worker._level_memory.record_site_refused = AsyncMock()
+        worker._fetch_url = AsyncMock(
+            side_effect=[self._page(403, lvl, source="paid_gateway") for lvl in (1, 2, 3)]
+        )
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-73", request)
+
+        worker._level_memory.record_site_refused.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_success_forgets_the_refusal(self, tenant, worker):
+        worker._level_memory.clear_site_refusal = AsyncMock()
+        result = await self._run(worker, tenant, [self._ok(1)])
+
+        assert result.success is True
+        worker._level_memory.clear_site_refusal.assert_awaited_once_with(tenant, "example.com")
+
+    @pytest.mark.asyncio
+    async def test_a_final_404_and_a_remembered_refusal_stream_their_result(self, tenant, worker):
+        streamed = AsyncMock()
+        worker._fetch_url = AsyncMock(side_effect=[self._page(404)])
+        request = ScrapeRequest(urls=[HttpUrl("http://example.com")])
+        await worker.process_job(tenant, "job-73-404", request, on_result=streamed)
+        assert streamed.await_args.args[0].failure_category == FailureCategory.NOT_FOUND
+
+        streamed.reset_mock()
+        worker._level_memory.site_refusal = AsyncMock(return_value=self._refusal())
+        await worker.process_job(tenant, "job-73-memory", request, on_result=streamed)
+        assert streamed.await_args.args[0].site_refused_recently is True

@@ -23,6 +23,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from scraper_engine.core.budget import start_display_wait_meter
+from scraper_engine.core.domain import registrable_domain
 from scraper_engine.core.models import FailureCategory, FetchResult, JobStatus, JobStatusResponse
 from scraper_engine.fetcher._failure import classify_http_status
 from scraper_engine.observability.metrics import fetch_duration_seconds
@@ -105,6 +106,19 @@ _NO_SITE_ANSWER_CATEGORIES = frozenset(
     }
 )
 _GATEWAY_ROTATE_CATEGORIES = _BLOCK_CATEGORIES
+
+# Round 73 — a 404/410 whose page is an ordinary error page is the URL's final
+# answer at once (`not_found`), not a bot check: no escalation, no gateway
+# retry. Round 45 found some sites answer a WAF block with a 404-shaped
+# response, so "ordinary" is judged on the body: no challenge signature, and
+# enough text to be a real page rather than a stub (Cloudflare's and Squid's
+# are far shorter). Anything else keeps the round-45 climb.
+_NOT_FOUND_STATUSES = frozenset({404, 410})
+_NOT_FOUND_MIN_BODY_CHARS = 200
+# Round 73 — statuses that remember a site's refusal (with a bot-check
+# signature, see Worker._remember_site_refusal). 404/410 are per-URL, 429 is
+# the engine's own re-drive.
+_REFUSAL_STATUSES = frozenset({401, 403, 405})
 
 # Round 68 — why a URL did not go out through the paid gateway while it is
 # refusing our credentials (proxy/gateway_health.py). Ends up in the result's
@@ -453,6 +467,85 @@ class Worker:
         result.paid_gateway_skipped = True
         return False
 
+    def _is_final_not_found(self, result: FetchResult) -> bool:
+        """Round 73 — `result` is an ordinary 404/410 error page: the URL's
+        final answer, not a block to escalate past. See _NOT_FOUND_STATUSES."""
+        if result.http_status not in _NOT_FOUND_STATUSES:
+            return False
+        html = result.html or ""
+        return (
+            len(html.strip()) >= _NOT_FOUND_MIN_BODY_CHARS
+            and self._challenge_detector.content_reason(html) is None
+        )
+
+    @property
+    def _paid_route_is_pool_only(self) -> bool:
+        """Round 73 — the deployment's paid gateway is not a route that could
+        reach a site the pool cannot, whatever its health right now:
+        disabled, or free_only. (paid_only is the reverse: the gateway IS the
+        route, so a refusal there is the site's, never the pool's.)"""
+        di = self._config.dataimpulse
+        return not di.enabled or di.strategy == "free_only"
+
+    async def _site_refusal(self, tenant_id: TenantId, site: str) -> dict[str, Any] | None:
+        """Round 73 — the remembered refusal for `site` if it still applies.
+
+        Under free_first it applies only while no gateway success has been seen
+        since it was recorded (orchestrator/level_memory.py::gateway_epoch): a
+        gateway that works again can reach what the pool could not, so the
+        site gets its ladder back the moment it does, not when the memory
+        expires."""
+        di = self._config.dataimpulse
+        if di.enabled and di.strategy == "paid_only":
+            return None
+        refusal = await self._level_memory.site_refusal(tenant_id, site)
+        if refusal is None:
+            return None
+        if not self._paid_route_is_pool_only and (
+            refusal.get("gateway_epoch") != await self._level_memory.gateway_epoch()
+        ):
+            return None
+        return refusal
+
+    async def _remember_site_refusal(
+        self,
+        tenant_id: TenantId,
+        site: str,
+        terminal: FetchResult,
+        *,
+        gateway_skipped: bool,
+    ) -> None:
+        """Round 73 — `terminal` (a URL's final DETECTION_BLOCK, every level
+        tried) says `site` refuses us. Remember it only when nothing else could
+        change the answer: a 401/403/405 or a bot-check page (not a 429, which
+        the DLQ reaper re-drives), and the paid gateway either never a route or
+        skipped on this URL because it is refusing our credentials. With a
+        working gateway nothing is remembered: free_first keeps trying it."""
+        di = self._config.dataimpulse
+        if di.enabled and di.strategy == "paid_only":
+            return
+        reason = terminal.block_reason or ""
+        definitive = (
+            terminal.http_status in _REFUSAL_STATUSES
+            or reason.startswith("signature:")
+            or terminal.is_challenge_page
+        )
+        if not definitive or not (self._paid_route_is_pool_only or gateway_skipped):
+            return
+        await self._level_memory.record_site_refused(
+            tenant_id,
+            site,
+            {
+                "level": terminal.level_used,
+                "http_status": terminal.http_status,
+                "block_reason": terminal.block_reason,
+                "message": terminal.error_message,
+                "proxy_source": terminal.proxy_source,
+                "paid_gateway_skipped": bool(terminal.paid_gateway_skipped),
+                "gateway_epoch": await self._level_memory.gateway_epoch(),
+            },
+        )
+
     async def process_job(
         self,
         tenant_id: TenantId,
@@ -595,6 +688,35 @@ class Worker:
                     result.engine,
                 )
 
+            async def _conclude_not_found(level: int, result: FetchResult) -> None:
+                """Round 73 — `result` is an ordinary 404/410 page: this URL's
+                answer, so it ends here (`not_found`, a permanent DLQ entry).
+                Not a block: no circuit failure, no level memory, no later
+                level, no gateway retry."""
+                status = result.http_status
+                _reject(level, result, f"status:{status}")
+                result.success = False
+                result.is_challenge_page = False
+                result.failure_category = FailureCategory.NOT_FOUND
+                result.block_reason = f"status:{status}"
+                route = result.proxy_source or "direct"
+                result.error_message = (
+                    f"HTTP {status} ({'gone' if status == 410 else 'not found'}) at "
+                    f"L{level} via {route} — the page is missing, not a bot check"
+                )
+                await self._dlq.enqueue(
+                    tenant_id,
+                    job_id,
+                    url_str,
+                    FailureCategory.NOT_FOUND,
+                    result.error_message,
+                    level,
+                )
+                errors.append(result.error_message)
+                results[index] = _finish(result)
+                if on_result is not None:
+                    await on_result(result)
+
             # Checked once per task, right after this task's semaphore slot
             # comes free — same cooperative granularity the old "checked
             # before starting the next loop iteration" gave, just per-task
@@ -636,6 +758,11 @@ class Worker:
                     is_cancelled=_job_cancelled,
                     timings=timings,
                 )
+            # Round 73 — this URL's site refused every level a few minutes ago
+            # and nothing has changed (see _site_refusal): say so at once
+            # instead of climbing the ladder again.
+            site = registrable_domain(domain)
+            refusal = await self._site_refusal(tenant_id, site)
             plan = await self._level_memory.plan(tenant_id, domain, levels)
             start_level = plan.start_level
             # Round 64 — a domain known to refuse the free pool goes straight
@@ -690,6 +817,42 @@ class Worker:
                 # report the REAL last failure instead of fabricating one. See
                 # that branch's comment for the bug this closes.
                 last_level_result: FetchResult | None = None
+
+                if refusal is not None:
+                    refused_level = int(refusal.get("level") or levels[-1])
+                    refused = FetchResult(
+                        url=url_str,
+                        success=False,
+                        level_used=refused_level,
+                        duration_ms=0,
+                        failure_category=FailureCategory.DETECTION_BLOCK,
+                        error_message=(
+                            f"{site} refused every level recently — not retried: "
+                            f"{refusal.get('message') or 'blocked'}"
+                        ),
+                        http_status=refusal.get("http_status"),
+                        block_reason=refusal.get("block_reason"),
+                        proxy_source=refusal.get("proxy_source"),
+                        paid_gateway_skipped=refusal.get("paid_gateway_skipped") or None,
+                        site_refused_recently=True,
+                    )
+                    _reject(refused_level, refused, "site_refused_recently")
+                    logger.info(
+                        "site_refused_recently job_id=%s url=%s site=%s", job_id, url_str, site
+                    )
+                    await self._dlq.enqueue(
+                        tenant_id,
+                        job_id,
+                        url_str,
+                        FailureCategory.DETECTION_BLOCK,
+                        refused.error_message or "",
+                        refused_level,
+                    )
+                    errors.append(refused.error_message or "")
+                    results[index] = _finish(refused)
+                    if on_result is not None:
+                        await on_result(refused)
+                    return
 
                 for level in url_levels:
                     circuit_open = not await self._circuit_breaker.allow_request(domain)
@@ -829,6 +992,12 @@ class Worker:
                     if result.paid_gateway_skipped:
                         gateway_skipped = True
 
+                    # Round 73 — an ordinary 404/410 page ends the URL here:
+                    # before the gateway retry and before any later level.
+                    if self._is_final_not_found(result):
+                        await _conclude_not_found(level, result)
+                        break
+
                     # Round 49 — one gateway retry before conceding a
                     # final-level block, evaluated BEFORE branching on
                     # result.success so it covers both real shapes a block
@@ -859,8 +1028,16 @@ class Worker:
                     # L3 attempt (blocked the same way) and then this same
                     # retry at L3 anyway — and taught level memory that the
                     # domain needs L3, so every later URL skipped L2 too.
+                    #
+                    # Round 73 — never at L1, and never as a second free render.
+                    # L1 has no proxy path (`force_gateway` is ignored), so the
+                    # "retry" was the identical HTTP request; and where the
+                    # gateway had refused our login, _fetch_with_proxy fell back
+                    # to the pool and rendered the same page again. Live: every
+                    # definitive 403 paid both (research_agent, 80-113s each).
                     if (
-                        self._gateway_fallback_eligible
+                        level >= 2
+                        and self._gateway_fallback_eligible
                         and result.proxy_source != "paid_gateway"
                         and (
                             result.failure_category in _BLOCK_CATEGORIES
@@ -885,9 +1062,7 @@ class Worker:
                         # total_ms ~2x level_2_ms with nothing to account for
                         # the difference, and a result whose only visible
                         # trace was `proxy_source: paid_gateway`.
-                        _reject(
-                            level,
-                            result,
+                        retried_reason = (
                             f"failure:{result.failure_category.value}"
                             if not result.success and result.failure_category is not None
                             else self._challenge_detector.challenge_reason(
@@ -895,7 +1070,7 @@ class Worker:
                                 result.http_status or 200,
                                 short_page_is_suspect=False,
                             )
-                            or "blocked",
+                            or "blocked"
                         )
                         retry_start = time.monotonic()
                         gateway_result = await self._fetch_url(
@@ -904,13 +1079,28 @@ class Worker:
                             level,
                             request.config_overrides,
                             force_gateway=True,
+                            gateway_only=True,
                             skip_botasaurus=skip_botasaurus,
                             admission=admission if claims_per_render else None,
                         )
                         timings[f"level_{level}_gateway_retry_ms"] = int(
                             (time.monotonic() - retry_start) * 1000
                         )
-                        if gateway_result is not None:
+                        retry_refused = (
+                            gateway_result is not None
+                            and gateway_result.failure_category
+                            == FailureCategory.PROXY_AUTH_FAILED
+                            and gateway_result.proxy_source == "paid_gateway"
+                        )
+                        if retry_refused:
+                            # Round 73 — the gateway refused our login before
+                            # it reached the site: the pool attempt's result
+                            # stands (it is not rejected twice) and the URL
+                            # says the usual route was down.
+                            gateway_skipped = True
+                        else:
+                            _reject(level, result, retried_reason)
+                        if gateway_result is not None and not retry_refused:
                             result = gateway_result
                             last_level_result = result
                             if (
@@ -928,9 +1118,7 @@ class Worker:
                                 # taught level memory the domain refuses the
                                 # pool, and each later URL of it went
                                 # gateway-first into the same refusal (10
-                                # domains live, research_agent). The retry may
-                                # also have come back from the pool, once
-                                # _fetch_with_proxy fell back on a refusal.
+                                # domains live, research_agent).
                                 await self._level_memory.record_pool_blocked(tenant_id, domain)
 
                     # Round 69 — a refused block retry, or a gateway retry that
@@ -1029,6 +1217,7 @@ class Worker:
                         # would have taught a level whose "success" is about to
                         # be reclassified as a block.
                         await self._level_memory.record_success(tenant_id, domain, level)
+                        await self._level_memory.clear_site_refusal(tenant_id, site)
                         if result.proxy_source == "pool":
                             await self._level_memory.record_pool_ok(tenant_id, domain)
                         if level == 2 and self._l2_tries_botasaurus and not skip_botasaurus:
@@ -1235,6 +1424,14 @@ class Worker:
                             real_category = FailureCategory.RATE_LIMITED
                     _note_gateway_skipped(exhausted_result, gateway_skipped)
                     real_message = exhausted_result.error_message or real_message
+                    # Round 73 — every level refused; tell the site's next URLs.
+                    if (
+                        real_category == FailureCategory.DETECTION_BLOCK
+                        and url_levels[-1] == LEVELS[-1]
+                    ):
+                        await self._remember_site_refusal(
+                            tenant_id, site, exhausted_result, gateway_skipped=gateway_skipped
+                        )
                     await self._dlq.enqueue(
                         tenant_id,
                         job_id,
@@ -1437,8 +1634,13 @@ class Worker:
         force_gateway: bool = False,
         skip_botasaurus: bool = False,
         admission: _RenderAdmission | None = None,
+        gateway_only: bool = False,
     ) -> FetchResult | None:
         """Dispatch fetch to the appropriate level fetcher.
+
+        gateway_only (round 73): with force_gateway, a refused gateway login
+        returns the refusal instead of falling back to the free pool — the
+        caller already has a pool result and wants the gateway's answer or none.
 
         force_gateway (round 49): only meaningful for level 2/3 — level 1
         never leases a proxy through _fetch_with_proxy at all (L1 is
@@ -1479,6 +1681,7 @@ class Worker:
                 self._pg,
                 _build_l2,
                 force_gateway=force_gateway,
+                gateway_only=gateway_only,
                 admission=admission,
                 weight=weight,
             )
@@ -1504,6 +1707,7 @@ class Worker:
                 self._pg,
                 _build_l3,
                 force_gateway=force_gateway,
+                gateway_only=gateway_only,
                 admission=admission,
                 weight=self._config.host_capacity.camoufox_weight,
             )
@@ -1520,6 +1724,7 @@ class Worker:
         force_gateway: bool = False,
         admission: _RenderAdmission | None = None,
         weight: float = 1.0,
+        gateway_only: bool = False,
     ) -> FetchResult:
         """Shared L2/L3 lease-fetch-score cycle, with a bounded same-level
         retry (round 37, see _PROXY_RETRYABLE_CATEGORIES/
@@ -1531,6 +1736,9 @@ class Worker:
         `if self._pg is None: raise` guard narrows it to non-None across
         the function boundary — mypy can't carry that narrowing through a
         separate method call on `self._pg` directly.
+
+        gateway_only (round 73): with force_gateway, a refused gateway login is
+        returned as PROXY_AUTH_FAILED instead of retried on the free pool.
 
         force_gateway (round 49): used by process_job's circuit-open and
         still-looks-blocked gateway-fallback branches to force this one
@@ -1579,7 +1787,7 @@ class Worker:
         while True:
             if (force_gateway or strategy == "paid_only") and not gateway_refused:
                 gateway_refused = await self._gateway_health.refusal() is not None
-            if gateway_refused and strategy == "paid_only":
+            if gateway_refused and (strategy == "paid_only" or gateway_only):
                 return FetchResult(
                     url=url,
                     success=False,
@@ -1656,10 +1864,11 @@ class Worker:
                                 result.error_message or "proxy authentication failed"
                             )
                             gateway_refused = True
-                            if strategy == "free_first":
+                            if strategy == "free_first" and not gateway_only:
                                 continue
                         elif result.success:
                             await self._gateway_health.clear()
+                            await self._level_memory.bump_gateway_epoch()
                     # A paid-gateway lease has no proxy_pool row (see
                     # proxy/paid_gateway.py) — mark_success/mark_failure would be
                     # a harmless no-op UPDATE either way, but gating on source

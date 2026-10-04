@@ -402,7 +402,9 @@ supervisor==4.3.0
 tld==0.13.2
     # via scrapling
 tldextract==5.3.1
-    # via scrapy
+    # via
+    #   scraper-engine (pyproject.toml)
+    #   scrapy
 twisted==26.4.0
     # via scrapy
 typing-extensions==4.16.0
@@ -434,7 +436,7 @@ ua-parser==1.0.2
     # via camoufox
 ua-parser-builtins==202606
     # via ua-parser
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   botasaurus-requests
     #   botocore

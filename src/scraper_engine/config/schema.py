@@ -323,6 +323,13 @@ class EscalationConfig(BaseModel):
     # after a full hour of inactivity, which a continuous crawl never has.
     # 0 disables re-probing.
     reprobe_every: int = 20
+    # Round 73 — how long a site that refused every level (a final-level
+    # 401/403/405 or bot-check page) is remembered while the paid gateway is
+    # unavailable; the site's next URLs fail at once instead of climbing the
+    # ladder again. Short on purpose: a refusal by free exits says little about
+    # the site tomorrow. 0 disables. Reads re-check the gateway, so a returning
+    # gateway ends the effect without waiting for this to expire.
+    site_refusal_ttl_seconds: int = 1800
 
 
 class ExtractionConfig(BaseModel):

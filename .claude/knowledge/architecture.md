@@ -504,6 +504,32 @@ entirely — the warning is now cosmetic noise, not a failure mode.
 
 ---
 
+## Failing Fast on Definitive Refusals (Round 73)
+
+`orchestrator/worker.py::process_job`, per URL, in this order:
+
+1. **Site memory** (before any fetch): `_site_refusal()` reads
+   `levelhint:refused:{tenant}:{registrable domain}` (`level_memory.py`). A hit
+   ends the URL with `site_refused_recently`. It applies only if the paid
+   route is not a pool-only fallback that has since worked: under `free_first`
+   the entry stores `gateway_epoch`, and `bump_gateway_epoch()` (a gateway
+   success) invalidates every earlier entry. `paid_only` never reads or
+   writes it.
+2. **Final 404/410** (after each level, before the gateway retry):
+   `_is_final_not_found()` — status 404/410, body >= 200 chars, no challenge
+   signature (`ChallengeDetector.content_reason`) -> `_conclude_not_found()`.
+3. **Gateway block retry**: L2/L3 only, `gateway_only=True`. A refused login
+   returns `proxy_auth_failed` and leaves the pool result standing.
+4. **Terminal**: `_remember_site_refusal()` writes the memory after a
+   final-level `detection_block` (401/403/405 or a signature) when the gateway
+   was never a route or was skipped.
+
+The refused-result shape is a normal `FetchResult` plus
+`site_refused_recently`, persisted in the `scrape_results.timings` JSON like
+`paid_gateway_skipped` (no migration).
+
+---
+
 ## Browser Process Ownership (Round 72)
 
 A finished rq job owns no processes. Two layers enforce it:
