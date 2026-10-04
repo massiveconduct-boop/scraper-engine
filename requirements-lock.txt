@@ -436,7 +436,7 @@ ua-parser==1.0.2
     # via camoufox
 ua-parser-builtins==202606
     # via ua-parser
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   botasaurus-requests
     #   botocore
