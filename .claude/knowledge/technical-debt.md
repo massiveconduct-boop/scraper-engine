@@ -39,6 +39,17 @@ Its researchers waited 15-23 min per task; part of it was scrapes that end
 in failure only after a full climb (80-113 s each, e.g. pulse.ng 404 =
 L1 x2, L2 x2, L3).
 
+- **Merge follow-ups (2026-10-04).** (1) `pip-audit` failed CI on
+  `urllib3` 2.7.0 (PYSEC-2026-4175/4176/4177, fixed in 2.8.0) with no code
+  change; `main`'s lock failed it too. Bumped in both lock files as its own
+  commit; `pip check` clean, suite unchanged. (2) Rebuilding images on this
+  `aarch64` host failed: the `camoufox-fetch` stage installed camoufox
+  unpinned, 0.5.7 needs `indexed-zstd` (x86-only wheel, needs gcc), and the
+  `|| echo` hid it until `COPY --from=camoufox-fetch` broke. CI (x86) was
+  green. Pinned to the locked 0.5.4 (PR #41). The `|| echo` still masks fetch
+  failures. (3) One image build needs ~8 GB of transient disk (Camoufox
+  layer + build cache); building all five in parallel filled the disk.
+
 - **Where the "x2" came from.** Not a retry setting. The round-49/64 gateway
   block retry (`worker.py`, after each level) ran at EVERY level. At L1 it
   re-sent the identical HTTP request (`force_gateway` is ignored there). At
