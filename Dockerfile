@@ -70,7 +70,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 FROM python:3.12-slim AS camoufox-fetch
 # camoufox[geoip] — production config sets camoufox.geoip=true; the plain
 # `camoufox` package raises NotInstalledGeoIPExtra at launch without the extra.
-RUN pip install --no-cache-dir "camoufox[geoip]" && \
+# Pinned to the version in requirements-lock.txt (keep in step). Unpinned, a
+# newer release pulled indexed-zstd, which has no wheel and needs gcc that this
+# slim stage lacks; the `|| echo` below hid that until the later COPY failed,
+# and the fetched Firefox could drift from the installed Python package.
+RUN pip install --no-cache-dir "camoufox[geoip]==0.5.4" && \
     python -m camoufox fetch || echo "Camoufox fetch skipped (binary may not be available)"
 
 # ── Stage 2b: Python deps (cache-stable) ────────────────────────────────────

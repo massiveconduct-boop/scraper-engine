@@ -317,6 +317,19 @@ Related: `.wolf/cerebrum.md`'s 2026-08-07 Do-Not-Repeat entry already warned
 that 8000 can be held by something else; round 62 pins down the current
 owner and the one-command way to check.
 
+## Image Build Fails on `camoufox-fetch` or With `no space left on device` (Round 73)
+
+**Symptom:** `docker compose build` ends with `failed to compute cache key ...
+"/root/.cache/camoufox": not found`, or `failed to extract layer ... no space
+left on device`. The task may still report exit 0 if a trailing `echo` ran.
+
+**Causes:** (1) an unpinned camoufox in the fetch stage pulling a release whose
+dependency (`indexed-zstd`) has no wheel on this ARM host; the stage is pinned
+to the version in `requirements-lock.txt`, keep them in step. (2) Disk: one
+image needs ~8 GB transient. Build one service at a time, check `df -h /`
+first, and `docker builder prune -f` afterwards. Never `docker image prune -a`:
+other projects' images share this daemon.
+
 ## Infrastructure Failures
 
 ### PgBouncer Connection Refused (Port 6432)
